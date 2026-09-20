@@ -5,7 +5,7 @@
 
 ## 环境
 
-- 项目：LitBoard 1.2.0（`package.json`），Node engines `>=22.13.0`
+- 项目：LitBoard 1.2.14（`package.json`，2026-09-20 复核更新），Node engines `>=22.13.0`
 - 审计机：Windows 10.0.26100 x64，Git Bash；Node v24.x（见下）
 - 真实用户数据位于 `%APPDATA%\LitBoard`，**全程未接触**；所有运行验证使用隔离目录。
 

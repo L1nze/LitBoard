@@ -33,7 +33,7 @@
 3. 生成校验和（连同安装包一起发布）：
 
    ```powershell
-   node scripts/release-checksums.js
+   npm run release-checksums
    ```
 
    产出 `dist/SHA256SUMS.txt`，含哈希、文件大小与构建环境（Electron / electron-builder 版本）。

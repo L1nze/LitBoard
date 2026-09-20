@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 /* 对齐片段键的首尾空格：键以空格开头/结尾而译文没有时，补上空格。
- * 用法：node scripts/i18n-space-fix.js <keys-all.json> <chunks-dir> */
+ * 用法：node scripts/one-off/i18n-space-fix.js <keys-all.json> <chunks-dir>
+ * 一次性工具（首版词典翻译用），日常增补直接手改 js/i18n-en.js。 */
 const fs = require('fs');
 const path = require('path');
 

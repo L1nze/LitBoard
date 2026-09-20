@@ -1,5 +1,5 @@
 /* LitBoard 英文词典：键 = 中文源串（与 js/i18n.js、界面源码一致）。
- * 由 scripts/i18n-en-merge.js 生成，手工维护译文；新增界面文案后请补条目
+ * 由 scripts/one-off/i18n-en-merge.js 生成，手工维护译文；新增界面文案后请补条目
  * （test/i18n.test.js 会校验 T() 键与本词典的覆盖关系）。 */
 (function (root, factory) {
   var LitI18n = (root && root.LitI18n) || (typeof module === 'object' && module.exports ? require('./i18n.js') : null);

@@ -292,7 +292,7 @@ npm.cmd run smoke             # 标准功能冒烟（隔离目录启动 Electron
 npm.cmd run smoke:lifecycle   # 生命周期冒烟：写入 → 真实关闭 → 重启 → 数据一致
 npm.cmd run perf              # 冷启动/加载/保存分段计时（默认 5 轮，输出 P50/P95）
 npm.cmd run vendor-hashes     # 重生成 vendor/SHA256SUMS（升级第三方库后必须跑）
-node scripts/release-checksums.js   # dist/ 发布包校验和（npm run dist 之后）
+npm.cmd run release-checksums # dist/ 发布包校验和（npm run dist 之后）
 ```
 
 构建完成后，`dist` 目录包含（`npm run dist` 每次会自动把 `package.json` 的 patch 号 +1，所以版本号逐次递增）：
@@ -302,7 +302,7 @@ LitBoard-Setup-1.2.14-x64.exe
 LitBoard-Portable-1.2.14-x64.exe
 ```
 
-应用图标由 `scripts/gen-icons.ps1` 生成 `build/icon.ico`、`build/icon-*.png` 与 `extension/icons/*`（改图标后重新运行该脚本再构建即可）。
+应用图标由 `npm run gen-icons`（`scripts/gen-icons.ps1`）生成 `build/icon.ico`、`build/icon-*.png` 与 `extension/icons/*`（源图是 `icon/Logo.png`，改图标后重新运行该脚本再构建即可）。
 
 首次执行 `start`、`dist` 或 `lint` 需要联网下载工具；想让 Electron 走国内镜像，自行设置环境变量 `$env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/'`（脚本已不再写死镜像地址）。
 
@@ -394,5 +394,7 @@ LitBoard 自有代码按 AGPL-3.0-only 发布，完整项目许可见根目录 `
 - [docs/roadmap.md](docs/roadmap.md) — 路线图（开源前完善与长期演进，M0–M8）
 - [docs/THIRD-PARTY.md](docs/THIRD-PARTY.md) — 第三方组件台账（版本/来源/哈希/许可）
 - [docs/audit-baseline.md](docs/audit-baseline.md) — 审查基线与性能基准数据
+- [docs/task-ledger.md](docs/task-ledger.md) — 里程碑任务台账（各阶段完成状态）
+- [docs/audits/](docs/audits/) — 历次审查与评审报告（按日期归档）
 - [docs/releasing.md](docs/releasing.md) — 维护者发布清单
 - [SECURITY.md](SECURITY.md) — 安全政策

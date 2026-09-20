@@ -22,7 +22,9 @@
     "smoke:lifecycle": "node scripts/smoke-lifecycle.js",
     "diag:word": "node scripts/word-diag.js",
     "perf": "node scripts/perf-baseline.js",
-    "vendor-hashes": "node scripts/vendor-hashes.js"
+    "vendor-hashes": "node scripts/vendor-hashes.js",
+    "gen-icons": "powershell -ExecutionPolicy Bypass -File scripts/gen-icons.ps1",
+    "release-checksums": "node scripts/release-checksums.js"
   },
   "devDependencies": {
     "electron": "39.2.7",
