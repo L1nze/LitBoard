@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>LitBoard 保存助手 · 选项</title>
+<style>
+  body { max-width: 520px; margin: 24px auto; font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; padding: 0 16px; }
+  h1 { font-size: 18px; }
+  label { display: block; margin: 14px 0 4px; font-weight: 600; }
+  input { width: 100%; padding: 8px 10px; border: 1px solid #d0d0d0; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
+  .row { display: flex; gap: 10px; margin-top: 18px; align-items: center; }
+  button { cursor: pointer; border: 1px solid #d0d0d0; background: #fff; border-radius: 6px; padding: 8px 16px; font-size: 14px; }
+  button.primary { background: #2f6fdb; border-color: #2f6fdb; color: #fff; }
+  #status { font-size: 13px; color: #666; }
+  .hint { font-size: 12px; color: #888; }
+</style>
+</head>
+<body>
+  <h1>LitBoard 保存助手 · 选项</h1>
+  <p class="hint">端口与令牌在 LitBoard 桌面端「设置 → 浏览器扩展」中查看（令牌可一键复制）。</p>
+  <label for="port">桌面端端口</label>
+  <input id="port" type="number" placeholder="24117">
+  <label for="token">令牌（X-LitBoard-Token）</label>
+  <input id="token" type="text" placeholder="粘贴桌面端设置页中的令牌" spellcheck="false">
+  <div class="row">
+    <button class="primary" id="save">保存</button>
+    <button id="test">测试连接</button>
+    <span id="status"></span>
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>

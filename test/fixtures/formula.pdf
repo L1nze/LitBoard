@@ -1,0 +1,47 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>
+endobj
+6 0 obj
+<< /Length 205 >>
+stream
+BT
+/F1 18 Tf
+72 720 Td
+(Formula rendering fixture) Tj
+/F2 28 Tf
+0 -70 Td
+(S) Tj
+/F1 22 Tf
+24 0 Td
+( f\(x\) dx = ) Tj
+/F1 24 Tf
+120 0 Td
+(1) Tj
+0 -5 Td
+(____) Tj
+10 -24 Td
+(2) Tj
+35 29 Td
+(mc) Tj
+/F1 12 Tf
+33 10 Td
+(2) Tj
+ET
+endstream
+endobj
+trailer
+<< /Root 1 0 R /Size 7 >>
+%%EOF

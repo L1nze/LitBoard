@@ -1,0 +1,91 @@
+name: Bug 报告
+description: 报告一个可复现的缺陷
+title: '[Bug] '
+labels: ['bug', 'needs-triage']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请尽量补齐下列信息——LitBoard 是本地优先应用，**没有服务端日志**，
+        你提供的信息是唯一的排查依据。
+
+        提交前请先搜索 issue 是否已有同样问题。
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我搜索过已有 issue，没有重复
+          required: true
+        - label: 我已阅读 README 的「联网与隐私」一节（中文版 README.zh-CN.md），确认该行为不是设计如此
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: LitBoard 版本
+      description: 见「设置」页底部，或安装包文件名（如 1.2.0）
+      placeholder: 1.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-kind
+    attributes:
+      label: 安装形态
+      options:
+        - 安装版（LitBoard-Setup-*.exe）
+        - 免安装版（LitBoard-Portable-*.exe）
+        - 源码运行（npm start）
+        - 仅浏览器打开 index.html
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Windows 版本
+      placeholder: Windows 11 23H2 (22631.4169)
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 越具体越好，写明点击了哪个按钮、导入了什么文件
+      placeholder: |
+        1. 打开 LitBoard，导入 sample.bib
+        2. 在搜索框输入 tag:综述
+        3. 观察到 …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 有报错请贴出完整文本。渲染/界面问题建议附截图
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他线索
+      description: |
+        可选，但很有用：
+        - 是否只在特定数据下出现（文献数量、是否启用全文索引 / 语义搜索 / 坚果云同步）
+        - 开发版跑一次 smoke 测试的结果：
+          `LITBOARD_SMOKE_TEST=1 LITBOARD_SMOKE_RESULT=%TEMP%\smoke.json electron . --user-data-dir=%TEMP%\litboard-smoke`
+        - 是否与回收站、附件路径迁移、备份恢复相关
+    validations:
+      required: false

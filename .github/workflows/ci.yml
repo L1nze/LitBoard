@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test / node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows-latest = 受支持的运行/构建平台；ubuntu-latest 用于守住测试套件的可移植性
+        # （应用本体只在 Windows 上构建，见 README「开发与构建」）
+        os: [windows-latest, ubuntu-latest]
+        node: ['22.x', '24.x']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # 测试是纯 Node（node:test），不加载 Electron，也不需要 npm install：
+      # 这正是「项目目录零 node_modules」约定成立的前提，请勿在此处加装依赖。
+      - name: Run test suite
+        run: npm test
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+          cache: npm
+
+      # 只装 lint 工具；--ignore-scripts 阻止 Electron 下载二进制（CI 里用不到）
+      - name: Install lint tooling
+        run: npm ci --ignore-scripts
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+      - name: Run ESLint
+        run: npm run lint
+
+  package-smoke:
+    # M5：真实打包 + 隔离 Electron 冒烟（标准功能断言 + 生命周期「写入→真实关闭→重启→校验」）。
+    # 保证 CI 覆盖的不只是纯函数，还有「构建产物可启动、可读写库、可干净退出」。
+    name: package + smoke (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+
+      # 外置构建工具（electron / electron-builder）装到 runner 的 %LOCALAPPDATA%\LitBoardBuildTools，
+      # 项目目录保持零 node_modules（ensure-tools.ps1 自带版本核对）。
+      - name: Install external build tools
+        shell: pwsh
+        run: scripts/ensure-tools.ps1
+
+      # 1) 先出一份保留 win-unpacked 的构建，用打包产物跑隔离冒烟
+      - name: Build (keep unpacked for smoke)
+        shell: pwsh
+        run: |
+          $toolsDir = Join-Path $env:LOCALAPPDATA 'LitBoardBuildTools'
+          $electronDist = Join-Path $toolsDir 'node_modules\electron\dist'
+          $builderCli = Join-Path $toolsDir 'node_modules\electron-builder\out\cli\cli.js'
+          & node $builderCli --projectDir $env:GITHUB_WORKSPACE "--config.electronDist=$electronDist" --win nsis portable --x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke packaged binary + lifecycle
+        shell: pwsh
+        run: |
+          node scripts/smoke-lifecycle.js
+          node scripts/smoke.js (Join-Path $env:GITHUB_WORKSPACE 'dist\win-unpacked\LitBoard.exe')
+
+      # 2) 再走正式发布脚本（会把 win-unpacked 清理掉），验证发布路径本身。
+      #    用 dist:nobump：CI 不能把版本号提交回仓库，产物版本必须与仓库一致，
+      #    否则上传的安装包会声称一个仓库里不存在的版本（本地发布用 npm run dist 自动 +1）。
+      - name: Package via official dist script
+        shell: pwsh
+        run: npm run dist:nobump
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: LitBoard-windows-x64
+          path: dist/*.exe
+          if-no-files-found: error
+          retention-days: 7

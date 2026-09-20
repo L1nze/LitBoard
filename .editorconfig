@@ -1,0 +1,23 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.ps1]
+# Windows PowerShell 5.1 在非 UTF-8 代码页（如 GB2312）下会把无 BOM 的 UTF-8 脚本解析错乱：
+# 中文注释的多字节序列会吞掉换行，导致紧随其后的那行代码被并进注释而静默失效 —— 必须带 BOM。
+charset = utf-8-bom
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[Makefile]
+indent_style = tab

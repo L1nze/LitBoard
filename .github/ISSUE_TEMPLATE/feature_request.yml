@@ -1,0 +1,42 @@
+name: 功能建议
+description: 提出一个新功能或改进
+title: '[Feature] '
+labels: ['enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先说明**要解决的问题**，而不是直接给出实现方案。
+        LitBoard 的取舍偏好是：本地优先、零依赖、数据可迁移、不做需要自己服务器的功能。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      placeholder: 我在整理某个主题的文献时，需要反复……很费时间
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你设想的做法
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你目前是怎么绕过去的
+      description: 已有的替代做法能说明这个需求的真实强度
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: 约束确认（LitBoard 的硬性设计约束）
+      options:
+        - label: 该功能可以完全离线工作，或只访问已有白名单主机（OpenAlex / Semantic Scholar / Crossref / PubMed / OpenLibrary）
+        - label: 该功能不需要引入 node_modules 依赖（可 vendor 的单文件库除外）
+        - label: 该功能不需要项目自建服务器

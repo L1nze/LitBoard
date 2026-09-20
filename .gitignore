@@ -1,0 +1,44 @@
+# ---------- 依赖 ----------
+# 本项目约定项目目录零依赖：构建工具装在 %LOCALAPPDATA%\LitBoardBuildTools。
+# 若你选择了标准 npm 流程（见 CONTRIBUTING.md），node_modules 不入库。
+node_modules/
+npm-debug.log*
+
+# ---------- 构建产物 ----------
+# 应用图标 build/icon.ico 与 build/icon-*.png 是源文件，必须入库，勿在此忽略 build/
+dist/
+build/win-unpacked/
+*.blockmap
+builder-debug.yml
+builder-effective-config.yaml
+
+# ---------- 测试与冒烟产物 ----------
+coverage/
+test/artifacts/
+test/smoke-*.json
+.tmp/
+extension/js/
+
+# ---------- 本地数据（绝不入库）----------
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.bak
+*.corrupt-*
+.env
+.env.*
+*.local.json
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---------- 工具与预览残留（不入库）----------
+.icon-previews/
+.zcode/

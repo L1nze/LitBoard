@@ -1,0 +1,36 @@
+TY  - JOUR
+AU  - Turing, Alan M.
+TI  - Computing machinery and intelligence
+JO  - Mind
+VL  - 59
+IS  - 236
+SP  - 433
+EP  - 460
+PY  - 1950
+DO  - 10.1093/mind/LIX.236.433
+UR  - https://doi.org/10.1093/mind/LIX.236.433
+AB  - I propose to consider the question, "Can machines think?"
+KW  - artificial intelligence
+KW  - computation
+SN  - 0026-4423
+ER  - 
+
+TY  - CHAP
+AU  - Knuth, Donald E.
+TI  - Literate Programming
+T2  - The Computer Journal
+SP  - 97
+EP  - 111
+PY  - 1984
+PB  - Oxford University Press
+SN  - 978-0-19-853301-2
+ET  - 2
+LA  - en
+ER  - 
+
+TY  - ELEC
+AU  - OpenAI
+TI  - GPT-4 Technical Report
+PY  - 2023
+UR  - https://arxiv.org/abs/2303.08774
+ER  - 

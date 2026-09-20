@@ -1,0 +1,79 @@
+{
+  "name": "litboard",
+  "version": "1.2.14",
+  "description": "本地优先的个人文献阅读仪表盘",
+  "main": "electron/main.js",
+  "author": "LitBoard",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "powershell -ExecutionPolicy Bypass -File scripts/start.ps1",
+    "test": "node --test",
+    "lint": "node scripts/lint.js",
+    "dist": "powershell -ExecutionPolicy Bypass -File scripts/build.ps1",
+    "dist:nobump": "powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -NoBump",
+    "bump-version": "node scripts/bump-version.js",
+    "pack-extension": "powershell -ExecutionPolicy Bypass -File scripts/pack-extension.ps1",
+    "check-translators": "node scripts/check-translator-upstream.js",
+    "smoke": "node scripts/smoke.js",
+    "smoke:lifecycle": "node scripts/smoke-lifecycle.js",
+    "diag:word": "node scripts/word-diag.js",
+    "perf": "node scripts/perf-baseline.js",
+    "vendor-hashes": "node scripts/vendor-hashes.js"
+  },
+  "devDependencies": {
+    "electron": "39.2.7",
+    "electron-builder": "26.0.12",
+    "eslint": "^10.10.0"
+  },
+  "build": {
+    "appId": "com.litboard.desktop",
+    "productName": "LitBoard",
+    "electronVersion": "39.2.7",
+    "asar": true,
+    "npmRebuild": false,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "index.html",
+      "css/**/*",
+      "js/**/*",
+      "vendor/**/*",
+      "electron/**/*",
+      "extension/**/*",
+      "word/**/*",
+      "build/icon.ico",
+      "build/icon-*.png",
+      "package.json",
+      "README.md",
+      "LICENSE"
+    ],
+    "asarUnpack": ["word/**/*"],
+    "win": {
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": true,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "artifactName": "LitBoard-Setup-${version}-${arch}.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "portable": {
+      "artifactName": "LitBoard-Portable-${version}-${arch}.${ext}"
+    }
+  }
+}

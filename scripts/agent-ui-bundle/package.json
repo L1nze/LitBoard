@@ -1,0 +1,13 @@
+{
+  "name": "litboard-agent-ui-bundle",
+  "private": true,
+  "description": "Pinned sources for the one-off external build of vendor/assistant-ui/agent-chat.js. node_modules never enter the repository (installed to an external tools dir by build.js).",
+  "dependencies": {
+    "@assistant-ui/react": "0.11.58",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

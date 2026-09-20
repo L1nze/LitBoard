@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "LitBoard 保存助手",
+  "version": "1.2.0",
+  "description": "一键把当前文献页保存到 LitBoard 桌面端（识别 DOI / 标题 / 开放获取 PDF，支持知网元数据与登录态 PDF 下载）",
+  "permissions": ["activeTab", "contextMenus", "storage", "scripting"],
+  "host_permissions": ["http://127.0.0.1/*", "https://kns.cnki.net/*", "https://*.cnki.net/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "保存到 LitBoard" },
+  "options_page": "options.html",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}

@@ -1,0 +1,21 @@
+# 行尾策略（对应 AGENTS.md「文件统一 LF」）：仓库与工作区一律 LF，
+# 包括 *.ps1 —— 现有 PowerShell 脚本即是 LF 且构建正常（PowerShell 5.1+ 无碍）。
+* text=auto eol=lf
+
+# 二进制文件：禁止任何行尾/编码转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.wasm  binary
+*.pdf   binary
+*.exe   binary
+*.zip   binary
+
+# GitHub 展示：第三方代码折叠、生成物不参与语言统计
+vendor/**           linguist-vendored=true
+extension/icons/**  linguist-generated=true
+build/icon*.png     linguist-generated=true
+build/icon.ico      linguist-generated=true
+package-lock.json   linguist-generated=true

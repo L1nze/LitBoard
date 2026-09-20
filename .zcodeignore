@@ -1,0 +1,73 @@
+# ---------- 依赖 ----------
+# 本项目约定项目目录零依赖：构建工具装在 %LOCALAPPDATA%\LitBoardBuildTools。
+# 若你选择了标准 npm 流程（见 CONTRIBUTING.md），node_modules 不入库。
+node_modules/
+npm-debug.log*
+
+# ---------- 构建产物 ----------
+# 应用图标 build/icon.ico 与 build/icon-*.png 是源文件，必须入库，勿在此忽略 build/
+dist/
+build/win-unpacked/
+*.blockmap
+builder-debug.yml
+builder-effective-config.yaml
+
+# ---------- 测试与冒烟产物 ----------
+coverage/
+test/artifacts/
+test/smoke-*.json
+.tmp/
+extension/js/
+
+# ---------- 本地数据（绝不入库）----------
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.bak
+*.corrupt-*
+.env
+.env.*
+*.local.json
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+bower_components/
+jspm_packages/
+__pycache__/
+site-packages/
+venv/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.egg-info/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）
+
+# ---------- 工具与预览残留（不入库）----------
+.icon-previews/

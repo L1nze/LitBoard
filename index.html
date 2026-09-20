@@ -1,0 +1,1688 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data: blob:; connect-src 'self' https://api.openalex.org https://api.semanticscholar.org https://api.crossref.org https://eutils.ncbi.nlm.nih.gov https://openlibrary.org; object-src 'none'; base-uri 'none'">
+<title>LitBoard · 文献阅读仪表盘</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- 统一线性图标库（stroke=currentColor，随主题变色；JS 动态处用 LitIcons.use(id) 引用） -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="lb-i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5.5v13M5.5 12h13"/></symbol>
+    <symbol id="lb-i-minus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 12h13"/></symbol>
+    <symbol id="lb-i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+    <symbol id="lb-i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.3"/><path d="M15.3 15.3l4.2 4.2"/></symbol>
+    <symbol id="lb-i-ft" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.3"/><path d="M15.3 15.3l4.2 4.2M7.6 9.4h5.8M7.6 12.6h3.8"/></symbol>
+    <symbol id="lb-i-doc" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 3.5H14l4.5 4.5v12.5H7.5zM14 3.5V8h4.5M10 12.5h5M10 16h5"/></symbol>
+    <symbol id="lb-i-file-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 3.5H14l4.5 4.5v12.5H7.5zM14 3.5V8h4.5M12 10.5v5M9.8 13.2l2.2 2.2 2.2-2.2"/></symbol>
+    <symbol id="lb-i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 7V5.8a1.5 1.5 0 0 1 1.5-1.5h3.8l2 2.7h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z"/></symbol>
+    <symbol id="lb-i-folder-new" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 7V5.8a1.5 1.5 0 0 1 1.5-1.5h3.8l2 2.7h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1zM16.5 13v5M14 15.5h5"/></symbol>
+    <symbol id="lb-i-folder-import" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 7V5.8a1.5 1.5 0 0 1 1.5-1.5h3.8l2 2.7h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1zM12 10.4v4.4M10 12.4l2 2 2-2"/></symbol>
+    <symbol id="lb-i-tray-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 13l2.3-6.5h11.4L20 13M4 13v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5M12 15.8V9.8M9.5 12.3L12 9.8l2.5 2.5"/></symbol>
+    <symbol id="lb-i-tray-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 13l2.3-6.5h11.4L20 13M4 13v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5M12 4v6M9.5 7L12 9.5 14.5 7"/></symbol>
+    <symbol id="lb-i-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.6 4.9l4.5 4.5L8.3 20.2l-4.8 1.3 1.3-4.8zM13.2 6.3l4.5 4.5"/></symbol>
+    <symbol id="lb-i-sparkle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4.2c.7 4 2.6 5.9 6.6 6.6-4 .7-5.9 2.6-6.6 6.6-.7-4-2.6-5.9-6.6-6.6 4-.7 5.9-2.6 6.6-6.6zM18.8 3c.3 1.7 1 2.4 2.7 2.7-1.7.3-2.4 1-2.7 2.7-.3-1.7-1-2.4-2.7-2.7 1.7-.3 2.4-1 2.7-2.7z"/></symbol>
+    <symbol id="lb-i-quote" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.7 7.2c-2.1.7-3.3 2.1-3.3 4.4V17h5.6v-5.4H8.9c.1-1.5.8-2.4 2-3zM16.9 7.2c-2.1.7-3.3 2.1-3.3 4.4V17h5.6v-5.4h-3.1c.1-1.5.8-2.4 2-3z"/></symbol>
+    <symbol id="lb-i-tag" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12.7 3.5h7.8v7.8l-8.2 8.2a1.55 1.55 0 0 1-2.2 0L4.9 13.9a1.55 1.55 0 0 1 0-2.2l7.8-8.2z"/><circle cx="7.7" cy="7.7" r="1.3"/></symbol>
+    <symbol id="lb-i-keyboard" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="6.5" width="17" height="11" rx="2"/><path d="M7 10.3h.01M10.5 10.3h.01M14 10.3h.01M17.5 10.3h.01M7 13.8h.01M17.5 13.8h.01M8.5 13.8h7"/></symbol>
+    <symbol id="lb-i-theme-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="7.5"/><path fill="currentColor" stroke="none" d="M12 4.5a7.5 7.5 0 0 0 0 15z"/></symbol>
+    <symbol id="lb-i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.8"/><path d="M12 3.2v2M12 18.8v2M3.2 12h2M18.8 12h2M5.8 5.8l1.4 1.4M16.8 16.8l1.4 1.4M18.2 5.8l-1.4 1.4M7.2 16.8l-1.4 1.4"/></symbol>
+    <symbol id="lb-i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13.2A8 8 0 1 1 10.8 4 6.4 6.4 0 0 0 20 13.2z"/></symbol>
+    <symbol id="lb-i-sync" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7.2 4v15.5M7.2 4L3.9 7.3M7.2 4l3.3 3.3M16.8 20V4.5M16.8 20l3.3-3.3M16.8 20l-3.3-3.3"/></symbol>
+    <symbol id="lb-i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.8 12a8.2 8.2 0 0 1 14.2-5.7l2.5 2.1M20.5 3.8v4.6h-4.6M20.2 12a8.2 8.2 0 0 1-14.2 5.7l-2.5-2.1M3.5 20.2v-4.6h4.6"/></symbol>
+    <symbol id="lb-i-pause" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><path d="M9.4 5.6v12.8M14.6 5.6v12.8"/></symbol>
+    <symbol id="lb-i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8.4 5.4l10.2 6.6-10.2 6.6z"/></symbol>
+    <symbol id="lb-i-rotate" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.2 12a8.2 8.2 0 1 1-2.9-6.3M17.3 2.4v3.9h3.9"/></symbol>
+    <symbol id="lb-i-undo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8.6 5.6L4 10.2l4.6 4.6M4 10.2h9.5a6 6 0 0 1 0 12H10"/></symbol>
+    <symbol id="lb-i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 6.5h15M9.8 6.3V4.6a1.1 1.1 0 0 1 1.1-1.1h2.2a1.1 1.1 0 0 1 1.1 1.1v1.7M6.5 6.5l.8 12a1.4 1.4 0 0 0 1.4 1.3h6.6a1.4 1.4 0 0 0 1.4-1.3l.8-12M10 10.8v6.2M14 10.8v6.2"/></symbol>
+    <symbol id="lb-i-x-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="7.5"/><path d="M9.4 9.4l5.2 5.2M14.6 9.4l-5.2 5.2"/></symbol>
+    <symbol id="lb-i-external" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M13.8 5H19v5.2M19 5l-8.3 8.3M9.3 5H6.5a1.5 1.5 0 0 0-1.5 1.5v11a1.5 1.5 0 0 0 1.5 1.5h11a1.5 1.5 0 0 0 1.5-1.5V14.5"/></symbol>
+    <symbol id="lb-i-sidebar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="14" rx="1.5"/><path d="M9.3 5v14"/></symbol>
+    <symbol id="lb-i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 11v5.5M12 7.8v.4"/></symbol>
+    <symbol id="lb-i-more" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="12" r="1.2" fill="currentColor"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/><circle cx="18.5" cy="12" r="1.2" fill="currentColor"/></symbol>
+    <symbol id="lb-i-camera" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.2 8.6h2.8l1.5-2.2h6.9l1.6 2.2h2.8v9.9H4.2z"/><circle cx="12" cy="13.2" r="3.1"/></symbol>
+    <symbol id="lb-i-pen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.8 5.2l4 4L8 20l-4 .8.8-4zM12.8 7.2l4 4"/></symbol>
+    <symbol id="lb-i-inbox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.2 13.2l2.2-6.4h11.2l2.2 6.4M4.2 13.2v5.3a1 1 0 0 0 1 1h13.6a1 1 0 0 0 1-1v-5.3M12 8.8v4M9.6 11L12 13.4 14.4 11"/></symbol>
+    <symbol id="lb-i-layers" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.6L20.3 8 12 12.4 3.7 8 12 3.6zM3.7 12.3L12 16.7l8.3-4.4M3.7 16.3L12 20.7l8.3-4.4"/></symbol>
+    <symbol id="lb-i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.6 7.6h8.8M17.6 7.6h2.8M3.6 16.4h2.8M11.6 16.4h8.8"/><circle cx="15" cy="7.6" r="2.6" fill="currentColor" stroke="none"/><circle cx="9" cy="16.4" r="2.6" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="lb-i-note" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 4.5h13v9l-4 4h-9zM14.5 17.5v-4h4M8.8 8.6h6.4M8.8 11.6h4"/></symbol>
+    <symbol id="lb-i-paperclip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.2 11.6l-7.3 7.3a4.8 4.8 0 0 1-6.8-6.8l7.7-7.7a3.2 3.2 0 0 1 4.5 4.5l-7.7 7.7a1.6 1.6 0 0 1-2.3-2.3l7.1-7.1"/></symbol>
+    <symbol id="lb-i-package" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.9l8.1 4.3v9.6L12 21.1l-8.1-4.3V7.2L12 2.9zM4.1 7.4L12 11.5l7.9-4.1M12 11.5v9.4"/></symbol>
+    <symbol id="lb-i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.8" cy="7.7" r="3.3"/><path d="M3.6 19.7c.4-3.2 2.6-4.9 5.2-4.9s4.8 1.7 5.2 4.9M15.4 11.3a3.3 3.3 0 0 0 0-5.9M17.4 14.9c1.9.5 3.1 2 3.4 4.4"/></symbol>
+    <symbol id="lb-i-bank" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.2 9.8L12 4.6l7.8 5.2M5.8 11.4v6M9.8 11.4v6M14.2 11.4v6M18.2 11.4v6M4 17.4h16M4 20.4h16"/></symbol>
+    <symbol id="lb-i-book" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6.3c-2-1.7-4.8-2.2-8-2v14.4c3.2-.2 6 .3 8 2 2-1.7 4.8-2.2 8-2V4.3c-3.2-.2-6 .3-8 2zM12 6.3v14.4"/></symbol>
+    <symbol id="lb-i-library" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="7.5" width="11.5" height="11.5" rx="1.5"/><path d="M8.5 3.5H15l3.5 3.5V19H8.5zM15 3.5V7h3.5M11.5 11h4.5M11.5 14.5h4.5"/></symbol>
+    <symbol id="lb-i-chev-l" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.8 5.8L8.6 12l6.2 6.2"/></symbol>
+    <symbol id="lb-i-chev-r" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9.2 5.8L15.4 12l-6.2 6.2"/></symbol>
+    <symbol id="lb-i-chev-u" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5.8 14.8L12 8.6l6.2 6.2"/></symbol>
+    <symbol id="lb-i-chev-d" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5.8 9.2L12 15.4l6.2-6.2"/></symbol>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <div class="topbar-left">
+    <div class="brand">
+      <span class="brand-logo" aria-hidden="true">
+        <img src="build/icon-64.png" width="28" height="28" alt="LitBoard">
+      </span>
+      <span class="brand-name">LitBoard</span>
+    </div>
+    <div class="topbar-actions">
+      <button class="btn" id="btn-import" title="导入 .bib / .ris / .pdf / .json 文件"><svg class="ic" aria-hidden="true"><use href="#lb-i-folder-import"/></svg>导入文件</button>
+      <button class="btn" id="btn-add" title="按 DOI / arXiv / 标题添加，或手动录入"><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg>添加</button>
+      <button class="btn" id="btn-enrich" title="用 OpenAlex、Semantic Scholar、Crossref 补全元数据"><svg class="ic" aria-hidden="true"><use href="#lb-i-sparkle"/></svg><span class="btn-label">一键补全</span></button>
+      <button class="btn btn-icon" id="btn-enrich-stop" title="中断补全（已命中的结果保留，下次从断点继续）" hidden><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <div class="topbar-actions">
+      <div class="menu-wrap">
+        <button class="btn btn-ghost btn-icon" id="btn-undo" title="撤销 (Ctrl+Z)" disabled><svg class="ic" aria-hidden="true"><use href="#lb-i-undo"/></svg></button>
+        <button class="btn btn-ghost btn-icon" id="btn-redo" title="重做 (Ctrl+Y)" disabled><svg class="ic" aria-hidden="true" style="transform:scaleX(-1)"><use href="#lb-i-undo"/></svg></button>
+        <button class="btn btn-ghost btn-icon" id="btn-issues" title="通知中心：最近的问题与失败提示" aria-label="通知中心" hidden><svg class="ic" aria-hidden="true"><use href="#lb-i-inbox"/></svg><span id="issues-badge" class="issues-badge" hidden></span></button>
+        <div class="menu" id="issues-menu" hidden>
+          <div class="issues-head">最近的问题<span class="field-hint">（本机保留 20 条，点击条目复制详情）</span></div>
+          <div id="issues-list" class="issues-list"></div>
+          <button class="menu-item" id="issues-clear">清空记录</button>
+        </div>
+        <button class="btn" id="btn-export"><svg class="ic" aria-hidden="true"><use href="#lb-i-tray-up"/></svg>导出</button>
+        <div class="menu" id="export-menu" hidden>
+          <button class="menu-item" id="btn-export-json">导出 JSON（含笔记，可备份恢复）</button>
+          <button class="menu-item" id="btn-export-csv">导出 CSV（Excel 可打开）</button>
+          <button class="menu-item" id="btn-export-bib">导出 BibTeX</button>
+          <button class="menu-item" id="btn-export-ris">导出 RIS（Zotero / EndNote）</button>
+          <button class="menu-item" id="btn-export-csljson">导出 CSL-JSON（完整字段）</button>
+          <button class="menu-item" id="btn-export-docx">导出 Word（带可刷新引文域）</button>
+          <hr class="menu-sep">
+          <button class="menu-item" id="btn-dedupe"><svg class="ic" aria-hidden="true"><use href="#lb-i-search"/></svg>库内查重与合并…</button>
+          <button class="menu-item" id="btn-authors"><svg class="ic" aria-hidden="true"><use href="#lb-i-users"/></svg>作者合并…</button>
+          <hr class="menu-sep">
+          <button class="menu-item danger" id="btn-clear">清空全部数据…</button>
+        </div>
+      </div>
+      <span class="topbar-sep" aria-hidden="true"></span>
+      <button class="btn btn-icon sync-indicator" id="sync-indicator" title="同步状态"><svg class="ic" aria-hidden="true"><use href="#lb-i-sync"/></svg></button>
+      <button class="btn btn-icon" id="btn-theme" title="切换主题"><svg class="ic" aria-hidden="true"><use href="#lb-i-theme-auto"/></svg></button>
+      <button class="btn btn-icon" id="btn-sync" title="设置" aria-label="设置"><svg class="ic" aria-hidden="true"><use href="#lb-i-settings"/></svg></button>
+      <span class="topbar-sep" aria-hidden="true"></span>
+      <div class="menu-wrap">
+        <button class="btn btn-icon" id="btn-more" title="更多操作" aria-label="更多操作"><svg class="ic" aria-hidden="true"><use href="#lb-i-more"/></svg></button>
+        <div class="menu" id="more-menu" hidden>
+          <button class="menu-item" id="btn-paste"><svg class="ic" aria-hidden="true"><use href="#lb-i-doc"/></svg>粘贴 BibTeX</button>
+          <button class="menu-item" id="btn-word"><svg class="ic" aria-hidden="true"><use href="#lb-i-quote"/></svg>插入引文（Word）</button>
+          <button class="menu-item" id="btn-bridge"><svg class="ic" aria-hidden="true"><use href="#lb-i-package"/></svg>浏览器扩展</button>
+        </div>
+      </div>
+    </div>
+    <div class="window-controls" id="window-controls" hidden>
+    <button class="win-btn" id="win-min" title="最小化" aria-label="最小化">
+      <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden="true"><line x1="1" y1="5.5" x2="10" y2="5.5" stroke="currentColor" stroke-width="1.1"/></svg>
+    </button>
+    <button class="win-btn" id="win-max" title="最大化" aria-label="最大化或还原">
+      <svg class="win-icon-max" width="11" height="11" viewBox="0 0 11 11" aria-hidden="true"><rect x="1" y="1" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+      <svg class="win-icon-restore" width="11" height="11" viewBox="0 0 11 11" aria-hidden="true" hidden><rect x="3" y="1" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.1"/><path d="M1 8 V3 Q1 1 3 1 H8" fill="none" stroke="currentColor" stroke-width="1.1" transform="translate(0 2)"/></svg>
+    </button>
+    <button class="win-btn win-close" id="win-close" title="关闭" aria-label="关闭">
+      <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden="true"><path d="M1 1 L10 10 M10 1 L1 10" stroke="currentColor" stroke-width="1.1"/></svg>
+    </button>
+    </div>
+  </div>
+  <input type="file" id="file-input" multiple accept=".bib,.bibtex,.pdf,.json,.ris,.xml,.txt" hidden>
+</header>
+
+<!-- 顶层标签页（Zotero 式）：资料库 + 打开的 PDF -->
+<div class="pdf-tabs" id="pdf-tabs"></div>
+
+<div class="workspace">
+  <aside class="library-sidebar" aria-label="资料库导航">
+    <div class="sidebar-section-head">
+      <span>资料库</span>
+      <button class="icon-btn" id="btn-new-folder" title="新建文件夹" aria-label="新建文件夹"><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg></button>
+    </div>
+    <nav class="library-nav" id="library-nav">
+      <button class="library-item active" data-folder="all">
+        <span class="library-item-label"><svg class="ic" aria-hidden="true"><use href="#lb-i-layers"/></svg>全部文献</span>
+        <span class="library-count" id="library-count-all">0</span>
+      </button>
+      <button class="library-item" data-folder="unfiled">
+        <span class="library-item-label"><svg class="ic" aria-hidden="true"><use href="#lb-i-inbox"/></svg>未分类</span>
+        <span class="library-count" id="library-count-unfiled">0</span>
+      </button>
+      <button class="library-item" data-folder="recent" title="按最近打开阅读的时间排序">
+        <span class="library-item-label"><svg class="ic" aria-hidden="true"><use href="#lb-i-book"/></svg>最近阅读</span>
+        <span class="library-count" id="library-count-recent">0</span>
+      </button>
+      <button class="library-item" data-folder="trash">
+        <span class="library-item-label"><svg class="ic" aria-hidden="true"><use href="#lb-i-trash"/></svg>回收站</span>
+        <span class="library-count" id="library-count-trash">0</span>
+      </button>
+    </nav>
+    <div class="sidebar-section-head folder-heading">
+      <span>智能文件夹</span>
+      <button class="icon-btn" id="btn-save-search" title="把当前搜索条件保存为智能文件夹" aria-label="保存当前搜索"><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg></button>
+    </div>
+    <div class="saved-search-list" id="saved-search-list"></div>
+    <div class="sidebar-section-head folder-heading">
+      <span>我的文件夹</span>
+    </div>
+    <form class="folder-create-form" id="folder-create-form" hidden>
+      <div class="folder-create-parent" id="folder-create-parent" hidden></div>
+      <input type="text" id="folder-name-input" maxlength="80" autocomplete="off"
+             aria-label="文件夹名称" placeholder="文件夹名称">
+      <div class="folder-create-actions">
+        <button type="button" class="folder-create-cancel" id="folder-create-cancel">取消</button>
+        <button type="submit" class="folder-create-submit">创建</button>
+      </div>
+      <span class="folder-create-error" id="folder-create-error" role="alert"></span>
+    </form>
+    <div class="folder-list" id="folder-list"></div>
+    <div class="folder-empty" id="folder-empty">新建文件夹以整理研究主题</div>
+  </aside>
+  <div class="pane-resizer pane-resizer-left" id="resizer-left" role="separator" tabindex="0"
+       aria-label="调整左侧栏宽度" aria-orientation="vertical"></div>
+
+  <main class="center-pane">
+
+  <!-- 统计区（可整体收起；收起后仅剩一行摘要，状态记忆在 localStorage） -->
+  <section class="stats-row" id="stats-row">
+    <button type="button" class="stats-strip" id="stats-strip" hidden aria-expanded="false" title="展开统计面板">
+      <span class="stats-strip-caret" aria-hidden="true">›</span>
+      <span id="stats-strip-text">&nbsp;</span>
+      <span class="stats-strip-note">展开统计</span>
+    </button>
+    <div class="tile">
+      <div class="tile-label">文献总数</div>
+      <div class="tile-value" id="stat-total">0</div>
+      <div class="tile-hint" id="stat-total-hint">&nbsp;</div>
+    </div>
+    <div class="tile">
+      <div class="tile-label">本地 PDF 覆盖</div>
+      <div class="tile-value" id="stat-pdf">0%</div>
+      <div class="tile-hint" id="stat-pdf-hint">&nbsp;</div>
+    </div>
+    <div class="tile">
+      <div class="tile-label">元数据完整度</div>
+      <div class="tile-value tile-value-soft" id="stat-completeness">0%</div>
+      <div class="tile-hint tile-links" id="stat-completeness-hint">
+        <button type="button" class="tile-link" id="stat-missing-doi" hidden title="点击按 missing:doi 筛选缺少 DOI 的文献"></button>
+        <button type="button" class="tile-link" id="stat-missing-abstract" hidden title="点击按 missing:abstract 筛选缺少摘要的文献"></button>
+      </div>
+    </div>
+    <div class="chart-card viz-root">
+      <div class="chart-head">
+        <span class="chart-title">发表年份分布</span>
+        <span class="chart-note" id="chart-note">点击柱子可按年份筛选</span>
+        <button type="button" class="stats-collapse" id="btn-stats-collapse" title="收起统计面板" aria-label="收起统计面板">›</button>
+      </div>
+      <div class="chart-body" id="year-chart" role="img" aria-label="按发表年份统计的文献数量柱状图"></div>
+      <div class="chart-tooltip" id="chart-tooltip" hidden></div>
+    </div>
+    <!-- 专用拖放导入落区：文件拖入统计区时显示（虚线框 + 提示胶囊），松手即导入 -->
+    <div class="stats-drop-hint" id="stats-drop-hint" hidden>
+      <div class="drop-box-pill"><svg class="ic" aria-hidden="true"><use href="#lb-i-tray-down"/></svg>松开以导入 .bib / .ris / .pdf / .json</div>
+    </div>
+  </section>
+
+  <!-- 全局拖放提示：文件拖入窗口即显示（不遮罩不拦截）；悬停统计区时由落区胶囊接管 -->
+  <div class="drag-hint-pill" id="drag-hint-pill" hidden>
+    <div class="drop-box-pill"><svg class="ic" aria-hidden="true"><use href="#lb-i-tray-down"/></svg>松开以导入 .bib / .ris / .pdf / .json</div>
+  </div>
+
+  <!-- 筛选区 -->
+  <section class="filter-bar">
+    <div class="search-wrap">
+      <svg class="ic search-icon" aria-hidden="true"><use href="#lb-i-search"/></svg>
+      <input type="search" id="search" class="search" placeholder="搜索（支持 tag:综述 year>=2020 AND has:pdf 等语法，? 查看帮助）">
+    </div>
+    <button class="btn btn-ghost" id="btn-ft" title="在 PDF 正文中全文检索（桌面版）"><svg class="ic" aria-hidden="true"><use href="#lb-i-ft"/></svg>全文</button>
+    <span class="ft-status" id="ft-status" hidden></span>
+    <span class="search-hint" id="search-hint" hidden></span>
+    <div class="seg" id="status-seg">
+      <button class="seg-btn active" data-status="">全部</button>
+      <button class="seg-btn" data-status="unread">未读</button>
+      <button class="seg-btn" data-status="reading">在读</button>
+      <button class="seg-btn" data-status="read">已读</button>
+    </div>
+    <div class="tag-chips" id="tag-chips"></div>
+    <button class="btn btn-ghost btn-icon" id="btn-manage-tags" title="标签管理（重命名 / 合并 / 颜色）"><svg class="ic" aria-hidden="true"><use href="#lb-i-tag"/></svg></button>
+    <div class="seg result-view-seg" id="result-view" title="检索结果视图：文献 / 批注 / 笔记 / 附件">
+      <button class="seg-btn active" data-result-view="papers">文献</button>
+      <button class="seg-btn" data-result-view="annotations">批注</button>
+      <button class="seg-btn" data-result-view="notes">笔记</button>
+      <button class="seg-btn" data-result-view="attachments">附件</button>
+    </div>
+    <button class="btn btn-ghost btn-icon" id="btn-query-builder" title="可视化查询构建器（与搜索框语法共享同一求值逻辑）"><svg class="ic" aria-hidden="true"><use href="#lb-i-search"/></svg></button>
+    <button class="btn btn-ghost" id="btn-clear-filters" hidden><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg>清除筛选</button>
+    <button class="btn btn-ghost btn-icon" id="btn-shortcuts" title="键盘快捷键 (?)"><svg class="ic" aria-hidden="true"><use href="#lb-i-keyboard"/></svg></button>
+  </section>
+
+  <!-- 文献矩阵 -->
+  <section class="table-card">
+    <div class="bulk-bar" id="bulk-bar" hidden>
+      <span class="bulk-count" id="bulk-count">已选 0 篇</span>
+      <div class="bulk-actions">
+        <button class="btn btn-ghost" data-bulk="unread" data-normal-only>标未读</button>
+        <button class="btn btn-ghost" data-bulk="reading" data-normal-only>标在读</button>
+        <button class="btn btn-ghost" data-bulk="read" data-normal-only>标已读</button>
+        <button class="btn btn-ghost" data-bulk="tag" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg>标签</button>
+        <button class="btn btn-ghost" data-bulk="folder" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg>文件夹</button>
+        <button class="btn btn-ghost" data-bulk="enrich" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-sparkle"/></svg>补全</button>
+        <button class="btn btn-ghost" data-bulk="rename" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-pencil"/></svg>重命名 PDF</button>
+        <button class="btn btn-ghost" data-bulk="export-bib" data-normal-only>导出 BibTeX</button>
+        <button class="btn btn-ghost" data-bulk="edit-fields" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-pencil"/></svg>编辑字段</button>
+        <button class="btn btn-ghost" data-bulk="export-ris" data-normal-only>导出 RIS</button>
+        <button class="btn btn-ghost" data-bulk="restore" data-trash-only hidden><svg class="ic" aria-hidden="true"><use href="#lb-i-undo"/></svg>恢复</button>
+        <button class="btn btn-ghost danger" data-bulk="purge" data-trash-only hidden><svg class="ic" aria-hidden="true"><use href="#lb-i-x-circle"/></svg>彻底删除</button>
+        <button class="btn btn-ghost danger" data-bulk="delete" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-trash"/></svg>删除</button>
+      </div>
+      <button class="btn btn-ghost btn-icon bulk-close" id="bulk-clear-sel" title="取消选择"><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
+    </div>
+    <div class="table-wrap" id="table-wrap">
+      <table class="lit-table" id="lit-table">
+        <thead>
+          <tr>
+            <th class="col-attachment" title="附件状态（PDF / 在线）">PDF</th>
+            <th class="col-title sortable" data-sort="title">标题</th>
+            <th class="col-authors sortable" data-sort="firstAuthor">作者</th>
+            <th class="col-year sortable" data-sort="year">年份</th>
+            <th class="col-venue sortable" data-sort="venue">期刊 / 会议</th>
+            <th class="col-rank sortable" data-sort="journalRank">
+              分区 <button type="button" class="btn btn-ghost btn-icon rank-refresh-all" id="rank-refresh-all"
+                title="补查当前文件夹没有分区数据的期刊（慢速串行，防止 API 限流；已有数据与近 7 天查过的跳过）" aria-label="补查当前文件夹缺失的期刊分区"><svg class="ic" aria-hidden="true"><use href="#lb-i-refresh"/></svg></button><span class="rank-refresh-progress" id="rank-refresh-progress" hidden></span>
+            </th>
+            <th class="col-rating sortable" data-sort="rating">评分</th>
+          </tr>
+        </thead>
+        <tbody id="table-body"></tbody>
+      </table>
+    </div>
+    <div class="entity-hits" id="entity-hits" hidden></div>
+    <div class="empty-state" id="empty-state">
+      <div class="empty-icon"><svg class="ic ic-lg" aria-hidden="true"><use href="#lb-i-library"/></svg></div>
+      <p class="empty-title">开始使用 LitBoard</p>
+      <p class="empty-text onboard-short" id="onboard-short" hidden>库是空的。点击右上角「导入文件」开始，或把 <b>.bib</b> / <b>.pdf</b> 拖到顶部统计区导入。</p>
+      <div class="onboard-steps" id="onboard-steps">
+        <button type="button" class="onboard-step" id="onboard-import">
+          <span class="onboard-num">1</span>
+          <span class="onboard-body"><b>导入文献</b><span>支持 BibTeX / RIS / CSL-JSON / PDF，全程离线可用</span></span>
+        </button>
+        <button type="button" class="onboard-step" id="onboard-bridge">
+          <span class="onboard-num">2</span>
+          <span class="onboard-body"><b>安装浏览器扩展</b><span>在学术页面一键保存元数据与 PDF（顶栏「扩展」）</span></span>
+        </button>
+        <div class="onboard-step onboard-static">
+          <span class="onboard-num">3</span>
+          <span class="onboard-body"><b>阅读与批注</b><span>双击条目打开 PDF / EPUB，高亮批注、一键摘录进笔记</span></span>
+        </div>
+        <button type="button" class="onboard-step" id="onboard-backup">
+          <span class="onboard-num">4</span>
+          <span class="onboard-body"><b>开启自动备份</b><span>选择备份目录后每日自动快照，可随时完整恢复（设置 → 数据与备份）</span></span>
+        </button>
+      </div>
+      <div class="onboard-actions" id="onboard-actions">
+        <button class="btn btn-primary" id="btn-demo">载入示例数据看看效果</button>
+        <button class="btn btn-ghost" id="onboard-skip">跳过引导</button>
+      </div>
+    </div>
+    <div class="table-footer">
+      <div class="table-foot" id="table-foot"></div>
+      <div class="table-pagination" id="table-pagination" hidden>
+        <button class="btn btn-ghost btn-icon" id="table-page-prev" title="上一页" aria-label="上一页"><svg class="ic" aria-hidden="true"><use href="#lb-i-chev-l"/></svg></button>
+        <span id="table-page-info" aria-live="polite"></span>
+        <button class="btn btn-ghost btn-icon" id="table-page-next" title="下一页" aria-label="下一页"><svg class="ic" aria-hidden="true"><use href="#lb-i-chev-r"/></svg></button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- 常驻详情侧栏 -->
+<div class="pane-resizer pane-resizer-right" id="resizer-right" role="separator" tabindex="0"
+     aria-label="调整右侧栏宽度" aria-orientation="vertical"></div>
+<aside class="detail-sidebar" aria-label="右侧栏">
+  <div class="sidebar-pane" id="panel-detail">
+  <div class="detail-empty" id="detail-empty">
+    <div class="detail-empty-icon" aria-hidden="true">ⓘ</div>
+    <strong>选择一篇文献</strong>
+    <span>具体信息、标签、分类和阅读笔记会显示在这里。</span>
+  </div>
+  <div class="drawer" id="drawer" hidden>
+  <div class="drawer-head">
+    <select id="d-status" class="status-select">
+      <option value="unread">○ 未读</option>
+      <option value="reading">◐ 在读</option>
+      <option value="read">● 已读</option>
+    </select>
+    <div class="drawer-head-actions">
+      <button class="btn btn-ghost" id="d-enrich" title="联网补全此条文献"><svg class="ic" aria-hidden="true"><use href="#lb-i-sparkle"/></svg><span class="btn-label">补全</span></button>
+      <button class="btn btn-ghost" id="d-edit" title="编辑字段"><svg class="ic" aria-hidden="true"><use href="#lb-i-pencil"/></svg>编辑</button>
+      <button class="btn btn-ghost" id="d-cite" title="生成引用（APA / 国标 / MLA）"><svg class="ic" aria-hidden="true"><use href="#lb-i-quote"/></svg>引用</button>
+      <button class="btn btn-ghost" id="d-copy-bib" title="复制 BibTeX"><svg class="ic" aria-hidden="true"><use href="#lb-i-doc"/></svg>BibTeX</button>
+      <button class="btn btn-ghost" id="d-fetch-pdf" title="从 OpenAlex / Semantic Scholar 查找开放获取 PDF 并保存到本机"><svg class="ic" aria-hidden="true"><use href="#lb-i-file-down"/></svg><span class="btn-label">PDF</span></button>
+      <button class="btn btn-ghost danger" id="d-delete"><svg class="ic" aria-hidden="true"><use href="#lb-i-trash"/></svg>删除</button>
+      <button class="btn btn-icon" id="d-close" title="清除选择 (Esc)" aria-label="清除选择"><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
+    </div>
+  </div>
+  <div class="drawer-body">
+    <h2 class="d-title" id="d-title"></h2>
+    <p class="d-meta" id="d-meta"></p>
+    <div class="journal-rank" id="d-journal-rank" hidden>
+      <div class="journal-rank-values" id="d-journal-rank-values"></div>
+      <button type="button" class="btn btn-ghost btn-icon" id="d-journal-rank-refresh" title="查询期刊分区"><svg class="ic" aria-hidden="true"><use href="#lb-i-refresh"/></svg></button>
+    </div>
+    <div class="d-links" id="d-links"></div>
+    <div class="d-rating" id="d-rating" title="点击打分"></div>
+
+    <div class="d-field">
+      <label>附件 <span class="label-hint">（主 PDF 用于阅读与全文索引）</span></label>
+      <div class="attachment-list" id="d-attachments"></div>
+    </div>
+
+    <div class="d-field">
+      <label>相关文献 <span class="label-hint">（本库内互链）</span></label>
+      <div class="related-list" id="d-related"></div>
+    </div>
+
+    <div class="d-field">
+      <label>标签 <span class="label-hint">（逗号分隔）</span></label>
+      <input type="text" id="d-tags" placeholder="如：综述, 机器学习, 待精读">
+    </div>
+
+    <div class="d-field">
+      <label>摘要</label>
+      <p class="d-abstract" id="d-abstract"></p>
+      <p class="d-extract" id="d-extract"></p>
+    </div>
+
+    <div class="d-field">
+      <label>所在文件夹 <span class="label-hint">（勾选加入，× 移出）</span></label>
+      <div class="detail-folders" id="d-folders"></div>
+    </div>
+
+    <div class="d-field">
+      <div class="notes-head">
+        <label>阅读笔记 <span class="label-hint" id="d-notes-saved"></span></label>
+        <div class="notes-tabs" role="tablist" aria-label="笔记模式">
+          <button type="button" class="notes-tab active" id="d-notes-edit-tab" role="tab" aria-selected="true">编辑</button>
+          <button type="button" class="notes-tab" id="d-notes-preview-tab" role="tab" aria-selected="false">预览</button>
+        </div>
+      </div>
+      <textarea id="d-notes" rows="10" placeholder="使用 Markdown 记录研究问题、方法和发现…"></textarea>
+      <div class="markdown-preview" id="d-notes-preview" hidden></div>
+    </div>
+  </div>
+  </div>
+  </div>
+  <!-- AI 调研助手（与详情共用右栏宽度，由最右图标轨切换） -->
+  <div class="sidebar-pane agent-drawer" id="agent-drawer" hidden>
+    <div class="agent-head">
+      <button type="button" class="btn btn-ghost btn-icon" id="agent-history-btn" title="历史会话"><svg class="ic" aria-hidden="true"><use href="#lb-i-inbox"/></svg></button>
+      <button type="button" class="btn btn-ghost btn-icon" id="agent-new-btn" title="新建会话"><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg></button>
+      <button type="button" class="btn btn-ghost btn-icon" id="agent-compact-btn" title="压缩上下文：把较旧对话摘要成一条，腾出上下文空间（原文仍在会话存档）"><svg class="ic" aria-hidden="true"><use href="#lb-i-layers"/></svg></button>
+      <div class="agent-title" id="agent-cur-title">AI 助手</div>
+      <button type="button" class="btn btn-ghost btn-icon" id="agent-close-btn" title="收起"><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
+    </div>
+    <div class="agent-history" id="agent-history" hidden>
+      <div class="agent-history-toolbar">
+        <input type="text" class="text-input" id="agent-history-filter" placeholder="按标题过滤…">
+        <button type="button" class="btn btn-ghost" id="agent-history-select" title="多选删除会话">多选</button>
+      </div>
+      <div class="agent-history-list" id="agent-history-list"></div>
+      <div class="agent-history-bulk" id="agent-history-bulk" hidden>
+        <span class="agent-bulk-count" id="agent-history-bulk-count"></span>
+        <button type="button" class="btn btn-ghost" id="agent-history-bulk-all">全选</button>
+        <button type="button" class="btn btn-ghost" id="agent-history-bulk-cancel">取消</button>
+        <button type="button" class="btn btn-danger-solid" id="agent-history-bulk-delete" disabled>删除所选</button>
+      </div>
+    </div>
+    <div class="agent-body" id="agent-body">
+      <div class="agent-chat-root" id="agent-chat-root"></div>
+      <div class="agent-not-ready" id="agent-not-ready" hidden></div>
+    </div>
+    <div class="agent-composer">
+      <div class="agent-attachments" id="agent-attachments" hidden></div>
+      <div class="agent-chips" id="agent-chips" hidden></div>
+      <div class="agent-composer-row">
+        <span class="agent-status" id="agent-status" role="status" aria-live="polite"></span>
+        <span class="agent-model" id="agent-model"></span>
+        <select id="agent-thinking" title="推理强度：是否生效取决于服务商与模型；若报错请改回「默认」">
+          <option value="">推理：默认</option>
+          <option value="off">推理：关</option>
+          <option value="low">推理：低</option>
+          <option value="medium">推理：中</option>
+          <option value="high">推理：高</option>
+          <option value="max">推理：最高</option>
+        </select>
+        <span class="agent-tokens" id="agent-tokens"></span>
+      </div>
+    </div>
+  </div>
+  <!-- 手动检索：不依赖任何 AI 配置，独立栏位常驻可用 -->
+  <div class="sidebar-pane" id="manual-panel" hidden>
+    <div class="agent-head">
+      <div class="agent-title">手动检索</div>
+    </div>
+    <div class="agent-manual" id="agent-manual"></div>
+  </div>
+</aside>
+<!-- 最右竖向图标轨（Zotero 式）：切换右栏面板 -->
+<div class="right-rail" id="right-rail" role="tablist" aria-label="右侧栏面板" aria-orientation="vertical">
+  <button type="button" class="rail-btn active" id="rail-detail" data-rail="detail" role="tab" aria-selected="true" title="文献详情"><svg class="ic" aria-hidden="true"><use href="#lb-i-info"/></svg></button>
+  <button type="button" class="rail-btn" id="btn-agent" data-rail="ai" role="tab" aria-selected="false" title="AI 调研助手：对话检索调研库（未配置 AI 也可用「检索」面板）"><svg class="ic" aria-hidden="true"><use href="#lb-i-sparkle"/></svg></button>
+  <button type="button" class="rail-btn" id="rail-search" data-rail="manual" role="tab" aria-selected="false" title="手动检索：无需配置 AI，直接检索调研库与 OpenAlex"><svg class="ic" aria-hidden="true"><use href="#lb-i-search"/></svg></button>
+  <button type="button" class="rail-btn" id="rail-anno" data-rail="anno" role="tab" aria-selected="false" title="批注与笔记：当前文献的高亮/下划线与笔记编辑器"><svg class="ic" aria-hidden="true"><use href="#lb-i-pen"/></svg></button>
+</div>
+</div>
+
+<!-- 粘贴 BibTeX 弹窗 -->
+<div class="modal-mask" id="paste-mask" hidden>
+  <div class="modal">
+    <div class="modal-head">粘贴 BibTeX</div>
+    <textarea id="paste-area" rows="12" placeholder="@article{key2024,&#10;  title = {...},&#10;  author = {...},&#10;  ...&#10;}"></textarea>
+    <div class="modal-actions">
+      <button class="btn" id="paste-cancel">取消</button>
+      <button class="btn btn-primary" id="paste-ok">导入</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导入目标文件夹选择 -->
+<div class="modal-mask" id="import-folder-mask" hidden>
+  <div class="modal">
+    <div class="modal-head">导入到文件夹</div>
+    <input type="search" class="detail-folder-filter" id="import-folder-filter" placeholder="搜索文件夹…" autocomplete="off" aria-label="搜索文件夹">
+    <div class="detail-folder-list" id="import-folder-list"></div>
+    <div class="modal-actions">
+      <button class="btn" id="import-folder-cancel">取消</button>
+      <button class="btn btn-primary" id="import-folder-ok">导入</button>
+    </div>
+  </div>
+</div>
+
+<!-- 相关文献选择 -->
+<div class="modal-mask" id="related-mask" hidden>
+  <div class="modal">
+    <div class="modal-head">添加相关文献</div>
+    <input type="search" id="related-filter" placeholder="按标题 / 作者搜索本库文献…" autocomplete="off" aria-label="搜索文献">
+    <div class="related-picker-list" id="related-picker-list"></div>
+    <div class="modal-actions">
+      <button class="btn" id="related-cancel">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 快速添加弹窗 -->
+<div class="modal-mask" id="add-mask" hidden>
+  <div class="modal">
+    <div class="modal-head">添加文献</div>
+    <label class="field-label">粘贴 DOI / arXiv ID / 标题，联网自动抓取</label>
+    <div class="inline-row">
+      <input type="text" id="add-id" class="text-input" placeholder="如 10.1038/s41586-021-03819-2 / arXiv:1706.03762 / Attention Is All You Need">
+      <button class="btn btn-primary" id="add-fetch"><svg class="ic" aria-hidden="true"><use href="#lb-i-search"/></svg>抓取并添加</button>
+    </div>
+    <p class="field-hint" id="add-status">支持 DOI、arXiv 编号或论文标题；抓取后可再编辑。</p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="add-manual"><svg class="ic" aria-hidden="true"><use href="#lb-i-pencil"/></svg>改为手动录入</button>
+      <button class="btn" id="add-cancel">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 新建 / 编辑弹窗 -->
+<div class="modal-mask" id="edit-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head" id="edit-head">编辑文献</div>
+    <div class="form-grid">
+      <label class="span-2">标题<input type="text" id="e-title"></label>
+      <label class="span-2">作者 <span class="label-hint">（分号分隔，单人支持 "姓, 名"）</span><input type="text" id="e-authors"></label>
+      <label>年份<input type="text" id="e-year" inputmode="numeric"></label>
+      <label>类型
+        <select id="e-type">
+          <option value="article">期刊论文 article</option>
+          <option value="inproceedings">会议论文 inproceedings</option>
+          <option value="book">书籍 book</option>
+          <option value="incollection">章节 incollection</option>
+          <option value="phdthesis">博士学位论文 phdthesis</option>
+          <option value="mastersthesis">硕士学位论文 mastersthesis</option>
+          <option value="report">报告 report</option>
+          <option value="newspaper">报纸 newspaper</option>
+          <option value="webpage">网页 webpage</option>
+          <option value="preprint">预印本 preprint</option>
+          <option value="patent">专利 patent</option>
+          <option value="misc">其他 misc</option>
+        </select>
+      </label>
+      <label class="span-2">期刊 / 会议<input type="text" id="e-venue"></label>
+      <label>卷<input type="text" id="e-volume"></label>
+      <label>期<input type="text" id="e-issue"></label>
+      <label>页码<input type="text" id="e-pages"></label>
+      <label>语言<input type="text" id="e-language" placeholder="如 en / zh"></label>
+      <label class="span-2">出版社<input type="text" id="e-publisher"></label>
+      <label>ISSN<input type="text" id="e-issn" placeholder="期刊"></label>
+      <label>ISBN<input type="text" id="e-isbn" placeholder="书籍"></label>
+      <label class="span-2">DOI<input type="text" id="e-doi"></label>
+      <label class="span-2">链接 URL<input type="text" id="e-url"></label>
+      <label class="span-2">citekey <span class="label-hint">（修改后钉住，不再自动重排）</span><input type="text" id="e-citekey" spellcheck="false"></label>
+      <label class="span-2">摘要<textarea id="e-abstract" rows="4"></textarea></label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="edit-cancel">取消</button>
+      <button class="btn btn-primary" id="edit-save">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 引用弹窗 -->
+<div class="modal-mask" id="cite-mask" hidden>
+  <div class="modal">
+    <div class="modal-head">生成引用</div>
+    <div class="cite-list" id="cite-list"></div>
+    <div class="cite-csl">
+      <div class="cite-csl-head">
+        <span>CSL 样式</span>
+        <div class="inline-row">
+          <select id="cite-csl-style" aria-label="CSL 样式选择"></select>
+          <button class="btn btn-ghost" id="cite-csl-more" title="从 zotero.org 样式库在线获取其它样式（输入样式 ID）">更多…</button>
+        </div>
+      </div>
+      <div class="cite-csl-output" id="cite-csl-output"></div>
+      <div class="inline-row">
+        <button class="btn btn-ghost" id="cite-csl-copy">复制 CSL 引用</button>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="cite-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 内置 PDF 阅读器 -->
+<div class="pdf-overlay" id="pdf-overlay" hidden>
+  <div class="pdf-toolbar">
+    <span class="pdf-title" id="pdf-title"></span>
+    <div class="pdf-tools">
+      <button class="btn btn-ghost btn-icon" id="pdf-side-toggle" title="大纲 / 缩略图侧栏" aria-pressed="false"><svg class="ic" aria-hidden="true"><use href="#lb-i-sidebar"/></svg></button>
+      <div class="pdf-page-nav" aria-label="页面导航">
+        <button class="btn btn-ghost btn-icon" id="pdf-page-prev" title="上一页" aria-label="上一页"><svg class="ic" aria-hidden="true"><use href="#lb-i-chev-l"/></svg></button>
+        <input id="pdf-page-number" type="number" min="1" value="1" aria-label="当前页">
+        <span id="pdf-page-total">/ 0</span>
+        <button class="btn btn-ghost btn-icon" id="pdf-page-next" title="下一页" aria-label="下一页"><svg class="ic" aria-hidden="true"><use href="#lb-i-chev-r"/></svg></button>
+      </div>
+      <div class="pdf-search-box">
+        <input id="pdf-search" type="search" placeholder="搜索文内…" aria-label="搜索文内">
+        <span id="pdf-search-status" aria-live="polite"></span>
+        <button class="btn btn-ghost btn-icon" id="pdf-search-prev" title="上一个匹配" aria-label="上一个匹配"><svg class="ic" aria-hidden="true"><use href="#lb-i-chev-u"/></svg></button>
+        <button class="btn btn-ghost btn-icon" id="pdf-search-next" title="下一个匹配" aria-label="下一个匹配"><svg class="ic" aria-hidden="true"><use href="#lb-i-chev-d"/></svg></button>
+      </div>
+      <button class="btn btn-ghost btn-icon" id="pdf-search-toggle" title="搜索文内 (Ctrl+F)" aria-pressed="false" aria-label="搜索文内"><svg class="ic" aria-hidden="true"><use href="#lb-i-search"/></svg></button>
+      <button class="btn btn-ghost btn-icon" id="pdf-zoom-out" title="缩小"><svg class="ic" aria-hidden="true"><use href="#lb-i-minus"/></svg></button>
+      <span class="pdf-zoom" id="pdf-zoom">135%</span>
+      <button class="btn btn-ghost btn-icon" id="pdf-zoom-in" title="放大"><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg></button>
+      <button class="btn btn-ghost" id="pdf-fit-width" title="适合页面宽度">适宽</button>
+      <button class="btn btn-ghost btn-icon" id="pdf-rotate" title="顺时针旋转" aria-label="顺时针旋转"><svg class="ic" aria-hidden="true"><use href="#lb-i-rotate"/></svg></button>
+      <button class="btn btn-ghost btn-icon" id="pdf-layout-toggle" title="切换双栏阅读" aria-pressed="false">
+        <svg class="layout-icon layout-icon-single" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+          <rect x="2.5" y="2" width="13" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"></rect>
+          <line x1="9" y1="2.5" x2="9" y2="15.5" stroke="currentColor" stroke-width="1.4" stroke-dasharray="2.5 2"></line>
+        </svg>
+        <svg class="layout-icon layout-icon-spread" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+          <rect x="1.5" y="2" width="6.6" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"></rect>
+          <rect x="9.9" y="2" width="6.6" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"></rect>
+        </svg>
+      </button>
+      <button class="btn btn-ghost" id="pdf-renderer-toggle" title="切换 PDF 渲染器">自动渲染</button>
+      <button class="btn btn-ghost" id="pdf-reflow-toggle" title="重排阅读：按阅读顺序重建纯文本流（栏检测）" aria-pressed="false">重排</button>
+      <button class="btn btn-ghost btn-icon" id="pdf-snapshot-toggle" title="区域截图批注（在页面上拖矩形）" aria-pressed="false"><svg class="ic" aria-hidden="true"><use href="#lb-i-camera"/></svg></button>
+      <button class="btn btn-ghost btn-icon" id="pdf-ink-toggle" title="手写批注（鼠标/触控笔绘制）" aria-pressed="false"><svg class="ic" aria-hidden="true"><use href="#lb-i-pen"/></svg></button>
+      <button class="btn btn-ghost btn-icon" id="pdf-translation-settings" title="翻译设置（打开设置弹窗并定位到「划词翻译」）">译</button>
+      <button class="btn btn-ghost" id="pdf-annotations-toggle" title="显示或隐藏批注列表" aria-pressed="true">批注</button>
+      <button class="btn btn-ghost" id="pdf-write-back" title="把库内批注写回 PDF 文件（标准批注，外部阅读器可见）"><svg class="ic" aria-hidden="true"><use href="#lb-i-tray-down"/></svg>写回 PDF</button>
+      <button class="btn btn-ghost" id="pdf-external" title="用外部程序打开"><svg class="ic" aria-hidden="true"><use href="#lb-i-external"/></svg>外部打开</button>
+      <button class="btn btn-ghost" id="pdf-tts" title="朗读全文（本机语音）">朗读</button>
+      <button class="btn btn-ghost btn-icon" id="pdf-close" title="关闭 (Esc)"><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
+    </div>
+  </div>
+  <div class="pdf-ocr-banner" id="pdf-ocr-banner" hidden>
+    <span id="pdf-ocr-banner-text">本文档没有文本层（可能是扫描件），全文检索与划词翻译不可用</span>
+    <button class="btn btn-ghost" id="pdf-ocr-page">OCR 本页</button>
+    <button class="btn btn-ghost" id="pdf-ocr-all">OCR 全文</button>
+    <button class="btn btn-ghost btn-icon" id="pdf-ocr-cancel" title="中止 / 关闭"><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
+  </div>
+  <div class="pdf-reader-main">
+    <aside class="pdf-side" id="pdf-side" hidden>
+      <div class="pdf-side-tabs">
+        <button class="pdf-side-tab active" id="pdf-side-tab-outline" type="button">大纲</button>
+        <button class="pdf-side-tab" id="pdf-side-tab-thumbs" type="button">缩略图</button>
+      </div>
+      <div class="pdf-outline" id="pdf-outline"></div>
+      <div class="pdf-thumbs" id="pdf-thumbs" hidden></div>
+    </aside>
+    <div class="pdf-scroll" id="pdf-scroll"></div>
+    <aside class="pdf-annotations" id="pdf-annotations" aria-label="PDF 批注">
+      <div class="pdf-annotations-head">
+        <strong>批注</strong>
+        <span id="pdf-annotation-count">0</span>
+        <span class="pdf-annotations-head-actions">
+          <button class="btn btn-ghost btn-xs" id="pdf-annotations-to-note" title="勾选批注，批量加入笔记">多选加入笔记…</button>
+          <button class="btn btn-ghost btn-xs" id="pdf-annotations-all-note" title="把本篇全部批注生成一篇笔记">整篇生成笔记</button>
+        </span>
+      </div>
+      <div class="pdf-annotation-colors" id="pdf-annotation-colors" aria-label="批注颜色">
+        <button class="pdf-color active" data-annotation-color="#ffd400" title="黄色" aria-label="黄色"></button>
+        <button class="pdf-color" data-annotation-color="#5fbf77" title="绿色" aria-label="绿色"></button>
+        <button class="pdf-color" data-annotation-color="#5aa9ff" title="蓝色" aria-label="蓝色"></button>
+        <button class="pdf-color" data-annotation-color="#ff6b6b" title="红色" aria-label="红色"></button>
+        <button class="pdf-color" data-annotation-color="#b28dff" title="紫色" aria-label="紫色"></button>
+      </div>
+      <div class="pdf-note-editor" id="pdf-note-editor">
+        <div class="pdf-note-editor-head">
+          <strong>笔记</strong>
+          <select id="pdf-note-select" class="pdf-note-select" aria-label="目标笔记"></select>
+          <button class="btn btn-ghost btn-xs" id="pdf-note-new" title="新建笔记">＋新建</button>
+          <span class="pdf-note-editor-tabs">
+            <button class="pdf-side-tab active" id="pdf-note-edit-tab" type="button">编辑</button>
+            <button class="pdf-side-tab" id="pdf-note-preview-tab" type="button">预览</button>
+          </span>
+          <button class="btn btn-ghost btn-xs" id="pdf-note-richtext" title="在富文本编辑器中打开当前笔记">富文本…</button>
+          <button class="btn btn-ghost btn-xs" id="pdf-note-export-word" title="把当前笔记（含图片与摘录引用）导出为 Word 文档">导出 Word</button>
+        </div>
+        <div class="pdf-note-stale" id="pdf-note-stale" hidden></div>
+        <textarea class="pdf-note-textarea" id="pdf-note-textarea" rows="6" placeholder="Markdown 笔记；批注可通过「加到笔记」汇入，摘录块带出处定位。"></textarea>
+        <div class="markdown-preview pdf-note-preview" id="pdf-note-preview" hidden></div>
+      </div>
+      <div class="pdf-annotation-list" id="pdf-annotation-list"></div>
+      <div class="pdf-annotation-empty" id="pdf-annotation-empty">选择 PDF 文字后可添加高亮、下划线或批注。</div>
+    </aside>
+  </div>
+  <div class="pdf-translation-popover" id="pdf-translation-popover" hidden>
+    <div class="pdf-translation-source" id="pdf-translation-source"></div>
+    <div class="pdf-translation-actions">
+      <button class="btn btn-ghost" id="pdf-add-highlight">高亮</button>
+      <button class="btn btn-ghost" id="pdf-add-underline">下划线</button>
+      <button class="btn btn-ghost" id="pdf-add-note">批注</button>
+      <button class="btn btn-primary" id="pdf-translate-selection">翻译</button>
+      <label class="pdf-translation-auto" title="勾选后：划选内容即自动翻译，无需点「翻译」">
+        <input type="checkbox" id="pdf-auto-translate"> 自动翻译
+      </label>
+      <span class="pdf-translation-provider" id="pdf-translation-provider"></span>
+      <button class="btn btn-ghost btn-icon" id="pdf-translation-close" title="关闭"><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
+    </div>
+    <div class="pdf-note-composer" id="pdf-note-composer" hidden>
+      <textarea id="pdf-note-text" rows="3" placeholder="输入批注内容…"></textarea>
+      <div class="pdf-note-composer-actions">
+        <button class="btn btn-ghost" id="pdf-note-cancel">取消</button>
+        <button class="btn btn-primary" id="pdf-note-save">保存批注</button>
+      </div>
+    </div>
+    <div class="pdf-translation-result" id="pdf-translation-result" hidden></div>
+  </div>
+</div>
+
+<!-- 内置 EPUB 阅读器（阶段六）：结构与 #pdf-overlay 对齐，id 前缀 epub- -->
+<div class="pdf-overlay epub-overlay" id="epub-overlay" hidden>
+  <div class="pdf-toolbar">
+    <span class="pdf-title" id="epub-title"></span>
+    <div class="pdf-tools">
+      <button class="btn btn-ghost btn-icon" id="epub-toc-toggle" title="章节目录" aria-pressed="false"><svg class="ic" aria-hidden="true"><use href="#lb-i-sidebar"/></svg></button>
+      <button class="btn btn-ghost btn-icon" id="epub-prev" title="上一页 / 上一章" aria-label="上一页"><svg class="ic" aria-hidden="true"><use href="#lb-i-chev-l"/></svg></button>
+      <span class="pdf-zoom epub-location" id="epub-location" aria-live="polite"></span>
+      <button class="btn btn-ghost btn-icon" id="epub-next" title="下一页 / 下一章" aria-label="下一页"><svg class="ic" aria-hidden="true"><use href="#lb-i-chev-r"/></svg></button>
+      <button class="btn btn-ghost" id="epub-font-minus" title="减小字号">A-</button>
+      <span class="pdf-zoom" id="epub-font-size">16px</span>
+      <button class="btn btn-ghost" id="epub-font-plus" title="增大字号">A+</button>
+      <button class="btn btn-ghost" id="epub-theme" title="切换主题（明亮 / 羊皮纸 / 暗黑）">主题</button>
+      <button class="btn btn-ghost" id="epub-annotations-toggle" title="显示或隐藏批注列表" aria-pressed="true">批注</button>
+      <button class="btn btn-ghost" id="epub-tts" title="朗读本章（本机语音）">朗读</button>
+      <button class="btn btn-ghost" id="epub-external" title="用外部程序打开"><svg class="ic" aria-hidden="true"><use href="#lb-i-external"/></svg>外部打开</button>
+      <button class="btn btn-ghost btn-icon" id="epub-close" title="关闭 (Esc)"><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
+    </div>
+  </div>
+  <div class="pdf-reader-main">
+    <aside class="pdf-side" id="epub-side" hidden>
+      <div class="epub-toc" id="epub-toc"></div>
+    </aside>
+    <div class="epub-view" id="epub-view"><div class="epub-progress" id="epub-progress" title="阅读进度（点击跳转）"><div class="epub-progress-fill" id="epub-progress-fill"></div></div></div>
+    <aside class="pdf-annotations" id="epub-annotations" aria-label="EPUB 批注">
+      <div class="pdf-annotations-head">
+        <strong>批注</strong>
+        <span id="epub-annotation-count">0</span>
+        <span class="pdf-annotations-head-actions">
+          <button class="btn btn-ghost btn-xs" id="epub-annotations-to-note" title="勾选批注，批量加入笔记">多选加入笔记…</button>
+          <button class="btn btn-ghost btn-xs" id="epub-annotations-all-note" title="把本篇全部批注生成一篇笔记">整篇生成笔记</button>
+        </span>
+      </div>
+      <div class="pdf-annotation-colors" id="epub-annotation-colors" aria-label="批注颜色">
+        <button class="pdf-color active" data-epub-color="#ffd400" title="黄色" aria-label="黄色"></button>
+        <button class="pdf-color" data-epub-color="#5fbf77" title="绿色" aria-label="绿色"></button>
+        <button class="pdf-color" data-epub-color="#5aa9ff" title="蓝色" aria-label="蓝色"></button>
+        <button class="pdf-color" data-epub-color="#ff6b6b" title="红色" aria-label="红色"></button>
+        <button class="pdf-color" data-epub-color="#b28dff" title="紫色" aria-label="紫色"></button>
+      </div>
+      <div class="pdf-note-editor" id="epub-note-editor">
+        <div class="pdf-note-editor-head">
+          <strong>笔记</strong>
+          <select id="epub-note-select" class="pdf-note-select" aria-label="目标笔记"></select>
+          <button class="btn btn-ghost btn-xs" id="epub-note-new" title="新建笔记">＋新建</button>
+          <span class="pdf-note-editor-tabs">
+            <button class="pdf-side-tab active" id="epub-note-edit-tab" type="button">编辑</button>
+            <button class="pdf-side-tab" id="epub-note-preview-tab" type="button">预览</button>
+          </span>
+          <button class="btn btn-ghost btn-xs" id="epub-note-richtext" title="在富文本编辑器中打开当前笔记">富文本…</button>
+          <button class="btn btn-ghost btn-xs" id="epub-note-export-word" title="把当前笔记（含图片与摘录引用）导出为 Word 文档">导出 Word</button>
+        </div>
+        <div class="pdf-note-stale" id="epub-note-stale" hidden></div>
+        <textarea class="pdf-note-textarea" id="epub-note-textarea" rows="6" placeholder="Markdown 笔记；批注可通过「加到笔记」汇入，摘录块带出处定位。"></textarea>
+        <div class="markdown-preview pdf-note-preview" id="epub-note-preview" hidden></div>
+      </div>
+      <div class="pdf-annotation-list" id="epub-annotation-list"></div>
+      <div class="pdf-annotation-empty" id="epub-annotation-empty">选中 EPUB 文字后可添加高亮或批注。</div>
+    </aside>
+  </div>
+  <div class="epub-sel-popover" id="epub-sel-popover" hidden>
+    <button class="btn btn-ghost" id="epub-add-highlight">高亮</button>
+    <button class="btn btn-ghost" id="epub-add-note">批注</button>
+    <button class="btn btn-ghost btn-icon" id="epub-sel-close" title="关闭"><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
+  </div>
+</div>
+
+<!-- 库内查重与合并 -->
+<div class="modal-mask" id="dedupe-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">库内查重与合并</div>
+    <p class="field-hint" id="dedupe-summary"></p>
+    <div class="dedupe-list" id="dedupe-list"></div>
+    <div class="modal-actions">
+      <button class="btn" id="dedupe-close">关闭</button>
+      <button class="btn btn-primary" id="dedupe-merge-all" hidden>合并全部重复组</button>
+    </div>
+  </div>
+</div>
+
+<!-- Zotero 导入向导（选择来源 → 扫描预览 → 导入 → 核对报告） -->
+<div class="modal-mask" id="zotero-import-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">Zotero 导入向导</div>
+    <p class="field-hint" id="zotero-wiz-step-label">第 1 步 / 共 4 步：选择来源</p>
+
+    <div class="zotero-wiz-step" data-zotero-step="source">
+      <p class="field-hint">选择 Zotero 数据目录（只读扫描，不修改 Zotero 原库与附件）。</p>
+      <div class="inline-row">
+        <input type="text" id="zotero-wiz-dir" readonly placeholder="未选择">
+        <button type="button" class="btn" id="zotero-wiz-detect">自动检测</button>
+        <button type="button" class="btn" id="zotero-wiz-choose">选择…</button>
+      </div>
+      <p class="field-hint" id="zotero-wiz-source-status"></p>
+    </div>
+
+    <div class="zotero-wiz-step" data-zotero-step="preview" hidden>
+      <div id="zotero-wiz-stats"></div>
+      <label class="field-hint zotero-wiz-copy-row"><input type="checkbox" id="zotero-wiz-copy" checked>
+        复制附件文件到 LitBoard 托管目录（推荐；关闭则引用 Zotero 原路径）</label>
+    </div>
+
+    <div class="zotero-wiz-step" data-zotero-step="progress" hidden>
+      <progress id="zotero-wiz-progress" max="1" value="0"></progress>
+      <p class="field-hint" id="zotero-wiz-progress-text">正在导入…</p>
+    </div>
+
+    <div class="zotero-wiz-step" data-zotero-step="report" hidden>
+      <div id="zotero-wiz-report"></div>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="btn" id="zotero-wiz-export" hidden>导出报告 JSON</button>
+      <span class="modal-actions-spacer"></span>
+      <button type="button" class="btn" id="zotero-wiz-cancel">取消</button>
+      <button type="button" class="btn" id="zotero-wiz-back" hidden>上一步</button>
+      <button type="button" class="btn btn-primary" id="zotero-wiz-next">下一步</button>
+    </div>
+  </div>
+</div>
+
+<!-- 可视化查询构建器 -->
+<div class="modal-mask" id="query-builder-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">查询构建器</div>
+    <p class="field-hint">逐行添加条件；生成条件填入搜索框，与文本语法共享同一求值逻辑。批注/笔记组内可写多个条件（须同一对象满足）。</p>
+    <div class="qb-rows" id="qb-rows"></div>
+    <button type="button" class="btn btn-ghost btn-xs" id="qb-add-row">＋添加条件</button>
+    <p class="field-hint qb-preview" id="qb-preview"></p>
+    <div class="modal-actions">
+      <button type="button" class="btn" id="qb-cancel">取消</button>
+      <button type="button" class="btn btn-primary" id="qb-apply">填入搜索框</button>
+    </div>
+  </div>
+</div>
+
+<!-- 批量字段编辑 -->
+<div class="modal-mask" id="bulk-edit-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">批量编辑字段</div>
+    <p class="field-hint" id="bulk-edit-summary"></p>
+    <div class="sync-form-grid">
+      <label>字段
+        <select id="bulk-edit-field">
+          <option value="status">阅读状态</option>
+          <option value="rating">评分</option>
+          <option value="tags">标签（替换整组）</option>
+          <option value="title">标题</option>
+          <option value="authors">作者（逗号分隔）</option>
+          <option value="venue">期刊 / 会议</option>
+          <option value="year">年份</option>
+          <option value="doi">DOI</option>
+          <option value="abstract">摘要</option>
+          <option value="language">语言</option>
+        </select>
+      </label>
+      <label>新值
+        <input type="text" id="bulk-edit-value" placeholder="输入新值">
+      </label>
+      <label class="sync-check-row span-2">
+        <input type="checkbox" id="bulk-edit-clear">
+        <span class="sync-check-content">
+          <span class="sync-check-title">明确清空该字段</span>
+          <span class="sync-check-desc">将所选条目的该字段重置为空值</span>
+        </span>
+      </label>
+      <div class="span-2" id="bulk-edit-distinct"></div>
+      <p class="span-2 field-hint" id="bulk-edit-preview"></p>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn" id="bulk-edit-cancel">取消</button>
+      <button type="button" class="btn btn-primary" id="bulk-edit-confirm">应用</button>
+    </div>
+  </div>
+</div>
+
+<!-- 网页快照安全阅读 -->
+<div class="modal-mask" id="snapshot-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">网页快照 <span class="field-hint" id="snapshot-title"></span></div>
+    <iframe class="snapshot-frame" id="snapshot-frame" sandbox=""></iframe>
+    <div class="modal-actions">
+      <span class="field-hint modal-actions-spacer">已隔离：禁止原网页脚本、不加载远端资源。</span>
+      <button type="button" class="btn" id="snapshot-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 富文本笔记编辑器 -->
+<div class="modal-mask" id="note-edit-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">编辑笔记 <span class="field-hint" id="note-edit-title"></span><span class="field-hint" id="note-edit-status" aria-live="polite"></span></div>
+    <div class="note-editor-toolbar" id="note-editor-toolbar">
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="p" title="正文">正文</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="h1" title="标题 1">H1</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="h2" title="标题 2">H2</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="h3" title="标题 3">H3</button>
+      <span class="toolbar-sep"></span>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="bold" title="加粗"><strong>B</strong></button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="italic" title="斜体"><em>I</em></button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="underline" title="下划线"><u>U</u></button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="code" title="行内代码">&lt;&gt;</button>
+      <span class="toolbar-sep"></span>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="insertUnorderedList" title="无序列表">• 列表</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="insertOrderedList" title="有序列表">1. 列表</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="blockquote" title="引用块">引用</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="pre" title="代码块">代码块</button>
+      <span class="toolbar-sep"></span>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="table" title="插入表格">表格</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="link" title="插入链接">链接</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="image" title="插入图片">图片</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="citation" title="插入引用节点">引用节点</button>
+      <span class="toolbar-sep"></span>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="undo" title="撤销">↶</button>
+      <button type="button" class="btn btn-ghost btn-xs" data-edit-cmd="redo" title="重做">↷</button>
+    </div>
+    <div class="note-edit-area markdown-preview" id="note-edit-area" contenteditable="true" spellcheck="false"></div>
+    <div class="modal-actions">
+      <span class="modal-actions-spacer"></span>
+      <button type="button" class="btn" id="note-edit-cancel">取消</button>
+      <button type="button" class="btn btn-primary" id="note-edit-save">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 批注多选加入笔记 -->
+<div class="modal-mask" id="excerpt-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">批注加入笔记</div>
+    <p class="field-hint" id="excerpt-summary"></p>
+    <div class="excerpt-filter-row">
+      <span class="field-hint">筛选：</span>
+      <span id="excerpt-color-filter"></span>
+      <select id="excerpt-tag-filter" class="excerpt-tag-filter" aria-label="按标签筛选"><option value="">全部标签</option></select>
+    </div>
+    <div class="excerpt-list" id="excerpt-list"></div>
+    <label class="field-hint excerpt-target-row">目标笔记
+      <select id="excerpt-target" class="excerpt-target"></select>
+      <button type="button" class="btn btn-ghost btn-xs" id="excerpt-target-new">＋新建</button>
+    </label>
+    <div class="modal-actions">
+      <button type="button" class="btn" id="excerpt-cancel">取消</button>
+      <button type="button" class="btn btn-primary" id="excerpt-confirm">加入笔记</button>
+    </div>
+  </div>
+</div>
+
+<!-- Word 插入引文：文献多选 -->
+<div class="modal-mask" id="word-cite-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">插入引文</div>
+    <p class="field-hint">勾选要引用的文献（同一处引文按列表顺序合并，数字制编号由「刷新引文与参考文献表」重算）。支持按标题 / 作者 / 年份搜索，多个词用空格分隔。</p>
+    <div class="excerpt-filter-row">
+      <input type="search" id="word-cite-search" class="excerpt-tag-filter" placeholder="搜索标题 / 作者 / 年份…" aria-label="搜索文献">
+    </div>
+    <div class="excerpt-list" id="word-cite-list"></div>
+    <div class="modal-actions">
+      <span class="field-hint" id="word-cite-count"></span>
+      <button type="button" class="btn" id="word-cite-cancel">取消</button>
+      <button type="button" class="btn btn-primary" id="word-cite-confirm">插入引文</button>
+    </div>
+  </div>
+</div>
+
+<!-- 作者合并 -->
+<div class="modal-mask" id="authors-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">作者合并</div>
+    <p class="field-hint">同一作者的不同写法分组如下（按出现次数排序）。勾选后统一为最常用写法，全库批量改写。</p>
+    <div class="authors-list" id="authors-list"></div>
+    <div class="modal-actions">
+      <button class="btn" id="authors-close">关闭</button>
+      <button class="btn btn-primary" id="authors-merge-selected" hidden>合并选中组</button>
+    </div>
+  </div>
+</div>
+
+<!-- 标签管理 -->
+<div class="modal-mask" id="tags-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">标签管理</div>
+    <p class="field-hint">点击色点更换颜色；「合并选中」把多个标签统一为一个；删除只移除标签，不影响文献。</p>
+    <div class="tag-manage-list" id="tag-manage-list"></div>
+    <div class="modal-actions">
+      <button class="btn" id="tags-close">关闭</button>
+      <button class="btn btn-primary" id="tags-merge-selected" hidden>合并选中标签</button>
+    </div>
+  </div>
+</div>
+
+<!-- 快捷键帮助 -->
+<div class="modal-mask" id="shortcuts-mask" hidden>
+  <div class="modal">
+    <div class="modal-head">键盘快捷键</div>
+    <table class="keys-table">
+      <tr><td><kbd>/</kbd></td><td>聚焦搜索框</td></tr>
+      <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>下一条 / 上一条</td></tr>
+      <tr><td><kbd>Shift</kbd> + <kbd>j</kbd> / <kbd>k</kbd> / <kbd>↑</kbd> / <kbd>↓</kbd></td><td>扩展区间选择</td></tr>
+      <tr><td><kbd>Enter</kbd></td><td>打开选中条目</td></tr>
+      <tr><td><kbd>x</kbd></td><td>勾选 / 取消勾选当前条目</td></tr>
+      <tr><td><kbd>Ctrl</kbd> + 点击</td><td>切换单条勾选</td></tr>
+      <tr><td><kbd>Shift</kbd> + 点击</td><td>区间勾选（锚点 → 当前行）</td></tr>
+      <tr><td><kbd>s</kbd></td><td>切换当前条目阅读状态</td></tr>
+      <tr><td><kbd>n</kbd></td><td>新建 / 添加文献</td></tr>
+      <tr><td><kbd>e</kbd></td><td>一键补全全部</td></tr>
+      <tr><td><input class="shortcut-input" data-shortcut="pdfOnly" readonly aria-label="只检索有 PDF 附件条目的快捷键" title="聚焦后按下新快捷键"></td><td>只显示有 PDF 附件的条目</td></tr>
+      <tr><td><input class="shortcut-input" data-shortcut="bibkey" readonly aria-label="按 bibkey 检索的快捷键" title="聚焦后按下新快捷键"></td><td>按 bibkey 检索</td></tr>
+      <tr><td><kbd>?</kbd></td><td>显示本帮助</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>关闭弹窗 / 抽屉 / 阅读器</td></tr>
+    </table>
+    <div class="modal-actions">
+      <button class="btn" id="shortcuts-close">知道了</button>
+    </div>
+  </div>
+</div>
+
+<!-- bibkey 检索 -->
+<div class="modal-mask" id="bibkey-search-mask" hidden>
+  <div class="modal">
+    <div class="modal-head">按 bibkey 检索</div>
+    <input type="search" id="bibkey-search-input" class="text-input" list="bibkey-suggest" placeholder="支持多个，用逗号或空格分隔，如：lovelace1843, turing1950">
+    <datalist id="bibkey-suggest"></datalist>
+    <p class="field-hint" id="bibkey-search-status" role="status" aria-live="polite"></p>
+    <div class="modal-actions">
+      <button class="btn" id="bibkey-search-cancel">取消</button>
+      <button class="btn btn-primary" id="bibkey-search-ok">检索</button>
+    </div>
+  </div>
+</div>
+
+<!-- 设置与同步 -->
+<div class="modal-mask" id="sync-mask" hidden>
+  <div class="modal modal-wide sync-modal">
+    <div class="modal-head">设置</div>
+    <div class="sync-body">
+      <nav class="sync-nav" id="sync-nav" aria-label="设置分组">
+        <button type="button" class="sync-nav-btn active" data-sync-group="storage">数据与备份</button>
+        <button type="button" class="sync-nav-btn" data-sync-group="cloud">云同步</button>
+        <button type="button" class="sync-nav-btn" data-sync-group="integrations">集成与服务</button>
+        <button type="button" class="sync-nav-btn" data-sync-group="prefs">偏好</button>
+      </nav>
+      <div class="sync-sections">
+      <section class="sync-section" data-sync-group="storage">
+        <h3>本地数据位置</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">配置与缓存目录
+            <div class="inline-row">
+              <input type="text" id="sync-config-dir" spellcheck="false" placeholder="正在读取…">
+              <button type="button" class="btn" id="sync-choose-config-dir">选择…</button>
+            </div>
+          </label>
+          <label class="span-2">文献库目录
+            <div class="inline-row">
+              <input type="text" id="sync-library-dir" spellcheck="false" placeholder="正在读取…">
+              <button type="button" class="btn" id="sync-choose-library-dir">选择…</button>
+            </div>
+          </label>
+          <p class="span-2 field-hint">配置目录放应用设置与缓存、同步附件与批注图片；文献库目录放数据库、全文索引和备份。你在其他位置选择的 PDF 与附件不会移动。路径可直接输入或点「选择…」，目标须为空目录或当前目录；点「应用并重启」后 LitBoard 会重启并搬移数据，随后清空旧目录（只留一个定位文件记录新位置）。</p>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn btn-primary" id="sync-data-paths-apply" disabled>应用并重启</button>
+            <span class="sync-inline-status" id="sync-data-path-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="storage">
+        <h3>完整备份（自动轮换，含全部附件）</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">备份目录（独立于配置与文献库目录，不会互相嵌套）
+            <div class="inline-row">
+              <input type="text" id="sync-backup-dir" readonly placeholder="未设置 — 建议选择 OneDrive 或外接盘上的专用目录">
+              <button type="button" class="btn" id="sync-backup-choose">选择…</button>
+            </div>
+          </label>
+          <p class="span-2 field-hint">完整备份包含数据库（含全文索引）、全部本地附件（托管与外部 PDF、补充材料）与批注截图；数据库为压缩快照，按下面设定的份数自动轮换，与最近一份相同的状态不会重复保存。备份不含 WebDAV/API 凭据，恢复后需重新配置浏览器扩展。距上次成功超过 24 小时会自动备份。</p>
+          <label class="span-2">保留快照份数
+            <div class="inline-row">
+              <input type="text" id="sync-backup-keep" inputmode="numeric" placeholder="1–30（默认 7）">
+              <button type="button" class="btn" id="sync-backup-keep-apply" disabled>应用</button>
+            </div>
+          </label>
+          <p class="span-2 field-hint">份数越少占用越小。附件跨快照按内容去重，只有数据库快照会按份数重复占用；调小份数不会立刻删文件，下一次成功备份时才轮换清理。</p>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn" id="sync-backup-now">立即完整备份</button>
+            <button type="button" class="btn" id="sync-backup-restore" disabled>从备份恢复…</button>
+            <button type="button" class="btn" id="sync-backup-open" disabled>打开备份目录</button>
+            <button type="button" class="btn" id="sync-backup-cleanup">清理遗留文件…</button>
+            <span class="sync-inline-status" id="sync-backup-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="storage">
+        <h3>PDF 全文索引</h3>
+        <div class="sync-form-grid">
+          <p class="span-2 field-hint" id="pdf-index-stats"></p>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn" id="sync-refresh-pdf-index">刷新统计</button>
+            <button type="button" class="btn" id="sync-build-pdf-index">构建索引</button>
+            <button type="button" class="btn" id="sync-clear-pdf-cache">清除索引</button>
+            <span class="sync-inline-status" id="sync-pdf-index-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="storage">
+        <h3>调研库（AI 助手）</h3>
+        <div class="sync-form-grid">
+          <p class="span-2 field-hint" id="research-stats-text">调研库保存检索发现的文献元数据（身份、摘要、引用关系），存储在配置目录 research/ 下，随数据目录迁移。</p>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn" id="sync-research-refresh">刷新统计</button>
+            <button type="button" class="btn" id="sync-research-import">导入现有调研库…</button>
+            <button type="button" class="btn" id="sync-research-backfill">回填缺失摘要</button>
+            <button type="button" class="btn" id="sync-research-register">补登记正式库</button>
+            <span class="sync-inline-status" id="sync-research-status" role="status" aria-live="polite"></span>
+          </div>
+          <p class="span-2 field-hint">检索与导入完成后会自动回填本批缺摘要的条目（后台，单批 ≤25 条）；下方按钮可手动补一批存量。回填链：Crossref → Elsevier abstract（限流自动暂停续跑）；补登记为正式库文献建立调研身份（DOI 直查，无 DOI 建本地身份）。</p>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="storage">
+        <h3>会话记录（AI 助手）</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">会话根目录
+            <div class="inline-row">
+              <input type="text" id="sync-agent-session-root" placeholder="默认：文档\LitBoard">
+              <button type="button" class="btn" id="sync-agent-session-browse">选择</button>
+              <button type="button" class="btn" id="sync-agent-session-open">打开</button>
+            </div>
+          </label>
+          <p class="span-2 field-hint">会话目录保存对话、工具结果与生成文件，是长期成果：不随缓存清理；改位置后新会话落新目录，已有会话保留原处。</p>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="cloud" hidden>
+        <h3>坚果云 WebDAV</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">WebDAV 地址<input type="url" id="sync-nutstore-url" value="https://dav.jianguoyun.com/dav/"></label>
+          <label>账号<input type="text" id="sync-nutstore-user" autocomplete="username"></label>
+          <label>应用密码<input type="password" id="sync-nutstore-password" autocomplete="new-password" placeholder="留空则保持原密码"></label>
+          <label class="span-2">LitBoard 同步目录<input type="text" id="sync-nutstore-folder" value="LitBoard" placeholder="例如 LitBoard 或 Research/LitBoard"></label>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn" id="sync-test-nutstore">测试连接</button>
+            <span class="sync-inline-status" id="sync-nutstore-test-status" role="status" aria-live="polite"></span>
+          </div>
+          <label class="sync-check-row span-2">
+            <input type="checkbox" id="sync-auto-sync" checked>
+            <span class="sync-check-content">
+              <span class="sync-check-title">内容变化时自动同步</span>
+              <span class="sync-check-desc">编辑后自动写入坚果云，并每 15 分钟核对一次。不勾选时仅在手动点「保存并同步」或远端恢复时联网。</span>
+            </span>
+          </label>
+        </div>
+      </section>
+      <section class="sync-section" id="remote-recovery-section" data-sync-group="cloud" hidden>
+        <h3>远端恢复与冲突对照</h3>
+        <p class="span-2 field-hint">先只读检查远端版本。新设备可直接恢复已同步到 LitBoard 的文献与附件；已有本地数据时会生成逐字段对照，未解决冲突不会写回云端。</p>
+        <div class="sync-inline-actions">
+          <button type="button" class="btn" id="sync-remote-inspect">检查远端</button>
+          <button type="button" class="btn" id="sync-remote-config">仅恢复配置</button>
+          <button type="button" class="btn" id="sync-remote-restore">从远端恢复…</button>
+          <button type="button" class="btn" id="sync-remote-merge">生成同步对照…</button>
+          <span class="sync-inline-status" id="sync-remote-status" role="status" aria-live="polite"></span>
+        </div>
+      </section>
+      <section class="sync-section" id="translation-section" data-sync-group="integrations" hidden>
+        <h3>划词翻译</h3>
+        <div class="sync-form-grid">
+          <label>服务商
+            <select id="sync-translator-provider">
+              <optgroup label="免费接口（无需 API Key）">
+                <option value="volc">火山翻译（免费接口）</option>
+                <option value="tencent">腾讯交互翻译（免费接口）</option>
+                <option value="google">谷歌翻译（免费接口）</option>
+                <option value="cnki">CNKI 学术翻译（免费接口）</option>
+                <option value="mymemory">MyMemory 翻译记忆库（免费接口）</option>
+              </optgroup>
+              <optgroup label="API Key 服务">
+                <option value="qwen">Qwen（DashScope API Key）</option>
+                <option value="aliyun">阿里云机器翻译（AK/SK）</option>
+                <option value="openai">OpenAI</option>
+                <option value="deepseek">DeepSeek</option>
+              </optgroup>
+            </select>
+          </label>
+          <label>目标语言
+            <select id="sync-translator-target">
+              <option value="zh">简体中文</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <label>模型<input type="text" id="sync-translator-model" placeholder="留空使用服务商默认模型"></label>
+          <label><span id="sync-translator-credential-label">API Key</span><input type="password" id="sync-translator-api-key" autocomplete="new-password" placeholder="留空则保持原 Key"></label>
+          <label class="sync-check-row span-2">
+            <input type="checkbox" id="sync-translator-auto">
+            <span class="sync-check-content">
+              <span class="sync-check-title">划选内容后自动翻译</span>
+              <span class="sync-check-desc">在 PDF 阅读器中划选文本后立即开始翻译，无需额外点击工具栏中的「翻译」按钮</span>
+            </span>
+          </label>
+          <p class="span-2 field-hint provider-help" id="sync-translator-provider-help" aria-live="polite"></p>
+          <div class="span-2 settings-help" id="sync-translator-key-help">
+            <div class="settings-help-title">API 申请入口</div>
+            <div class="api-link-list">
+              <a href="https://help.aliyun.com/zh/model-studio/get-api-key" target="_blank" rel="noopener">
+                <strong>Qwen / DashScope</strong>
+                <span>阿里云百炼 API Key</span>
+              </a>
+              <a href="https://help.aliyun.com/zh/machine-translation/getting-started/activate-machine-translation-for-developers" target="_blank" rel="noopener">
+                <strong>阿里云机器翻译</strong>
+                <span>先开通机器翻译服务</span>
+              </a>
+              <a href="https://help.aliyun.com/zh/machine-translation/getting-started/prepare-accounts-for-developers" target="_blank" rel="noopener">
+                <strong>阿里云 AccessKey</strong>
+                <span>创建 AccessKey ID / Secret</span>
+              </a>
+              <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">
+                <strong>OpenAI</strong>
+                <span>API keys</span>
+              </a>
+              <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener">
+                <strong>DeepSeek</strong>
+                <span>API keys</span>
+              </a>
+            </div>
+            <p class="field-hint">免费接口与 API Key 服务都可选；长文本自动分块，各接口有每日/单次限额。凭据只保存在本机加密配置中。</p>
+          </div>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn" id="sync-test-translator">测试连接</button>
+            <span class="sync-inline-status" id="sync-translator-test-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="integrations" hidden>
+        <h3>期刊分区</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">数据服务商
+            <select id="sync-rank-provider">
+              <option value="scigreat">OneScholar / SciGreat</option>
+              <option value="easyscholar">EasyScholar 会员 API（免费，≤2 次/秒）</option>
+            </select>
+          </label>
+          <label class="span-2">OneScholar / SciGreat API Key<input type="password" id="sync-scigreat-api-key" autocomplete="new-password" placeholder="留空则保持原 Key"></label>
+          <label class="span-2">EasyScholar SecretKey<input type="password" id="sync-easyscholar-api-key" autocomplete="new-password" placeholder="留空则保持原 Key"></label>
+          <div class="span-2 settings-help">
+            <div class="settings-help-title">申请入口</div>
+            <div class="api-link-list">
+              <a href="https://www.easyscholar.cc/console/user/open" target="_blank" rel="noopener">
+                <strong>EasyScholar 开放接口</strong>
+                <span>开通 / 查看 SecretKey</span>
+              </a>
+              <a href="https://www.scigreat.com/s/app/?t=onescholar-info" target="_blank" rel="noopener">
+                <strong>OneScholar 设置</strong>
+                <span>查看 API 使用量和秘钥教程</span>
+              </a>
+              <a href="https://www.scigreat.com/s/app/?t=onescholar" target="_blank" rel="noopener">
+                <strong>OneScholar 主页</strong>
+                <span>账号、会员与插件说明</span>
+              </a>
+            </div>
+            <p class="field-hint">按所选服务商的 Key 查询期刊等级：<strong>新锐等级 / Top / JCR / 影响因子</strong>；测试 API 会用 Nature 做一次查询。
+              <strong>中文刊优先选 EasyScholar</strong>（覆盖中文刊库），SciGreat 偏英文期刊。EasyScholar SecretKey 生成后不可更改，请勿泄露。</p>
+          </div>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn" id="sync-test-scigreat">测试 API</button>
+            <span class="sync-inline-status" id="sync-scigreat-test-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="integrations" hidden>
+        <h3>AI 助手（OpenAI 兼容）</h3>
+        <div class="sync-form-grid">
+          <p class="span-2 field-hint">填好端点与 Key 即启用：AI 助手栏位会自动就绪；未配置时该栏位给出使用引导，检索栏位始终可用。</p>
+          <label class="span-2">Base URL
+            <div class="inline-row">
+              <select id="sync-agent-preset">
+                <option value="">常用预设…</option>
+                <option value="https://opencode.ai/zen/go/v1">OpenCode Go（订阅套餐）</option>
+                <option value="https://opencode.ai/zen/v1">OpenCode Zen</option>
+                <option value="https://api.openai.com/v1">OpenAI</option>
+                <option value="https://api.anthropic.com">Anthropic（Claude）</option>
+                <option value="https://api.deepseek.com">DeepSeek</option>
+                <option value="https://api.deepseek.com/anthropic">DeepSeek（Anthropic 兼容）</option>
+                <option value="https://api.moonshot.cn/v1">Kimi（Moonshot）</option>
+                <option value="https://open.bigmodel.cn/api/paas/v4">智谱 GLM</option>
+                <option value="https://open.bigmodel.cn/api/anthropic">智谱 GLM（Anthropic 兼容）</option>
+                <option value="https://api.z.ai/api/anthropic">Z.ai（Anthropic 兼容）</option>
+                <option value="https://dashscope.aliyuncs.com/compatible-mode/v1">通义千问（DashScope）</option>
+                <option value="https://openrouter.ai/api/v1">OpenRouter</option>
+                <option value="https://api.siliconflow.cn/v1">硅基流动 SiliconFlow</option>
+                <option value="http://localhost:11434/v1">本地 ollama</option>
+              </select>
+              <input type="text" id="sync-agent-base-url" placeholder="https://api.deepseek.com（本地服务可用 http://localhost）">
+            </div>
+          </label>
+          <label class="span-2">接口格式
+            <select id="sync-agent-dialect">
+              <option value="">自动识别（推荐）</option>
+              <option value="chat">OpenAI Chat Completions</option>
+              <option value="responses">OpenAI Responses</option>
+              <option value="messages">Anthropic Messages</option>
+            </select>
+          </label>
+          <div class="span-2 field-hint" id="sync-agent-dialect-hint">—</div>
+          <label>API Key<input type="password" id="sync-agent-api-key" autocomplete="new-password" placeholder="留空则保持原 Key"></label>
+          <label>模型名
+            <div class="inline-row">
+              <input type="text" id="sync-agent-model" list="sync-agent-model-list" placeholder="如 kimi-k2.7-code；也可点右侧拉取">
+              <button type="button" class="btn" id="sync-agent-fetch-models">拉取模型</button>
+            </div>
+          </label>
+          <datalist id="sync-agent-model-list"></datalist>
+          <label class="sync-check-row span-2">
+            <input type="checkbox" id="sync-agent-autocompact">
+            <span class="sync-check-content">
+              <span class="sync-check-title">自动压缩上下文</span>
+              <span class="sync-check-desc">接近上下文上限时，把较旧的对话摘要成一条继续（摘要调用计入 token 用量，会话里可见压了多少）；关闭后改用裁剪与旧工具结果清理。会话头部的图层按钮可随时手动压缩</span>
+            </span>
+          </label>
+          <label>模型上下文（tokens）<input type="number" id="sync-agent-context-tokens" min="0" step="1000" placeholder="留空用默认 256000"></label>
+          <label>最大输出（tokens）<input type="number" id="sync-agent-max-output-tokens" min="0" step="500" placeholder="留空用默认 12800"></label>
+          <p class="span-2 field-hint">上下文是整份请求（含系统提示与工具定义）的长度上限，超出时从最旧的整轮开始丢弃；最大输出是单轮回复上限。部分模型对输出上限另有要求（如 Kimi 思考模型做多步工具调用要求 ≥ 16000），若端点报错请据此调整。</p>
+          <p class="span-2 field-hint">端点协议按 Base URL 自动识别，上方会实时显示判定结果（OpenCode 端点还会按模型系列分流）；判定不符时用上面的「接口格式」强制指定。</p>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn" id="sync-agent-test">测试连接</button>
+            <span class="sync-inline-status" id="sync-agent-test-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="integrations" hidden>
+        <h3>检索与元数据服务</h3>
+        <div class="sync-form-grid">
+          <label>OpenAlex 邮箱（polite pool）<input type="text" id="sync-openalex-email" placeholder="you@example.com"></label>
+          <label>OpenAlex API Key（可选）<input type="password" id="sync-openalex-key" autocomplete="new-password" placeholder="留空则保持原 Key"></label>
+          <label>Elsevier API Key（Scopus 检索与摘要回填，可选）<input type="password" id="sync-elsevier-key" autocomplete="new-password" placeholder="留空则保持原 Key"></label>
+          <label>Semantic Scholar API Key（可选，可提高配额）<input type="password" id="sync-semanticscholar-key" autocomplete="new-password" placeholder="留空则保持原 Key"></label>
+          <label class="sync-check-row span-2">
+            <input type="checkbox" id="sync-web-search-enabled">
+            <span class="sync-check-content">
+              <span class="sync-check-title">科研网页检索（TinyFish，实验）</span>
+              <span class="sync-check-desc">AI 助手可检索学术网页索引、抓取公开学术域 URL 正文（markdown 入全文检索）。首次开启会弹出境告知：检索词与抓取的 URL 将经 TinyFish 服务器；抓取仅限公开学术域白名单。</span>
+            </span>
+          </label>
+          <label>TinyFish API Key（网页检索）<input type="password" id="sync-tinyfish-key" autocomplete="new-password" placeholder="留空则保持原 Key"></label>
+          <p class="span-2 field-hint">配置 Elsevier Key 后，AI 助手可联网检索 Scopus 索引（返回 Scopus 引用数，不含摘要）；所有对外检索都有频率限制，速度偏慢属正常。</p>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="integrations" hidden>
+        <h3>向量嵌入（调研库 · 可选）</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">向量模型服务商
+            <select id="sync-embed-provider">
+              <option value="">自定义 / 不预设</option>
+              <option value="dashscope">通义千问（DashScope）</option>
+              <option value="openai">OpenAI</option>
+              <option value="ollama">本地 ollama</option>
+            </select>
+          </label>
+          <label class="span-2">Base URL<input type="text" id="sync-embed-base-url" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1（留空则沿用 AI 助手端点）"></label>
+          <label>API Key<input type="password" id="sync-embed-api-key" autocomplete="new-password" placeholder="留空则保持原 Key"></label>
+          <label>向量模型名<input type="text" id="sync-embed-model" placeholder="如 text-embedding-v3"></label>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn" id="sync-embed-test">测试向量模型</button>
+            <span class="sync-inline-status" id="sync-embed-test-status" role="status" aria-live="polite"></span>
+          </div>
+          <div class="span-2 field-hint" id="sync-embed-source">—</div>
+          <div class="span-2 field-hint" id="sync-embed-usage">嵌入用量：—</div>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn" id="sync-embed-build">构建 / 更新向量索引</button>
+            <span class="sync-inline-status" id="sync-embed-status" role="status" aria-live="polite"></span>
+          </div>
+          <p class="span-2 field-hint">调研库向量模型可单独配置服务商与凭据，下面会实时显示最终调用哪个端点。语义检索只作为 AI 助手的工具使用：配置齐备即注册该工具，并在库空闲时自动增量构建索引；换模型后需要重建索引。</p>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="integrations" hidden>
+        <h3>Zotero 本机资料库（可选，只读）</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">Zotero 云附件子目录<input type="text" id="sync-zotero-webdav-folder" value="zotero"></label>
+          <label class="span-2">本机数据目录
+            <div class="inline-row">
+              <input type="text" id="sync-zotero-dir" readonly>
+              <button type="button" class="btn" id="sync-detect-zotero">自动检测</button>
+              <button type="button" class="btn" id="sync-choose-zotero">选择</button>
+              <button type="button" class="btn" id="sync-import-zotero">导入本机库</button>
+              <button type="button" class="btn" id="sync-migrate-zotero-cloud">迁移云附件</button>
+            </div>
+          </label>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="prefs" hidden>
+        <h3>界面与外观</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">界面主题风格
+            <select id="sync-theme-select">
+              <option value="auto">跟随系统 (Auto)</option>
+              <optgroup label="浅色风格 (GitHub Top 5)">
+                <option value="light-github">GitHub Light（经典白）</option>
+                <option value="light-catppuccin">Catppuccin Latte（柔和浅色）</option>
+                <option value="light-solarized">Solarized Light（日耀米黄）</option>
+                <option value="light-onelight">One Light（原子浅灰）</option>
+                <option value="light-gruvbox">Gruvbox Light（复古羊皮）</option>
+              </optgroup>
+              <optgroup label="深色风格 (GitHub Top 5)">
+                <option value="dark-catppuccin">Catppuccin Mocha（摩卡深色）</option>
+                <option value="dark-dracula">Dracula（德古拉紫）</option>
+                <option value="dark-tokyonight">Tokyo Night（东京夜色）</option>
+                <option value="dark-nord">Nord（极光冷灰）</option>
+                <option value="dark-onedark">One Dark（原子深灰）</option>
+              </optgroup>
+            </select>
+          </label>
+          <label class="span-2">界面语言 / Language
+            <select id="sync-lang-select">
+              <option value="auto">跟随系统 (Auto)</option>
+              <option value="zh-CN">简体中文</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <p class="span-2 field-hint" data-no-i18n>切换后立即生效，无需重启；界面语言只影响显示，不改动文献数据。Switching takes effect immediately; only the interface language changes, never your library data.</p>
+          <p class="span-2 field-hint">也可点击顶栏右侧主题按钮直接切换。</p>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="prefs" hidden>
+        <h3>附件与命名</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">PDF 命名模板
+            <input type="text" id="sync-rename-template" placeholder="{author} - {year} - {title}" spellcheck="false">
+          </label>
+          <p class="span-2 field-hint">可用变量：{author} {authors3} {year} {title} {venue} {citekey}。详情栏附件区「按模板重命名」与批量重命名时使用。</p>
+          <label class="span-2">PDF 自动下载目录
+            <div class="inline-row">
+              <input type="text" id="sync-pdf-download-dir" readonly placeholder="未设置：自动存到配置目录 open-access-pdf 文件夹">
+              <button type="button" class="btn" id="sync-pdf-download-dir-choose">选择…</button>
+              <button type="button" class="btn" id="sync-pdf-download-dir-clear">清除</button>
+            </div>
+          </label>
+          <p class="span-2 field-hint">详情栏「PDF」按钮与浏览器扩展抓取到开放获取全文时，自动下载到该目录并按模板重命名（同名覆盖更新）；未设置时存到配置目录下的 open-access-pdf 文件夹。下载完成后自动构建全文索引。目录仅保存在本机，不随配置同步。</p>
+          <label class="sync-check-row span-2">
+            <input type="checkbox" id="sync-auto-writeback">
+            <span class="sync-check-content">
+              <span class="sync-check-title">保存批注时自动写回 PDF 文件</span>
+              <span class="sync-check-desc">阅读器编辑批注后自动将改动写回原文件，写回前自动在同级目录保留 .litbak 备份</span>
+            </span>
+          </label>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="prefs" hidden>
+        <h3>写作与导出</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">自动导出 .bib 路径
+            <div class="inline-row">
+              <input type="text" id="sync-bib-export-path" readonly placeholder="未设置：请选择目标 .bib 文件">
+              <button type="button" class="btn" id="sync-bib-export-choose">选择…</button>
+              <button type="button" class="btn" id="sync-bib-export-clear">清除</button>
+            </div>
+          </label>
+          <p class="span-2 field-hint">设置路径后，每次保存都会把文献库导出到该文件（适用于 Overleaf、Typst、VS Code 等外部写作工作流）；清除路径即停用。</p>
+        </div>
+      </section>
+      <section class="sync-section" data-sync-group="prefs" hidden>
+        <h3>访问与通用</h3>
+        <div class="sync-form-grid">
+          <label class="span-2">机构访问代理前缀（EZproxy，可选）
+            <input type="url" id="sync-proxy-prefix" placeholder="如 https://proxy.univ.edu/login?url=%U">
+          </label>
+          <p class="span-2 field-hint">设置后详情栏出现「机构访问」链接；前缀含 %U 时替换为编码后的目标地址，否则直接拼接。</p>
+          <label class="span-2">回收站保留天数
+            <input type="number" id="sync-trash-days" min="0" max="3650" placeholder="30">
+          </label>
+          <p class="span-2 field-hint">超过天数的回收站条目将在应用启动时自动彻底清除；设为 0 表示永不自动清理。</p>
+        </div>
+      </section>
+      </div>
+    </div>
+    <p class="sync-status" id="sync-status" aria-live="polite"></p>
+    <div class="modal-actions sync-modal-actions">
+      <span class="sync-auto-hint">改动即时保存，关闭窗口也会保存；「保存并同步」立即写入坚果云</span>
+      <button class="btn" id="sync-close">关闭</button>
+      <button class="btn" id="sync-save">保存配置</button>
+      <button class="btn btn-primary" id="sync-run">保存并同步</button>
+    </div>
+  </div>
+</div>
+
+<!-- 同步冲突报告 -->
+<div class="modal-mask" id="sync-conflict-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">同步冲突报告</div>
+    <p class="field-hint">以下条目在两台设备上都有修改，本次同步以云端（较新）版本为准。被覆盖的本地版本可导出留底。</p>
+    <div class="sync-conflict-list" id="sync-conflict-list"></div>
+    <div class="modal-actions">
+      <button class="btn" id="sync-conflict-export">导出被覆盖版本 JSON</button>
+      <button class="btn btn-primary" id="sync-conflict-close">知道了</button>
+    </div>
+  </div>
+</div>
+
+<!-- 浏览器扩展（顶栏「扩展」直接打开；不再埋在设置 → 集成与服务里） -->
+<div class="modal-mask" id="bridge-panel-mask" hidden>
+  <div class="modal">
+    <div class="modal-head">浏览器扩展</div>
+    <section class="sync-section" id="bridge-section">
+      <div class="sync-form-grid">
+        <label class="sync-check-row span-2">
+          <input type="checkbox" id="sync-bridge-enabled">
+          <span class="sync-check-content">
+            <span class="sync-check-label">启用浏览器扩展接收服务</span>
+            <span class="sync-check-desc">允许从 Chrome/Edge 浏览器扩展一键抓取并导入文献，仅监听本机 127.0.0.1</span>
+          </span>
+        </label>
+        <div class="span-2 sync-inline-actions">
+          <span class="sync-inline-status" id="sync-bridge-status"></span>
+          <button type="button" class="btn" id="sync-bridge-copy-token">复制令牌</button>
+        </div>
+        <p class="span-2 field-hint">用 Chrome/Edge「加载已解压的扩展程序」安装项目 extension/ 目录，在扩展选项页填入端口与令牌后，即可在文献页面一键保存到 LitBoard（含开放获取 PDF 自动下载）。</p>
+      </div>
+    </section>
+    <div class="modal-actions">
+      <button class="btn" id="bridge-panel-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- Word 写作（顶栏「插入引文」直接打开；不再埋在设置 → 集成与服务里） -->
+<div class="modal-mask" id="word-panel-mask" hidden>
+  <div class="modal modal-wide">
+    <div class="modal-head">Word 写作（COM 自动化，免安装免宏）</div>
+    <section class="sync-section" id="word-section">
+      <div class="sync-form-grid">
+        <label class="span-2">目标文档
+          <div class="inline-row">
+            <select id="word-doc-select" class="word-doc-select" aria-label="打开的 Word 文档"></select>
+            <button type="button" class="btn" id="word-detect">检测 Word</button>
+          </div>
+        </label>
+        <p class="span-2 field-hint" id="word-status">未连接。打开 Word（2016 及以上，桌面版 32/64 位均可）后点「检测 Word」。</p>
+        <label class="span-2">引文格式
+          <div class="inline-row">
+            <select id="word-style-select" class="word-style-select" aria-label="引文格式"></select>
+            <button type="button" class="btn" id="word-style-import">导入 CSL 样式…</button>
+            <span class="field-hint" id="word-style-hint"></span>
+          </div>
+        </label>
+        <div class="span-2 inline-row">
+          <button type="button" class="btn" id="word-insert-citation">插入引文</button>
+          <button type="button" class="btn" id="word-refresh">刷新引文与参考文献表</button>
+          <button type="button" class="btn" id="word-bibliography">插入参考文献表</button>
+          <button type="button" class="btn" id="word-unlink">解除关联（存副本）</button>
+          <button type="button" class="btn" id="word-convert-zotero">转换 Zotero 引文文档…</button>
+        </div>
+        <p class="span-2 field-hint">引文以 <code>ADDIN LitBoard.Citation.1</code> 复杂域保存，可在 Word 中点击域后选「切换域代码」查看；刷新/解除均在一次可撤销操作内完成，只读或受保护文档会被拒绝并提示。</p>
+      </div>
+    </section>
+    <div class="modal-actions">
+      <button class="btn" id="word-panel-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 远端同步计划与字段级冲突对照 -->
+<div class="modal-mask" id="sync-remote-plan-mask" hidden>
+  <div class="modal modal-wide remote-plan-modal">
+    <div class="modal-head" id="sync-remote-plan-title">远端同步对照</div>
+    <p class="field-hint" id="sync-remote-plan-summary"></p>
+    <div class="remote-plan-toolbar">
+      <button class="btn" id="sync-remote-choose-local">未决项采用本机</button>
+      <button class="btn" id="sync-remote-choose-remote">未决项采用远端</button>
+      <input type="search" class="search" id="sync-remote-plan-filter" placeholder="搜索对照项..." style="max-width: 220px; margin-left: auto; height: 30px; font-size: 12px;">
+    </div>
+    <div class="remote-plan-list" id="sync-remote-plan-list"></div>
+    <div class="remote-plan-progress" id="sync-remote-plan-progress" hidden>
+      <div class="remote-plan-progress-head">
+        <span id="sync-remote-plan-progress-text">正在同步…</span>
+        <span id="sync-remote-plan-progress-percent"></span>
+      </div>
+      <progress id="sync-remote-plan-progress-bar" max="100"></progress>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="sync-remote-plan-cancel">取消</button>
+      <button class="btn btn-primary" id="sync-remote-plan-apply">应用选择并同步</button>
+    </div>
+  </div>
+</div>
+
+<!-- 通用对话框（替代原生 confirm / prompt） -->
+<!-- 引文网络面板（三期）：应用内渲染 + 离线自包含 HTML 快照导出；数据来自调研库 -->
+<div class="modal-mask" id="graph-mask" hidden>
+  <div class="modal modal-wide graph-modal" role="dialog" aria-modal="true" aria-labelledby="graph-title">
+    <div class="modal-head">
+      <span id="graph-title">引文网络</span>
+      <button class="btn btn-icon" id="graph-close" title="关闭">✕</button>
+    </div>
+    <div class="graph-toolbar">
+      <label>深度 <input type="number" id="graph-depth" class="text-input graph-num" min="1" max="3" value="2"></label>
+      <label>节点上限 <input type="number" id="graph-maxnodes" class="text-input graph-num" min="10" max="500" step="10" value="200"></label>
+      <button class="btn" id="graph-rebuild">重新构建</button>
+      <button class="btn" id="graph-export">导出 HTML 快照</button>
+      <span class="field-hint" id="graph-status"></span>
+    </div>
+    <div id="graph-canvas" class="graph-canvas"></div>
+  </div>
+</div>
+
+<div class="modal-mask" id="dlg-mask" hidden>
+  <div class="modal dlg" role="dialog" aria-modal="true" aria-labelledby="dlg-title">
+    <div class="modal-head" id="dlg-title">确认</div>
+    <p class="dlg-body" id="dlg-body"></p>
+    <input type="text" class="text-input dlg-input" id="dlg-input" hidden>
+    <div class="dlg-list" id="dlg-list" hidden></div>
+    <div class="modal-actions">
+      <button class="btn" id="dlg-cancel">取消</button>
+      <button class="btn btn-primary" id="dlg-ok">确定</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toast-wrap"></div>
+
+<script src="vendor/pdflib/pdf-lib.min.js"></script>
+<script src="vendor/tesseract/tesseract.min.js"></script>
+<script src="vendor/bibtex-parse.js"></script>
+<script src="vendor/epub/jszip.min.js"></script>
+<script src="vendor/epub/epub.min.js"></script>
+<script src="js/i18n.js"></script>
+<script src="js/i18n-en.js"></script>
+<script src="js/model.js"></script>
+<script src="js/merge.js"></script>
+<script src="js/bibtex.js"></script>
+<script src="js/cite.js"></script>
+<script src="js/dedupe.js"></script>
+<script src="js/ris.js"></script>
+<script src="js/csljson.js"></script>
+<script src="js/cslcite.js"></script>
+<script src="js/csldoc.js"></script>
+<script src="js/docx.js"></script>
+<script src="js/rename.js"></script>
+<script src="js/authors.js"></script>
+<script src="js/enrich.js"></script>
+<script src="js/pdfium.js"></script>
+<script src="js/pdfannot.js"></script>
+<script src="js/ocr.js"></script>
+<script src="js/pdfimport.js"></script>
+<script src="js/pdfsearch.js"></script>
+<script src="js/reflow.js"></script>
+<script src="js/epub.js"></script>
+<script src="js/markdown.js"></script>
+<script src="js/excerpt.js"></script>
+<script src="js/noteml.js"></script>
+<script src="js/modal.js"></script>
+<script src="js/noteeditor.js"></script>
+<script src="js/sync.js"></script>
+<script src="js/query.js"></script>
+<script src="js/research.js"></script>
+<script src="vendor/assistant-ui/agent-chat.js"></script>
+<script src="js/agentcore.js"></script>
+<script src="js/agentproto.js"></script>
+<script src="js/agentcontext.js"></script>
+<script src="js/embedcfg.js"></script>
+<script src="js/agentreason.js"></script>
+<script src="js/agentloop.js"></script>
+<script src="js/webfetch.js"></script>
+<script src="js/litsearch.js"></script>
+<script src="js/agenttools.js"></script>
+<script src="vendor/vis-network/vis-network.min.js"></script>
+<script src="js/graphgen.js"></script>
+<script src="js/graphview.js"></script>
+<script src="js/agentui.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

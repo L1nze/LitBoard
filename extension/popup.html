@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+  body { width: 340px; font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; padding: 12px; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  .meta { margin: 6px 0; word-break: break-all; }
+  .meta-label { color: #888; font-size: 12px; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 11px; background: #e8f0fe; color: #1a56db; margin-left: 4px; }
+  .badge.cnki { background: #fdf2f2; color: #c25050; }
+  .translator-error { margin-top: 4px; font-size: 11px; color: #c25050; background: #fdf2f2; border-radius: 4px; padding: 3px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button { cursor: pointer; border: 1px solid #d0d0d0; background: #fff; border-radius: 6px; padding: 6px 12px; font-size: 13px; }
+  button.primary { background: #2f6fdb; border-color: #2f6fdb; color: #fff; }
+  #status { margin-top: 8px; font-size: 12px; color: #666; min-height: 1.2em; }
+  .row { display: flex; gap: 8px; margin-top: 10px; }
+  a { color: #2f6fdb; font-size: 12px; }
+  .folder-label { display: block; color: #888; font-size: 12px; margin: 8px 0 2px; }
+  .tags-input {
+    width: 100%; box-sizing: border-box; border: 1px solid #d0d0d0; border-radius: 6px;
+    padding: 6px 8px; font-size: 13px; font-family: inherit;
+  }
+  .tags-input:focus { border-color: #2f6fdb; outline: none; box-shadow: 0 0 0 1px #2f6fdb; }
+  /* 批量保存（列表页多个 DOI） */
+  #batch-section { margin-top: 10px; border-top: 1px solid #e5e5e5; padding-top: 8px; }
+  #batch-section summary { cursor: pointer; color: #666; font-size: 12px; }
+  #batch-list { max-height: 150px; overflow: auto; margin: 6px 0; border: 1px solid #e0e0e0; border-radius: 6px; padding: 4px; }
+  #batch-list label { display: flex; gap: 6px; align-items: flex-start; padding: 3px 4px; font-size: 12px; border-radius: 4px; cursor: pointer; }
+  #batch-list label:hover { background: #eef4ff; }
+  #batch-list input { margin-top: 2px; flex: none; }
+  #batch-list .batch-doi { color: #999; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #batch-save { width: 100%; }
+  /* Zotero 式文件夹下拉（原生 option 不支持图标，自绘） */
+  .folder-picker { position: relative; }
+  .folder-toggle {
+    width: 100%; box-sizing: border-box; display: flex; align-items: center; gap: 6px;
+    border: 1px solid #d0d0d0; border-radius: 6px; padding: 6px 8px; font-size: 13px; background: #fff; text-align: left;
+  }
+  .folder-toggle:hover { border-color: #2f6fdb; }
+  .folder-toggle[aria-expanded="true"] { border-color: #2f6fdb; box-shadow: 0 0 0 1px #2f6fdb; }
+  .folder-current-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .folder-chevron { flex: none; width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid #888; transition: transform .15s; }
+  .folder-toggle[aria-expanded="true"] .folder-chevron { transform: rotate(180deg); }
+  .folder-menu {
+    position: absolute; top: calc(100% + 3px); left: 0; right: 0; z-index: 10;
+    margin: 0; padding: 4px; list-style: none; background: #fff;
+    border: 1px solid #d0d0d0; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.14);
+    max-height: 240px; overflow: auto;
+  }
+  .folder-menu li { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 6px; font-size: 13px; color: #333; cursor: pointer; }
+  .folder-menu li:hover { background: #eef4ff; }
+  .folder-menu li.selected { background: #e2edff; color: #1a56db; font-weight: 600; }
+  .folder-menu li .folder-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .folder-ico { flex: none; width: 16px; height: 16px; background-position: center; background-repeat: no-repeat; background-size: 16px 16px; }
+  .folder-ico-folder { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%20viewBox='0%200%2016%2016'%3E%3Cpath%20d='M1.7%204.1c0-.83.67-1.5%201.5-1.5h3.14l1.24%201.24h5.6c.83%200%201.5.67%201.5%201.5v6.66c0%20.83-.67%201.5-1.5%201.5H3.2c-.83%200-1.5-.67-1.5-1.5V4.1z'%20fill='%23f4c477'%20stroke='%23b98a4a'%20stroke-width='.7'/%3E%3C/svg%3E"); }
+  .folder-ico-unfiled { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%20viewBox='0%200%2016%2016'%3E%3Cpath%20d='M1.8%203.4h12.4v9.2H1.8z'%20fill='%23e4e9f0'%20stroke='%239aa4b2'%20stroke-width='.7'/%3E%3Cpath%20d='M1.8%207.7h3.3l1%201.6h3.8l1-1.6h3.3v3.4a.8.8%200%200%201-.8.8H2.6a.8.8%200%200%201-.8-.8V7.7z'%20fill='%23b6c1cf'/%3E%3C/svg%3E"); }
+</style>
+</head>
+<body>
+  <h1>📚 保存到 LitBoard</h1>
+  <div class="meta">
+    <div class="meta-label">标题</div>
+    <div id="title">识别中…</div>
+  </div>
+  <div class="meta">
+    <span class="meta-label">DOI：</span><span id="doi">—</span>
+    <span class="badge" id="pdf-badge" hidden>含 PDF</span>
+    <span class="badge cnki" id="cnki-badge" hidden>知网</span>
+  </div>
+  <label class="folder-label">保存到文件夹</label>
+  <div class="folder-picker">
+    <button type="button" id="folder-toggle" class="folder-toggle" aria-haspopup="listbox" aria-expanded="false">
+      <span class="folder-ico folder-ico-unfiled" id="folder-current-ico"></span>
+      <span class="folder-current-name" id="folder-current-name">未分类（不放入文件夹）</span>
+      <span class="folder-chevron"></span>
+    </button>
+    <ul id="folder-menu" class="folder-menu" role="listbox" hidden></ul>
+  </div>
+  <label class="folder-label" for="tags-input">标签（逗号分隔，可选）</label>
+  <input type="text" id="tags-input" class="tags-input" placeholder="如：综述, 待精读">
+  <details id="batch-section" hidden>
+    <summary id="batch-summary">本页检测到多条目</summary>
+    <div id="batch-list"></div>
+    <button id="batch-save">保存选中的条目</button>
+  </details>
+  <div class="row">
+    <button class="primary" id="save">保存</button>
+    <button id="options">选项</button>
+  </div>
+  <div id="status"></div>
+  <a href="#" id="open-options">桌面端未运行？检查端口与令牌 →</a>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # 构建工具固定在 scripts/ensure-tools.ps1 + package.json，统一在此升级
+  - package-ecosystem: npm
+    directory: '/'
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      build-tooling:
+        patterns:
+          - 'electron'
+          - 'electron-builder'
+      lint-tooling:
+        patterns:
+          - 'eslint'
+          - '@eslint/*'
+          - 'globals'
+    commit-message:
+      prefix: 'chore(deps)'
+
+  - package-ecosystem: github-actions
+    directory: '/'
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: 'chore(ci)'

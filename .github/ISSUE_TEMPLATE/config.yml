@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+
+# 仓库地址确定后，取消下面的注释并替换 OWNER/REPO（现在写死假链接会变成死链）：
+#
+# contact_links:
+#   - name: 使用问题 / 求助
+#     url: https://github.com/OWNER/REPO/discussions
+#     about: 安装、同步配置、Zotero 迁移等使用类问题请走 Discussions
+#   - name: 安全漏洞
+#     url: https://github.com/OWNER/REPO/security/advisories/new
+#     about: 请勿用公开 issue 报告安全问题，见 SECURITY.md
