@@ -447,6 +447,7 @@
       <div class="agent-chips" id="agent-chips" hidden></div>
       <div class="agent-composer-row">
         <span class="agent-status" id="agent-status" role="status" aria-live="polite"></span>
+        <span class="agent-provider" id="agent-provider" hidden></span>
         <span class="agent-model" id="agent-model"></span>
         <select id="agent-thinking" title="推理强度：是否生效取决于服务商与模型；若报错请改回「默认」">
           <option value="">推理：默认</option>
@@ -1361,6 +1362,11 @@
           </label>
           <label>TinyFish API Key（网页检索）<input type="password" id="sync-tinyfish-key" autocomplete="new-password" placeholder="留空则保持原 Key"></label>
           <p class="span-2 field-hint">配置 Elsevier Key 后，AI 助手可联网检索 Scopus 索引（返回 Scopus 引用数，不含摘要）；所有对外检索都有频率限制，速度偏慢属正常。</p>
+          <div class="span-2 sync-inline-actions">
+            <button type="button" class="btn" id="sync-test-sources">测试全部服务</button>
+            <span class="sync-inline-status" id="sync-sources-test-status" role="status" aria-live="polite"></span>
+          </div>
+          <div class="span-2 field-hint sources-test-result" id="sync-sources-test-result" hidden></div>
         </div>
       </section>
       <section class="sync-section" data-sync-group="integrations" hidden>

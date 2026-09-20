@@ -405,3 +405,134 @@ test('R16: normalizeSemanticScholarPaper 边界（无 DOI/无 OA/未知类型不
   assert.equal(unknown.type, '', '认识不了的类型留空而非硬塞 article');
   assert.equal(LitResearch.normalizeSemanticScholarPaper(null).title, '');
 });
+
+/* ---------------- 连接测试探针（设置页「测试全部服务」） ----------------
+ * 探针的共同契约：只读、不抛异常、分类稳定（code 由渲染层翻成文案）。
+ * 三条要点各有断言：1) 通道如实（无 Key 不能假装走了 polite pool / 带 Key）；
+ * 2) 失败分类可区分（429 与断网不能都叫「失败」）；3) Elsevier 的两种能力分开报。 */
+
+function statusResponse(status) {
+  return {
+    ok: false, status: status,
+    headers: { get: function () { return null; } },
+    json: async function () { return {}; }
+  };
+}
+
+test('testOpenAlex: 通道如实回报（Key / 邮箱 / 匿名），429 与断网分类不同', async function () {
+  const seen = [];
+  const withEmail = await createResearchNet({
+    fetch: async function (url) { seen.push(url); return jsonResponse({ meta: { count: 1 }, results: [] }); },
+    getConfig: async function () { return { openalexEmail: 'me@example.com' }; }
+  }).testOpenAlex();
+  assert.equal(withEmail.status, 'ok');
+  assert.equal(withEmail.channel, 'email');
+  assert.equal(withEmail.count, 1);
+  assert.ok(seen[0].indexOf('api.openalex.org/works') !== -1);
+  assert.ok(seen[0].indexOf('mailto=me%40example.com') !== -1, 'polite pool 必须带上邮箱');
+  assert.ok(seen[0].indexOf('api_key') === -1, '未配 Key 不得悄悄塞 api_key');
+
+  const withKey = await createResearchNet({
+    fetch: async function (url) { seen.push(url); return jsonResponse({ meta: { count: 1 } }); },
+    getConfig: async function () { return { openalexEmail: 'me@example.com', openalexApiKey: 'OAK' }; }
+  }).testOpenAlex();
+  assert.equal(withKey.channel, 'key');
+  assert.ok(seen[seen.length - 1].indexOf('api_key=OAK') !== -1);
+
+  const anon = await createResearchNet({
+    fetch: async function () { return jsonResponse({ meta: { count: 1 } }); }
+  }).testOpenAlex();
+  assert.equal(anon.channel, 'anonymous', '既无邮箱也无 Key 时如实报「未填邮箱」');
+
+  const limited = await createResearchNet({
+    fetch: async function () { return statusResponse(429); },
+    sleep: async function () {}, now: function () { return 1000; }
+  }).testOpenAlex();
+  assert.deepEqual(limited, { status: 'error', code: 'rate_limited' });
+
+  const down = await createResearchNet({
+    fetch: async function () { throw new Error('boom'); },
+    sleep: async function () {}, now: function () { return 1000; }
+  }).testOpenAlex();
+  assert.equal(down.status, 'error');
+  assert.equal(down.code, 'network', '断网与限流必须是不同的 code');
+});
+
+test('testSemanticScholar: 无 Key 报共享池、带 Key 走 x-api-key、403 归 unauthorized', async function () {
+  const seen = [];
+  const shared = await createResearchNet({
+    fetch: async function (url, init) {
+      seen.push({ url: url, key: (init && init.headers && init.headers['x-api-key']) || '' });
+      return jsonResponse({ total: 7, data: [] });
+    }
+  }).testSemanticScholar();
+  assert.equal(shared.status, 'ok');
+  assert.equal(shared.channel, 'shared_pool');
+  assert.equal(shared.count, 7);
+  assert.equal(seen[0].key, '');
+  assert.ok(seen[0].url.indexOf('/graph/v1/paper/search') !== -1);
+
+  const withKey = await createResearchNet({
+    fetch: async function (url, init) {
+      seen.push({ url: url, key: (init.headers || {})['x-api-key'] });
+      return jsonResponse({ total: 1, data: [] });
+    },
+    getConfig: async function () { return { semanticscholarApiKey: 'S2K' }; }
+  }).testSemanticScholar();
+  assert.equal(withKey.channel, 'key');
+  assert.equal(seen[seen.length - 1].key, 'S2K');
+
+  const forbidden = await createResearchNet({
+    fetch: async function () { return statusResponse(403); },
+    sleep: async function () {}, now: function () { return 1000; }
+  }).testSemanticScholar();
+  assert.deepEqual(forbidden, { status: 'error', code: 'unauthorized' });
+});
+
+test('testElsevier: 未配置跳过；摘要回填与 Scopus 检索两种能力分开回报', async function () {
+  const skipped = await createResearchNet({
+    fetch: async function () { throw new Error('未配置 Key 时不得发请求'); }
+  }).testElsevier();
+  assert.deepEqual(skipped, { status: 'skipped', code: 'missing_key' });
+
+  const abstractBody = {
+    'abstracts-retrieval-response': {
+      item: { bibrecord: { head: { abstracts: [{ _: 'abstract text' }] } } }
+    }
+  };
+  const both = await createResearchNet({
+    fetch: async function (url) {
+      if (url.indexOf('/content/search/scopus') !== -1) {
+        return jsonResponse({ 'search-results': { 'opensearch:totalResults': '3', entry: [] } });
+      }
+      return jsonResponse(abstractBody);
+    },
+    getConfig: async function () { return { elsevierApiKey: 'EK' }; },
+    sleep: async function () {}, now: function () { return 1000; }
+  }).testElsevier();
+  assert.equal(both.status, 'ok');
+  assert.equal(both.abstract, true);
+  assert.equal(both.scopus, 'ok');
+
+  // 最常见的组合：摘要端点通（只需 Key），Scopus 无权限（另需机构订阅）——
+  // 含混成一句「失败」会让用户以为 Key 坏了
+  const partial = await createResearchNet({
+    fetch: async function (url) {
+      if (url.indexOf('/content/search/scopus') !== -1) return statusResponse(403);
+      return jsonResponse(abstractBody);
+    },
+    getConfig: async function () { return { elsevierApiKey: 'EK' }; },
+    sleep: async function () {}, now: function () { return 1000; }
+  }).testElsevier();
+  assert.equal(partial.status, 'ok');
+  assert.equal(partial.abstract, true);
+  assert.equal(partial.scopus, 'unauthorized');
+
+  // 摘要端点 401 = Key 本身无效：整体 error，不谎报「可用」
+  const bad = await createResearchNet({
+    fetch: async function () { return statusResponse(401); },
+    getConfig: async function () { return { elsevierApiKey: 'BAD' }; },
+    sleep: async function () {}, now: function () { return 1000; }
+  }).testElsevier();
+  assert.deepEqual(bad, { status: 'error', code: 'unauthorized' });
+});

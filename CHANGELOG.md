@@ -5,6 +5,41 @@
 
 ## [Unreleased]
 
+### 变更（公式：系统提示要求用 LaTeX，渲染器保证公式不被斜体规则改坏）
+
+- **系统提示加约束**（`js/agentui.js` 的 `systemPrompt`）：公式一律用 LaTeX 写——行内 `$...$`、
+  独立成行 `$$...$$`；不要用图片、Unicode 上下标（x₁、α）或纯文字描述代替公式。同时写明
+  「公式内不要留空行」（空行会切断段落，公式随之断开）。
+- **现状核查结论**：对话界面**没有 LaTeX 排版引擎**（`vendor/` 下无 KaTeX/MathJax/Temml，
+  `js/markdown.js` 是手写的最小子集渲染器）。所以在加约束之前先修了更要紧的一件事——
+  **公式会被斜体规则改坏**：`$x_1 + y_2 = z_3$` 曾渲染成 `x<em>1 + y</em>2 = z_3`，
+  `$a * b * c$` 会变成 `a <em> b </em> c`。公式里的 `_` 是下标语法，不是强调标记。
+- **渲染器保护**（`js/markdown.js`）：在斜体/加粗规则之前把 `$...$` / `$$...$$` 摘成占位 token，
+  内容按文本转义后包进 `<span class="lb-math">`（块级为 `lb-math-block`）。边界判定沿用
+  KaTeX auto-render 的保守规则（开括号后无空格、闭括号前无空格、闭括号后不接数字、
+  开括号前不是词字符），因此 `$5-$10`、`US$5 and US$10` 这类金额不会被误判成公式；
+  行内代码 `` `$x_1$` `` 仍是代码。样式（`css/style.css` 的 `.lb-math`）等宽 + 浅底 +
+  `font-style: normal`，长公式横向滚动——**只保证源码原样可见、边界清楚，不做排版**。
+- 段落内的换行会先合并成一行再解析，所以跨行的 `$$` 块照样识别（测试已固定这一行为）。
+- 测试：`test/markdown.test.js` 新增两条（源码保住 / 金额与代码不误伤、块级样式与跨行）；
+  790/790、lint、smoke 全绿。
+
+### 修复（备份对象仓发布竞态：偶发「有引用资源无法读取，未发布备份」）
+
+- **现象**：`test/backup.test.js` 的「两个文献引用同一个 PDF」偶发失败（隔离跑 3 次挂 2 次），
+  `createSnapshot()` 返回 `ok:false, missing:[{ reason: 'EPERM: operation not permitted, rename …' }]`
+  ——即**整份备份不发布**。这不是测试问题：生产上「同一 PDF 挂在两篇文献下」很常见。
+- **根因**：两个资产同内容 → 同一对象路径 → 4 路并发暂存同时走到发布步。旧实现直接
+  `fs.rename(temp, target)`；Windows 上 rename 覆盖「刚被另一路写入」或「被杀毒扫描占着句柄」
+  的目标会抛 EPERM/EBUSY。此时对象**其实已经就位**，却被当成资源读取失败。
+  （临时名唯一性此前已修过一次，这是同一路径上的第二个竞态。）
+- **修复**：新增 `publishObject(temp, target, hash)`（`electron/backup.js`，已导出可测）——
+  rename 抛 EPERM/EBUSY/EEXIST 时先复核 target 哈希，一致即视为成功并丢弃临时文件；
+  不一致则短暂退避重试（5 次），重试用尽才如实报错。绝不静默覆盖，也不因为「另一路先写完了」
+  把整份备份判失败。
+- 测试：新增 `publishObject tolerates a target that is already published`（含只读目标这一
+  Windows 上必然 EPERM 的形态）；修复后该文件连续 8 次全过。
+
 ### 重构（IPC 域拆分：main.js 瘦身 3091 → ~1260 行）
 
 - **全部 116 个 ipcMain.handle 注册按域拆进 `electron/ipc/`**（12 个域模块 + `context.js` + `index.js`）：

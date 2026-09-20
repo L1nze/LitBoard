@@ -303,3 +303,24 @@ test('convertBody: chat 形态带 max_tokens，responses/messages 各自映射�
   // messages 形态必须带 max_tokens：缺省时给内部默认值兜底
   assert.ok(P.convertBody({ model: 'm', messages: [] }, 'messages').max_tokens > 0);
 });
+
+test('providerLabel: 服务商展示名（OpenCode 分 Go/Zen，未知回落真实主机名）', function () {
+  // OpenCode 两种套餐计费与可用模型不同：界面上必须分开显示
+  assert.equal(P.providerLabel('https://opencode.ai/zen/go/v1'), 'OpenCode Go');
+  assert.equal(P.providerLabel('https://opencode.ai/zen/v1'), 'OpenCode Zen');
+  assert.equal(P.providerLabel('https://api.deepseek.com'), 'DeepSeek');
+  assert.equal(P.providerLabel('https://api.deepseek.com/anthropic'), 'DeepSeek');
+  assert.equal(P.providerLabel('https://api.moonshot.cn/v1'), 'Kimi');
+  assert.equal(P.providerLabel('https://open.bigmodel.cn/api/paas/v4'), '智谱 GLM');
+  assert.equal(P.providerLabel('https://api.anthropic.com'), 'Anthropic');
+  assert.equal(P.providerLabel('https://dashscope.aliyuncs.com/compatible-mode/v1'), 'DashScope');
+  // 未收录的主机给主机名本身（宁可如实显示域名，也不猜服务商）；www. 去掉
+  assert.equal(P.providerLabel('http://localhost:11434/v1'), 'localhost');
+  assert.equal(P.providerLabel('https://api.example.com/v1'), 'api.example.com');
+  assert.equal(P.providerLabel('https://www.example.com'), 'example.com');
+  // 未配置端点：空串（调用方据此隐藏徽标），不猜默认值
+  assert.equal(P.providerLabel(''), '');
+  assert.equal(P.providerLabel('   '), '');
+  assert.equal(P.providerLabel(null), '');
+  assert.equal(P.providerLabel(undefined), '');
+});

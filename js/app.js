@@ -10821,6 +10821,81 @@
         setSyncInlineStatus('sync-scigreat-test-status', error && error.message || String(error), 'error');
       }).finally(function () { button.disabled = false; });
     });
+    /* 检索与元数据服务：一个按钮测四个源（OpenAlex / Semantic Scholar / Elsevier / TinyFish）。
+     * 逐行列出「哪个源能用、为什么不能用」——只报一句成功/失败等于没说。服务名是专有名词，
+     * 不进词典；状态与细节走 T()。 */
+    var SOURCE_TEST_LABELS = {
+      openalex: 'OpenAlex', semanticscholar: 'Semantic Scholar',
+      elsevier: 'Elsevier', tinyfish: 'TinyFish'
+    };
+    function sourceStatusText(item) {
+      if (item.status === 'ok') return T('可用');
+      if (item.status === 'skipped') {
+        return item.code === 'not_enabled' ? T('未启用（需先勾选并确认出境告知）') : T('未配置');
+      }
+      var code = item.code || 'error';
+      if (code === 'unauthorized') return T('凭据无效或无权限');
+      if (code === 'rate_limited') return T('上游限流（稍后重试）');
+      if (code === 'network') return T('无法连接');
+      return T('测试失败');
+    }
+    function sourceDetailText(item) {
+      if (item.status !== 'ok') return '';
+      var parts = [];
+      if (item.id === 'openalex' || item.id === 'semanticscholar') {
+        parts.push(item.channel === 'key' ? T('带 API Key')
+          : (item.channel === 'shared_pool' ? T('共享池（可能限流）')
+            : (item.channel === 'email' ? T('polite pool（邮箱）') : T('未填邮箱'))));
+        parts.push(T('命中 {n} 条').replace('{n}', String(item.count == null ? 0 : item.count)));
+      } else if (item.id === 'elsevier') {
+        // 摘要回填（只需 Key）与 Scopus 检索（另需机构订阅）分开说：常见情形是前者通、
+        // 后者无权限，含混成一句会让用户以为 Key 坏了
+        parts.push(item.abstract ? T('摘要回填可用') : T('摘要端点无该 DOI 记录'));
+        if (item.scopus === 'ok') parts.push(T('Scopus 检索可用'));
+        else if (item.scopus === 'unauthorized') parts.push(T('Scopus 检索无权限（需机构订阅）'));
+        else parts.push(T('Scopus 检索不可用'));
+      } else if (item.id === 'tinyfish') {
+        parts.push(T('命中 {n} 条').replace('{n}', String(item.count == null ? 0 : item.count)));
+      }
+      return parts.join(' · ');
+    }
+    function renderSourcesTestResult(results) {
+      var box = $('#sync-sources-test-result');
+      if (!box) return;
+      box.textContent = '';
+      if (!results || !results.length) { box.hidden = true; return; }
+      results.forEach(function (item) {
+        var row = document.createElement('div');
+        row.className = 'st-row' + (item.status === 'error' ? ' bad' : '');
+        var name = document.createElement('span');
+        name.className = 'st-name';
+        name.textContent = SOURCE_TEST_LABELS[item.id] || item.id;
+        var text = document.createElement('span');
+        text.className = 'st-text';
+        var detail = sourceDetailText(item);
+        text.textContent = sourceStatusText(item) + (detail ? ' · ' + detail : '');
+        row.appendChild(name);
+        row.appendChild(text);
+        box.appendChild(row);
+      });
+      box.hidden = false;
+    }
+    $('#sync-test-sources').addEventListener('click', function () {
+      var button = this;
+      button.disabled = true;
+      setSyncInlineStatus('sync-sources-test-status', T('正在测试…'), 'pending');
+      renderSourcesTestResult(null);
+      desktop.testSources().then(function (payload) {
+        var results = (payload && payload.results) || [];
+        renderSourcesTestResult(results);
+        var failed = results.filter(function (item) { return item.status === 'error'; }).length;
+        setSyncInlineStatus('sync-sources-test-status',
+          failed ? T('有 {n} 个服务未通过').replace('{n}', String(failed)) : T('测试完成'),
+          failed ? 'error' : 'success');
+      }).catch(function (error) {
+        setSyncInlineStatus('sync-sources-test-status', error && error.message || String(error), 'error');
+      }).finally(function () { button.disabled = false; });
+    });
     $('#sync-run').addEventListener('click', function () {
       cancelSyncAutoSave();
       saveSyncSettings().then(function (config) { return performSync(config, false); });

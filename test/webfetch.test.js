@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const W = require('../js/webfetch.js');
+const { createWebFetchNet } = require('../electron/webfetch-net.js');
 
 test('isAcademicUrl: whitelist suffixes match with exact boundaries', function () {
   assert.equal(W.isAcademicUrl('https://arxiv.org/abs/2401.00001').ok, true);
@@ -148,4 +149,50 @@ test('R15: normalizeDoiValue 只做形态归一（不因机构号位数丢元数
   assert.equal(W.normalizeDoiValue('doi:10.1/a'), '10.1/a');
   assert.equal(W.normalizeDoiValue('not-a-doi'), '');
   assert.equal(W.normalizeDoiValue(''), '');
+});
+
+/* ---------------- 连接测试探针（设置页「测试全部服务」） ---------------- */
+
+function jsonResponse(body, status) {
+  return {
+    ok: (status || 200) >= 200 && (status || 200) < 300,
+    status: status || 200,
+    headers: { get: function () { return null; } },
+    json: async function () { return body; }
+  };
+}
+
+test('testConnection: 未配置 Key 跳过、命中即可用、鉴权失败归 unauthorized', async function () {
+  const skipped = await createWebFetchNet({
+    fetch: async function () { throw new Error('未配置 Key 时不得发请求'); }
+  }).testConnection();
+  assert.deepEqual(skipped, { status: 'skipped', code: 'missing_key' });
+
+  const seen = [];
+  const ok = await createWebFetchNet({
+    fetch: async function (url, init) {
+      seen.push({ url: url, key: (init && init.headers && init.headers['X-API-Key']) || '' });
+      return jsonResponse({ results: [{ title: 'A Study', url: 'https://arxiv.org/abs/1' }] });
+    },
+    getConfig: async function () { return { tinyfishApiKey: 'TFK' }; },
+    sleep: async function () {}, now: function () { return 1000; }
+  }).testConnection();
+  assert.equal(ok.status, 'ok');
+  assert.ok(ok.count >= 1, '有命中即报条数');
+  assert.equal(seen[0].key, 'TFK', 'Key 必须真的发出去（否则「可用」是假的）');
+  assert.ok(seen[0].url.indexOf('api.search.tinyfish.ai') !== -1);
+
+  const denied = await createWebFetchNet({
+    fetch: async function () { return jsonResponse({}, 401); },
+    getConfig: async function () { return { tinyfishApiKey: 'BAD' }; },
+    sleep: async function () {}, now: function () { return 1000; }
+  }).testConnection();
+  assert.deepEqual(denied, { status: 'error', code: 'unauthorized' });
+
+  const down = await createWebFetchNet({
+    fetch: async function () { throw new Error('offline'); },
+    getConfig: async function () { return { tinyfishApiKey: 'TFK' }; },
+    sleep: async function () {}, now: function () { return 1000; }
+  }).testConnection();
+  assert.deepEqual(down, { status: 'error', code: 'network' });
 });

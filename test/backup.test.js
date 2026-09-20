@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 const { DatabaseSync } = require('node:sqlite');
 const { createLibraryDb } = require('../electron/db.js');
-const { createBackupManager, MANIFEST_VERSION } = require('../electron/backup.js');
+const { createBackupManager, MANIFEST_VERSION, publishObject } = require('../electron/backup.js');
 const { createDataPathManager } = require('../electron/data-paths.js');
 
 function sha256(buffer) {
@@ -128,6 +128,38 @@ test('backup dedups the same file referenced from multiple papers', async functi
     objectCount += (await fs.readdir(path.join(env.backupDir, 'objects', bucket))).length;
   }
   assert.equal(objectCount, 1);
+});
+
+/* publishObject：内容寻址对象的发布必须容忍「目标已经就位」。
+ * 上面那条去重测试偶发 ok:false 就是这里出的问题——两路并发暂存同一内容，
+ * Windows 上 rename 覆盖已落地对象抛 EPERM（或被只读属性/杀毒句柄挡住），
+ * 旧实现直接把它当「资源无法读取」，于是整份备份不发布。 */
+test('publishObject tolerates a target that is already published', async function () {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-pub-'));
+  try {
+    const content = Buffer.from('SAME CONTENT PDF', 'utf8');
+    const hash = sha256(content);
+    const target = path.join(root, 'objects', hash.slice(0, 2), hash);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+
+    // 正常发布：临时文件就位后改名，内容与哈希一致
+    const tempOk = target + '.tmp-1';
+    await fs.writeFile(tempOk, content);
+    await publishObject(tempOk, target, hash);
+    assert.equal(sha256(await fs.readFile(target)), hash);
+    await assert.rejects(fs.access(tempOk), '临时文件必须已被改名/清理');
+
+    // 竞态形态：另一路已写好同内容对象，且目标带只读属性（Windows 上 rename 会 EPERM）
+    const tempRace = target + '.tmp-2';
+    await fs.writeFile(tempRace, content);
+    await fs.chmod(target, 0o444);
+    await publishObject(tempRace, target, hash);   // 不得抛错
+    assert.equal(sha256(await fs.readFile(target)), hash, '对象内容不得被改坏');
+    await assert.rejects(fs.access(tempRace), '竞态路径也要清掉临时文件');
+  } finally {
+    await fs.chmod(path.join(root, 'objects'), 0o666).catch(function () {});
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test('backup rotation keeps 7 snapshots and GC removes unreferenced objects', async function (t) {

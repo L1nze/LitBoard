@@ -35,6 +35,20 @@
   var ANTHROPIC_HOST = /(^|\.)anthropic\.com$/;
   var ANTHROPIC_IMAGE_MIME = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 
+  /* 已知服务商主机 → 展示名（与设置页 Base URL 预设同源，用于对话面板底部徽标）。
+   * 未收录的主机直接显示主机名——宁可给出真实域名，也不猜成某个服务商。 */
+  var PROVIDER_LABELS = {
+    'api.openai.com': 'OpenAI',
+    'api.anthropic.com': 'Anthropic',
+    'api.deepseek.com': 'DeepSeek',
+    'api.moonshot.cn': 'Kimi',
+    'open.bigmodel.cn': '智谱 GLM',
+    'api.z.ai': 'Z.ai',
+    'dashscope.aliyuncs.com': 'DashScope',
+    'openrouter.ai': 'OpenRouter',
+    'api.siliconflow.cn': 'SiliconFlow'
+  };
+
   /* OpenCode Zen / Go 官方文档把模型系列分到不同协议面（/responses 承载 Grok、GPT 系，
    * /messages 承载 MiniMax、Qwen，其余走 /chat/completions）。家族归属由上游调整，
    * 所以这层只在「没显式指定协议」时兜底，设置里的「接口格式」永远优先。 */
@@ -64,6 +78,19 @@
   }
 
   function isOpenCodeHost(baseUrl) { return OPENCODE_HOST.test(hostOf(baseUrl)); }
+
+  /** 当前端点的服务商展示名（对话面板底部徽标）：空配置返回空串（调用方据此隐藏徽标）。
+   *  OpenCode 区分订阅套餐与按量套餐（/zen/go vs /zen），两者计费与可用模型不同，
+   *  界面上分开显示，免得用户以为换套餐没生效。未知主机回落为主机名本身。 */
+  function providerLabel(baseUrl) {
+    var host = hostOf(baseUrl);
+    if (!host) return '';
+    if (OPENCODE_HOST.test(host)) {
+      return /\/zen\/go(\/|$)/.test(pathOf(baseUrl)) ? 'OpenCode Go' : 'OpenCode Zen';
+    }
+    if (PROVIDER_LABELS[host]) return PROVIDER_LABELS[host];
+    return host.replace(/^www\./, '');
+  }
 
   function isDialect(value) { return DIALECT_VALUES.indexOf(str(value).toLowerCase()) !== -1; }
 
@@ -743,6 +770,7 @@
     detectDialect: detectDialect,
     dialectForModel: dialectForModel,
     isOpenCodeHost: isOpenCodeHost,
+    providerLabel: providerLabel,
     endpointFor: endpointFor,
     modelsEndpointFor: modelsEndpointFor,
     embeddingsEndpointFor: embeddingsEndpointFor,

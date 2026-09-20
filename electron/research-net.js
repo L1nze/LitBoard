@@ -237,6 +237,19 @@ function parseElsevierAbstract(payload) {
   return decodeEntities(found).replace(/\s+/g, ' ').trim();
 }
 
+/** 连接测试的错误分类（模块作用域：research-net 与 webfetch-net 共用同一份判定）。
+ *  code 语义固定，渲染层按 code 出文案：missing_key / unauthorized / rate_limited /
+ *  not_found / network / error。 */
+function classifyTestError(error) {
+  const status = Number(error && error.status) || 0;
+  if (status === 401 || status === 403) return 'unauthorized';
+  if (status === 429) return 'rate_limited';
+  if (status === 404) return 'not_found';
+  if (error && error.code === 'NO_KEY') return 'missing_key';
+  if (/网络请求失败/.test(String(error && error.message || ''))) return 'network';
+  return 'error';
+}
+
 function createResearchNet(options) {
   const opts = options || {};
   const queue = createThrottleQueue(opts.fetch, opts);
@@ -424,7 +437,9 @@ function createResearchNet(options) {
     const data = await queue.requestJson(S2_SEARCH + '?' + params.toString(), { headers: headers })
       .catch(function (error) {
         if (error && error.status === 403) {
-          throw new Error('Semantic Scholar 拒绝访问（HTTP 403）：API Key 无效，或共享池限流（配置 Key 可提升配额）');
+          const denied = new Error('Semantic Scholar 拒绝访问（HTTP 403）：API Key 无效，或共享池限流（配置 Key 可提升配额）');
+          denied.status = error.status;   // 同上：状态码留给连接测试分类
+          throw denied;
         }
         throw error;
       });
@@ -513,8 +528,12 @@ function createResearchNet(options) {
       headers: { Accept: 'application/json', 'X-ELS-APIKey': cfg.elsevierApiKey }
     }).catch(function (error) {
       if (error && (error.status === 401 || error.status === 403)) {
-        throw new Error('Scopus 检索权限不足（HTTP ' + error.status +
+        const denied = new Error('Scopus 检索权限不足（HTTP ' + error.status +
           '）：Key 未开通 Scopus Search，或需要机构订阅（insttoken）');
+        // 保留原始状态码：连接测试要按 401/403 与 429 分别回报，
+        // 重抛时丢掉 status 就只剩「失败」一种说法了
+        denied.status = error.status;
+        throw denied;
       }
       throw error;
     });
@@ -527,12 +546,80 @@ function createResearchNet(options) {
     };
   }
 
+  /* ---------------- 连接测试（设置页「测试全部服务」一次测完本节所有源） ----------------
+   * 每个源打一发最小真实请求：只读、不写库、**不抛异常**——失败以
+   * { status:'error', code } 返回，由渲染层翻成用户语言（主进程不产出面向用户的句子）。
+   * code 语义固定：missing_key 未配置 / unauthorized 凭据无效或无权限 /
+   * rate_limited 上游限流 / not_found 目标记录不存在（端点本身通了）/ network 不可达 /
+   * error 其余。只做「能不能用」的判定，不进业务链、不改任何状态。
+   * 客户端与业务路径共用同一个节流队列：测试同样受主机限流约束，不会额外冲击配额。
+   * （错误分类在模块作用域 classifyTestError，webfetch-net 复用同一份。） */
+
+  /** OpenAlex：固定 DOI 反查一发。无 Key 也能用（polite pool 靠邮箱），
+   *  channel 如实回报实际走的是哪条通道——否则用户会以为填的 Key 生效了。 */
+  async function testOpenAlex() {
+    const cfg = (await getConfig()) || {};
+    try {
+      const params = await openalexParams({ filter: 'doi:10.1038/nature12373', 'per-page': '1' });
+      const data = await queue.requestJson(OPENALEX_WORKS + '?' + params.toString(), {
+        headers: { Accept: 'application/json' }
+      });
+      const count = Number(data && data.meta && data.meta.count);
+      return {
+        status: 'ok', code: '',
+        channel: cfg.openalexApiKey ? 'key' : (cfg.openalexEmail ? 'email' : 'anonymous'),
+        count: isFinite(count) ? count : null
+      };
+    } catch (error) { return { status: 'error', code: classifyTestError(error) }; }
+  }
+
+  /** Semantic Scholar：关键词检索一发。无 Key 走共享池（与他人争用，可能 429），
+   *  有 Key 走 1 req/s 配额——两种都能连通，channel 必须区分开。 */
+  async function testSemanticScholar() {
+    const cfg = (await getConfig()) || {};
+    try {
+      const params = new URLSearchParams({ query: 'literature management', limit: '1', fields: 'title' });
+      const headers = { Accept: 'application/json' };
+      if (cfg.semanticscholarApiKey) headers['x-api-key'] = String(cfg.semanticscholarApiKey);
+      const data = await queue.requestJson(S2_SEARCH + '?' + params.toString(), { headers: headers });
+      return {
+        status: 'ok', code: '',
+        channel: cfg.semanticscholarApiKey ? 'key' : 'shared_pool',
+        count: Number(data && data.total) || 0
+      };
+    } catch (error) { return { status: 'error', code: classifyTestError(error) }; }
+  }
+
+  /** Elsevier：两个能力分开回报——摘要检索端点（回填链用的那个，只需 Key）
+   *  与 Scopus 检索（另需机构订阅）。「摘要通但 Scopus 无权限」是最常见的组合，
+   *  必须分开说，否则用户会以为 Key 坏了。未配置 Key → skipped。
+   *  摘要端点返回 404 时按「凭据没问题、该 DOI 不在库」处理（401/403 才会被判无效）。 */
+  async function testElsevier() {
+    const cfg = (await getConfig()) || {};
+    if (!cfg.elsevierApiKey) return { status: 'skipped', code: 'missing_key' };
+    const result = { status: 'ok', code: '', abstract: false, scopus: '' };
+    try {
+      result.abstract = !!(await fetchElsevierAbstract('10.1016/j.cell.2011.02.013'));
+    } catch (error) {
+      const code = classifyTestError(error);
+      if (code !== 'not_found') return { status: 'error', code: code };
+    }
+    try {
+      await searchScopus({ query: 'literature management', limit: 1 });
+      result.scopus = 'ok';
+    } catch (error) { result.scopus = classifyTestError(error); }
+    return result;
+  }
+
   return {
     searchOpenAlex: searchOpenAlex,
     searchSemanticScholar: searchSemanticScholar,
     fetchWorksByIds: fetchWorksByIds,
     fetchWorksByDois: fetchWorksByDois,
     searchScopus: searchScopus,
+    testOpenAlex: testOpenAlex,
+    testSemanticScholar: testSemanticScholar,
+    testElsevier: testElsevier,
     backfillAbstracts: backfillAbstracts,
     autocomplete: autocomplete,
     parseCrossrefAbstract: parseCrossrefAbstract,
@@ -544,6 +631,7 @@ module.exports = {
   createResearchNet: createResearchNet,
   createThrottleQueue: createThrottleQueue,
   createEndpointGate: createEndpointGate,
+  classifyTestError: classifyTestError,
   parseCrossrefAbstract: parseCrossrefAbstract,
   parseElsevierAbstract: parseElsevierAbstract,
   buildScopusQuery: buildScopusQuery,

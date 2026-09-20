@@ -2023,6 +2023,19 @@ td.num { font-variant-numeric: tabular-nums; }
 }
 .markdown-preview > :first-child { margin-top: 0; }
 .markdown-preview > :last-child { margin-bottom: 0; }
+/* 数学公式（LaTeX 源码形态）：渲染器只做「原样保住 + 标明边界」，没有排版引擎。
+ * 关键是 font-style: normal —— 公式里的 _ 是下标语法，不能被斜体规则牵走；
+ * 等宽 + 浅底让 $...$ 的边界一眼可见，长公式横向滚动而不撑破面板。 */
+.lb-math {
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+  font-style: normal; font-size: 0.94em;
+  background: rgba(127, 127, 127, 0.12);
+  border-radius: 4px; padding: 0 3px; overflow-wrap: anywhere;
+}
+.lb-math-block {
+  display: block; padding: 6px 8px; margin: 6px 0;
+  overflow-x: auto; white-space: pre; text-align: left;
+}
 .markdown-preview h1, .markdown-preview h2, .markdown-preview h3, .markdown-preview h4 { margin: 14px 0 6px; line-height: 1.35; letter-spacing: -0.01em; color: var(--text-primary); }
 .markdown-preview h1 { font-size: 17px; }
 .markdown-preview h2 { font-size: 15.5px; }
@@ -2256,6 +2269,13 @@ td.num { font-variant-numeric: tabular-nums; }
   white-space: nowrap;
   flex-shrink: 0;
 }
+/* 「测试全部服务」逐源结果：每行「服务名 · 状态」，失败行整体偏红（正常行不额外上色） */
+.sources-test-result { display: flex; flex-direction: column; gap: 2px; }
+.sources-test-result[hidden] { display: none; }
+.sources-test-result .st-row { display: flex; gap: 6px; min-width: 0; }
+.sources-test-result .st-name { flex: none; color: var(--text-primary); }
+.sources-test-result .st-row.bad .st-name,
+.sources-test-result .st-row.bad .st-text { color: #b91c1c; }
 .sync-inline-status {
   display: none;
   min-width: 0;
@@ -3117,7 +3137,10 @@ mark.reflow-hit.active { background: #ff9f43; outline: 2px solid #d35400; }
 @keyframes agent-spin { to { transform: rotate(360deg); } }
 .agent-history-empty { color: var(--text-secondary); font-size: 12px; padding: 8px; }
 
-.agent-body { flex: 1; overflow-y: auto; padding: 12px 14px 24px; }
+/* 对话体：自身不滚动，只做纵向 flex 容器——滚动交给 .aui-viewport，
+ * 这样输入区（在 .aui-thread 内）与下方模型行一起钉在面板底部（曾因高度按内容收缩，
+ * 输入框浮在半空、下面留一大片空白）。 */
+.agent-body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .agent-empty { color: var(--text-secondary); font-size: 13px; text-align: center; padding: 28px 12px; }
 .agent-empty .agent-suggest { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
 .agent-empty .agent-suggest .btn { justify-content: flex-start; }
@@ -3157,6 +3180,12 @@ mark.reflow-hit.active { background: #ff9f43; outline: 2px solid #d35400; }
 .agent-model {
   font-size: 11px; color: var(--text-secondary); flex: none;
   max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 当前服务商（由 Base URL 判定，如 OpenCode Go / DeepSeek；tooltip 给完整 URL） */
+.agent-provider {
+  font-size: 11px; color: var(--text-secondary); flex: none;
+  max-width: 104px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  border: 1px solid var(--border); border-radius: 6px; padding: 1px 5px;
 }
 .agent-composer-row select {
   font-size: 11px; color: var(--text-primary); flex: none;
@@ -3227,6 +3256,12 @@ mark.reflow-hit.active { background: #ff9f43; outline: 2px solid #d35400; }
 }
 .aui-send.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .aui-send:disabled { opacity: .45; cursor: default; }
+/* 发送/停止合并后的图标按钮（无文字，点击语义随运行状态切换） */
+.aui-send.aui-icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; padding: 0;
+}
+.aui-ic { width: 15px; height: 15px; display: block; }
 .aui-empty { text-align: center; color: var(--text-secondary); font-size: 13px; padding: 28px 10px; }
 .aui-suggest { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
 .aui-jump {
@@ -3299,7 +3334,7 @@ body.reading-open .detail-sidebar .pdf-annotations {
 .agent-history-item.selecting { cursor: pointer; }
 .agent-history-item.selected { background: var(--accent-soft); }
 .agent-history-check { flex: none; font-size: 13px; color: var(--accent); }
-.agent-not-ready { padding: 12px 4px; }
+.agent-not-ready { padding: 12px 14px; }
 #manual-panel .agent-manual { padding: 12px 14px; overflow-y: auto; flex: 1; }
 
 /* ---------------- 引文网络面板（三期） ---------------- */

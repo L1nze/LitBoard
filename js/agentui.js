@@ -294,6 +294,7 @@ window.LitAgentUi = (function () {
 
   function renderModelLabel() {
     var node = $('agent-model');
+    renderProviderLabel();
     if (!node) return;
     if (lastConfig && lastConfig.agentModel) {
       node.textContent = lastConfig.agentModel;
@@ -305,6 +306,20 @@ window.LitAgentUi = (function () {
       node.textContent = T('未配置模型');
       node.title = T('在 设置 → 集成与服务 → AI 助手 中配置');
     }
+  }
+
+  /** 底部服务商徽标：由当前 Base URL 判定（与发送路径同一份纯函数规则），
+   *  未配置端点就隐藏——「哪个模型、经谁的端点」在面板里必须可见，
+   *  否则多端点用户只能靠记忆判断自己在跟谁说话。 */
+  function renderProviderLabel() {
+    var node = $('agent-provider');
+    if (!node) return;
+    var baseUrl = (lastConfig && lastConfig.agentBaseUrl) || '';
+    var label = (window.LitAgentProto && LitAgentProto.providerLabel)
+      ? LitAgentProto.providerLabel(baseUrl) : '';
+    node.textContent = label;
+    node.hidden = !label;
+    node.title = baseUrl || '';
   }
 
   /* ---------------- 右栏面板切换（详情 / AI 对话 / 手动检索） ---------------- */
@@ -564,7 +579,8 @@ window.LitAgentUi = (function () {
       '可用工具：正式库检索（search_library / get_paper / fulltext_search）、PDF 阅读（read_pdf_pages 按页读正文 / list_pdf_annotations 读批注）、调研库检索（search_research / get_research_work / get_work 精确解析 DOI 或 ID / autocomplete_entity 名称转 ID / backfill_abstracts 补摘要 / read_work_fulltext 全文参考——要实验细节与方法学时用它，临时拉取 OA 全文抽成文本、PDF 即删不留）、联网发现（search_openalex，keyword 与 semantic 两种模式）、引文关系（graph_neighbors 库内邻接 / build_graph 扩边建图）、为一段论述找文献依据（find_literature）。',
       '规则：优先用工具回答事实性问题；引用文献时给出其 id（workId 或 paperId），引用正文位置时给出页码；回答保持简洁，使用与用户相同的语言；不确定就说不知道，不要编造文献或页码。',
       '阅读覆盖如实声明：回答 PDF 相关问题时注明实际读过的页码范围（read_pdf_pages 的 from/to）；未读全篇不得宣称已通读全文。',
-      '找文献依据时必须用 find_literature（不要自己拼几轮 search_* 再声称"有文献支持"）：它多源召回后逐条给出证据句与出处。若某条论点的 status 是 not_found，就如实告诉用户没有找到依据；把 evidence.verdict=partial/none 的条目包装成"有文献支持"属于编造依据，绝对禁止。'
+      '找文献依据时必须用 find_literature（不要自己拼几轮 search_* 再声称"有文献支持"）：它多源召回后逐条给出证据句与出处。若某条论点的 status 是 not_found，就如实告诉用户没有找到依据；把 evidence.verdict=partial/none 的条目包装成"有文献支持"属于编造依据，绝对禁止。',
+      '公式一律用 LaTeX 写：行内 $...$（如 $E = mc^2$、$x_1$、$\\frac{a}{b}$、$\\alpha$），需要单独成行时用 $$...$$（内部可换行，但不要用空行断开——空行会把公式切断）。不要用图片、Unicode 上下标（x₁、α）或纯文字描述代替公式。'
     ];
     var cap = thinkingCapability();
     if (cap && cap.vision) {

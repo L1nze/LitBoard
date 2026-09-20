@@ -92,6 +92,38 @@ async function sha256File(filePath) {
 }
 
 /**
+ * 把校验过的临时文件发布为内容寻址对象（temp → objects/<hash>）。
+ *
+ * 同内容资产的并发暂存会争抢同一个 target：Windows 上 rename 覆盖「刚被另一路写入」
+ * 或「被杀毒扫描占着句柄」的目标会抛 EPERM/EBUSY/EEXIST——**这不是备份失败**，
+ * 对象其实已经就位。此时复核 target 哈希，一致即视为成功（丢弃临时文件）；
+ * 不一致就短暂退避重试，重试用尽才如实报错。
+ *
+ * 曾因此把「两个文献引用同一个 PDF」的备份整份判失败（missing 一条 → 不发布快照），
+ * 且只在并发竞态下偶发：测试表现为 createSnapshot 偶发 ok:false。
+ */
+async function publishObject(temp, target, hash) {
+  const attempts = 5;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await fs.rename(temp, target);
+      return;
+    } catch (error) {
+      const code = error && error.code;
+      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EEXIST') throw error;
+      try {
+        if ((await sha256File(target)) === hash) {
+          await fs.rm(temp, { force: true }).catch(function () {});
+          return;
+        }
+      } catch (inner) { /* 目标还读不了（对方仍在写）：退避后重试 */ }
+      await new Promise(function (resolve) { setTimeout(resolve, 20 * (attempt + 1)); });
+    }
+  }
+  throw new Error('对象仓写入失败：目标被占用且内容不一致（' + target + '）');
+}
+
+/**
  * 流式 SHA-256 Transform：插入 pipeline 边转发边算哈希，
  * pipeline resolve 后调 digestHex() 取值 —— 大文件不再整段进内存。
  */
@@ -322,7 +354,8 @@ function createBackupManager(options) {
         await fs.rm(temp, { force: true });
         throw new Error('写入对象仓后哈希不匹配');
       }
-      await fs.rename(temp, target);
+      // 发布到内容寻址路径：同内容资产并发争抢同一 target 时容忍 Windows 的 EPERM
+      await publishObject(temp, target, hash);
     }
     const stat = await fs.stat(asset.path);
     const archivePath = asset.relPath
@@ -1336,6 +1369,7 @@ function createBackupManager(options) {
 
 module.exports = {
   createBackupManager: createBackupManager,
+  publishObject: publishObject,
   MANIFEST_VERSION: MANIFEST_VERSION,
   KEEP_SNAPSHOTS: DEFAULT_KEEP_SNAPSHOTS,
   DEFAULT_KEEP_SNAPSHOTS: DEFAULT_KEEP_SNAPSHOTS,

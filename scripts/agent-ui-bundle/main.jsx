@@ -172,16 +172,35 @@ function AssistantMessage() {
   );
 }
 
-function ComposerArea({ bridge }) {
+/** 底部输入区：发送与停止合并为**一个**图标按钮，不再出现「发送」文字。
+ *  未运行 = 向上箭头（发送），运行中 = 方块（停止）——按钮形态与当前能做的事严格一一对应，
+ *  避免两个按钮同时挂在行尾时「哪个能点」要靠猜。（编辑态 composer 仍保留文字按钮。） */
+function ComposerArea({ bridge, isRunning }) {
   const T = makeT(bridge);
+  const label = isRunning ? T('停止') : T('发送');
   return (
     <div className="aui-composer-wrap">
       <ComposerPrimitive.Root className="aui-composer">
         <ComposerPrimitive.Input className="aui-input" autoFocus rows={1} placeholder={T('问点什么…（Enter 发送，Shift+Enter 换行）')} />
         <div className="aui-composer-row">
           <span className="aui-hint">{T('Enter 发送 · Shift+Enter 换行')}</span>
-          <ComposerPrimitive.Cancel className="aui-send">{T('停止')}</ComposerPrimitive.Cancel>
-          <ComposerPrimitive.Send className="aui-send primary">{T('发送')}</ComposerPrimitive.Send>
+          {isRunning ? (
+            <ComposerPrimitive.Cancel className="aui-send primary aui-icon-btn" title={label} aria-label={label}>
+              <svg className="aui-ic" viewBox="0 0 16 16" aria-hidden="true">
+                <rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1.6" fill="currentColor" />
+              </svg>
+            </ComposerPrimitive.Cancel>
+          ) : (
+            <ComposerPrimitive.Send className="aui-send primary aui-icon-btn" title={label} aria-label={label}>
+              <svg className="aui-ic" viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M8 13.1V3.5M8 3.5 4.3 7.2M8 3.5l3.7 3.7"
+                  fill="none" stroke="currentColor" strokeWidth="1.7"
+                  strokeLinecap="round" strokeLinejoin="round"
+                />
+              </svg>
+            </ComposerPrimitive.Send>
+          )}
         </div>
       </ComposerPrimitive.Root>
     </div>
@@ -244,7 +263,7 @@ function App({ bridge }) {
             }} />
             <ThreadPrimitive.ScrollToBottom className="aui-jump">{T('↓ 回到底部')}</ThreadPrimitive.ScrollToBottom>
           </ThreadPrimitive.Viewport>
-          <ComposerArea bridge={bridge} />
+          <ComposerArea bridge={bridge} isRunning={snap.isRunning} />
         </ThreadPrimitive.Root>
       </div>
     </AssistantRuntimeProvider>

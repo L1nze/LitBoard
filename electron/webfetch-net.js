@@ -10,7 +10,7 @@
  *   响应形状校验与规范化在 js/webfetch.js（纯函数）；
  * - 失败不自动重试计费类请求（Search/Fetch 虽免费，仍沿用队列既有 429/5xx 退避语义，仅 3 次封顶）。
  */
-const { createThrottleQueue } = require('./research-net.js');
+const { createThrottleQueue, classifyTestError } = require('./research-net.js');
 const LitWebFetch = require('../js/webfetch.js');
 
 const SEARCH_URL = 'https://api.search.tinyfish.ai';
@@ -79,7 +79,19 @@ function createWebFetchNet(options) {
     return LitWebFetch.parseFetchResponse(data, url);
   }
 
-  return { webSearch: webSearch, fetchPage: fetchPage };
+  /** 连接测试（设置页「测试全部服务」）：一发最小检索，只验证「Key 能不能通」。
+   *  未配置 Key → skipped（由调用方判，这里兜底）；已配置但鉴权失败 → unauthorized。
+   *  与业务路径共用节流队列，测试同样受 2s 间隔约束，不会额外冲击免费配额。 */
+  async function testConnection() {
+    const cfg = await getConfig();
+    if (!cfg || !cfg.tinyfishApiKey) return { status: 'skipped', code: 'missing_key' };
+    try {
+      const result = await webSearch({ query: 'literature management', mode: 'paper', limit: 1 });
+      return { status: 'ok', code: '', count: (result && result.results ? result.results.length : 0) };
+    } catch (error) { return { status: 'error', code: classifyTestError(error) }; }
+  }
+
+  return { webSearch: webSearch, fetchPage: fetchPage, testConnection: testConnection };
 }
 
 module.exports = { createWebFetchNet: createWebFetchNet };
