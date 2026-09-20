@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### 新增（AI 对话 LaTeX 公式渲染：MathJax tex-svg）
+
+- **`vendor/mathjax/`（3.2.2 tex-svg 单文件，Apache-2.0，SVG 输出无字体依赖）**：
+  聊天气泡正文经 LitMarkdown 渲染出的 `.lb-math` / `.lb-math-block`（原始 LaTeX 源码）
+  现在真正排版成公式。
+- **懒加载 + 观察器驱动**（`js/agentui.js`）：首次出现公式才注入 MathJax（无公式的
+  会话零开销）；聊天挂载后 MutationObserver（250ms 防抖）驱动——流式增量和切换
+  会话的 DOM 重建都会自动补排版。只对 lb-math 节点做 `tex2svgPromise`（textContent
+  即 TeX 源），不扫全文定界符、不会误伤普通文本里的 `$`；单条公式失败保留原文，
+  MathJax 加载失败下次自动重试。
+- 笔记/预览保持源码保真展示（lb-math 的既有语义不变）；类型化后的样式切换在
+  `css/style.css`（`.lb-math[data-math-typeset]`）。
+- smoke 新增端到端断言 `chatMathRendered`（LitMarkdown 出节点 → typesetMath →
+  mjx-container 生成，隔离环境全程离线）；vendor/SHA256SUMS、README 双语许可、
+  docs/THIRD-PARTY.md 已登记。
+
 ### 变更（公式：系统提示要求用 LaTeX，渲染器保证公式不被斜体规则改坏）
 
 - **系统提示加约束**（`js/agentui.js` 的 `systemPrompt`）：公式一律用 LaTeX 写——行内 `$...$`、

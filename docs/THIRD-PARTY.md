@@ -22,6 +22,7 @@
 | bibtex-parse | 上游版（未在文件头标注） | https://github.com/noahfalk/（PEG.js 生成解析器，MIT） | MIT | `bibtex-parse.js` 041dc7977d34e890 |
 | assistant-ui 对话层 bundle（react 18.3.1 + react-dom 18.3.1 + @assistant-ui/react 0.11.58，esbuild 0.25.12 构建） | 0.11.58 | 源码 scripts/agent-ui-bundle/（复现构建见其 README）；上游 https://github.com/assistant-ui/assistant-ui 、 https://github.com/facebook/react | react / react-dom：MIT；@assistant-ui/react：MIT（内嵌许可声明已随 legalComments:inline 保留在产物内） | `agent-chat.js`（完整值见 SHA256SUMS） |
 | vis-network | 9.1.9（standalone UMD） | https://github.com/visjs/vis-network（官方 standalone 产物） | Apache-2.0 / MIT 双许可（本项目以 MIT 使用） | `vis-network.min.js` f53f833ddb9bf97e |
+| MathJax（tex-svg 单文件组件） | 3.2.2 | https://github.com/mathjax/MathJax（官方 es5/tex-svg.js 产物） | Apache-2.0（完整文本随 `vendor/mathjax/LICENSE`） | `tex-svg.js` d4295dc337448369 |
 
 ## 构建工具（不随应用分发，装在 %LOCALAPPDATA%\LitBoardBuildTools）
 

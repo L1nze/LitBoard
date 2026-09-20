@@ -486,6 +486,23 @@ function createWindow() {
                 return ok;
               } catch (error) { return String(error && error.message || error); }
             })(),
+            // 聊天公式渲染端到端：LitMarkdown 出 .lb-math/.lb-math-block → agentui 的
+            // typesetMath 懒加载 vendor/mathjax/tex-svg.js 并类型化 → mjx-container 真的生成。
+            // 隔离环境全程离线（MathJax 是本地 vendor 单文件），加载失败/渲染失败都会 false。
+            chatMathRendered: await (async function () {
+              try {
+                if (!window.LitAgentUi || !window.LitAgentUi.typesetMath || !window.LitMarkdown) return false;
+                const probe = document.createElement('div');
+                probe.innerHTML = window.LitMarkdown.render('行内 $x_1 + y_2 = z_3$ 与块级 $$E = mc^2$$ 结束');
+                document.body.appendChild(probe);
+                const done = await window.LitAgentUi.typesetMath(probe);
+                const ok = done === true &&
+                  !!probe.querySelector('.lb-math mjx-container') &&
+                  !!probe.querySelector('.lb-math-block mjx-container');
+                probe.remove();
+                return ok;
+              } catch (error) { return false; }
+            })(),
             // 对话体是纵向 flex 容器（自身不滚动）：输入区与模型行才能钉在面板底部
             chatBodyIsFlexColumn: (function () {
               const body = document.querySelector('.agent-body');
@@ -819,6 +836,7 @@ function createWindow() {
           result.agentPhase2Present && result.agentGraphPresent && result.agentWebSearchPresent &&
           result.agentReaderPresent && result.agentFindLiteraturePresent &&
           result.agentChatRendered === true && result.chatBodyIsFlexColumn === true &&
+          result.chatMathRendered === true &&
           result.rightRailPresent && result.railSwitchWorks === true &&
           result.journalRankColumnPresent && result.rankRefreshTogglePresent &&
           result.scigreatTestPresent && result.easyscholarTestPresent && result.sourcesTestPresent &&

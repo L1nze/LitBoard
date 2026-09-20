@@ -2036,6 +2036,13 @@ td.num { font-variant-numeric: tabular-nums; }
   display: block; padding: 6px 8px; margin: 6px 0;
   overflow-x: auto; white-space: pre; text-align: left;
 }
+/* 聊天公式类型化后（agentui 对 .lb-math 注入 MathJax SVG）：去掉「源码块」观感；
+   mjx-container 自身的基线/字号样式由 MathJax 启动时注入，这里只管容器布局 */
+.lb-math[data-math-typeset] { background: transparent; padding: 0; font-family: inherit; overflow-wrap: normal; }
+.lb-math-block[data-math-typeset] { text-align: center; white-space: normal; }
+.lb-math[data-math-typeset] mjx-container, .aui-md mjx-container {
+  max-width: 100%; overflow-x: auto; overflow-y: hidden;
+}
 .markdown-preview h1, .markdown-preview h2, .markdown-preview h3, .markdown-preview h4 { margin: 14px 0 6px; line-height: 1.35; letter-spacing: -0.01em; color: var(--text-primary); }
 .markdown-preview h1 { font-size: 17px; }
 .markdown-preview h2 { font-size: 15.5px; }

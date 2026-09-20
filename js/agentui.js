@@ -936,6 +936,7 @@ window.LitAgentUi = (function () {
     if (agentReady && !chatRoot.dataset.mounted && window.LitAgentChat) {
       window.LitAgentChat.mount(chatRoot, bridge());
       chatRoot.dataset.mounted = '1';
+      watchChatMath(chatRoot); // 公式渲染观察器随挂载建立（流式/切会话的 DOM 重建都由它驱动）
     }
     var run = current ? runs.get(current) : null;
     setStatus(!agentReady ? '' : (run && run.streaming ? T('生成中…（切换会话不会中断）') : ''));
@@ -1388,6 +1389,83 @@ window.LitAgentUi = (function () {
   function toastText(text) { if (deps.toast) deps.toast(text); }
   function toastError(error) { toastText(T('AI 助手：') + String(error && error.message || error)); }
 
+  /* ---------------- 聊天公式渲染（MathJax tex-svg，懒加载） ----------------
+   * 正文经 LitMarkdown 渲染：$...$ / $$...$$ 已被摘成 .lb-math / .lb-math-block
+   * span（内容 = 转义后的原始 LaTeX，textContent 即 TeX 源）。这里对聊天容器里的
+   * 这些节点逐个 tex2svgPromise 类型化——不扫全文定界符，不会误伤普通文本里的 $；
+   * 失败（LaTeX 语法错等）保留原文，绝不打断消息显示。MathJax 只在首次出现公式时
+   * 才注入（vendor/mathjax/tex-svg.js 单文件、SVG 输出无字体依赖），无公式的会话零开销。 */
+  var mathjaxPromise = null;
+  function ensureMathJax() {
+    if (window.MathJax && window.MathJax.startup && window.MathJax.startup.promise) {
+      return window.MathJax.startup.promise;
+    }
+    if (mathjaxPromise) return mathjaxPromise;
+    // 配置必须在脚本加载前就位；菜单在桌面应用里是干扰，关掉
+    window.MathJax = {
+      startup: { typeset: false },
+      options: { enableMenu: false },
+      svg: { fontCache: 'global' }
+    };
+    mathjaxPromise = new Promise(function (resolve, reject) {
+      var script = document.createElement('script');
+      script.src = 'vendor/mathjax/tex-svg.js';
+      script.onload = function () {
+        (window.MathJax && window.MathJax.startup ? window.MathJax.startup.promise : Promise.resolve())
+          .then(resolve, reject);
+      };
+      script.onerror = function () { reject(new Error('MathJax 加载失败')); };
+      document.head.appendChild(script);
+    });
+    // 加载失败后允许重试（下次出现公式再试一次）
+    mathjaxPromise.catch(function () { mathjaxPromise = null; });
+    return mathjaxPromise;
+  }
+
+  /** 对 root 内尚未处理的公式节点做类型化；无公式返回 false，有则处理完返回 true */
+  function typesetMath(root) {
+    if (!root || !root.querySelectorAll) return Promise.resolve(false);
+    var pending = Array.prototype.slice.call(
+      root.querySelectorAll('.lb-math:not([data-math-typeset]), .lb-math-block:not([data-math-typeset])'));
+    if (!pending.length) return Promise.resolve(false);
+    pending.forEach(function (span) { span.setAttribute('data-math-typeset', '1'); });
+    return ensureMathJax().then(function () {
+      var MathJax = window.MathJax;
+      var chain = Promise.resolve();
+      pending.forEach(function (span) {
+        var tex = span.textContent;
+        var display = span.classList.contains('lb-math-block');
+        chain = chain.then(function () {
+          return MathJax.tex2svgPromise(tex, { display: display }).then(function (node) {
+            span.textContent = '';
+            span.appendChild(node);
+          }).catch(function () {
+            // 单条公式失败（LaTeX 语法错误等）：还原为原文继续展示
+            span.removeAttribute('data-math-typeset');
+          });
+        });
+      });
+      return chain.then(function () { return true; });
+    }).catch(function () {
+      // MathJax 本身加载失败：全部还原（下次 Observer 触发会重试）
+      pending.forEach(function (span) { span.removeAttribute('data-math-typeset'); });
+      return false;
+    });
+  }
+
+  /** 聊天是 React 侧渲染（流式增量 + 会话切换都会重建 DOM），用 MutationObserver
+   *  防抖驱动类型化；只在挂载时建立一次。 */
+  function watchChatMath(root) {
+    var timer = null;
+    var sweep = function () {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(function () { typesetMath(root); }, 250);
+    };
+    var observer = new MutationObserver(sweep);
+    observer.observe(root, { childList: true, subtree: true });
+    sweep();
+  }
+
   return {
     init: init,
     toggle: toggle,
@@ -1398,6 +1476,8 @@ window.LitAgentUi = (function () {
     refreshConfig: refreshConfig,
     refreshChips: refreshChips,
     onSettingsOpen: onSettingsOpen,
-    refreshResearchStats: refreshResearchStats
+    refreshResearchStats: refreshResearchStats,
+    typesetMath: typesetMath,
+    ensureMathJax: ensureMathJax
   };
 })();

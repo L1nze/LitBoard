@@ -364,6 +364,7 @@ vendor/tesseract/      tesseract.js 核心（语言包按需下载）
 vendor/epub/           epub.js + JSZip
 vendor/vis-network/    引文网络可视化
 vendor/assistant-ui/   AI 对话层构建产物
+vendor/mathjax/        AI 对话 LaTeX 公式渲染（tex-svg 单文件）
 word/wordbridge.js     常驻 JScript Word COM 桥
 extension/             Chrome/Edge 浏览器扩展
 scripts/               外置工具启动与构建脚本（lint.js 兼容零 node_modules）
@@ -380,7 +381,7 @@ test/                  数据模型、存储、同步、引用等测试
 LitBoard 自有代码按 AGPL-3.0-only 发布，完整项目许可见根目录 `LICENSE`。
 `vendor/` 下的第三方组件继续按各自许可证发布，不因本项目许可证改变。
 
-- PDF.js（Apache-2.0）、PDFium（BSD）、pdf-lib（MIT）、tesseract.js（Apache-2.0）、bibtex-parse（MIT）、assistant-ui 对话层 bundle（MIT，经外置 esbuild 构建为单文件，见 scripts/agent-ui-bundle/）、vis-network（Apache-2.0 / MIT 双许可，本程序以 MIT 使用，© Almende B.V. 与 visjs contributors）
+- PDF.js（Apache-2.0）、PDFium（BSD）、pdf-lib（MIT）、tesseract.js（Apache-2.0）、bibtex-parse（MIT）、assistant-ui 对话层 bundle（MIT，经外置 esbuild 构建为单文件，见 scripts/agent-ui-bundle/）、vis-network（Apache-2.0 / MIT 双许可，本程序以 MIT 使用，© Almende B.V. 与 visjs contributors）、MathJax tex-svg（Apache-2.0，AI 对话中的 LaTeX 公式渲染）
 - epub.js（BSD-2-Clause，© FuturePress）、JSZip（MIT 或 GPLv3 双许可，本程序以 MIT 使用）
 - citeproc-js（CPAL-1.0 / AGPL-3.0 双许可，本程序以 CPAL 使用并在此署名：© Frank Bennett）
 - CSL 样式与语言环境文件（CC BY-SA 3.0，citation-style-language 项目）

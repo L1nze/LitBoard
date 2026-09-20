@@ -388,7 +388,7 @@ electron/integrations.js  Nutstore sync, translation, journal ranking, embedding
 electron/research-*.js  research library, OpenAlex client, embedding builder
 electron/word-bridge.js Word COM bridge (driver for word/wordbridge.js)
 electron/backup.js      snapshot creation, verification and restore
-vendor/                 bundled third-party libraries (pdfjs, pdfium, pdflib, citeproc, tesseract, epub, vis-network…)
+vendor/                 bundled third-party libraries (pdfjs, pdfium, pdflib, citeproc, tesseract, epub, vis-network, mathjax…)
 extension/              Chrome/Edge browser extension (MV3)
 word/wordbridge.js      resident JScript Word COM bridge
 scripts/                external-tool launchers and build scripts
@@ -406,7 +406,8 @@ LitBoard's own code is released under **AGPL-3.0-only** — see [LICENSE](LICENS
 
 - PDF.js (Apache-2.0), PDFium (BSD), pdf-lib (MIT), tesseract.js (Apache-2.0), bibtex-parse (MIT),
   assistant-ui chat bundle (MIT, built with an external esbuild from `scripts/agent-ui-bundle/`),
-  vis-network (Apache-2.0 / MIT dual-licensed, used here under MIT)
+  vis-network (Apache-2.0 / MIT dual-licensed, used here under MIT),
+  MathJax tex-svg (Apache-2.0, renders LaTeX in AI chat messages)
 - epub.js (BSD-2-Clause, © FuturePress), JSZip (MIT or GPLv3 dual-licensed, used here under MIT)
 - citeproc-js (CPAL-1.0 / AGPL-3.0 dual-licensed, used here under CPAL, © Frank Bennett)
 - CSL styles and locales (CC BY-SA 3.0, citation-style-language project)
