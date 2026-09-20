@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
 const path = require('node:path');
 const codemod = require('../scripts/i18n-codemod.js');
 const LitI18n = require('../js/i18n.js');
@@ -75,12 +76,15 @@ test('pick：trim 后按键查译文；源语言或缺失返回 null', () => {
   LitI18n.setLang('zh-CN', { persist: false });
 });
 
+// electron/ipc/ 下的域模块自动枚举：新增 IPC 域文件无需改这里即进 T() 键覆盖门禁
 const WRAPPED_FILES = [
   'js/app.js', 'js/model.js', 'js/sync.js', 'js/query.js', 'js/zotero.js',
   'js/pdfimport.js', 'js/csldoc.js', 'js/cslcite.js', 'js/docx.js',
   'js/translators.js', 'js/noteeditor.js', 'js/epub.js', 'js/translate.js',
   'js/ocr.js', 'js/pdfannot.js', 'electron/main.js'
-];
+].concat(fs.readdirSync(path.join(ROOT, 'electron', 'ipc'))
+  .filter(function (f) { return /\.js$/.test(f); })
+  .map(function (f) { return 'electron/ipc/' + f; }));
 
 test('词典覆盖：全部 T() 键都有非空英文译文', () => {
   const dict = getEnDict();

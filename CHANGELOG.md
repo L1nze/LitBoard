@@ -5,6 +5,105 @@
 
 ## [Unreleased]
 
+### 重构（IPC 域拆分：main.js 瘦身 3091 → ~1260 行）
+
+- **全部 116 个 ipcMain.handle 注册按域拆进 `electron/ipc/`**（12 个域模块 + `context.js` + `index.js`）：
+  window / word / library+settings / backup+data-paths+app:relaunch / bridge / integrations /
+  files+clipboard+csl / ocr / pdfsearch / research+embed / agent+session / api+pdf。
+  通道名、handler 逻辑、受信校验与错误文案逐字不变；`registerAll()` 保持在
+  `createWindow()` 之前、bridgeServer 创建之前调用（与原 `registerIpc()` 同位）。
+- **共享可变状态收进 `ipc/context.js` 单例**（main.js 启动装配写入、域模块调用时读取）：
+  解决 bridgeServer 注册后才创建、researchDb/agentSessions 可为 null、dataPathState
+  多处重赋值、mainWindow 可重建的晚绑定约束；跨域标志 forceQuitNext/syncInFlight/
+  lastLibraryWriteAt 一并归位；startupLog（整文件重写式，必须全进程唯一）随迁。
+- **新增 `test/ipc-parity.test.js` 长期护栏**：preload invoke ↔ 主进程注册双向对等、
+  handle 通道无重复注册、渲染层 send 的生命周期通道有监听、ipc 域模块相对 require
+  路径存在性——此前对等只是约定，没有测试。
+- `test/i18n.test.js` 的 `WRAPPED_FILES` 改为自动枚举 `electron/ipc/*.js`：
+  新增 IPC 域文件自动进 T() 键覆盖门禁。
+- AGENTS.md 架构要点补 IPC 域拆分条目；`ALLOWED_API_HOSTS` 位置说明同步为
+  `electron/ipc/api.js`（唯一消费方，随通道一起迁移）。
+- 验证：777+5 测试全绿、lint 0 问题、Electron 39 冒烟 97/97 断言、生命周期冒烟
+  （写入 → 真实关闭 → 重启 → 数据一致）通过。
+
+### 性能与稳定（全库审计：冗余 / 串行 / 热点三线优化）
+
+- **渲染层**：侧栏计数（头部四项 + 每文件夹 + 智能文件夹命中）从 O(文件夹×文献)
+  的逐文件夹全量扫描改为单遍统计 + 签名缓存（内容性修改必抬 updatedAt，签名不变则
+  计数不变）；`folderDescendantSet` 先建父→子索引（消 O(文件夹²)）；排序 Collator
+  实例复用（localeCompare 每次调用重解析 locale）；haystack 缓存容量 5000→20000、
+  「超限整表清空」改逐条最旧先出（万篇库此前每搜一次必抖动一半）；搜索防抖 150→250ms。
+- **串行 → 并行（全部有界并发 4-8，结果按输入序落位）**：PDF 全文抽取按页 6 路并发、
+  备份资产暂存/发布前校验/恢复复制（4/4/6 路，暂存临时文件名加序号修并发互截 bug）、
+  OA PDF 批量下载（4 路下载 + 落盘单链串行防同名竞态）、PDF 暂存复制、OpenAlex
+  批量分块并发递交（主机节流队列本就限并发 3）、会话列表存在性检查、导入 PDF 受管
+  拷贝、快照目录 ZIP 读取。
+- **主进程**：db.js 子表写语句 WeakMap 缓存（批量标记万篇时省 ~10 万次 prepare）；
+  sync.js sameEntityContent 直调 entitySignature；applyLocalOnlyResolutions 从
+  O(标记×实体) 线性化（恢复整库场景原先平方级）。
+- **死代码清理**：sync.js 五个历史别名导出与 resolveSyncPlan、docx FIELD_ADDIN、
+  preload/main 的 research:graph-progress 死事件路径、约 120 行孤儿 CSS
+  （旧版 agent 消息渲染块 / 旧状态药丸 / mini-tag / col-check）；**修复 model.js
+  `tagColorsFromRecords` 被调用但从未导出的真 bug**（标签颜色合并后静默不重算）。
+
+### 整理（文件组织）
+
+- 两份 2026-09-20 审查报告归位 `docs/audits/`；README 双语文档索引补 task-ledger 与
+  audits/；audit-baseline 版本号 1.2.0 → 1.2.14（标注复核日期）。
+- i18n 一次性迁移脚本入 `scripts/one-off/`（修 __dirname 层级）；gen-icons /
+  release-checksums 注册进 package.json scripts，文档同步 npm run 形式。
+- 删 `build/icon-master.png`（gen-icons 可再生中间产物，此前被 `build/icon-*.png`
+  通配误打进每个安装包，1.4MB）与零引用的 `icon/LitboardLogo.png`。
+- 仓库建立 git 基线（此前零提交）。
+
+### 新增（设置页「检索与元数据服务」一个按钮测完四个源）
+
+- **一个按钮、四个源、逐行回报**（设置 → 集成与服务 → 检索与元数据服务 → 「测试全部服务」）：
+  OpenAlex / Semantic Scholar / Elsevier / TinyFish 各打一发最小真实请求，结果逐行列出
+  「服务名 · 状态 · 细节」。只报一句成功/失败等于没说——**哪个源能用、为什么不能用**必须一眼看清。
+- **通道如实回报**（`electron/research-net.js` 的探针）：OpenAlex 无 Key 时报「polite pool（邮箱）」、
+  既无邮箱也无 Key 时报「未填邮箱」，带 Key 才报「带 API Key」——不让用户以为填的 Key 生效了；
+  Semantic Scholar 区分「共享池（可能限流）」与「带 API Key」。
+- **失败分类可区分**：`missing_key` 未配置 / `unauthorized` 凭据无效或无权限 / `rate_limited` 上游限流 /
+  `not_found` 端点通了但无该记录 / `network` 不可达 / `error` 其余。分类是模块作用域的
+  `classifyTestError`（research-net 导出，webfetch-net 复用同一份），渲染层按 code 出文案——
+  主进程不产出面向用户的句子。探针**只读、不写库、不抛异常**，并与业务路径共用同一个节流队列，
+  测试同样受主机限流约束。
+- **Elsevier 两种能力分开回报**：摘要回填端点（只需 Key）与 Scopus 检索（另需机构订阅）分别探测。
+  「摘要通、Scopus 无权限」是最常见的组合，含混成一句「失败」会让用户以为 Key 坏了。
+  顺带修正：`searchScopus`/`searchSemanticScholar` 重抛 401/403 时丢掉了 `error.status`，
+  只剩一句「权限不足」——现在保留状态码，连接测试才能把它与 429 区分开。
+- **TinyFish 守门**：受「开关 + 出境告知」双重门控，未启用时如实回报 `skipped` 且**不发请求**
+  （未经同意的出境不能靠一个测试按钮绕过）；已配置则验证 Key 是否真的发得出去（`X-API-Key`）。
+- 新增 IPC `integrations:test-sources`（`electron/main.js`）/ preload `testSources`；
+  冒烟加 `sourcesTestPresent`（按钮 + 状态行 + 结果区三件套同时在位）。
+- 测试：research-net 三条（通道如实 / 失败分类 / Elsevier 两能力组合）、webfetch 一条
+  （跳过 / 可用 / 401 / 断网），共 782/782 通过；lint、smoke 全绿。i18n 补 20 条词典条目。
+
+### 变更（AI 助手面板：发送/停止合并为一个箭头按钮、输入区钉底、显示服务商）
+
+- **发送与停止合并成一个图标按钮**（`scripts/agent-ui-bundle/main.jsx` 的 ComposerArea）：
+  未运行 = 向上箭头（发送），运行中 = 方块（停止），不再出现「发送」文字。原先两个文字按钮
+  同时挂在行尾，用户要先判断「现在能点哪个」；合并后按钮形态与当前可做的动作一一对应，
+  文案走 `title`/`aria-label`（沿用词典既有的「发送」/「停止」，无障碍不丢）。
+  编辑态 composer（保存并重发/取消）保持文字按钮不变。
+- **输入区钉在面板底部**（`css/style.css`）：`.agent-body` 从「自身滚动 + padding」改为
+  纵向 flex 容器（`min-height:0` + `overflow:hidden`），滚动交给 `.aui-viewport`。
+  此前 `.agent-chat-root` 的 `flex:1` 因父级不是 flex 而失效、高度按内容收缩——输入框
+  浮在半空、下面留一大片空白。`.agent-not-ready` 补回 14px 内边距（原 padding 来自
+  `.agent-body`）。
+- **底部显示当前服务商**：`js/agentproto.js` 新增纯函数 `providerLabel(baseUrl)`
+  （已知主机 → 展示名；OpenCode 按 `/zen/go` 与 `/zen` 区分 Go / Zen 两种套餐；未收录的
+  主机回落为真实主机名，不猜服务商；未配置端点返回空串由调用方隐藏徽标），
+  `js/agentui.js` 的 `renderModelLabel` 顺带渲染 `#agent-provider`（tooltip = 完整 Base URL），
+  `index.html` 加徽标元素、`css/style.css` 加样式——「哪个模型、经谁的端点」在面板里可见。
+- 冒烟新增两条断言：`chatBodyIsFlexColumn`（对话体必须是纵向 flex 容器，防回退成自滚动）
+  与 `agentChatRendered` 内的**几何检查**（探针挂真实 `.agent-chat-root` 样式链 + 固定高度，
+  输入区底边须与容器底边齐平 ≤3px——输入框若回到滚动视口内会立刻失败）。
+- 重建 `vendor/assistant-ui/agent-chat.js`（266 KB）并更新 `vendor/SHA256SUMS`；
+  依赖版本未变，`docs/THIRD-PARTY.md` 条目仍准确。
+- `npm test` 778/778（新增 providerLabel 一条）、lint、smoke 全绿。
+
 ### 变更（设置页瘦身：去掉冗余说明与两个「静默失效」的勾选项）
 
 - **动机**：设置页 18 个小节里有 22 条帮助文本、2321 字，最长一条 255 字；其中相当一部分是

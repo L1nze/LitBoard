@@ -46,6 +46,7 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   testTranslationConnection: function (value) { return ipcRenderer.invoke('integrations:test-translation', value); },
   getScigreatRank: function (value) { return ipcRenderer.invoke('integrations:scigreat-rank', value); },
   testScigreatConnection: function (value) { return ipcRenderer.invoke('integrations:test-scigreat', value); },
+  testSources: function () { return ipcRenderer.invoke('integrations:test-sources'); },
   detectZoteroDataDir: function () { return ipcRenderer.invoke('integrations:detect-zotero'); },
   chooseZoteroDataDir: function () { return ipcRenderer.invoke('integrations:choose-zotero'); },
   importZoteroLocal: function () { return ipcRenderer.invoke('integrations:import-zotero-local'); },
