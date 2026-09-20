@@ -11,7 +11,7 @@
 | M0-4 | 确定性测试数据生成器（1k/10k/50k + 样本 PDF/EPUB） | 未开始 | 计划：脚本生成隔离 SQLite + 资产目录；样本需许可明确来源 |
 | M1-1 | 弹窗栈：Esc 只关最顶层 | 完成（已验收） | `js/modal.js`（UMD+node:test 4 例）；app.js 移除一次性全隐列表，改 `LitModal.closeTop()`；19 个 mask + 2 阅读器 + 2 悬浮层经 MutationObserver 自动进栈 |
 | M1-2 | 笔记编辑器 dirty 守卫 + 本机草稿持久化 + 草稿不进同步正文 | 完成（已验收） | noteeditor.js：input→dirty+localStorage 草稿（防抖 400ms，pagehide 兜底）；save 写克隆不改实体（markdown 迁移 sourceMarkdown 移至克隆）；保存失败回滚 dirty 保留草稿；requestClose 脏守卫 + confirmDiscard 确认；冒烟断言 `#note-edit-status` |
-| M1-3 | 关闭收尾握手（关闭请求→等保存确认→放行），保存失败保留窗口 | 完成（已验收） | main.js close 拦截 + `app:close-request`/`app:close-ack`/`app:close-force`（8s 超时放行）；渲染层 `waitForLocalSave()` 保存链（save() 全部经 trackSave）；失败弹 dlgConfirm 由用户决定强退；内部 relaunch 置 forceQuitNext；退出时不再发起网络同步（改由定时+防抖覆盖，理由见 roadmap M1） |
+| M1-3 | 关闭收尾握手（关闭请求→等保存确认→放行），保存失败保留窗口 | 完成（已验收） | main.js close 拦截 + `app:close-request`/`app:close-ack`（8s 超时放行；原设计的 `app:close-force` 通道从未被渲染层使用——强退实际走 closeAck ok=true——已于 2026-09-20 作为死代码移除）；渲染层 `waitForLocalSave()` 保存链（save() 全部经 trackSave）；失败弹 dlgConfirm 由用户决定强退；内部 relaunch 置 forceQuitNext；退出时不再发起网络同步（改由定时+防抖覆盖，理由见 roadmap M1） |
 | M1-4 | 端到端关闭→重启一致性验证 | 完成（已验收） | `npm run smoke:lifecycle` 两阶段真实冒烟：写入→真实窗口关闭（收尾 ack=true）→重启→paperCount=1 标题一致。`npm run smoke` 标准断言 44 项全过（含 closeRequestAckWorks） |
 | M2-1 | ensure-tools.ps1 版本核对（空缓存/不符/半安装/离线） | 完成（已验收） | installed-versions.json（无 BOM）比对 package.json；实测三路径：全新安装落记录 / 版本不符自动重装修复（0.0.0→39.2.7）/ 已最新 0.3s 跳过；保持 UTF-8 BOM |
 | M2-2 | IPC 受信窗口 + 顶层 frame 校验 | 完成（已验收） | registerIpc 统一 `handle()` 包装（77 通道）：sender 必须=主窗口 webContents 且为顶层 frame；smoke 通过 |

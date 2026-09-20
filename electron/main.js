@@ -884,8 +884,9 @@ function createWindow() {
 let quitting = false;
 
 /* M1 关闭收尾：窗口 close 被拦截后向渲染层请求保存收尾（等待「已持久化」而非「已入队」）。
- * app:close-ack 回报结果（ok=false → 保留窗口）；app:close-force 是用户在失败确认弹窗中
- * 明确放弃后的强制放行。渲染层崩溃/无响应超时放行，避免出现无法退出的死锁。
+ * app:close-ack 回报结果：ok=false 保存失败保留窗口（渲染层负责向用户确认）；用户在失败
+ * 弹窗里确认放弃强退时，渲染层同样以 close-ack ok=true 放行（app.js → closeAck({ok:!!force})）。
+ * 渲染层崩溃/无响应超时放行，避免出现无法退出的死锁。
  * 内部 relaunch（数据目录切换 / 备份恢复重启）置 forceQuitNext 直接放行——彼时数据库已切换，
  * 渲染层的保存收尾不再有意义。 */
 let quitApproved = false;
@@ -905,13 +906,6 @@ ipcMain.on('app:close-ack', function (_event, payload) {
   closeWaiter = null;
   clearTimeout(waiter.timer);
   if (payload && payload.ok === false) return; // 保存失败：窗口保留，渲染层负责向用户确认
-  proceedClose();
-});
-ipcMain.on('app:close-force', function () {
-  if (!closeWaiter) return;
-  const waiter = closeWaiter;
-  closeWaiter = null;
-  clearTimeout(waiter.timer);
   proceedClose();
 });
 
