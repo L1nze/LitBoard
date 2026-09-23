@@ -1,9 +1,9 @@
-# 第三方组件台账（THIRD-PARTY）
+# 第三方组件（THIRD-PARTY）
 
-> 开源分发义务的唯一核对表：每个随应用分发的第三方组件——**版本、来源、哈希、许可证、NOTICE 义务**。
+> 开源分发义务的核对表：列明随应用分发的第三方组件的**版本、来源、哈希、许可证、NOTICE 义务**；未随包分发的设计来源另列说明。
 > 哈希为 SHA-256（完整值见 `vendor/` 旁的 `SHA256SUMS` 校验文件，由 `scripts/vendor-hashes.js` 生成）。
-> 新增 vendor 文件时：登记本表 + 把哈希加进 `SHA256SUMS` + 在 README 的许可一节补一行
-> （中文 `README.zh-CN.md`「第三方组件与许可」／英文 `README.md`「License」两处同步）。
+> 新增 vendor 文件时：登记本表，并把哈希加进 `SHA256SUMS`。
+> README 的许可章节分别为中文 `README.zh-CN.md`「许可证与第三方组件」和英文 `README.md`「License and third-party components」。
 
 ## 运行时随应用分发的组件
 
@@ -23,6 +23,12 @@
 | MathJax（tex-svg 单文件组件） | 3.2.2 | https://github.com/mathjax/MathJax（官方 es5/tex-svg.js 产物） | Apache-2.0（完整文本随 `vendor/mathjax/LICENSE`） | `tex-svg.js` d4295dc337448369 |
 | pinyin-pro（中文转拼音） | 3.29.4 | https://github.com/zh-lx/pinyin-pro（npm 官方发布产物） | MIT（完整文本随 `vendor/pinyin-pro/LICENSE`） | `pinyin-pro.js` 1f660d2a52b762a |
 | markdown-it | 14.3.2 | https://github.com/markdown-it/markdown-it（官方 npm 产物 `dist/markdown-it.min.js`） | MIT（完整文本见 `vendor/markdown-it/LICENSE`） | `markdown-it.min.js` e32488403e2e565a |
+
+## 文献调研模块的设计来源（不随应用分发）
+
+LitBoard 文献Agent调研模块的核心工作流以 [PAPER-SQL](https://github.com/galois-yan/PAPER-SQL) 为设计基础，包括检索结果写入本地调研库、缺失摘要回填、语义检索和引文关系分析。感谢该项目作者，我的导师严寅中老师（Yinzhong Yan，西北工业大学）。PAPER-SQL 的[许可证为 MIT](https://github.com/galois-yan/PAPER-SQL/blob/master/LICENSE)，版权声明为 © 2026 严寅中。
+
+这里登记的是方法与设计来源；LitBoard 的对应功能由本项目的 JavaScript / Electron 模块实现，PAPER-SQL 的 Python 包不作为运行时组件随应用分发，因此不列入上表的随包文件哈希。若后续直接引入其源代码，应按 MIT 许可证保留版权和许可声明，并在本台账登记具体文件。
 
 ## 构建工具（不随应用分发，装在 %LOCALAPPDATA%\LitBoardBuildTools）
 

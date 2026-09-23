@@ -8,7 +8,7 @@
 - [ ] `npm test` 与 `npm run lint` 全绿；CI 的 `package-smoke` job 通过（含打包产物冒烟与生命周期冒烟）。
 - [ ] `npm run smoke`（标准断言）与 `npm run smoke:lifecycle`（写入→真实关闭→重启→校验）本机通过。
 - [ ] 无未解决的数据丢失或高风险安全问题；备份恢复流程（设置 → 数据与备份 → 恢复）验证通过。
-- [ ] CHANGELOG.md 已更新本版本条目。
+- [ ] 本地 `CHANGELOG.md` 已更新本版本条目。
 
 ## 构建与校验
 
@@ -44,8 +44,8 @@
 
    产出 `dist/SHA256SUMS.txt`，含哈希、文件大小与构建环境（Electron / electron-builder 版本）。
 5. 记录本次构建的依赖指纹：`vendor/SHA256SUMS`（`npm run vendor-hashes` 可重生成）应与仓库一致。
-6. 打包会让 `package.json` / `package-lock.json` 变脏（版本 +1）：确认无误后把它们连同
-   `CHANGELOG.md` 的本版本条目一起提交，别把版本改动留在未提交的工作区里。
+6. 打包会让 `package.json` / `package-lock.json` 变脏（版本 +1）：确认无误后提交版本文件。
+   `CHANGELOG.md` 是本地工作记录，已由 `.gitignore` 排除；发布说明需另行从中整理。
 
 ## 发布前人工验收（每次必做）
 
@@ -59,7 +59,7 @@
 ## 发布渠道
 
 - 首版：GitHub Release（源码归档 + 两个安装包 + SHA256SUMS.txt）。Release Notes 从 CHANGELOG 摘录。
-- 用户升级：手动下载新安装包覆盖安装；README（中文版 `README.zh-CN.md`）「完整备份与数据库安全」一节说明升级前可先手动备份。
+- 用户升级：手动下载新安装包覆盖安装；中文版 `README.zh-CN.md` 的「数据、同步与更新」一节建议升级前创建快照。
 
 ## 明确不做（本轮约束）
 

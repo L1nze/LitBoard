@@ -6,7 +6,7 @@
 
 **A local research workspace for collecting, reading, and citing papers**
 
-**English** · [简体中文](README.zh-CN.md) · [Release and downloads](docs/release.html)
+**English** · [简体中文](README.zh-CN.md) · [Feature tour (Chinese)](docs/feature-tour.md) · [Release and downloads](docs/release.md)
 
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 [![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6.svg)](#install)
@@ -39,7 +39,7 @@ Research activity is stored separately from the main library. You configure the 
 
 ## Install
 
-LitBoard currently provides Windows x64 installer and portable builds. See [release and download information](docs/release.html) for the available files and verification steps.
+LitBoard targets Windows x64 installer and portable builds. See the [release and download instructions](docs/release.md); actual downloads depend on the assets listed on the repository's Releases page.
 
 1. Run the installer, or launch the portable build.
 2. Drop in a PDF, BibTeX, RIS, or CSL-JSON file. You can also drag a folder of PDFs into the folder sidebar.
@@ -72,4 +72,6 @@ npm.cmd run dist:nobump
 
 `npm run dist` increments the patch version before packaging. Use `dist:nobump` when you need a build of the current version.
 
-LitBoard's own code is licensed under [AGPL-3.0-only](LICENSE). Vendored components retain their respective licenses.
+## License and third-party components
+
+LitBoard's own code is licensed under [AGPL-3.0-only](LICENSE). Vendored components retain their respective licenses; see the [third-party component inventory](docs/THIRD-PARTY.md) for details.
