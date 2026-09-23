@@ -157,3 +157,22 @@ test('estimateEmbedTokens weights CJK', function () {
   assert.ok(LitResearch.estimateEmbedTokens(['battery health']) <= 4);
   assert.equal(LitResearch.estimateEmbedTokens([]), 0);
 });
+
+test('A-followup #4: vectorReadiness 按当前模型覆盖判定，区分「没配」与「模型过期」', function () {
+  const target = { ok: true, model: 'model-B' };
+  // 当前模型有向量：可用
+  assert.deepEqual(LitResearch.vectorReadiness(target, { total: 8, matched: 8 }), { ready: true, reason: '' });
+  // 换过模型：库里全是别的模型的向量——旧实现按总数判定会误判为可用，检索必然空手而归
+  assert.deepEqual(LitResearch.vectorReadiness(target, { total: 8, matched: 0 }), { ready: false, reason: 'stale-model' });
+  // 一条向量都没有：没配/索引为空
+  assert.deepEqual(LitResearch.vectorReadiness(target, { total: 0, matched: 0 }), { ready: false, reason: 'unconfigured' });
+  // 嵌入服务未就绪：无论库里有什么都不算可用
+  assert.deepEqual(LitResearch.vectorReadiness({ ok: false }, { total: 8, matched: 8 }), { ready: false, reason: 'unconfigured' });
+  assert.deepEqual(LitResearch.vectorReadiness(null, null), { ready: false, reason: 'unconfigured' });
+});
+
+test('A-followup #5: normalizeTitleKey 折叠大小写/标点/空白', function () {
+  assert.equal(LitResearch.normalizeTitleKey('Zinc Battery: A Review!'), 'zinc battery a review');
+  assert.equal(LitResearch.normalizeTitleKey('  Zinc   Battery  '), 'zinc battery');
+  assert.equal(LitResearch.normalizeTitleKey(null), '');
+});

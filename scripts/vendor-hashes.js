@@ -24,7 +24,8 @@ function walk(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort(function (a, b) { return a.name < b.name ? -1 : 1; })) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) out.push(...walk(full));
-    else if (entry.isFile() && EXTS.has(path.extname(entry.name)) && entry.name !== 'SHA256SUMS') out.push(full);
+    else if (entry.isFile() && entry.name !== 'SHA256SUMS' &&
+      (EXTS.has(path.extname(entry.name)) || /^(LICENSE|COPYING|NOTICE)([._-].*)?$/i.test(entry.name))) out.push(full);
   }
   return out;
 }

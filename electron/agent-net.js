@@ -70,6 +70,8 @@ function createAgentNet(options) {
   const notify = opts.notify || function () {};
   // 出网身份：OpenCode 等网关要求客户端自带 User-Agent（不要通用 HTTP 库名）
   const userAgent = String(opts.userAgent || '').trim() || 'LitBoard';
+  // 「服务商 + 模型」清单（设置页按 id 测试/拉取清单时解析该服务商自己那把 Key）
+  const getProvider = opts.getProvider || async function () { return null; };
   const controllers = new Map();
 
   /* R03：按轮固定端点凭据——同一轮（sessionId|turnId）的续请求（模型→工具→模型…）
@@ -254,16 +256,32 @@ function createAgentNet(options) {
     return !!controller;
   }
 
+  /** 设置页按 providerId 调用（测试连接 / 拉取模型）时的目标解析：
+   *  表单里刚敲的值优先 → 该服务商已存的凭据 → 当前生效配置。
+   *  用户没重填 Key 时也要能测——所以由主进程解自己存的那把，明文不出主进程。 */
+  async function resolveTarget(input, cfg) {
+    const provider = input.providerId ? await getProvider(String(input.providerId)) : null;
+    if (input.providerId && !provider) throw new Error('服务商不存在或已被删除，请重新选择');
+    const base = validateBaseUrl(input.baseUrl || (provider && provider.baseUrl) || cfg.agentBaseUrl);
+    // 指定了服务商就只用它自己的 Key：回落当前生效配置会把别的账号的凭据打到该端点上
+    // （比报「Key 未配置」危险得多），所以这里没有跨服务商的兜底。
+    const apiKey = input.apiKey || (provider ? provider.apiKey : cfg.agentApiKey) || '';
+    const model = String(input.model || (provider && provider.model) || cfg.agentModel || '');
+    const providerCfg = provider ? { agentApiDialect: provider.dialect } : cfg;
+    return { base: base, apiKey: apiKey, model: model, dialect: resolveDialect(base, providerCfg, model, input.dialect) };
+  }
+
   /** 连接测试：非流式最小请求，一次成败（不重试）。
    * 协议形态随 Base URL 判定（也可由设置显式指定）——Anthropic 兼容端点走 /v1/messages。 */
   async function testConnection(overrides) {
     const cfg = await getConfig();
     const input = overrides || {};
-    const base = validateBaseUrl(input.baseUrl || cfg.agentBaseUrl);
-    const apiKey = input.apiKey || cfg.agentApiKey;
-    const model = String(input.model || cfg.agentModel || '');
+    const target = await resolveTarget(input, cfg);
+    const base = target.base;
+    const apiKey = target.apiKey;
+    const model = target.model;
     if (!apiKey) throw new Error('AI 助手 API Key 未配置');
-    const dialect = resolveDialect(base, cfg, model, input.dialect);
+    const dialect = target.dialect;
     const body = LitAgentProto.convertBody({
       model: model || undefined,
       messages: [{ role: 'user', content: 'ping' }],
@@ -292,10 +310,11 @@ function createAgentNet(options) {
   async function listModels(overrides) {
     const cfg = await getConfig();
     const input = overrides || {};
-    const base = validateBaseUrl(input.baseUrl || cfg.agentBaseUrl);
-    const apiKey = input.apiKey || cfg.agentApiKey;
+    const target = await resolveTarget(input, cfg);
+    const base = target.base;
+    const apiKey = target.apiKey;
     if (!apiKey) throw new Error('AI 助手 API Key 未配置');
-    const dialect = resolveDialect(base, cfg, input.model, input.dialect);
+    const dialect = target.dialect;
     // OpenCode 的清单端点按官方 curl 惯例走 Bearer；此处不跟随对话协议形态——
     // 用户填了 Qwen 模型（messages）时清单仍应以 Bearer 鉴权，否则 401 而不是列表。
     const listDialect = LitAgentProto.isOpenCodeHost(base) ? LitAgentProto.DIALECTS.CHAT : dialect;

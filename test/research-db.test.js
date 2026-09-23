@@ -377,6 +377,54 @@ test('R19: 全文进 FTS（search_research 可命中正文词）；元数据 ups
   assert.equal(db.getWorks(['W202'])[0].citedBy, 99);
 });
 
+test('性能回归：内容未变的 upsert 不重建 FTS 行（检索工具一次会 upsert 上百行）', async function () {
+  const { db, dir } = await makeDb();
+  try {
+    db.upsertWorks([W1, W2]);
+    const rowIds = function () {
+      const raw = new DatabaseSync(path.join(dir, 'research.db'), { readOnly: true });
+      const rows = raw.prepare('SELECT rowid AS rid, work_id FROM works_fts ORDER BY work_id').all();
+      raw.close();
+      return rows;
+    };
+    const before = rowIds();
+    assert.equal(before.length, 2);
+    const ridOf = function (rows, id) {
+      return rows.filter(function (row) { return row.work_id === id; })[0].rid;
+    };
+    // 同内容重跑（「检索即入库」是常态）：FTS 行既不删也不插，rowid 保持
+    db.upsertWorks([W1, W2]);
+    assert.equal(ridOf(rowIds(), 'W1'), ridOf(before, 'W1'), '内容未变不得重建 FTS 行');
+    assert.equal(db.queryWorks({ q: '锌电池' }).works.length, 1, '跳过重建也不能丢命中');
+    // 内容变了必须重建（正确性优先，不能因为省事一起跳过）
+    db.upsertWorks([Object.assign({}, W1, { title: '锌电池寿命预测研究（修订版）' })]);
+    const after = rowIds();
+    assert.notEqual(ridOf(after, 'W1'), ridOf(before, 'W1'), '改过的行要重建');
+    assert.equal(ridOf(after, 'W2'), ridOf(before, 'W2'), '没改的行仍不重建');
+    assert.equal(db.queryWorks({ q: '修订版' }).works.length, 1);
+  } finally { db.close(); }
+});
+
+test('queryWorks：命中总数只算到「本页取满」为止（不再为每页做一次全量 COUNT）', async function () {
+  const { db } = await makeDb();
+  try {
+    for (let i = 0; i < 5; i++) {
+      db.upsertWorks([{ id: 'W' + i, title: 'battery pack study ' + i, refs: [] }]);
+    }
+    const short = db.queryWorks({ q: 'battery', limit: 2 });
+    assert.equal(short.works.length, 2);
+    assert.equal(short.totalIsLowerBound, true, '取满一页时 total 是下限');
+    assert.equal(short.total, 2);
+    const full = db.queryWorks({ q: 'battery', limit: 20 });
+    assert.equal(full.works.length, 5);
+    assert.equal(full.total, 5, '取不满时 total 精确');
+    assert.equal(full.totalIsLowerBound, false);
+    const paged = db.queryWorks({ q: 'battery', limit: 4, offset: 2 });
+    assert.equal(paged.works.length, 3);
+    assert.equal(paged.total, 5, '翻页时 total = offset + 本页条数');
+  } finally { db.close(); }
+});
+
 test('R19: v2 → v3 迁移：旧库数据保留、works_fulltext 建表、FTS 重建为五列', async function () {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-research-v2-'));
   const { DatabaseSync } = require('node:sqlite');
@@ -401,5 +449,82 @@ test('R19: v2 → v3 迁移：旧库数据保留、works_fulltext 建表、FTS �
   assert.equal(db.getFulltextWindow('W300', 0, 100), null, '旧库无全文');
   db.upsertFulltext('W300', '迁移后新增的全文内容 unique-token-after-migration');
   assert.equal(db.queryWorks({ q: 'unique-token-after-migration' }).works.length, 1, '迁移后的库可写全文并检索');
+  await db.close();
+});
+
+/* ---------------- A-followup #4/#5：向量覆盖判定 + 规范化标题索引 ---------------- */
+
+test('A-followup #4: vecCoverage 按当前模型 + 配方统计，不把「别的模型的向量」算作可用', async function () {
+  const { db } = await makeDb();
+  const vecOf = function (dim) { return new Float32Array(dim).fill(0.5); };
+  db.upsertWorks([{ id: 'W401', title: 'a', abstract: 'x', refs: [] }, { id: 'W402', title: 'b', abstract: 'y', refs: [] }]);
+  db.vecPut([
+    { workId: 'W401', model: 'model-A', dim: 4, recipe: 2, hash: 'h1', vec: vecOf(4) },
+    { workId: 'W402', model: 'model-A', dim: 4, recipe: 2, hash: 'h2', vec: vecOf(4) }
+  ]);
+  assert.deepEqual(db.vecCoverage({ model: 'model-A', recipe: 2 }), { total: 2, matched: 2 });
+  // 换了模型：总数不为零，但当前模型覆盖为零——旧实现按 stats().vectors 判定会误判为可用
+  assert.deepEqual(db.vecCoverage({ model: 'model-B', recipe: 2 }), { total: 2, matched: 0 });
+  // 配方不同也不算
+  assert.equal(db.vecCoverage({ model: 'model-A', recipe: 1 }).matched, 0);
+  await db.close();
+});
+
+test('A-followup #5: 标题去重覆盖全库（不再只扫被引数前 400 篇）', async function () {
+  const { db } = await makeDb();
+  // 401 篇高被引 + 1 篇低被引，目标标题只属于低被引的那篇
+  const bulk = [];
+  for (let i = 0; i < 401; i++) {
+    bulk.push({ id: 'W5' + i, title: 'High cited paper number ' + i, citedBy: 10000 - i, refs: [] });
+  }
+  db.upsertWorks(bulk);
+  db.upsertWorks([{ id: 'Wlow', title: 'Deep learning for zinc battery health estimation', citedBy: 0, refs: [] }]);
+  // 标题大小写/标点差异应归一化后命中同一身份
+  assert.equal(db.findIdByNormalizedTitle('deep  learning for zinc battery health ESTIMATION!!'), 'Wlow');
+  assert.equal(db.findIdByNormalizedTitle('Deep learning for zinc battery health estimation'), 'Wlow');
+  assert.equal(db.findIdByNormalizedTitle('High cited paper number 400'), 'W5400');
+  // 过短标题不参与匹配（沿用既有下限）
+  assert.equal(db.findIdByNormalizedTitle('short'), null);
+  await db.close();
+});
+
+test('A-followup #5: v3 旧库迁移时回填 title_norm（旧行迁移后可参与去重）', async function () {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-research-v3-'));
+  const file = path.join(dir, 'research.db');
+  const raw = new DatabaseSync(file);
+  raw.exec(`PRAGMA journal_mode = WAL; PRAGMA user_version = 3;`);
+  raw.exec(`CREATE TABLE works(id TEXT PRIMARY KEY, doi TEXT DEFAULT '', title TEXT NOT NULL DEFAULT '',
+    year INTEGER, pubdate TEXT DEFAULT '', type TEXT DEFAULT '', source_id TEXT DEFAULT '', source_name TEXT DEFAULT '',
+    abstract TEXT DEFAULT '', snippet TEXT DEFAULT '', page_url TEXT DEFAULT '', lang TEXT DEFAULT '',
+    cited_by INTEGER DEFAULT 0, is_oa INTEGER DEFAULT 0, oa_url TEXT DEFAULT '',
+    authors_json TEXT DEFAULT '[]', refs_json TEXT DEFAULT '[]', concepts_json TEXT DEFAULT '[]',
+    keywords_json TEXT DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+  // v3 库应有的 FTS 与全文侧表（迁移只在 <3 时重建 FTS）
+  raw.exec(`CREATE VIRTUAL TABLE works_fts USING fts5(work_id UNINDEXED, title, abstract, snippet, fulltext, tokenize='trigram')`);
+  raw.exec(`CREATE TABLE works_fulltext(work_id TEXT PRIMARY KEY, content TEXT NOT NULL DEFAULT '', chars INTEGER NOT NULL DEFAULT 0, fetched_at INTEGER NOT NULL DEFAULT 0)`);
+  raw.prepare(`INSERT INTO works(id, title, created_at, updated_at) VALUES('Wold', 'Zinc Battery Health Estimation', 1, 1)`).run();
+  raw.prepare(`INSERT INTO works_fts(work_id, title, abstract, snippet, fulltext) VALUES('Wold', 'Zinc Battery Health Estimation', '', '', '')`).run();
+  raw.close();
+  const db = createResearchDb({ dir: dir });
+  await db.open(); // v3 → v4：加列 + 索引 + 回填
+  assert.equal(db.findIdByNormalizedTitle('zinc battery health estimation'), 'Wold', '迁移回填后旧行可命中');
+  assert.equal(db.findIdByNormalizedTitle('Zinc  Battery   Health Estimation!!'), 'Wold', '规范化后同键');
+  await db.close();
+});
+
+test('A-followup #5: title_norm 随 upsert / updateWorkText 同步维护', async function () {
+  const { db } = await makeDb();
+  db.upsertWorks([{ id: 'W500', title: 'Zinc Battery Health Estimation', refs: [] }]);
+  assert.equal(db.findIdByNormalizedTitle('zinc battery health estimation'), 'W500');
+  // upsert 改标题：规范化键跟着走，旧键不再命中
+  db.upsertWorks([{ id: 'W500', title: 'Nickel Battery Aging Model', refs: [] }]);
+  assert.equal(db.findIdByNormalizedTitle('Nickel Battery Aging Model'), 'W500');
+  assert.equal(db.findIdByNormalizedTitle('Zinc Battery Health Estimation'), null, '旧标题不再命中');
+  // updateWorkText 改标题同样维护（回填链会走这条路）
+  db.updateWorkText('W500', { title: 'Solid State Electrolyte Review' }, 'crossref');
+  assert.equal(db.findIdByNormalizedTitle('Solid State Electrolyte Review'), 'W500');
+  // 只改摘要不动标题：标题键保持
+  db.updateWorkText('W500', { abstract: 'new abstract' }, 'crossref');
+  assert.equal(db.findIdByNormalizedTitle('Solid State Electrolyte Review'), 'W500');
   await db.close();
 });

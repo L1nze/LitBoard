@@ -232,6 +232,19 @@ test('A13: max_steps termination adds explainer error note', async function () {
   assert.ok(last.content.indexOf('最大步数') !== -1);
 });
 
+test('summarize_paper extends the step budget only for its current turn', async function () {
+  const script = Array.from({ length: 14 }, (_, i) => toolCall('review-' + i, 'summarize_paper', { paperId: 'p1', from: i * 8 + 1 }));
+  script.push({ message: { content: '全文梳理完成' } });
+  const { hooks, calls } = makeHooks(script);
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  run.core.maxSteps = 2;
+  Core.appendUser(run.core, '梳理整篇文献');
+  assert.equal(await runner.runTurn(run), 'done');
+  assert.equal(calls.tools.length, 14);
+  assert.equal(run.core.maxSteps, 2);
+});
+
 test('run_end event carries endReason for the UI', async function () {
   const { hooks, calls } = makeHooks([{ message: { content: 'done' } }]);
   const runner = Loop.createRunner(hooks);
@@ -512,4 +525,94 @@ test('R17: 端点回报 usage.prompt_tokens 回喂 state.lastInputTokens（跨 s
   assert.equal(run.core.lastInputTokens, 54321);
   const restored = Core.deserialize(JSON.parse(JSON.stringify(Core.serialize(run.core))));
   assert.equal(restored.lastInputTokens, 54321);
+});
+
+/* ---------------- A-followup #1：压缩摘要不得抢占重试/编辑重发的目标 ---------------- */
+
+test('A-followup #1: 压缩后重试当前轮，重跑的是真实提问而不是上下文摘要', async function () {
+  const script = [{ message: { content: 'a1' } }, { message: { content: 'a2' } }];
+  const { hooks, calls } = makeHooks(script);
+  // 真实压缩路径（LitAgentContext.applyCompaction）：摘要带 synthetic + kind=compaction
+  hooks.maybeCompact = async function (run) {
+    if (run.core.messages.length < 3) return; // 只在「已有历史 + 当前提问」时压缩
+    const plan = {
+      boundaryIndex: 2, droppedCount: 2, headTokens: 100,
+      headMessages: run.core.messages.slice(0, 2)
+    };
+    Context.applyCompaction(run.core, plan, 'SUMMARY：用户在问电池', { estimate: () => 10 });
+  };
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  Core.appendUser(run.core, 'old question');
+  await runner.runTurn(run);
+  script.push({ message: { content: 'a2-answer' } });
+  Core.appendUser(run.core, 'CURRENT QUESTION');
+  await runner.runTurn(run);
+
+  const currentTurn = run.core.messages[run.core.messages.length - 1].turnId;
+  // 摘要发生在当前轮请求前，但必须使用独立身份；旧实现复用当前 turnId，重试会命中摘要。
+  const summary = run.core.messages.filter((m) => m.kind === 'compaction')[0];
+  assert.ok(summary, '压缩确实发生');
+  assert.equal(summary.synthetic, true);
+  assert.notEqual(summary.turnId, currentTurn, '摘要不占用业务轮次 ID');
+
+  script.push({ message: { content: 'rerun-answer' } });
+  assert.equal(await runner.rerunTurn(run, currentTurn), 'done');
+  const rerunBody = calls.chat[calls.chat.length - 1];
+  // 旧实现会定位到摘要（同 turnId 且更靠前），于是截断点落在摘要处、重跑的问题变成摘要——
+  // 请求体里根本不会出现 CURRENT QUESTION。断言最后一条 user 消息就是真实提问。
+  const lastUser = rerunBody.messages.filter((m) => m.role === 'user').pop();
+  assert.equal(String(lastUser.content), 'CURRENT QUESTION', '重跑的输入是当前提问，不是摘要');
+});
+
+test('A-followup #1: retryLast 跳过合成 user 消息（工具注入截图），定位到真实提问', async function () {
+  const { hooks } = makeHooks([toolCall('c1', 'render_pdf_pages', {}), { message: { content: '看完了' } }, { message: { content: '重跑答案' } }]);
+  hooks.executeTool = async function () {
+    return { text: '{"rendered":1}', images: [{ type: 'image', ref: 'session:s1|a.png', label: '第 3 页' }] };
+  };
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  Core.appendUser(run.core, 'REAL QUESTION');
+  await runner.runTurn(run);
+  const synthetic = run.core.messages.filter((m) => m.role === 'user' && m.synthetic === true);
+  assert.equal(synthetic.length, 1, '截图合成消息确实存在（且是最后一条 user）');
+  assert.equal(run.core.messages[run.core.messages.length - 1].role, 'assistant');
+  assert.equal(await runner.retryLast(run), 'done');
+  const userMsgs = run.core.messages.filter((m) => m.role === 'user');
+  assert.equal(userMsgs.length, 1);
+  assert.equal(userMsgs[0].content, 'REAL QUESTION');
+});
+
+test('修回复核: 重试已压缩旧轮时恢复该轮之前的原始上下文', async function () {
+  const { hooks, calls } = makeHooks([{ message: { content: 'rerun answer' } }]);
+  const builtBodies = [];
+  hooks.buildBody = function (run) {
+    const body = Core.buildRequestBody(run.core, {});
+    builtBodies.push(body);
+    return body;
+  };
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  Core.appendUser(run.core, 'Q1 IMPORTANT CONTEXT');
+  const q1 = run.core.turnId;
+  Core.appendAssistant(run.core, { content: 'A1' });
+  Core.appendUser(run.core, 'Q2 DEPENDS ON Q1');
+  const q2 = run.core.turnId;
+  Core.appendAssistant(run.core, { content: 'A2' });
+  Core.appendUser(run.core, 'Q3');
+  Core.appendAssistant(run.core, { content: 'A3' });
+  Context.applyCompaction(run.core, {
+    boundaryIndex: 4, droppedCount: 4, headTokens: 100,
+    headMessages: run.core.messages.slice(0, 4)
+  }, 'SUMMARY OF Q1 AND Q2', { estimate: () => 10 });
+  assert.equal(run.core.messages.filter((m) => m.turnId === q1)[0].compacted, true);
+  assert.equal(run.core.messages.filter((m) => m.turnId === q2)[0].compacted, true);
+
+  assert.equal(await runner.rerunTurn(run, q2), 'done');
+  assert.equal(calls.chat.length, 1, '重试只发起一次模型请求');
+  const built = builtBodies[0];
+  const sent = built.messages.map((m) => String(m.content || '')).join('\n');
+  assert.match(sent, /Q1 IMPORTANT CONTEXT/, '目标轮之前的原始背景重新进入请求');
+  assert.match(sent, /Q2 DEPENDS ON Q1/, '重试目标仍是原问题');
+  assert.doesNotMatch(sent, /SUMMARY OF Q1 AND Q2/, '覆盖目标轮的旧摘要不重复进入请求');
 });

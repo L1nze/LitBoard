@@ -51,7 +51,7 @@ function register() {
       if (error && error.code !== 'ENOENT') throw error;
     }
     const bytes = new Uint8Array(await fs.readFile(source));
-    const entries = LitDocx.zipRead(bytes);
+    const entries = await LitDocx.zipRead(bytes);
     const docEntry = entries.filter(function (e) { return e.name === 'word/document.xml'; })[0];
     if (!docEntry) throw new Error(ctx.T('docx 缺少 word/document.xml'));
     const fields = value.fields || [];
@@ -65,9 +65,9 @@ function register() {
     });
     const temp = target + '.litboard-tmp-' + process.pid + '-' + Date.now();
     try {
-      await fs.writeFile(temp, Buffer.from(LitDocx.zipStore(out)));
+      await fs.writeFile(temp, Buffer.from(await LitDocx.zipStore(out)));
       const verified = new Uint8Array(await fs.readFile(temp));
-      if (!LitDocx.zipRead(verified).some(function (entry) { return entry.name === 'word/document.xml'; })) {
+      if (!((await LitDocx.zipRead(verified)).some(function (entry) { return entry.name === 'word/document.xml'; }))) {
         throw new Error(ctx.T('转换结果缺少 word/document.xml'));
       }
       await fs.rename(temp, target);

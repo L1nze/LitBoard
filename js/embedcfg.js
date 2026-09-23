@@ -30,6 +30,7 @@
   /** 常用预设：只填 Base URL + 模型名（任何 OpenAI 兼容 /embeddings 端点都可手填） */
   var PRESETS = {
     dashscope: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'text-embedding-v3', batch: 10 },
+    zhipu: { baseUrl: 'https://open.bigmodel.cn/api/paas/v4', model: 'embedding-3', batch: 16 },
     openai: { baseUrl: 'https://api.openai.com/v1', model: 'text-embedding-3-small', batch: 50 },
     ollama: { baseUrl: 'http://localhost:11434/v1', model: 'nomic-embed-text', batch: 16 }
   };

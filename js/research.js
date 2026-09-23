@@ -324,6 +324,31 @@
     return s;
   }
 
+  /** 标题规范化键（身份去重用）：小写 + 非字母数字折叠为空格 + 去首尾空白。
+   *  调研库把它落成 title_norm 列并建索引——旧实现是「按被引数取前 400 篇再逐行比对」，
+   *  低被引的既有条目匹配不到，反复检索会为同一篇论文造出重复身份（A-followup #5）。 */
+  function normalizeTitleKey(title) {
+    return String(title == null ? '' : title)
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .trim();
+  }
+
+  /**
+   * 语义检索可用性判定（A-followup #4）：必须按**当前嵌入模型 + 配方**的覆盖判定。
+   * 「全库向量总数 > 0」会把「换过模型、新模型还没建」误判为可用——cosineSearch 只认同模型
+   * 同配方的向量，进了向量分支也一篇都命不中，用户看到的像是「没有相关文献」。
+   * @param target   embedService.resolveTarget() 的结果（{ok, model}）
+   * @param coverage researchDb.vecCoverage({model, recipe}) 的结果（{total, matched}）
+   * @returns {{ready: boolean, reason: string}} reason ∈ '' | 'unconfigured' | 'stale-model'
+   */
+  function vectorReadiness(target, coverage) {
+    if (!target || target.ok !== true) return { ready: false, reason: 'unconfigured' };
+    var c = coverage || { total: 0, matched: 0 };
+    if (Number(c.matched) > 0) return { ready: true, reason: '' };
+    return { ready: false, reason: Number(c.total) > 0 ? 'stale-model' : 'unconfigured' };
+  }
+
   /* ---------------- 嵌入（二期：调研库向量） ---------------- */
 
   // 嵌入配方版本：配方或模型变更必须 bump——旧版本向量视为缺失、全量重算。
@@ -391,6 +416,8 @@
     truncateForDisk: truncateForDisk,
     renderSessionMarkdown: renderSessionMarkdown,
     sanitizeSessionForDisk: sanitizeSessionForDisk,
+    normalizeTitleKey: normalizeTitleKey,
+    vectorReadiness: vectorReadiness,
     embeddingText: embeddingText,
     contentHash: contentHash,
     embeddingHash: embeddingHash,

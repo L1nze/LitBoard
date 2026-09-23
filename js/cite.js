@@ -1,9 +1,13 @@
-/* LitBoard 引用生成：APA / GB/T 7714 / MLA 引文字符串 + RIS 导出（浏览器 / Node 共用） */
+/* LitBoard 引用：RIS 导出 + splitName + 样式元数据；样式渲染统一走 citeproc（js/cslcite.js） */
 (function (root, factory) {
-  var api = factory();
+  var csl = null;
+  if (typeof module === 'object' && module.exports) {
+    try { csl = require('./cslcite.js'); } catch (e) { /* 浏览器端经 window.LitCsl 取 */ }
+  }
+  var api = factory(csl);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.LitCite = api;
-})(typeof window !== 'undefined' ? window : null, function () {
+})(typeof window !== 'undefined' ? window : null, function (nodeCsl) {
   'use strict';
 
   var CJK = /[぀-ヿ㐀-䶿一-鿿가-힯豈-﫿]/;
@@ -22,95 +26,6 @@
     if (parts.length <= 1) return { raw: raw, family: raw, given: '', isCJK: false };
     var family = parts.pop();
     return { raw: raw, family: family, given: parts.join(' '), isCJK: false };
-  }
-
-  function initials(given, opts) {
-    opts = opts || {};
-    var toks = String(given || '').split(/[\s.-]+/).filter(Boolean);
-    return toks.map(function (t) {
-      return t.charAt(0).toUpperCase() + (opts.dot ? '.' : '');
-    }).join(opts.space ? ' ' : '');
-  }
-
-  function tidy(s) { return String(s).replace(/\s+/g, ' ').replace(/\s+([,.\]])/g, '$1').trim(); }
-
-  function firstIsCJK(authors) {
-    return !!(authors && authors.length && splitName(authors[0]).isCJK);
-  }
-
-  // ---------- APA 7 ----------
-  function apaAuthor(name) {
-    var n = splitName(name);
-    if (n.isCJK || !n.given) return n.raw;
-    return n.family + ', ' + initials(n.given, { dot: true, space: true });
-  }
-  function joinApa(list) {
-    if (!list.length) return '';
-    if (list.length === 1) return list[0];
-    return list.slice(0, -1).join(', ') + ', & ' + list[list.length - 1];
-  }
-  function apa(p) {
-    var s = joinApa((p.authors || []).map(apaAuthor));
-    if (s) s += ' ';
-    s += '(' + (p.year != null ? p.year : 'n.d.') + '). ';
-    if (p.title) s += p.title + (/[.?!]$/.test(p.title) ? ' ' : '. ');
-    if (p.venue) {
-      s += p.venue;
-      if (p.volume) s += ', ' + p.volume;
-      if (p.pages) s += ', ' + p.pages;
-      s += '.';
-    }
-    if (p.doi) s += ' https://doi.org/' + p.doi;
-    return tidy(s);
-  }
-
-  // ---------- GB/T 7714-2015（顺序编码，期刊）----------
-  var GB_TYPE = {
-    article: 'J', inproceedings: 'C', incollection: 'C', proceedings: 'C',
-    book: 'M', inbook: 'M', phdthesis: 'D', mastersthesis: 'D',
-    techreport: 'R', misc: 'EB', online: 'EB'
-  };
-  function gbAuthor(name) {
-    var n = splitName(name);
-    if (n.isCJK || !n.given) return n.raw;
-    return n.family + ' ' + initials(n.given, { dot: false, space: false }).toUpperCase();
-  }
-  function gbt7714(p) {
-    var authors = (p.authors || []).map(gbAuthor);
-    var etal = firstIsCJK(p.authors) ? ', 等' : ', et al';
-    var au = authors.length > 3 ? authors.slice(0, 3).join(', ') + etal : authors.join(', ');
-    var type = GB_TYPE[p.entryType] || 'J';
-    var s = '';
-    if (au) s += au + '. ';
-    s += (p.title || '') + '[' + type + ']. ';
-    if (p.venue) s += p.venue + ', ';
-    s += (p.year != null ? p.year : '');
-    if (p.volume) s += ', ' + p.volume;
-    if (p.pages) s += ': ' + p.pages;
-    s += '.';
-    return tidy(s);
-  }
-
-  // ---------- MLA 9 ----------
-  function mlaAuthor(name) {
-    var n = splitName(name);
-    if (n.isCJK || !n.given) return n.raw;
-    return n.family + ', ' + n.given;
-  }
-  function mla(p) {
-    var a = p.authors || [];
-    var au = '';
-    if (a.length === 1) au = mlaAuthor(a[0]);
-    else if (a.length === 2) au = mlaAuthor(a[0]) + ', and ' + mlaAuthor(a[1]);
-    else if (a.length > 2) au = mlaAuthor(a[0]) + ', et al';
-    var s = '';
-    if (au) s += au + '. ';
-    if (p.title) s += '“' + p.title + '.” ';
-    if (p.venue) s += p.venue + ', ';
-    if (p.volume) s += 'vol. ' + p.volume + ', ';
-    if (p.year != null) s += p.year + ', ';
-    if (p.pages) s += 'pp. ' + p.pages + ', ';
-    return tidy(s).replace(/,$/, '.');
   }
 
   // ---------- RIS（Zotero / EndNote 互通）----------
@@ -149,16 +64,49 @@
     return list.map(risEntry).join('\r\n\r\n') + '\r\n';
   }
 
+  // ---------- 样式渲染（统一走 citeproc：js/cslcite.js + vendor 样式）----------
   var FORMATS = [
-    { key: 'apa', label: 'APA (7th)', fn: apa },
-    { key: 'gbt7714', label: 'GB/T 7714-2015（国标）', fn: gbt7714 },
-    { key: 'mla', label: 'MLA (9th)', fn: mla }
+    { key: 'apa', label: 'APA (7th)', styleId: 'apa' },
+    { key: 'gbt7714', label: 'GB/T 7714-2015（国标）', styleId: 'china-national-standard-gb-t-7714-2015-numeric' },
+    { key: 'mla', label: 'MLA (9th)', styleId: 'modern-language-association' }
   ];
 
+  function cslApi() {
+    return nodeCsl || (typeof window !== 'undefined' ? window.LitCsl : null);
+  }
+
+  /**
+   * 用内置 CSL 样式渲染单条文献 → Promise<纯文本>（locale 恒 zh-CN，引擎唯一语言环境）。
+   * citeproc 输出是 HTML，经 htmlToRuns 拼纯文本：<sup>/<i> 是 run 上的格式标志，
+   * 不会留下字面标签；编号与正文之间的制表位（second-field-align）还原为 \t。
+   */
+  function renderFormat(styleId, paper) {
+    var csl = cslApi();
+    if (!csl) return Promise.reject(new Error('citeproc 不可用'));
+    var rendered;
+    if (typeof window === 'undefined') {
+      var fs = require('node:fs');
+      var path = require('node:path');
+      var base = path.join(__dirname, '..', 'vendor', 'citeproc');
+      var styleXml = fs.readFileSync(path.join(base, 'styles', styleId + '.csl'), 'utf8');
+      var localeXml = fs.readFileSync(path.join(base, 'locales', 'zh-CN.xml'), 'utf8');
+      rendered = csl.renderBibliography([paper], styleXml, localeXml);
+    } else {
+      rendered = csl.renderWithBuiltinStyle([paper], styleId);
+    }
+    return rendered.then(function (htmlList) {
+      return csl.htmlToRuns(htmlList && htmlList[0] || '').map(function (run) {
+        if (run.tab) return '\t';
+        if (run.br) return '\n';
+        return run.text || '';
+      }).join('');
+    });
+  }
+
   return {
-    apa: apa, gbt7714: gbt7714, mla: mla,
     ris: ris, risEntry: risEntry,
     formats: FORMATS,
+    renderFormat: renderFormat,
     _splitName: splitName
   };
 });

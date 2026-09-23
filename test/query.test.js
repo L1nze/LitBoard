@@ -30,6 +30,32 @@ test('bare words search across text fields', function () {
   assert.deepEqual(match('里程碑'), ['p1']); // 命中笔记
 });
 
+test('普通关键词相关度：标题命中优先于摘要顺带命中，并返回可解释片段', function () {
+  const titleHit = LitQuery.rankPlainText({
+    id: 'title', title: 'Robust SOH estimation for lithium-ion batteries', abstract: 'battery study'
+  }, 'soh estimation');
+  const abstractHit = LitQuery.rankPlainText({
+    id: 'abstract', title: 'A general battery management system',
+    abstract: 'The system includes state of health (SOH) estimation and protective operation.'
+  }, 'soh estimation');
+  assert.equal(titleHit.matched, true);
+  assert.equal(titleHit.field, 'title');
+  assert.equal(abstractHit.matched, true);
+  assert.equal(abstractHit.field, 'abstract');
+  assert.ok(titleHit.score > abstractHit.score);
+  assert.match(abstractHit.snippet, /SOH.*estimation/i);
+});
+
+test('普通关键词相关度保持跨字段 AND 语义；缺任一词则不命中', function () {
+  const crossField = LitQuery.rankPlainText({
+    title: 'Battery estimation method', tags: ['SOH'], abstract: ''
+  }, 'soh estimation');
+  const missing = LitQuery.rankPlainText({ title: 'Battery estimation method', abstract: '' }, 'soh estimation');
+  assert.equal(crossField.matched, true);
+  assert.equal(crossField.field, 'tags', '标题只解释一个词时，应展示另一个隐藏字段的命中原因');
+  assert.equal(missing.matched, false);
+});
+
 test('implicit AND and explicit boolean operators', function () {
   assert.deepEqual(match('attention vaswani'), ['p1']);
   assert.deepEqual(match('attention AND lecun'), []);

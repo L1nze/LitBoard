@@ -460,8 +460,52 @@ test('OpenCode 模型清单固定走 Bearer（不随对话协议形态切到 x-a
   assert.deepEqual(result.models, ['qwen3-max']);
 });
 
-/* ---------------- H3：同会话并发请求的停止控制（审计复现场景） ---------------- */
+/* 服务商清单（设置页按 providerId 测试连接 / 拉取模型）：用户没重填 Key 时，
+ * 主进程按 id 取自己存的那把；表单里刚敲的值仍然优先。 */
+test('providerId：测试连接与拉取模型按 id 取该服务商的端点、协议与 Key', async function () {
+  const seen = [];
+  const net = createAgentNet({
+    fetch: async function (url, init) {
+      seen.push({ url: url, headers: init.headers });
+      return { ok: true, status: 200, json: async function () { return { data: [{ id: 'deepseek-v4-pro' }] }; } };
+    },
+    // 当前生效的是另一个服务商（内置）：providerId 必须胜过它，否则「测的是别人」
+    getConfig: async function () {
+      return { agentBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', agentApiKey: 'K-default', agentModel: 'qwen-plus' };
+    },
+    getProvider: async function (id) {
+      if (id !== 'p1') return null;
+      return {
+        id: 'p1', name: 'DS', baseUrl: 'https://api.deepseek.com/anthropic', dialect: 'messages',
+        model: 'deepseek-v4-pro', models: ['deepseek-v4-pro'], apiKey: 'K-provider'
+      };
+    },
+    notify: function () {}
+  });
+  const test_ = await net.testConnection({ providerId: 'p1' });
+  assert.equal(test_.dialect, 'messages');
+  assert.equal(seen[0].url, 'https://api.deepseek.com/anthropic/v1/messages');
+  assert.equal(seen[0].headers['x-api-key'], 'K-provider');
+  const models = await net.listModels({ providerId: 'p1' });
+  assert.deepEqual(models.models, ['deepseek-v4-pro']);
+  assert.equal(seen[1].url, 'https://api.deepseek.com/anthropic/v1/models');
+  // 表单里刚敲的 Base URL 优先于已存值（还没保存就能测）
+  const draft = await net.testConnection({ providerId: 'p1', baseUrl: 'https://opencode.ai/zen/go/v1', model: 'qwen3-max' });
+  assert.equal(draft.dialect, 'messages'); // 已存协议仍然生效（表单没改协议）
+  assert.equal(seen[2].url, 'https://opencode.ai/zen/go/v1/messages');
+  // id 不存在 → 明确报错，而不是悄悄去测当前生效的另一个服务商
+  await assert.rejects(function () { return net.testConnection({ providerId: 'gone' }); }, /服务商不存在/);
+  // 没配 Key 的服务商：报「Key 未配置」，不是拿别的服务商的 Key 顶上
+  const noKey = createAgentNet({
+    fetch: async function () { throw new Error('不该出网'); },
+    getConfig: async function () { return { agentBaseUrl: 'https://api.test', agentApiKey: 'K', agentModel: 'm' }; },
+    getProvider: async function () { return { id: 'p2', baseUrl: 'https://api.moonshot.cn/v1', dialect: '', model: 'kimi-k2.7-code', apiKey: '' }; },
+    notify: function () {}
+  });
+  await assert.rejects(function () { return noKey.testConnection({ providerId: 'p2' }); }, /API Key 未配置/);
+});
 
+/* ---------------- H3：同会话并发请求的停止控制（审计复现场景） ---------------- */
 test('H3: 同会话两个并发请求，先结束者不得删掉后者的控制器（cancel 仍有效）', async function () {
   let seq = 0;
   const gates = [];

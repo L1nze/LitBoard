@@ -217,7 +217,10 @@
       content: header + text,
       synthetic: true,
       kind: 'compaction',
-      turnId: state.turnId || '',
+      // 摘要不承担业务轮次入口（A-followup #1）：带 state.turnId 会让「同 turnId 的第一条
+      // user」变成这条摘要——rerunTurn 于是截断整条保留尾并拿摘要当问题重跑。独立身份
+      // （空 turnId）后，重试/编辑定位只会命中真实提问。
+      turnId: '',
       ts: new Date().toISOString()
     };
     messages.splice(boundary, 0, msg);
@@ -261,6 +264,41 @@
     return Math.max(EMERGENCY_BUDGET_MIN, Math.floor((prev > 0 ? prev : 256000) / 2));
   }
 
+  /* 划词上下文（阅读器选区 → agent 轮次冻结）：选中文字进系统提示前的唯一整形点。
+   * 整页拖选可能上万字符，全量进提示词会挤爆预算——折叠空白、封顶并如实标记截断。 */
+  var SELECTION_TEXT_MAX = 1500;
+
+  /** 阅读器选区 → 冻结进轮次的 selection 对象；无有效选区返回 null。
+   *  PDF：{ kind:'pdf', paperId, attachmentId, page, pageTo, text }（页码已是 1 基物理页）；
+   *  EPUB：{ kind:'epub', paperId, attachmentId, cfi, chapter, progress, text }——流式排版没有
+   *  固定页码（字号/窗口一变分页就变），位置身份 = CFI + 章节名 + 进度百分比。 */
+  function normalizeSelectionContext(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var text = String(raw.text == null ? '' : raw.text).replace(/\s+/g, ' ').trim();
+    if (!text) return null;
+    var truncated = text.length > SELECTION_TEXT_MAX;
+    if (truncated) text = text.slice(0, SELECTION_TEXT_MAX);
+    var out = {
+      paperId: raw.paperId || '',
+      attachmentId: raw.attachmentId || '',
+      text: text,
+      truncated: truncated
+    };
+    if (raw.kind === 'epub') {
+      out.kind = 'epub';
+      out.cfi = String(raw.cfi || '').slice(0, 2000);
+      out.chapter = String(raw.chapter || '').slice(0, 120);
+      out.progress = typeof raw.progress === 'number' && isFinite(raw.progress)
+        ? Math.max(0, Math.min(100, Math.round(raw.progress))) : null;
+    } else {
+      out.kind = 'pdf';
+      var page = Math.max(1, Number(raw.page) || 1);
+      out.page = page;
+      out.pageTo = Math.max(page, Number(raw.pageTo) || page);
+    }
+    return out;
+  }
+
   return {
     THRESHOLD_RATIO: THRESHOLD_RATIO,
     SUMMARY_MAX_CHARS: SUMMARY_MAX_CHARS,
@@ -275,6 +313,8 @@
     maskToolMessage: maskToolMessage,
     maskOldToolResults: maskOldToolResults,
     isContextOverflowError: isContextOverflowError,
-    emergencyBudget: emergencyBudget
+    emergencyBudget: emergencyBudget,
+    SELECTION_TEXT_MAX: SELECTION_TEXT_MAX,
+    normalizeSelectionContext: normalizeSelectionContext
   };
 });

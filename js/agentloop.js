@@ -131,6 +131,7 @@
 
     async function runTurnInner(run) {
       register(run);
+      var normalMaxSteps = run.core.maxSteps;
       run.streaming = true;
       run.cancelRequested = false;
       run.phase = 'waiting';
@@ -224,6 +225,8 @@
           for (var i = 0; i < pending.length; i++) {
             if (run.cancelRequested) { cancelledMidway = true; break; }
             var call = pending[i];
+            // 整篇梳理需要多次续读；仅本轮放宽步数，收尾恢复原上限。
+            if (call.name === 'summarize_paper') run.core.maxSteps = Math.max(run.core.maxSteps, 48);
             try {
               var out = await executeTool(call.name, call.args, run);
               if (out && typeof out === 'object' && !Array.isArray(out) && (out.text != null || Array.isArray(out.images))) {
@@ -267,6 +270,7 @@
           retry: true
         });
       } finally {
+        run.core.maxSteps = normalMaxSteps;
         run.streaming = false;
         run.doc.streaming = false;
         run.core.endReason = run.endReason;
@@ -290,10 +294,14 @@
      * 编辑定位错误最坏也只是「历史藏起来了」，不会再造成不可逆丢失。 */
     function rerunTurn(run, turnId, newText) {
       if (run.streaming) return Promise.resolve('busy');
+      if (!turnId) return Promise.resolve('not_found');
       var messages = run.core.messages;
       var idx = -1;
+      // A-followup #1：只认「真实用户消息」——上下文摘要与工具注入的截图都是 synthetic
+      // user 消息，若被当成轮次入口，重跑的内容就不是用户的问题
       for (var i = 0; i < messages.length; i++) {
-        if (messages[i].role === 'user' && messages[i].turnId === turnId) { idx = i; break; }
+        var candidate = messages[i];
+        if (candidate.role === 'user' && candidate.synthetic !== true && candidate.turnId === turnId) { idx = i; break; }
       }
       if (idx < 0) return Promise.resolve('not_found');
       var original = messages[idx];
@@ -301,6 +309,15 @@
         ? String(newText)
         : { text: String(original.content || ''), images: original.images };
       stashEditHistory(run, turnId, messages.slice(idx));
+      // 修回复核：若目标轮已经被压缩，截断会同时移除位于它后面的摘要，而目标之前的
+      // 原始消息仍带 compacted 标记，最终请求只剩当前问题。恢复目标之前的原始历史，
+      // 并继续屏蔽旧摘要，避免「原文 + 摘要」重复进入模型上下文。
+      if (original.compacted === true) {
+        for (var r = 0; r < idx; r++) {
+          if (messages[r] && messages[r].kind === 'compaction') messages[r].compacted = true;
+          else if (messages[r]) delete messages[r].compacted;
+        }
+      }
       messages.length = idx; // 截掉该轮与其后所有内容（含历史错误卡）
       Core.appendUser(run.core, input);
       // R03：重试/编辑沿用原轮冻结上下文（模型/思考档/文献/选区）——重启后重试 PDF
@@ -355,8 +372,9 @@
     function retryLast(run) {
       var messages = run.core.messages;
       var turnId = '';
+      // 同样只看真实用户消息：轮末注入的截图/摘要是合成 user 消息
       for (var i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role === 'user') { turnId = messages[i].turnId; break; }
+        if (messages[i].role === 'user' && messages[i].synthetic !== true) { turnId = messages[i].turnId; break; }
       }
       return turnId ? rerunTurn(run, turnId) : Promise.resolve('not_found');
     }

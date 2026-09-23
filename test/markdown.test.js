@@ -11,9 +11,9 @@ test('existing syntax still renders (regression)', function () {
   assert.match(html, /<strong>加粗<\/strong>/);
   assert.match(html, /<em>斜体<\/em>/);
   assert.match(html, /<a href="https:\/\/example\.com" target="_blank"/);
-  assert.match(html, /<ul><li>甲<\/li><li>乙<\/li><\/ul>/);
-  assert.match(html, /<blockquote>引用<\/blockquote>/);
-  assert.match(html, /<pre><code>code block<\/code><\/pre>/);
+  assert.match(html, /<ul>\s*<li>甲<\/li>\s*<li>乙<\/li>\s*<\/ul>/);
+  assert.match(html, /<blockquote>\s*<p>引用<\/p>\s*<\/blockquote>/);
+  assert.match(html, /<pre><code>code block\s*<\/code><\/pre>/);
 });
 
 test('images render for http, file and note-assets paths', function () {
@@ -53,7 +53,23 @@ test('lbex markers are hidden and quote gets a locate anchor', function () {
 
 test('consecutive plain quotes merge into one blockquote', function () {
   const html = LitMarkdown.render('> 甲\n> 乙\n\n后段');
-  assert.match(html, /<blockquote>甲<br>乙<\/blockquote>/);
+  // markdown-it 原生形态：引用行是同一 blockquote 内同一段落的软换行
+  assert.match(html, /<blockquote>\s*<p>甲\s*乙<\/p>\s*<\/blockquote>/);
+});
+
+test('GFM tables render as structured, aligned tables', function () {
+  const html = LitMarkdown.render('| 用途 | 文献 | 分数 |\n| :--- | :---: | ---: |\n| 系统入门 | **Energy Storage** | 9 |');
+  assert.match(html, /<div class="lb-table-wrap"><table class="lb-markdown-table">/);
+  assert.match(html, /<th style="text-align:left">用途<\/th>/);
+  assert.match(html, /<th style="text-align:center">文献<\/th>/);
+  assert.match(html, /<td style="text-align:right">9<\/td>/);
+  assert.match(html, /<strong>Energy Storage<\/strong>/);
+});
+
+test('ordinary pipe-delimited prose is not mistaken for a table', function () {
+  const html = LitMarkdown.render('用途 | 文献\n不是表格分隔行');
+  assert.match(html, /<p>用途 \| 文献\s*不是表格分隔行<\/p>/);
+  assert.doesNotMatch(html, /<table/);
 });
 
 /* ---------------- 数学公式（LaTeX 源码形态） ----------------
@@ -79,9 +95,10 @@ test('公式：LaTeX 源码原样保住，不被斜体/加粗规则改坏', func
   assert.match(risky, /<span class="lb-math">a &lt; b<\/span>/);
 });
 
-test('公式：$$ 走块级样式；金额、行内代码、跨行都不误伤', function () {
+test('公式：$$ 走独立块级元素；金额、行内代码、跨行都不误伤', function () {
   const block = LitMarkdown.render('前\n\n$$\\begin{bmatrix} 1 & 2 \\end{bmatrix}$$\n\n后');
-  assert.match(block, /<span class="lb-math lb-math-block">/);
+  assert.match(block, /<div class="lb-math lb-math-block">/);
+  assert.doesNotMatch(block, /<p><div/, '块公式不嵌入段落，避免 MathJax 类型化后产生异常留白');
 
   // 金额不是公式：闭括号后接数字（$5-$10）、开括号前是词字符（US$5）都不算
   const price = LitMarkdown.render('价格 $5-$10，以及 US$5 and US$10 两种写法');
@@ -96,11 +113,32 @@ test('公式：$$ 走块级样式；金额、行内代码、跨行都不误伤',
   const cjk = LitMarkdown.render('由$E=mc^2$可得');
   assert.match(cjk, /<span class="lb-math">E=mc\^2<\/span>/);
 
-  // 段落内的换行会先合并成一行再解析：$$ 块跨行照样识别（期望行为，别当回归删掉）
+  // 块公式可跨行，且保留换行给 MathJax 的 aligned / matrix 等环境。
   const multiline = LitMarkdown.render('$$\n\\begin{aligned} a \\\\ b \\end{aligned}\n$$');
   assert.match(multiline, /lb-math-block/);
 
-  // 但空行会切断段落 → 公式被断开（系统提示据此要求公式内不留空行）
-  const broken = LitMarkdown.render('$$a\n\nb$$');
+  // 只有起止标记成对才按块公式消费，未闭合文本保持原样。
+  const broken = LitMarkdown.render('$$\na\n\nb');
   assert.doesNotMatch(broken, /lb-math/);
+});
+
+test('CommonMark 边界：嵌套列表与段落内多行', function () {
+  const nested = LitMarkdown.render('- 甲\n  - 子项\n- 乙');
+  assert.match(nested, /<ul>\s*<li>甲\s*<ul>\s*<li>子项<\/li>\s*<\/ul>\s*<\/li>\s*<li>乙<\/li>\s*<\/ul>/);
+  const para = LitMarkdown.render('第一行\n第二行');
+  assert.match(para, /<p>第一行\s*第二行<\/p>/);
+});
+
+test('公式：行内 $$、\\[ \\] 块与强调混排不吃字', function () {
+  // 行内 $$…$$ 在段落内排版为 display span
+  const inlineDd = LitMarkdown.render('见 $$a+b$$ 式');
+  assert.match(inlineDd, /<span class="lb-math lb-math-block">a\+b<\/span>/);
+  // \[ … \] 独立块
+  const bracket = LitMarkdown.render('\\[\nE=mc^2\n\\]');
+  assert.match(bracket, /<div class="lb-math lb-math-block">E=mc\^2<\/div>/);
+  // 公式与强调混排：公式内容不被强调规则吃掉
+  const mixed = LitMarkdown.render('公式 $x_1 + y_2$ 与 **加粗** 混排');
+  assert.match(mixed, /<span class="lb-math">x_1 \+ y_2<\/span>/);
+  assert.match(mixed, /<strong>加粗<\/strong>/);
+  assert.doesNotMatch(mixed, /<em>/);
 });

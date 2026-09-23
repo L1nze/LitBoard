@@ -1,13 +1,14 @@
 # 贡献指南 · Contributing to LitBoard
 
-> **English TL;DR** — LitBoard is a local-first literature manager for Windows (Electron 39 + framework-free
+> **English TL;DR** — LitBoard is a local-first literature manager for Windows (Electron 44 + framework-free
 > frontend). Run `npm test` before every PR; the suite is pure Node and needs no `npm install`. Do not add
-> `node_modules` dependencies — vendor single-file libraries into `vendor/`. See [`AGENTS.md`](AGENTS.md) for
-> the architecture invariants. The UI is currently Chinese-only. Full guide below is in Chinese.
+> `node_modules` dependencies — vendor single-file libraries into `vendor/`. The architecture
+> invariants are summarized under 「代码约定」 and 「新增功能前请先确认硬性约束」 below. The UI is
+> currently Chinese-only. Full guide below is in Chinese.
 
 ---
 
-本项目的工程约定集中在 [`AGENTS.md`](AGENTS.md)，**动手前请先读它**——那里写着几条"改了就会出事"的红线。
+几条「改了就会出事」的红线集中在下面「代码约定」与「新增功能前请先确认硬性约束」两节，**动手前请先读**。
 
 ## 环境要求
 

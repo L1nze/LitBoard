@@ -619,6 +619,33 @@
     }).catch(function () { return null; });
   }
 
+  // ============ 数据源 6：OpenAlex 期刊库（ISSN → 刊名）============
+  /**
+   * 按 ISSN 反查期刊名。中文期刊的文章多不在 OpenAlex 作品库里（DOI 多注册在
+   * ISTIC 而非 Crossref），但期刊本身的 source 记录大多有——PDF 导入时联网
+   * 补全全落空，就用文章编号里解析出的 ISSN 兜底填 venue。
+   */
+  function venueByIssn(issn) {
+    var clean = String(issn || '').replace(/[^0-9Xx]/g, '').toUpperCase();
+    if (!/^\d{7}[\dX]$/.test(clean)) return Promise.resolve('');
+    var url = API + '/sources?filter=issn:' + clean.slice(0, 4) + '-' + clean.slice(4) + '&per-page=5';
+    return fetchJson(url).then(function (data) {
+      var results = (data && data.results) || [];
+      for (var i = 0; i < results.length; i++) {
+        var source = results[i] || {};
+        var alternatives = Array.isArray(source.alternate_titles) ? source.alternate_titles : [];
+        var name = '';
+        for (var j = 0; j < alternatives.length; j++) {
+          var alternative = sanitizeVenue(alternatives[j]);
+          if (/[一-鿿]/.test(alternative)) { name = alternative; break; }
+        }
+        if (!name) name = sanitizeVenue(source.display_name);
+        if (name) return name;
+      }
+      return '';
+    }).catch(function () { return ''; });
+  }
+
   window.LitEnrich = {
     enrichPaper: enrichPaper,
     enrichBatch: enrichBatch,
@@ -627,6 +654,7 @@
     byTitle: byTitle,
     byPmid: byPmid,
     byIsbn: byIsbn,
+    venueByIssn: venueByIssn,
     guessSampleSize: guessSampleSize,
     findPdfUrls: findPdfUrls
   };

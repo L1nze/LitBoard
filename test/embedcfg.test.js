@@ -7,9 +7,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const C = require('../js/embedcfg.js');
 
-test('预设：DashScope / OpenAI / 本地 ollama，都自带 Base URL + 模型名 + 单批条数', function () {
+test('预设：DashScope / 智谱 / OpenAI / 本地 ollama，都自带 Base URL + 模型名 + 单批条数', function () {
   assert.equal(C.PRESETS.dashscope.baseUrl, 'https://dashscope.aliyuncs.com/compatible-mode/v1');
   assert.equal(C.PRESETS.dashscope.model, 'text-embedding-v3');
+  assert.equal(C.PRESETS.zhipu.baseUrl, 'https://open.bigmodel.cn/api/paas/v4');
+  assert.equal(C.PRESETS.zhipu.model, 'embedding-3');
   assert.equal(C.PRESETS.openai.model, 'text-embedding-3-small');
   assert.equal(C.PRESETS.ollama.baseUrl, 'http://localhost:11434/v1');
   Object.keys(C.PRESETS).forEach(function (id) {

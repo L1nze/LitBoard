@@ -127,3 +127,17 @@ test('enrichment ignores arXiv venue from Semantic Scholar', async function () {
   assert.equal(patch.source, 'Semantic Scholar');
   assert.equal(patch.venue, undefined);
 });
+
+test('ISSN venue lookup prefers a Chinese alternate title over OpenAlex English display name', async function () {
+  const responses = {};
+  responses['https://api.openalex.org/sources?filter=issn:1002-087X&per-page=5'] = {
+    results: [{
+      display_name: 'Chinese Journal of Power Sources',
+      alternate_titles: ['电源技术', 'Dianyuan jishu']
+    }]
+  };
+  const loaded = loadEnrichModule(responses);
+  const venue = await loaded.enrich.venueByIssn('1002-087X');
+
+  assert.equal(venue, '电源技术');
+});

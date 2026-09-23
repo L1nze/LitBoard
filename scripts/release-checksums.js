@@ -14,38 +14,56 @@ const root = path.resolve(__dirname, '..');
 const distDir = path.join(root, 'dist');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 
-if (!fs.existsSync(distDir)) {
-  console.error('release-checksums: dist/ 不存在，请先运行 npm run dist');
-  process.exit(1);
+function releaseFiles(dir, version) {
+  const expected = [
+    `LitBoard-Setup-${version}-x64.exe`,
+    `LitBoard-Portable-${version}-x64.exe`
+  ];
+  const missing = expected.filter(function (name) {
+    return !fs.existsSync(path.join(dir, name));
+  });
+  if (missing.length) {
+    throw new Error('缺少当前版本安装包：' + missing.join('、'));
+  }
+  // 扩展包也带版本号；历史版本 exe/zip/blockmap 一律排除。
+  const extension = `LitBoard-Extension-${version}.zip`;
+  if (fs.existsSync(path.join(dir, extension))) expected.push(extension);
+  return expected;
 }
 
-const files = fs.readdirSync(distDir).filter(function (name) {
-  return /\.(exe|zip|blockmap)$/i.test(name);
-}).sort();
+function main() {
+  if (!fs.existsSync(distDir)) {
+    throw new Error('dist/ 不存在，请先运行 npm run dist');
+  }
+  const files = releaseFiles(distDir, pkg.version);
+  const lines = [
+    '# LitBoard ' + pkg.version + ' — SHA-256 校验和',
+    '# 生成时间: ' + new Date().toISOString(),
+    '# 构建环境: Windows x64 · Electron ' + pkg.devDependencies.electron +
+      ' · electron-builder ' + pkg.devDependencies['electron-builder'],
+    '# 核对方式（PowerShell）: Get-FileHash <文件> -Algorithm SHA256',
+    '# 核对方式（Linux/macOS）: sha256sum -c SHA256SUMS.txt',
+    ''
+  ];
 
-if (!files.length) {
-  console.error('release-checksums: dist/ 下没有可校验的发布文件');
-  process.exit(1);
+  for (const name of files) {
+    const full = path.join(distDir, name);
+    const hash = crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex');
+    const sizeMB = (fs.statSync(full).size / 1024 / 1024).toFixed(1);
+    lines.push(hash + '  ' + name + '  (' + sizeMB + ' MB)');
+  }
+
+  const outFile = path.join(distDir, 'SHA256SUMS.txt');
+  fs.writeFileSync(outFile, lines.join('\n') + '\n', 'utf8');
+  console.log('release-checksums: 写入 ' + outFile);
+  console.log(lines.slice(7).join('\n'));
 }
 
-const lines = [
-  '# LitBoard ' + pkg.version + ' — SHA-256 校验和',
-  '# 生成时间: ' + new Date().toISOString(),
-  '# 构建环境: Windows x64 · Electron ' + pkg.devDependencies.electron +
-    ' · electron-builder ' + pkg.devDependencies['electron-builder'],
-  '# 核对方式（PowerShell）: Get-FileHash <文件> -Algorithm SHA256',
-  '# 核对方式（Linux/macOS）: sha256sum -c SHA256SUMS.txt',
-  ''
-];
-
-for (const name of files) {
-  const full = path.join(distDir, name);
-  const hash = crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex');
-  const sizeMB = (fs.statSync(full).size / 1024 / 1024).toFixed(1);
-  lines.push(hash + '  ' + name + '  (' + sizeMB + ' MB)');
+if (require.main === module) {
+  try { main(); } catch (error) {
+    console.error('release-checksums: ' + error.message);
+    process.exitCode = 1;
+  }
 }
 
-const outFile = path.join(distDir, 'SHA256SUMS.txt');
-fs.writeFileSync(outFile, lines.join('\n') + '\n', 'utf8');
-console.log('release-checksums: 写入 ' + outFile);
-console.log(lines.slice(7).join('\n'));
+module.exports = { releaseFiles };

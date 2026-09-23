@@ -45,6 +45,20 @@ if (Test-Path -LiteralPath $versionsFile) {
 & npm.cmd install --prefix $toolsDir --no-save "electron@$electronVersion" "electron-builder@$builderVersion"
 if ($LASTEXITCODE -ne 0) { throw 'Failed to install external LitBoard build tools' }
 
+# npm 11 的 install-script allowlist 可能跳过 Electron 的 postinstall，表现为包文件已装好但
+# node_modules/electron/dist 不存在。只在缺失时显式执行 Electron 自带的受信安装脚本，
+# 再由下方的 electron.exe 存在性检查确认下载确实完成。
+if (-not (Test-Path -LiteralPath $electronExe)) {
+  $electronInstall = Join-Path $toolsDir 'node_modules\electron\install.js'
+  if (-not (Test-Path -LiteralPath $electronInstall)) { throw 'Electron install.js is missing after npm install' }
+  Write-Host "LitBoard: Electron binary was not installed by npm; running the pinned Electron install script"
+  & node $electronInstall
+  if ($LASTEXITCODE -ne 0) { throw 'Failed to download the pinned Electron binary' }
+}
+if (-not ((Test-Path -LiteralPath $electronExe) -and (Test-Path -LiteralPath $builderCli))) {
+  throw 'External LitBoard build tools are incomplete after installation'
+}
+
 # 安装成功后才落版本记录：半安装/中断不会留下与 package.json 恰好一致的假记录。
 # 用 .NET API 写 UTF-8 **无 BOM**（PS 5.1 的 -Encoding utf8 会带 BOM，影响跨工具读取）。
 $versionsPayload = @{ electron = $electronVersion; electronBuilder = $builderVersion; installedAt = (Get-Date).ToUniversalTime().ToString('o') } | ConvertTo-Json

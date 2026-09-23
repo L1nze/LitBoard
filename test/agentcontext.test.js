@@ -90,6 +90,9 @@ test('applyCompaction：头部打标记、摘要消息落在边界、消息总�
   assert.equal(summaryMsg.synthetic, true);
   assert.ok(summaryMsg.content.indexOf('摘要正文') !== -1);
   assert.ok(summaryMsg.content.indexOf('[上下文摘要') === 0);
+  // A-followup #1：摘要不承担业务轮次入口——空 turnId，否则「同 turnId 的第一条 user」
+  // 会命中摘要，重试/编辑重发会拿摘要当问题重跑
+  assert.equal(summaryMsg.turnId, '', '摘要不得占用当前业务轮次的 turnId');
   // 边界前的消息全部打上 compacted
   for (let i = 0; i < plan.boundaryIndex; i++) assert.equal(state.messages[i].compacted, true);
   // 空摘要拒绝应用
@@ -184,4 +187,50 @@ test('emergencyBudget：减半且有下限', () => {
   assert.equal(Ctx.emergencyBudget(10000), 5000 + 3000); // max(8000, 5000)
   assert.equal(Ctx.emergencyBudget(10000), 8000);
   assert.equal(Ctx.emergencyBudget(0), 128000);
+});
+
+test('normalizeSelectionContext：无效输入返回 null，空白折叠', () => {
+  assert.equal(Ctx.normalizeSelectionContext(null), null);
+  assert.equal(Ctx.normalizeSelectionContext({}), null);
+  assert.equal(Ctx.normalizeSelectionContext({ text: '   ' }), null);
+  const sel = Ctx.normalizeSelectionContext({
+    paperId: 'p1', attachmentId: 'a1', page: 3, pageTo: 4,
+    text: '  第一段\n第二行\t 有空格  '
+  });
+  assert.equal(sel.text, '第一段 第二行 有空格');
+  assert.equal(sel.page, 3);
+  assert.equal(sel.pageTo, 4);
+  assert.equal(sel.truncated, false);
+});
+
+test('normalizeSelectionContext：超长截断并如实标记，页码钳制', () => {
+  const long = Ctx.normalizeSelectionContext({ page: 5, text: 'x'.repeat(Ctx.SELECTION_TEXT_MAX + 100) });
+  assert.equal(long.text.length, Ctx.SELECTION_TEXT_MAX);
+  assert.equal(long.truncated, true);
+  // 页码缺省/倒挂都钳成合法区间（pageTo ≥ page ≥ 1）
+  const clamped = Ctx.normalizeSelectionContext({ text: '句', page: 0, pageTo: -2 });
+  assert.equal(clamped.page, 1);
+  assert.equal(clamped.pageTo, 1);
+  const single = Ctx.normalizeSelectionContext({ text: '句', page: 7 });
+  assert.equal(single.pageTo, 7);
+});
+
+test('normalizeSelectionContext：EPUB 形态（cfi/章节/进度），无页码', () => {
+  const sel = Ctx.normalizeSelectionContext({
+    kind: 'epub', paperId: 'p1', attachmentId: 'a2',
+    cfi: 'epubcfi(/6/4!/4/2,/1:0,/1:20)', chapter: '第三章 讨论',
+    progress: 42.7, text: '  某句\n被选中  '
+  });
+  assert.equal(sel.kind, 'epub');
+  assert.equal(sel.cfi, 'epubcfi(/6/4!/4/2,/1:0,/1:20)');
+  assert.equal(sel.chapter, '第三章 讨论');
+  assert.equal(sel.progress, 43); // 四舍五入到整数百分比
+  assert.equal(sel.text, '某句 被选中');
+  assert.equal(sel.truncated, false);
+  assert.equal(sel.page, undefined); // EPUB 没有页码字段
+  // 进度越界钳到 [0,100]；缺章节/进度也能成形态（无 TOC 的书）
+  assert.equal(Ctx.normalizeSelectionContext({ kind: 'epub', text: '句', progress: 140 }).progress, 100);
+  const bare = Ctx.normalizeSelectionContext({ kind: 'epub', text: '句', cfi: 'epubcfi(/6/2)' });
+  assert.equal(bare.chapter, '');
+  assert.equal(bare.progress, null);
 });

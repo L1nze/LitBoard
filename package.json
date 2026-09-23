@@ -1,6 +1,6 @@
 {
   "name": "litboard",
-  "version": "1.2.14",
+  "version": "1.2.19",
   "description": "本地优先的个人文献阅读仪表盘",
   "main": "electron/main.js",
   "author": "LitBoard",
@@ -27,14 +27,14 @@
     "release-checksums": "node scripts/release-checksums.js"
   },
   "devDependencies": {
-    "electron": "39.2.7",
-    "electron-builder": "26.0.12",
+    "electron": "44.4.3",
+    "electron-builder": "26.15.3",
     "eslint": "^10.10.0"
   },
   "build": {
     "appId": "com.litboard.desktop",
     "productName": "LitBoard",
-    "electronVersion": "39.2.7",
+    "electronVersion": "44.4.3",
     "asar": true,
     "npmRebuild": false,
     "directories": {
@@ -46,7 +46,6 @@
       "js/**/*",
       "vendor/**/*",
       "electron/**/*",
-      "extension/**/*",
       "word/**/*",
       "build/icon.ico",
       "build/icon-*.png",
@@ -55,6 +54,12 @@
       "LICENSE"
     ],
     "asarUnpack": ["word/**/*"],
+    "extraResources": [
+      {
+        "from": "extension",
+        "to": "extension"
+      }
+    ],
     "win": {
       "icon": "build/icon.ico",
       "signAndEditExecutable": true,

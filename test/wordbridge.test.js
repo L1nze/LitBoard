@@ -82,3 +82,12 @@ test('APPLY/BIB 收尾兜底：光标若在引文域结果内则挪到域外', (
   assert.match(fn[0], /caret >= rs && caret <= re/);
   assert.match(fn[0], /placeCursorAfterField\(f, app\)/);
 });
+
+test('挤在正文引文后的旧参考文献域必须按可见前置文本识别，而非按域代码长度放行', () => {
+  // 真实故障形态：正文 [1-3] 后立刻跟着参考文献域的 [1]。域代码本身很长，
+  // 不能用其长度当阈值，否则短短的 [1-3] 永远检测不到，刷新也无法自动修复。
+  const fn = /function bibFieldIsJammed[\s\S]*?\n\}/.exec(SRC);
+  assert.ok(fn, 'bibFieldIsJammed 必须存在');
+  assert.match(fn[0], /replace\(\/\[\\x13\\x14\\x15\\r\]/, '仅 Word 域控制字符可忽略');
+  assert.doesNotMatch(fn[0], /codeLen/, '域代码长度不属于可见前置文本');
+});

@@ -158,17 +158,23 @@
       schema('get_paper', '按 paperId 取正式库一篇文献的详细信息（标题/作者/摘要/标签，含附件清单与各自的 id/类型/文件名）。读取 PDF 前先看这里确认可读附件；attachmentId 来自本工具或 fulltext_search 结果。paperId 来自 search_library / fulltext_search 的结果。', {
         paperId: { type: 'string', description: '正式库文献 ID' }
       }, ['paperId']),
-      schema('fulltext_search', '在正式库已建全文索引的 PDF / 网页快照正文里检索，返回命中的文献与片段（含 attachmentId——继续读取时带上它可保持在同一份附件）。适合「哪篇论文的正文里提到过…」。', {
+      schema('fulltext_search', '在正式库已建全文索引的 PDF / EPUB / 网页快照正文里检索，返回命中的文献与片段（含 attachmentId——继续读取时带上它可保持在同一份附件；EPUB 命中的 page 是章节序号）。适合「哪篇论文的正文里提到过…」。', {
         query: qProp, limit: limitProp
       }, ['query']),
       // AI 阅读助手（期一）：按页读正文与批注——解释选段/整篇问答的上下文来源
-      schema('read_pdf_pages', '按页码区间读取一篇文献 PDF 的逐页正文文本（来自已建的全文索引，无需重新解析）。attachmentId 省略时自动读主 PDF（第一个 PDF 附件）。适合：解释某页内容、理解上下文、回答「这篇第 N 部分讲了什么」。页码 1 起；一次最多 8 页，但单次结果有总字符预算——超预算带 truncated:true 与 nextFrom/nextFromChar（nextFromChar 是页内偏移：单页文字很长被截断时，用同一页码 + fromChar 续读该页余下部分，不必重读整页）。', {
+      schema('read_pdf_pages', '按页码区间读取一篇文献 PDF 的逐页正文文本（来自已建的全文索引，无需重新解析）。attachmentId 省略时自动读主 PDF（第一个 PDF 附件；没有 PDF 附件时读 EPUB 附件）。EPUB 附件的页 = spine 章节序号（第 1 章是第 1 页），同样支持区间与续读。适合：解释某页内容、理解上下文、回答「这篇第 N 部分讲了什么」。页码 1 起；一次最多 8 页，但单次结果有总字符预算——超预算带 truncated:true 与 nextFrom/nextFromChar（nextFromChar 是页内偏移：单页文字很长被截断时，用同一页码 + fromChar 续读该页余下部分，不必重读整页）。返回「没有找到该附件的全文索引」说明尚未建索引，可在 设置 → 数据与备份 → 全文索引 构建。', {
         paperId: { type: 'string', description: '正式库文献 ID（来自 get_paper / fulltext_search / 当前文献上下文）' },
         from: { type: 'integer', description: '起始页码（含），1 起' },
         to: { type: 'integer', description: '结束页码（含），与 from 相差不超过 7' },
         attachmentId: { type: 'string', description: '可选：附件 ID（读补充材料等非主 PDF 时必填；get_paper 返回附件清单）' },
         fromChar: { type: 'integer', description: '可选：起始页的页内字符偏移（上次返回的 nextFromChar）；首次不传' }
       }, ['paperId', 'from', 'to']),
+      schema('summarize_paper', '梳理一篇文献的完整研究逻辑链时使用（例如“梳理整篇”“完整解读这篇论文”）。工具分批读取正文并返回续读位置；必须持续调用到 complete=true，不能仅凭摘要或部分页面声称已读全文。首次调用只传 paperId，可选 attachmentId；之后按返回的 nextFrom/nextFromChar 续读。', {
+        paperId: { type: 'string', description: '文献库 ID；用户说“这篇”时使用当前文献上下文中的 paperId' },
+        attachmentId: { type: 'string', description: '可选：要梳理的 PDF / EPUB 附件 ID；省略时选主 PDF，若没有则选 EPUB' },
+        from: { type: 'integer', description: '续读页码；首次不传，之后使用上次返回的 nextFrom' },
+        fromChar: { type: 'integer', description: '续读页内字符偏移；首次不传，之后使用上次返回的 nextFromChar（若有）' }
+      }, ['paperId']),
       schema('list_pdf_annotations', '列出用户在某一篇文献 PDF 上做过的批注（高亮/下划线/笔记），含页码、划选文本、批注 id 与所属 attachmentId（主 PDF/补充材料/EPUB 不混淆）。超过 50 条时带 total 与 nextOffset，用 offset 续取。适合「我标过什么」「结合我的批注讲讲这篇」。', {
         paperId: { type: 'string', description: '正式库文献 ID' },
         offset: { type: 'integer', description: '可选：续取偏移（上次返回的 nextOffset）；首次不传' }
@@ -240,10 +246,10 @@
     }
     // 三期：引文网络（只读构建 + 快照存会话附件；不动正式库，无需确认门）
     if (deps.buildGraph) {
-      tools.push(schema('build_graph', '基于调研库构建引文网络：以给定文献为种子，按引用关系扩邻居（缺的会自动补库）后计算并展示，同时把离线 HTML 快照存进当前会话附件。用户要求「看引文网络/引用关系图」时使用。', {
-        workIds: { type: 'array', items: { type: 'string' }, description: '种子调研库文献 ID 列表' },
-        depth: { type: 'integer', description: '扩边深度 1-3（默认 2）' },
-        maxNodes: { type: 'integer', description: '节点上限 10-500（默认 200）' }
+      tools.push(schema('build_graph', '基于调研库构建引文网络：以给定文献为种子按引用关系扩邻居（缺的会自动补库），只在集合内部成边后计算并展示（左侧论文列表 + 中间画布 + 右侧详情），同时把离线 HTML 快照存进当前会话附件。用户要求「看引文网络/引用关系图」时使用。种子多而杂时按重要性（被引/PageRank/集合内被引/奠基年份）择优保留。', {
+        workIds: { type: 'array', items: { type: 'string' }, description: '种子调研库文献 ID 列表（建议先用 search_research/semantic_search 选出一批相关文献再建图）' },
+        depth: { type: 'integer', description: '扩边深度 0-3（默认 2；0 = 只用给定文献本身，不扩邻居）' },
+        maxNodes: { type: 'integer', description: '节点上限 10-80（默认 60，超过按重要性截取）' }
       }, ['workIds']));
     }
     // R18：库内引文邻接（对照 literature-mcp graph_neighbors）——不扩边不补库，
@@ -306,6 +312,7 @@
         });
         return JSON.stringify({
           source: '调研库', query: String(a.query || ''), total: r.total,
+          totalNote: r.totalIsLowerBound ? '取满一页，total 为下限（至少这么多条）' : undefined,
           works: (r.works || []).slice(0, clampLimit(a)).map(workSummary)
         });
       }
@@ -529,7 +536,54 @@
             snippets: (hit.snippets || []).slice(0, 2)
           };
         });
-        return JSON.stringify({ source: '全文索引（PDF / 网页快照）', query: String(a.query || ''), count: mapped.length, hits: mapped });
+        return JSON.stringify({ source: '全文索引（PDF / EPUB / 网页快照）', query: String(a.query || ''), count: mapped.length, hits: mapped });
+      }
+      if (name === 'summarize_paper') {
+        var summaryPaperId = String(a.paperId || '');
+        if (!summaryPaperId) return '缺少 paperId，无法梳理文献';
+        var summaryFrom = Math.max(1, Math.floor(Number(a.from) || 1));
+        var summaryFromChar = Math.max(0, Math.floor(Number(a.fromChar) || 0));
+        var summaryBatch = await execute('read_pdf_pages', {
+          paperId: summaryPaperId, attachmentId: String(a.attachmentId || ''),
+          from: summaryFrom, to: summaryFrom + 7, fromChar: summaryFromChar
+        }, context);
+        var summaryData;
+        try { summaryData = JSON.parse(summaryBatch); } catch (error) { return summaryBatch; }
+        if (!summaryData || !Array.isArray(summaryData.pages)) return summaryBatch;
+        if (!summaryData.pages.length) return JSON.stringify({ error: '该附件没有可读取的正文页面', paperId: summaryPaperId, attachmentId: summaryData.attachmentId });
+        summaryData.pages.forEach(function (pg) {
+          if (pg.truncatedInCall) pg.text = String(pg.text || '').replace(/…\[本页在此截断\]$/, '');
+        });
+        summaryData.complete = summaryData.nextFrom == null && summaryData.pages.length > 0;
+        if (summaryFrom === 1 && summaryFromChar === 0) {
+          summaryData.taskPrompt = '梳理这篇文献从问题到结论的证据链。完整读取可用正文，遇到截断按 nextFrom/nextFromChar 续读，直到 complete=true。依次说明：研究背景与缺口、核心问题或假设、方法与数据、各项实验或分析、关键结果、结果如何支撑结论、作者承认的局限。把作者声称的内容与实际证据对应起来，关键结果标注 PDF 物理页码（EPUB 标注章节序号）。最后给出简短章节地图和三条最值得记住的结论。无法读取的页面、图表或附件单独列出，不当作已核实内容；未读完不得宣称已梳理全文。';
+        }
+        // 单条工具结果不得被 core 的 12000 字符护栏从 JSON 中间截断；必要时
+        // 缩短本批最后一页并回退游标，下次仍从该页的未读位置继续。
+        var summaryText = JSON.stringify(summaryData);
+        while (summaryText.length > 11000 && summaryData.pages.length) {
+          var lastPage = summaryData.pages[summaryData.pages.length - 1];
+          var lastText = String(lastPage.text || '');
+          var removeChars = Math.min(lastText.length, Math.max(200, summaryText.length - 11000));
+          lastPage.text = lastText.slice(0, lastText.length - removeChars);
+          summaryData.nextFrom = lastPage.page;
+          summaryData.nextFromChar = (lastPage.charOffset || 0) + lastPage.text.length;
+          summaryData.truncated = true;
+          summaryData.complete = false;
+          if (!lastPage.text) summaryData.pages.pop();
+          summaryText = JSON.stringify(summaryData);
+        }
+        if (!summaryData.pages.length) return JSON.stringify({ error: '单页正文无法在工具输出限制内完整返回', paperId: summaryPaperId, attachmentId: summaryData.attachmentId });
+        summaryData.to = summaryData.pages[summaryData.pages.length - 1].page;
+        summaryData.coverageNote = '本次实际读取 ' + summaryData.from + '–' + summaryData.to + ' 页，共 ' + summaryData.totalPages + ' 页' +
+          (summaryData.nextFrom == null ? '；已读到文末' : '；尚未读完，请按 nextCall 续读');
+        if (!summaryData.complete) {
+          summaryData.nextCall = {
+            paperId: summaryPaperId, attachmentId: summaryData.attachmentId,
+            from: summaryData.nextFrom, fromChar: summaryData.nextFromChar || 0
+          };
+        }
+        return JSON.stringify(summaryData);
       }
       if (name === 'read_pdf_pages') {
         if (!desktop.pdfSearchGetPageRange) return '此版本不支持按页读取 PDF 正文';
@@ -540,13 +594,20 @@
         var resolvedNote = '';
         if (!attId) {
           // R10：省略 attachmentId 时解析主 PDF（第一个 PDF 附件）——索引按真实附件 ID
-          // 存储，拿空 ID 去查只会命中旧版单 PDF 时代的空 ID 行
+          // 存储，拿空 ID 去查只会命中旧版单 PDF 时代的空 ID 行；
+          // 无 PDF 附件时回退 EPUB 附件（页 = spine 章节序号）
           var paperForAtt = deps.getPaperById ? deps.getPaperById(String(a.paperId || '')) : null;
-          var primary = (paperForAtt && Array.isArray(paperForAtt.attachments) ? paperForAtt.attachments : [])
-            .filter(function (att) { return att && att.kind === 'pdf'; })[0];
+          var atts = (paperForAtt && Array.isArray(paperForAtt.attachments) ? paperForAtt.attachments : []);
+          var primary = atts.filter(function (att) { return att && att.kind === 'pdf'; })[0];
           if (primary) {
             attId = primary.id;
             resolvedNote = 'attachmentId 省略，已自动选用主 PDF（' + (primary.fileName || attId) + '）';
+          } else {
+            var epubAtt = atts.filter(function (att) { return att && att.kind === 'epub' && att.path; })[0];
+            if (epubAtt) {
+              attId = epubAtt.id;
+              resolvedNote = 'attachmentId 省略且无 PDF 附件，已自动选用 EPUB（' + (epubAtt.fileName || attId) + '；页 = 章节序号）';
+            }
           }
         }
         var range = await desktop.pdfSearchGetPageRange({
@@ -554,9 +615,17 @@
           attachmentId: attId,
           from: from,
           to: to,
+          capChars: READ_PAGE_BUDGET,
           fromChar: fromChar
         });
-        if (!range) return '该文献还没有全文索引（可在 设置 → 数据与备份 → PDF 全文索引 构建），或 paperId/attachmentId 无效';
+        if (!range) {
+          // A-followup #2：索引按附件身份独立存储——指定附件没有索引时**不会**退回主 PDF 的
+          // 旧索引，所以这里必须如实报出问的是哪份附件，不能让它以为读到的就是所要的内容
+          return '没有找到该附件的全文索引（paperId=' + String(a.paperId || '') +
+            '，attachmentId=' + (attId || '(空)') +
+            '）。索引按附件分别存储，请求的附件未建索引时不会退回该文献其它附件的正文；' +
+            '可在 设置 → 数据与备份 → PDF 全文索引 构建，或核对 paperId/attachmentId。';
+        }
         // R12：按总预算裁页——放不下的页不进本次结果，nextFrom 告知从哪续读；
         // R4：页内截断不再「从本页重新开始」——本页返回 charOffset/charTotal，
         // 续读用同一页码 + fromChar=charOffset+本次取到的长度，逐段读完整页
@@ -568,16 +637,28 @@
         for (var pi = 0; pi < range.pages.length; pi++) {
           var pg = range.pages[pi] || {};
           var pgText = String(pg.text || '');
+          var charOffset = pg.charOffset || 0;
+          var charTotal = pg.charTotal != null ? pg.charTotal : pgText.length;
+          // 数据库层单页 capChars 截断会附加标记；标记不属于正文，页内余量必须续读。
+          if (/…\[截断\]$/.test(pgText) && charOffset + pgText.length - '…[截断]'.length < charTotal) {
+            pgText = pgText.replace(/…\[截断\]$/, '');
+          }
           if (pgText.length <= budget) {
-            outPages.push({ page: pg.page, charOffset: pg.charOffset || 0, charTotal: pg.charTotal != null ? pg.charTotal : pgText.length, text: pgText });
+            outPages.push({ page: pg.page, charOffset: charOffset, charTotal: charTotal, text: pgText });
             budget -= pgText.length;
+            if (charOffset + pgText.length < charTotal) {
+              nextFrom = pg.page;
+              nextFromChar = charOffset + pgText.length;
+              pageTruncated = true;
+              break;
+            }
           } else {
             if (budget > 800) {
-              outPages.push({ page: pg.page, charOffset: pg.charOffset || 0, charTotal: pg.charTotal != null ? pg.charTotal : pgText.length, text: pgText.slice(0, budget) + '…[本页在此截断]', truncatedInCall: true });
+              outPages.push({ page: pg.page, charOffset: charOffset, charTotal: charTotal, text: pgText.slice(0, budget) + '…[本页在此截断]', truncatedInCall: true });
               pageTruncated = true;
-              nextFromChar = (pg.charOffset || 0) + budget;
+              nextFromChar = charOffset + budget;
             } else {
-              nextFromChar = pg.charOffset || 0;
+              nextFromChar = charOffset;
             }
             nextFrom = pg.page;
             break;
@@ -594,7 +675,7 @@
             (nextFrom != null
               ? '；未读完，用 from=' + nextFrom + (nextFromChar ? ' + fromChar=' + nextFromChar : '') + ' 续读'
               : '；已到文末或请求区间末尾'),
-          note: '页码为 PDF 物理页；每页超长会截断并给 charOffset/charTotal，用同页码 + fromChar 续读该页余下文字。公式与图表在纯文本抽取中可能失真，精确理解时请向用户说明该局限。'
+          note: '页码为 PDF 物理页（EPUB 附件页码 = spine 章节序号）；每页超长会截断并给 charOffset/charTotal，用同页码 + fromChar 续读该页余下文字。公式与图表在纯文本抽取中可能失真，精确理解时请向用户说明该局限。'
         };
         if (resolvedNote) out.resolvedAttachment = resolvedNote;
         out.pages = outPages;
@@ -621,14 +702,26 @@
         if (!rvAtt || !rvAtt.path) return '该文献没有本地 PDF 附件（无法渲染页面）';
         var rvRefs = [];
         var rvFailures = [];
-        for (var ri = 0; ri < rvPages.length; ri++) {
-          var rvPage = rvPages[ri];
+        // 批量渲染：文档只开一次（逐页调用会为每页重读整份 PDF 并重新解析，大文件上界面直接卡住）
+        var rvRendered = deps.renderPagesImage
+          ? await deps.renderPagesImage({ path: rvAtt.path, pages: rvPages, scale: 1.6 })
+          : await Promise.all(rvPages.map(function (page) {
+            return deps.renderPageImage({ path: rvAtt.path, pageIndex: page, scale: 1.6 })
+              .then(function (png) { return { page: page, dataUrl: png && png.dataUrl }; },
+                function (error) { return { page: page, error: String(error && error.message || error) }; });
+          }));
+        (Array.isArray(rvRendered) ? rvRendered : []).forEach(function (item) {
+          if (item && item.error) rvFailures.push({ page: item.page, error: item.error });
+        });
+        for (var ri = 0; ri < (rvRendered || []).length; ri++) {
+          var rvItem = rvRendered[ri];
+          if (!rvItem || !rvItem.dataUrl) continue;
+          var rvPage = rvItem.page;
           try {
-            var png = await deps.renderPageImage({ path: rvAtt.path, pageIndex: rvPage, scale: 1.6 });
             var saved = await desktop.sessionSaveAttachment(context.sessionId, {
               name: 'page-' + rvPage + '-' + Date.now() + '.png',
               label: String(rvPaper.title || rvPaper.id).slice(0, 40) + ' 第 ' + rvPage + ' 页',
-              dataBase64: png.dataUrl.slice(png.dataUrl.indexOf(',') + 1)
+              dataBase64: rvItem.dataUrl.slice(rvItem.dataUrl.indexOf(',') + 1)
             });
             rvRefs.push({ type: 'image', ref: 'session:' + context.sessionId + '|' + saved.file, label: '第 ' + rvPage + ' 页' });
           } catch (error) {
@@ -696,11 +789,11 @@
         });
       }
       if (name === 'build_graph') {
-        var gIds = (Array.isArray(a.workIds) ? a.workIds : []).map(String).filter(Boolean).slice(0, 50);
+        var gIds = (Array.isArray(a.workIds) ? a.workIds : []).map(String).filter(Boolean).slice(0, 500);
         if (!gIds.length) return 'workIds 为空';
         var g = await desktop.researchGraph({
           workIds: gIds,
-          depth: Number(a.depth) || null,
+          depth: a.depth == null ? null : Number(a.depth),
           maxNodes: Number(a.maxNodes) || null
         });
         var gFile = '';
@@ -711,9 +804,16 @@
           } catch (error) { /* 快照失败不阻断展示 */ }
         }
         if (deps.openGraphPanel) deps.openGraphPanel(g);
+        // truncated/hidden/missing 如实回报：模型不能说「这就是全部引用网络」
         return JSON.stringify({
           built: true, nodes: g.meta.nodeCount, edges: g.meta.edgeCount,
           depth: g.meta.depth, maxNodes: g.meta.maxNodes,
+          communities: g.meta.communityCount,
+          truncated: !!g.meta.truncated, hidden: g.meta.hiddenCount || 0,
+          missing: g.meta.missing || [],
+          note: '节点 = 给定文献集合（含扩边），边只在集合内部生成（A→B 表示 A 引用 B）；' +
+            '超出节点上限时按重要性（被引 50% + PageRank 25% + 集合内被引 15% + 年份 10%）截取，' +
+            'truncated/hidden 即被隐藏的篇数',
           snapshot: gFile || '（快照保存失败，图已在面板展示）'
         });
       }
@@ -727,11 +827,14 @@
         return JSON.stringify({
           source: '网页（TinyFish · research_paper，已入调研库）', query: String(a.query || ''),
           total: ws.total, matched: ws.matched, created: ws.created,
+          // A-followup #3：collected = 已收藏到**正式库**（正式库反查），inResearch = 调研库
+          // 已有。两者是两件事：调研库命中不等于用户收藏过
+          keyNote: 'collected=已收藏到用户正式文献库；inResearch=调研库已有该条（不等于已收藏）',
           works: (ws.works || []).map(function (w) {
             return {
               workId: w.workId, title: w.title, year: w.year, site: w.siteName,
               url: w.url, snippet: w.snippet, citations: w.citations,
-              collected: !w.isNew
+              collected: !!w.inLibrary, inResearch: !!w.inResearch
             };
           })
         });
@@ -781,7 +884,9 @@
           works: (scp.works || []).slice(0, clampLimit(a)).map(function (w) {
             return {
               workId: w.id, title: w.title, year: w.year, doi: w.doi,
-              source: w.sourceName, citedByScopus: w.citedBy, alreadyInLibrary: w.existed
+              source: w.sourceName, citedByScopus: w.citedBy,
+              // A-followup #3：alreadyInLibrary 只认真式库反查结果；调研库命中的是 inResearch
+              alreadyInLibrary: !!w.inLibrary, inResearch: !!w.existed
             };
           })
         });
@@ -790,7 +895,11 @@
         var ids = (Array.isArray(a.workIds) ? a.workIds : []).map(String).filter(Boolean).slice(0, 50);
         if (!ids.length) return 'workIds 为空';
         if (!deps.collectWorks) return '当前环境不支持收藏';
-        var cr = await deps.collectWorks(ids, String(a.folderId || '') || null);
+        // A-followup #6：同一取消纪律——取文献与确认框都是异步边界，提交前复核
+        var collectStopped = function () { return !!(context.cancelRequested && context.cancelRequested()); };
+        if (collectStopped()) return '该轮已停止，未收藏';
+        var cr = await deps.collectWorks(ids, String(a.folderId || '') || null, { isCancelled: collectStopped });
+        if (cr && cr.stopped) return '该轮已停止，未收藏';
         if (cr && cr.canceled) return '用户取消了收藏';
         return JSON.stringify({ collected: true, added: cr && cr.added || 0, merged: cr && cr.merged || 0 });
       }
@@ -812,12 +921,19 @@
         if (!files.length) return 'files 为空';
         if (!context.sessionId) return '缺少会话上下文';
         if (!deps.importStagedPdfs) return '当前环境不支持收入 PDF';
+        // A-followup #6：确认门只保护「进入工具之前」——暂存（下载/复制到受管目录）是长
+        // 异步操作，用户完全可能在此期间点停止。异步边界前后各核一次取消状态。
+        var stopped = function () { return !!(context.cancelRequested && context.cancelRequested()); };
+        if (stopped()) return '该轮已停止，未收入 PDF';
         var staged = await desktop.researchStagePdfs({ sessionId: context.sessionId, files: files });
+        if (stopped()) return '该轮已停止，未收入 PDF（已暂存的文件未进正式库）';
         var ok = (staged.results || []).filter(function (r) { return r.path; });
         if (!ok.length) {
           return JSON.stringify({ staged: 0, errors: (staged.results || []).map(function (r) { return r.error; }).filter(Boolean) });
         }
-        var ir = await deps.importStagedPdfs(ok, String(a.folderId || '') || null);
+        // 确认框也是异步边界：isCancelled 交给渲染层在「确认通过后、实际提交前」再核一次
+        var ir = await deps.importStagedPdfs(ok, String(a.folderId || '') || null, { isCancelled: stopped });
+        if (ir && ir.stopped) return '该轮已停止，未收入 PDF';
         if (ir && ir.canceled) return '用户取消了收入';
         return JSON.stringify({ staged: ok.length, added: ir && ir.added || 0, merged: ir && ir.merged || 0 });
       }

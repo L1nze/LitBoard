@@ -1,0 +1,6 @@
+onnxruntime-web 1.24.3 — MIT License.
+Copyright (c) Microsoft Corporation.
+Upstream: https://github.com/microsoft/onnxruntime (LICENSE at repo root).
+The npm package (onnxruntime-web) distributes dist artifacts without a bundled
+LICENSE file; this notice records the upstream license for the vendored copies
+under vendor/paddleocr/ort/.

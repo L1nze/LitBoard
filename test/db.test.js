@@ -334,14 +334,14 @@ test('hard-deleting a paper purges its full-text index rows', async function (t)
   await db.saveState({ papers: [{ id: 'p1', title: 'Gone' }] });
   await db.pdfTextPut({ paperId: 'p1', fingerprint: 'fp1', method: 'pdfjs', pages: ['orphan full text ABC'] });
   assert.equal(db.pdfTextStats().entries, 1);
-  assert.equal(db.pdfTextQuery('orphan full text').length, 1);
+  assert.equal((await db.pdfTextQuery('orphan full text')).length, 1);
 
   // 整库替换 = 硬删除（payload 里没有的条目被真正移除）
   await db.replaceState({ papers: [] });
 
   assert.equal((await db.loadState()).papers.length, 0);
   assert.equal(db.pdfTextStats().entries, 0, 'pdf_text 不应留下孤儿行');
-  assert.equal(db.pdfTextQuery('orphan full text').length, 0, '已删除的文献不应还能被搜到');
+  assert.equal((await db.pdfTextQuery('orphan full text')).length, 0, '已删除的文献不应还能被搜到');
 });
 
 /* ---------- DB v4：迁移前备份 + notes 表 + 批注附件关联 ---------- */
@@ -628,8 +628,53 @@ test('pdfTextGet tolerates legacy uncompressed TEXT rows at runtime', async func
   d.close();
   const entry = await db.pdfTextGet('pOld', '');
   assert.deepEqual(entry.pages, ['legacy plain text']);
-  // 未压缩行也可被 <3 字符的 LIKE 回退路径检索（≥3 字符走 FTS，需 pdf_fts 有索引行）
-  assert.equal(db.pdfTextQuery('la').length, 1);
+  // 未压缩行也可被 <3 字符的全表回退路径检索（≥3 字符走 FTS，需 pdf_fts 有索引行）
+  assert.equal((await db.pdfTextQuery('la')).length, 1);
+});
+
+test('性能回归：短词回退的全表扫描分批让出事件循环，主进程不会长时间「未响应」', async function (t) {
+  const db = await tempDb(t);
+  // ~12MB 正文（每篇 200KB），全部不含查询词：旧实现一次性 gunzipSync 全表会把窗口冻住
+  const chunk = 'lorem ipsum dolor sit amet '.repeat(8000);   // ≈200KB
+  for (let i = 0; i < 60; i++) {
+    await db.pdfTextPut({ paperId: 'p' + i, fingerprint: 'fp' + i, method: 'pdfjs', pages: [chunk, chunk] });
+  }
+  await db.pdfTextPut({ paperId: 'hit', fingerprint: 'fphit', method: 'pdfjs', pages: ['量子纠缠与超声成像'] });
+  let maxGap = 0;
+  let last = Date.now();
+  const heartbeat = setInterval(function () {
+    const now = Date.now();
+    if (now - last > maxGap) maxGap = now - last;
+    last = now;
+  }, 10);
+  let hits = null;
+  try {
+    hits = await db.pdfTextQuery('量子');
+  } finally {
+    clearInterval(heartbeat);
+  }
+  assert.equal(hits.length, 1, '短词命中要能查出来（trigram 覆盖不到的 2 字词走这条路）');
+  assert.equal(hits[0].snippets.length, 1);
+  assert.ok(hits[0].snippets[0].text.indexOf('⟪量子⟫') !== -1, '命中处要用标记括出：' + hits[0].snippets[0].text);
+  // 事件循环心跳连续：任何一次同步块都不该超过这个量级（旧实现一次性解压全表，实测 0.6–1.3s 卡死）
+  assert.ok(maxGap < 300, '最长同步块 ' + maxGap + 'ms（分批让出后应远小于整表解压）');
+});
+
+test('性能回归：FTS 路径不再整批取 snippet，片段只对前若干篇现算', async function (t) {
+  const db = await tempDb(t);
+  for (let i = 0; i < 40; i++) {
+    await db.pdfTextPut({
+      paperId: 'q' + i, fingerprint: 'f' + i, method: 'pdfjs',
+      pages: ['transformers and attention mechanisms ' + i, 'unrelated page']
+    });
+  }
+  const hits = await db.pdfTextQuery('transformers');
+  assert.equal(hits.length, 40);
+  // 每篇都命中页码；片段只为排在前面的若干篇生成（界面不展示片段，agent 每篇最多用 2 条）
+  assert.ok(hits.every(function (hit) { return hit.pages.length === 1 && hit.count === 1; }));
+  const withSnippets = hits.filter(function (hit) { return hit.snippets.length; });
+  assert.ok(withSnippets.length > 0 && withSnippets.length <= 24, '片段篇数 = ' + withSnippets.length);
+  assert.ok(withSnippets[0].snippets[0].text.indexOf('⟪transformers⟫') !== -1, withSnippets[0].snippets[0].text);
 });
 
 test('F04 回归：补全只写投影字段时 saveState 返回的签名对不上渲染层，重规范化后对齐', async function (t) {
@@ -700,8 +745,28 @@ test('pdfTextGetRange returns a bounded page slice for the reading assistant', a
   assert.ok(r4.pages[0].text.indexOf('截断') !== -1);
   // 不存在的文献
   assert.equal(await db.pdfTextGetRange('nope', '', 1, 1), null);
-  // 多附件：attachmentId 精确命中 + 回退主行
+  // 多附件：attachmentId 精确命中（A-followup #2：指定附件查不到时不得回退其它附件）
   await db.pdfTextPut({ paperId: 'pa', attachmentId: 'a1', fingerprint: 'f1', pages: ['att one', 'att two'] });
   const r5 = await db.pdfTextGetRange('pa', 'a1', 2, 2);
   assert.equal(r5.pages[0].text, 'att two');
+});
+
+test('A-followup #2: 显式附件查询不越界回退到该文献其它附件的索引', async function (t) {
+  const db = await tempDb(t);
+  // 旧版单 PDF 时代的行写在 attachment_id='' 上
+  await db.pdfTextPut({ paperId: 'p1', attachmentId: '', fingerprint: 'legacy', pages: ['MAIN PDF PAGE 1'] });
+  await db.pdfTextPut({ paperId: 'p1', attachmentId: 'supp-1', fingerprint: 'supp', pages: ['SUPP PAGE 1'] });
+  // 指定附件有索引：严格命中
+  assert.equal((await db.pdfTextGet('p1', 'supp-1')).pages[0], 'SUPP PAGE 1');
+  // 指定附件没有索引：null（旧实现返回主 PDF 旧行，调用方以为读到了所请求的附件）
+  assert.equal(await db.pdfTextGet('p1', 'supp-2'), null);
+  assert.equal(await db.pdfTextGetRange('p1', 'supp-2', 1, 1), null);
+  // 空 attachmentId（调用方明确问「该文献的旧版主行」）：照常命中
+  assert.equal((await db.pdfTextGet('p1', '')).pages[0], 'MAIN PDF PAGE 1');
+  // 兼容回退只在调用方显式选择时生效，且读回的行如实带空 attachmentId
+  const legacy = await db.pdfTextGet('p1', 'supp-2', { legacyFallback: true });
+  assert.equal(legacy.attachmentId, '');
+  assert.equal(legacy.pages[0], 'MAIN PDF PAGE 1');
+  const legacyRange = await db.pdfTextGetRange('p1', 'supp-2', 1, 1, 3500, 0, { legacyFallback: true });
+  assert.equal(legacyRange.pages[0].text, 'MAIN PDF PAGE 1');
 });

@@ -5,13 +5,17 @@
  *   编辑重发、重新生成、复制、停止、IME 安全输入、自动吸底（A07/A08/A15）；
  * - 编排/协议 = js/agentcore（状态机）+ js/agentloop（可取消循环，A01-A06/A13）；
  * - 本模块是桥：把 core.messages 转换为 assistant-ui 的 ThreadMessageLike 快照（节流推送）、
- *   处理会话生命周期（历史/重命名/删除/恢复）、手动检索降级模式、上下文冻结（A11）。
+ *   处理会话生命周期（历史/重命名/删除/恢复）、未配置引导、上下文冻结（A11）。
  * - 运行上下文按轮冻结：发送时快照 model/thinking/文献/阅读位置（PDF 页码 / EPUB 进度）/文件夹
  *   → doc.turnMeta[turnId]，生成中途改动界面不影响本轮；chips 显示冻结值。
  */
 window.LitAgentUi = (function () {
   'use strict';
-  var T = function (s) { return (typeof window !== 'undefined' && window.LitI18n && window.LitI18n.t) ? window.LitI18n.t(s) : s; };
+  // A-followup #7：params 必须透传——丢掉第二个参数会让 T('第 {n} 页', {n:7}) 显示成字面
+  // 「第 {n} 页」，阅读位置 chip 上无法核对页码/进度
+  var T = function (s, params) {
+    return (typeof window !== 'undefined' && window.LitI18n && window.LitI18n.t) ? window.LitI18n.t(s, params) : s;
+  };
 
   var desk = null;
   var deps = null;
@@ -20,16 +24,15 @@ window.LitAgentUi = (function () {
   var sessionsIndex = [];
   var runs = new Map();      // sessionId → run（活跃会话，含流式状态）
   var current = null;
-  var activePane = 'detail';   // 当前右栏面板：detail | ai | manual
-  var agentReady = false;    // 启用 + 配置齐 → 对话模式；否则手动检索模式
+  var activePane = 'detail';   // 当前右栏面板：detail | ai | anno
+  var agentReady = false;    // 端点 + Key 配置齐 → 对话模式；否则显示配置引导
   var thinking = '';         // ''=默认 | off | low | medium | high | max
   var lastConfig = null;
-  var chipState = { paper: true, folder: true };
+  var chipState = { paper: true, folder: true, selection: true };
   var openSeq = 0;           // A09：会话打开请求序号，慢返回不覆盖新选择
   var bumpTimer = null;
   var subscriber = null;
   var persistWarned = {};    // sessionId → 已提示过保存失败
-  var manualBusy = false;
   var historySelectMode = false;   // 历史会话多选删除
   var historySelected = {};        // sessionId → true
   var semanticReady = false;       // 二期：语义检索（向量）可用
@@ -39,6 +42,7 @@ window.LitAgentUi = (function () {
   var autoCompactEnabled = true;   // R17：上下文压缩（设置 → AI 助手；关闭则只走裁剪+旧工具结果掩码）
   var MASK_KEEP_LAST = 30;         // R17：掩码保留的最近消息条数（压缩关闭时的零成本降级）
   var compactBusy = false;         // H3：手动压缩进行中——与正常发送互斥（控制器按会话唯一，并发会互相顶掉）
+  var recentGraphAvailable = false;
 
   function $(id) { return document.getElementById(id); }
   function el(tag, cls, text) {
@@ -122,6 +126,7 @@ window.LitAgentUi = (function () {
       }
     });
     bindEvents();
+    bindModelPicker();
     desk.onAgentEvent(function (payload) {
       if (runner && payload && payload.sessionId) {
         runner.handleStreamEvent(payload.sessionId, payload);
@@ -148,7 +153,12 @@ window.LitAgentUi = (function () {
       getPapersInFolder: deps.getPapersInFolder || function () { return []; },
       collectWorks: deps.collectWorks,
       importStagedPdfs: deps.importStagedPdfs,
-      openGraphPanel: deps.openGraphPanel,
+      openGraphPanel: function (data, title) {
+        if (!deps.openGraphPanel) return;
+        deps.openGraphPanel(data, title);
+        recentGraphAvailable = true;
+        renderAttachments(current ? runs.get(current) : null);
+      },
       saveGraphHtmlToSession: deps.saveGraphHtmlToSession,
       buildGraph: !!deps.openGraphPanel && !!deps.saveGraphHtmlToSession,
       includeWrite: true,
@@ -158,6 +168,7 @@ window.LitAgentUi = (function () {
       includeSemanticscholar: !!semanticscholarReady,
       includeVisionRender: !!(cap && cap.vision && deps.renderPageImage),
       renderPageImage: deps.renderPageImage,
+      renderPagesImage: deps.renderPagesImage,   // 多页一次开文档（缺省时工具回退到逐页渲染）
       extractPdfText: deps.extractPdfTextByPath, // R19：临时全文链的抽取端（app.js 注入）
       attachSnapshot: deps.attachSnapshot
     });
@@ -170,18 +181,18 @@ window.LitAgentUi = (function () {
     var from = run && run.doc && run.doc.title ? T('来自会话「') + run.doc.title + T('」。') : '';
     if (name === 'collect_papers') {
       var folder = deps.getCurrentFolder ? deps.getCurrentFolder() : '';
-      return T('收藏 {n} 篇文献到正式库（重复项自动合并）').replace('{n}', String((a.workIds || []).length)) +
+      return T('收藏 {n} 篇文献到文献库（重复项自动合并）').replace('{n}', String((a.workIds || []).length)) +
         (folder ? T('目标文件夹：「') + folder + T('」。') : '') + from;
     }
     if (name === 'download_pdfs') {
       return T('下载 {n} 篇开放获取 PDF 到当前会话附件目录').replace('{n}', String((a.workIds || []).length)) + from;
     }
     if (name === 'add_pdfs_to_folder') {
-      return T('将 {n} 个会话附件 PDF 复制进受管目录并收入文献库').replace('{n}', String((a.files || []).length)) + from;
+      return T('将 {n} 个会话附件 PDF 复制到应用数据目录并收入文献库').replace('{n}', String((a.files || []).length)) + from;
     }
     if (name === 'fetch_page' && a.paperId) {
       var paper = deps.getPaperById ? deps.getPaperById(String(a.paperId)) : null;
-      return T('抓取网页并写入正式库：') + String(a.url || '') + '\n' +
+      return T('联网获取网页并收入文献库：') + String(a.url || '') + '\n' +
         T('将挂为文献「') + (paper && paper.title || String(a.paperId)) + T('」的网页快照附件，并建立全文索引。') + from;
     }
     return name;
@@ -195,7 +206,7 @@ window.LitAgentUi = (function () {
     return gate.then(function (ok) {
       if (!ok) return T('用户取消了操作');
       // R08：确认通过后再核取消状态——用户可能在确认框挂着时点了「停止」或删了会话，
-      // 晚到的确认不得执行操作；工具内部（正式库提交前）还会经 ctx.cancelRequested 再核一次
+      // 晚到的确认不得执行操作；工具内部（文献库提交前）还会经 ctx.cancelRequested 再核一次
       if (run && run.cancelRequested) return T('该轮已停止，操作未执行');
       return tools.execute(name, args, {
         sessionId: run && run.id,
@@ -204,7 +215,7 @@ window.LitAgentUi = (function () {
     });
   }
 
-  /** 配置齐备即对话模式；否则手动模式（「可以不用，不能没有」） */
+  /** 配置齐备即对话模式；否则显示配置引导。 */
   function refreshConfig() {
     var checks = [];
     if (desk.getIntegrationConfig) checks.push(desk.getIntegrationConfig().catch(function () { return null; }));
@@ -223,7 +234,7 @@ window.LitAgentUi = (function () {
       autoCompactEnabled = values[3] !== false;
       // 端点 + Key 齐备即就绪（原「启用 AI 对话助手」开关已移除：配了就是要用）
       agentReady = !!config.agentBaseUrl && config.hasAgentApiKey === true;
-      // 语义检索是 AI 助手的工具（正式库的 semantic: 搜索链与它的开关已移除）：向量模型
+      // 语义检索是 AI 助手的工具（文献库的 semantic: 搜索链与它的开关已移除）：向量模型
       // 配好即可用，不再要求另开一个开关。主进程按 js/embedcfg.js 的规则算好 embedReady
       // （专用配置齐备，或回退到 AI 助手端点 + 嵌入模型名），这里只读结果。
       semanticReady = config.embedReady === true;
@@ -236,8 +247,6 @@ window.LitAgentUi = (function () {
       semanticscholarReady = !!desk.researchSearchSemanticscholar;
       lastConfig = config;
       buildTools();
-      // 语义能力变化后重建手动检索面板（按钮组随能力增减）
-      if (activePane === 'manual') ensureManualBuilt();
       if (desk.getSetting) {
         desk.getSetting('agentThinking').then(function (value) {
           thinking = String(value || '');
@@ -294,46 +303,117 @@ window.LitAgentUi = (function () {
 
   function renderModelLabel() {
     var node = $('agent-model');
+    var button = $('agent-model-btn');
     renderProviderLabel();
     if (!node) return;
     if (lastConfig && lastConfig.agentModel) {
       node.textContent = lastConfig.agentModel;
       // 生效的上下文/输出预算写进 tooltip：设置改了没生效时用户能一眼看出实际下发值
       var limits = agentLimits(null);
-      node.title = (lastConfig.agentBaseUrl || '') + '\n' + T('上下文预算 {ctx} tokens · 单轮输出上限 {out} tokens')
+      var tip = (lastConfig.agentBaseUrl || '') + '\n' + T('本轮上下文约 {ctx} tokens · 单次回复上限 {out} tokens')
         .replace('{ctx}', String(limits.contextTokens)).replace('{out}', String(limits.maxOutputTokens));
+      node.title = tip;
+      if (button) button.title = T('切换服务商与模型') + '\n' + tip;
     } else {
       node.textContent = T('未配置模型');
-      node.title = T('在 设置 → 集成与服务 → AI 助手 中配置');
+      var hint = T('在 设置 → 集成与服务 → AI 助手 中添加服务商与模型');
+      node.title = hint;
+      if (button) button.title = T('切换服务商与模型') + '\n' + hint;
     }
   }
 
-  /** 底部服务商徽标：由当前 Base URL 判定（与发送路径同一份纯函数规则），
-   *  未配置端点就隐藏——「哪个模型、经谁的端点」在面板里必须可见，
-   *  否则多端点用户只能靠记忆判断自己在跟谁说话。 */
+  /** 底部服务商徽标：优先自定义名称（设置里给服务商起的名字），
+   *  否则由当前 Base URL 判定（与发送路径同一份纯函数规则）；未配置端点就隐藏——
+   *  「哪个模型、经谁的端点」在面板里必须可见，否则多端点用户只能靠记忆判断自己在跟谁说话。 */
   function renderProviderLabel() {
     var node = $('agent-provider');
     if (!node) return;
-    var baseUrl = (lastConfig && lastConfig.agentBaseUrl) || '';
-    var label = (window.LitAgentProto && LitAgentProto.providerLabel)
-      ? LitAgentProto.providerLabel(baseUrl) : '';
+    var provider = null;
+    if (window.LitAgentCfg && lastConfig) provider = LitAgentCfg.activeProvider(lastConfig);
+    var baseUrl = (provider && provider.baseUrl) || (lastConfig && lastConfig.agentBaseUrl) || '';
+    var label = (provider && window.LitAgentCfg) ? LitAgentCfg.providerLabel(provider, window.LitAgentProto) : '';
+    if (!label && window.LitAgentProto && LitAgentProto.providerLabel) label = LitAgentProto.providerLabel(baseUrl);
     node.textContent = label;
     node.hidden = !label;
     node.title = baseUrl || '';
   }
 
-  /* ---------------- 右栏面板切换（详情 / AI 对话 / 手动检索） ---------------- */
+  /* ---------------- 底部「模型」切换（不打开设置即换服务商 / 模型） ----------------
+   * 菜单结构对齐 ZCode：每个服务商一项，子菜单里是它勾选的模型（当前项打勾），
+   * 末尾「管理模型…」跳设置。选择走 agent:set-selection：只改配置文件里的选中项，
+   * 扁平镜像由主进程重算，所以下一轮请求自然带上新的 Base URL / Key / 协议形态；
+   * 正在生成的那一轮按 R03 仍用轮开始时的端点（换模型不打断在途请求）。 */
+  function bindModelPicker() {
+    var button = $('agent-model-btn');
+    if (!button || button.dataset.bound === '1') return;
+    button.dataset.bound = '1';
+    button.addEventListener('click', function (event) {
+      event.preventDefault();
+      openModelMenu(button);
+    });
+  }
+
+  function openModelMenu(button) {
+    if (!deps.showCtxMenu) return;
+    var groups = (window.LitAgentCfg && lastConfig)
+      ? LitAgentCfg.menuGroups(lastConfig, window.LitAgentProto) : [];
+    function itemsOf(group) {
+      return group.models.map(function (model) {
+        return {
+          label: (model.active ? '✓ ' : '') + model.id,
+          fn: function () { switchModel(group.id, model.id); }
+        };
+      });
+    }
+    var items = [];
+    if (!groups.length) {
+      items.push({ header: T('还没有可选模型：先在设置里添加') });
+    } else if (groups.length === 1) {
+      // 只有一个服务商时不再套一层子菜单（点两次才换模型是纯粹的负担）
+      items.push({ header: groups[0].label });
+      items = items.concat(itemsOf(groups[0]));
+    } else {
+      groups.forEach(function (group) {
+        items.push({ label: (group.active ? '✓ ' : '') + group.label, children: itemsOf(group) });
+      });
+    }
+    items.push('sep');
+    items.push({
+      label: T('管理模型…'),
+      fn: function () { if (deps.openAgentSettings) deps.openAgentSettings(); }
+    });
+    var rect = button.getBoundingClientRect();
+    deps.showCtxMenu(rect.left, rect.top, items, { anchor: rect });
+  }
+
+  function switchModel(providerId, model) {
+    if (!desk.agentSetSelection) return;
+    desk.agentSetSelection({ providerId: providerId, model: model }).then(function (config) {
+      if (config) lastConfig = config;
+      // 走一次完整配置刷新：工具集要按新模型的能力重建（vision 渲染工具、语义检索门控），
+      // 推理档位与就绪判定也跟着换——只改标签会留下「界面换了、发的还是旧能力」的错位
+      return refreshConfig();
+    }).then(function () {
+      var busy = !!(runner && current && runner.isStreaming && runner.isStreaming(current));
+      if (deps.toast) {
+        deps.toast(T('已切换模型：') + model + (busy ? T('（本轮仍用原模型，下一轮生效）') : ''));
+      }
+    }).catch(function (error) {
+      if (deps.toast) deps.toast(T('切换模型失败：') + (error && error.message || error));
+    });
+  }
+
+  /* ---------------- 右栏面板切换（详情 / AI 助手 / 阅读批注） ---------------- */
 
   var RAIL_PANES = {
     detail: { pane: 'panel-detail', rail: 'rail-detail' },
     ai: { pane: 'agent-drawer', rail: 'btn-agent' },
-    manual: { pane: 'manual-panel', rail: 'rail-search' },
     // 批注与笔记：仅阅读模式存在（#pdf-annotations 由 app.js 停靠进右栏，见 dockAnnotations）
     anno: { pane: 'pdf-annotations', rail: 'rail-anno' }
   };
 
-  /** 切到指定右栏面板；手动检索与 AI 配置状态无关，任何时候都可用。
-   * 批注页签只在阅读模式有效（元素停靠在右栏里；非阅读模式调用是 no-op）。 */
+  /** 切到指定右栏面板；批注页签只在阅读模式有效
+   * （元素停靠在右栏里；非阅读模式调用是 no-op）。 */
   function switchPane(name) {
     if (!RAIL_PANES[name]) return;
     if (name === 'anno' && !(typeof document !== 'undefined' && document.body.classList.contains('reading-open'))) return;
@@ -353,26 +433,6 @@ window.LitAgentUi = (function () {
     activePane = name;
     try { localStorage.setItem('litboard.railPane', name); } catch (error) {}
     if (name === 'ai') { loadSessions(); bump(); }
-    if (name === 'manual') ensureManualBuilt();
-  }
-
-  /** 手动检索面板（独立栏位）：与 AI 是否配置无关，始终可用。
-   * 只在**能力签名变化**时重建（语义检索/收藏按钮的增减）——
-   * 每次进入或每次配置刷新都清空重建会把用户的检索词与结果抹掉。 */
-  function manualCapability() {
-    return (semanticReady ? 's' : '-') + (deps.collectWorks ? 'c' : '-') +
-      (semanticscholarReady ? '2' : '-') + (webSearchReady ? 'w' : '-');
-  }
-  function ensureManualBuilt() {
-    var root = $('agent-manual');
-    if (!root) return;
-    var signature = manualCapability();
-    if (root.dataset.signature === signature && root.childNodes.length) return;
-    var prevInput = root.querySelector('input.text-input');
-    var prevQuery = prevInput ? prevInput.value : '';
-    root.innerHTML = '';
-    buildManual(root, prevQuery);
-    root.dataset.signature = signature;
   }
 
   function toggle() { agentPaneActive() ? switchPane('detail') : switchPane('ai'); }
@@ -381,7 +441,7 @@ window.LitAgentUi = (function () {
   function close() {
     switchPane('detail');
     // 阅读模式（PDF/EPUB 层打开）下关 AI 面板 = 整个右栏收起，宽度还给阅读区；
-    // 非阅读模式维持三面板互斥语义（回到详情）
+    // 非阅读模式维持面板互斥语义（回到详情）
     if (typeof document !== 'undefined' && document.body.classList.contains('reading-open')) {
       var ws = document.querySelector('.workspace');
       if (ws) ws.classList.add('rail-collapsed');
@@ -390,7 +450,7 @@ window.LitAgentUi = (function () {
   function isOpen() { return activePane === 'ai'; }
 
   function bindEvents() {
-    // 右栏图标轨（Zotero 式）：三个面板互斥切换；
+    // 右栏图标轨（Zotero 式）：面板互斥切换；
     // 阅读模式下再点「当前面板」的轨按钮 = 收起整个右栏浮层，把宽度还给阅读区
     Object.keys(RAIL_PANES).forEach(function (name) {
       var rail = $(RAIL_PANES[name].rail);
@@ -545,6 +605,7 @@ window.LitAgentUi = (function () {
   function freezeContext() {
     var paper = null;
     var reading = null;
+    var selection = null;
     if (chipState.paper) {
       // R19：阅读层可见时把正在读的位置一并冻结（PDF 页码 / EPUB 进度）——
       // 「当前页讲了什么」不再让模型从第 1 页猜起；位置与文献同源，随轮持久化
@@ -554,6 +615,11 @@ window.LitAgentUi = (function () {
         reading = now.kind === 'pdf'
           ? { kind: 'pdf', page: now.page || 1, pageCount: now.pageCount || 0, attachmentId: now.attachmentId || '' }
           : { kind: 'epub', progress: typeof now.progress === 'number' ? now.progress : null };
+        // 划词上下文：阅读器里有有效选区时一并冻结（VSCode 式「当前选中」）——PDF 带页码、
+        // EPUB 带 CFI+章节+进度；形态归一（截断/空白折叠）走纯函数层，getter 按阅读层自分发
+        if (chipState.selection && deps.getCurrentSelection && window.LitAgentContext) {
+          selection = window.LitAgentContext.normalizeSelectionContext(deps.getCurrentSelection());
+        }
       } else if (deps.getCurrentPaper) {
         paper = deps.getCurrentPaper();
       }
@@ -568,6 +634,7 @@ window.LitAgentUi = (function () {
       maxOutputTokens: limits.maxOutputTokens,
       paper: paper ? { id: paper.id, title: paper.title || '', year: paper.year || null } : null,
       reading: reading || null,
+      selection: selection || null,
       folder: folderName || null
     };
     return frozen;
@@ -576,7 +643,7 @@ window.LitAgentUi = (function () {
   function systemPrompt(run) {
     var lines = [
       '你是 LitBoard（本地文献管理软件）内置的科研调研与阅读助手。',
-      '可用工具：正式库检索（search_library / get_paper / fulltext_search）、PDF 阅读（read_pdf_pages 按页读正文 / list_pdf_annotations 读批注）、调研库检索（search_research / get_research_work / get_work 精确解析 DOI 或 ID / autocomplete_entity 名称转 ID / backfill_abstracts 补摘要 / read_work_fulltext 全文参考——要实验细节与方法学时用它，临时拉取 OA 全文抽成文本、PDF 即删不留）、联网发现（search_openalex，keyword 与 semantic 两种模式）、引文关系（graph_neighbors 库内邻接 / build_graph 扩边建图）、为一段论述找文献依据（find_literature）。',
+      '可用工具：文献库检索（search_library / get_paper / fulltext_search）、PDF 阅读（read_pdf_pages 按页读正文 / list_pdf_annotations 读批注）、调研库检索（search_research / get_research_work / get_work 精确解析 DOI 或 ID / autocomplete_entity 名称转 ID / backfill_abstracts 补摘要 / read_work_fulltext 全文参考——要实验细节与方法学时用它，临时拉取 OA 全文抽成文本、PDF 即删不留）、联网发现（search_openalex，keyword 与 semantic 两种模式）、引文关系（graph_neighbors 库内邻接 / build_graph 扩边建图）、为一段论述找文献依据（find_literature）。',
       '规则：优先用工具回答事实性问题；引用文献时给出其 id（workId 或 paperId），引用正文位置时给出页码；回答保持简洁，使用与用户相同的语言；不确定就说不知道，不要编造文献或页码。',
       '阅读覆盖如实声明：回答 PDF 相关问题时注明实际读过的页码范围（read_pdf_pages 的 from/to）；未读全篇不得宣称已通读全文。',
       '找文献依据时必须用 find_literature（不要自己拼几轮 search_* 再声称"有文献支持"）：它多源召回后逐条给出证据句与出处。若某条论点的 status 是 not_found，就如实告诉用户没有找到依据；把 evidence.verdict=partial/none 的条目包装成"有文献支持"属于编造依据，绝对禁止。',
@@ -603,7 +670,26 @@ window.LitAgentUi = (function () {
         '需要更多上下文再向前后扩展。');
     } else if (frozen.paper && frozen.reading && frozen.reading.kind === 'epub') {
       lines.push('用户正在阅读当前文献的 EPUB' + (frozen.reading.progress != null ? '（约 ' + frozen.reading.progress + '%）' : '') + '。' +
-        'EPUB 正文没有全文索引，read_pdf_pages 读不到 EPUB 内容——不要假装读过正文，可基于元数据与批注（list_pdf_annotations）回答。');
+        'EPUB 正文可用 read_pdf_pages 按章节读取（页 = spine 章节序号，第 1 章是第 1 页）；' +
+        '若返回「没有找到该附件的全文索引」说明尚未建索引，此时如实告知用户，不要假装读过正文，可基于元数据与批注（list_pdf_annotations）回答。');
+    }
+    if (frozen.selection && frozen.selection.kind !== 'epub') {
+      // 划词上下文（发送时冻结）：「这句话/这段」的指代即选区文字，页码可直接引用
+      var sel = frozen.selection;
+      lines.push('用户在当前文献第 ' + sel.page + (sel.pageTo > sel.page ? '–' + sel.pageTo : '') + ' 页选中了以下文字：\n「' + sel.text + '」' +
+        (sel.truncated ? '\n（选区过长，以上仅为开头部分；要完整内容用 read_pdf_pages 读该页）' : '') +
+        '\n用户说「这句话 / 这段 / 选中的部分」时即指上述文字，回答时可直接引用并注明页码；需要前后文时用 read_pdf_pages 从第 ' + sel.page + ' 页读起。');
+    }
+    if (frozen.selection && frozen.selection.kind === 'epub') {
+      // EPUB 划词：流式排版没有页码，位置身份 = 章节 + 进度百分比；正文无索引，别让模型去 read_pdf_pages
+      var esel = frozen.selection;
+      var posParts = [];
+      if (esel.chapter) posParts.push('章节：' + esel.chapter);
+      if (esel.progress != null) posParts.push('约 ' + esel.progress + '%');
+      lines.push('用户在当前文献 EPUB 阅读位置' + (posParts.length ? '（' + posParts.join('、') + '）' : '') +
+        '选中了以下文字：\n「' + esel.text + '」' +
+        (esel.truncated ? '\n（选区过长，以上仅为开头部分）' : '') +
+        '\n用户说「这句话 / 这段 / 选中的部分」时即指上述文字，回答时可直接引用；需要前后文时可用 read_pdf_pages 读相邻章节（页 = spine 章节序号）；若返回「没有找到该附件的全文索引」就如实说明，可基于上述文字本身与批注（list_pdf_annotations）回答。');
     }
     return lines.join('\n\n');
   }
@@ -799,12 +885,18 @@ window.LitAgentUi = (function () {
 
   /* ---------------- core.messages → ThreadMessageLike 快照 ---------------- */
 
+  /** core 消息在 assistant-ui 中使用的稳定前缀。摘要没有业务 turnId，展示层以原始
+   *  下标生成 tN；编辑回调给的是前驱消息的展示前缀，反向定位必须使用同一规则。 */
+  function messageDisplayKey(msg, index) {
+    return msg && msg.turnId ? msg.turnId : ('t' + index);
+  }
+
   function convertRun(run) {
     var out = [];
     var messages = run.core.messages;
     var counters = {};
     messages.forEach(function (msg, index) {
-      var turnId = msg.turnId || ('t' + index);
+      var turnId = messageDisplayKey(msg, index);
       if (msg.role === 'user' && msg.kind === 'compaction') {
         // R17 上下文摘要：以带标记的助手气泡呈现（📦 头部行说明压缩了什么），不是用户的发言
         var skey = turnId + ':c' + (counters[turnId] = (counters[turnId] || 0) + 1);
@@ -912,22 +1004,15 @@ window.LitAgentUi = (function () {
     node.textContent = t && (t.in || t.out) ? '≈' + ((t.in || 0) + (t.out || 0)) + ' tokens' : '';
   }
 
-  /* ---------------- 模式切换 / 手动检索 ---------------- */
+  /* ---------------- 对话模式 / 未配置引导 ---------------- */
 
   function renderMode() {
     var chatRoot = $('agent-chat-root');
     var notReady = $('agent-not-ready');
     if (!chatRoot) return;
-    // 手动检索已是独立栏位（#manual-panel），与 AI 配置无关、始终可用
     if (notReady && !agentReady && !notReady.dataset.built) {
       var tip = el('div', 'agent-empty');
-      tip.innerHTML = T('尚未启用 AI 对话：可在 设置 → 集成与服务 → AI 助手 中配置并勾选启用。') +
-        '<br>' + T('不配置也能用：点最右的搜索图标打开「手动检索」面板。');
-      var suggest = el('div', 'agent-suggest');
-      var jump = el('button', 'btn left', T('去打手动检索'));
-      jump.addEventListener('click', function () { switchPane('manual'); });
-      suggest.appendChild(jump);
-      tip.appendChild(suggest);
+      tip.innerHTML = T('尚未启用 AI 助手：在 设置 → 集成与服务 中添加服务商（地址与密钥）并勾选想用的模型即可。');
       notReady.appendChild(tip);
       notReady.dataset.built = '1';
     }
@@ -955,13 +1040,15 @@ window.LitAgentUi = (function () {
     if (parentTurnPrefix) {
       var last = -1;
       for (var i = 0; i < messages.length; i++) {
-        if (messages[i].turnId === parentTurnPrefix) last = i;
+        if (messageDisplayKey(messages[i], i) === parentTurnPrefix) last = i;
       }
       if (last < 0) return '';
       start = last + 1;
     }
+    // A-followup #1：与 rerunTurn 同一规则——合成 user 消息（上下文摘要 / 工具注入截图）
+    // 不是轮次入口，编辑定位跳过它们，否则编辑重发会截到摘要那一轮
     for (var j = start; j < messages.length; j++) {
-      if (messages[j].role === 'user') return messages[j].turnId || '';
+      if (messages[j].role === 'user' && messages[j].synthetic !== true) return messages[j].turnId || '';
     }
     return '';
   }
@@ -973,8 +1060,21 @@ window.LitAgentUi = (function () {
     if (!wrap) return;
     wrap.innerHTML = '';
     var list = run && Array.isArray(run.doc.attachments) ? run.doc.attachments : [];
-    if (!list.length) { wrap.hidden = true; return; }
+    var canReopenGraph = recentGraphAvailable && typeof deps.reopenGraphPanel === 'function';
+    if (!list.length && !canReopenGraph) { wrap.hidden = true; return; }
     wrap.hidden = false;
+    if (canReopenGraph) {
+      var graphNode = el('span', 'agent-chip agent-att agent-graph-reopen');
+      graphNode.appendChild(el('span', '', T('重开最近引文网络')));
+      graphNode.title = T('在 LitBoard 中重新打开最近一次引文网络');
+      graphNode.addEventListener('click', function () {
+        if (!deps.reopenGraphPanel()) {
+          recentGraphAvailable = false;
+          renderAttachments(run);
+        }
+      });
+      wrap.appendChild(graphNode);
+    }
     list.slice(-8).forEach(function (att) {
       if (!att || !att.file) return;
       var node = el('span', 'agent-chip agent-att');
@@ -1027,105 +1127,6 @@ window.LitAgentUi = (function () {
         }
       }
     };
-  }
-
-  function buildManual(root, initialQuery) {
-    var hint = el('p', 'agent-empty');
-    hint.innerHTML = T('直接检索调研库与 OpenAlex，无需任何 AI 配置；点结果查看摘要，可收藏进正式库。');
-    root.appendChild(hint);
-    var row = el('div', 'inline-row');
-    var input = el('input', 'text-input');
-    input.placeholder = T('检索调研库（标题/摘要/DOI）…');
-    if (initialQuery) input.value = initialQuery;
-    var localBtn = el('button', 'btn', T('查调研库'));
-    var remoteBtn = el('button', 'btn btn-primary', T('查 OpenAlex'));
-    // 语义检索不再有用户面入口（只作 agent 工具：semantic_search / find_literature /
-    // search_openalex 的 mode=semantic），这里只剩关键词检索与在线发现源
-    row.appendChild(input); row.appendChild(localBtn); row.appendChild(remoteBtn);
-    var s2Btn = null;
-    if (semanticscholarReady && desk.researchSearchSemanticscholar) {
-      s2Btn = el('button', 'btn', T('查 S2'));
-      s2Btn.title = T('Semantic Scholar 相关度检索（与 OpenAlex 互补的第二发现源）');
-      row.appendChild(s2Btn);
-    }
-    root.appendChild(row);
-    var results = el('div', 'agent-manual-results');
-    root.appendChild(results);
-    function doSearch(mode) {
-      if (manualBusy) return;
-      var q = input.value.trim();
-      if (!q) return;
-      manualBusy = true;
-      results.innerHTML = '';
-      results.appendChild(el('div', 'agent-history-empty', T('检索中…')));
-      var task = mode === 'remote'
-        ? desk.researchSearchOpenalex({ query: q, limit: 20 })
-        : mode === 's2'
-          ? desk.researchSearchSemanticscholar({ query: q, limit: 20 })
-          : desk.researchQuery({ q: q, limit: 20 });
-      task.then(function (r) {
-        manualBusy = false;
-        results.innerHTML = '';
-        // 降级/范围说明如实展示（例如「未配置嵌入模型，已按关键词检索」）
-        if (r && r.note) {
-          results.appendChild(el('div', 'agent-hit-meta', String(r.note)));
-        }
-        var works = (r && r.works) || [];
-        if (!works.length) { results.appendChild(el('div', 'agent-history-empty', T('没有命中。'))); return; }
-        works.forEach(function (w) {
-          var hit = el('div', 'agent-manual-hit');
-          hit.appendChild(el('div', '', w.title || '(no title)'));
-          var meta = el('div', 'agent-hit-meta');
-          meta.textContent = [w.year, w.sourceName, w.citedBy != null ? T('被引 ') + w.citedBy : '', w.doi,
-            w.type === 'web' ? T('网页') : '',
-            w.score != null && w.score > 0 ? T('相似度 ') + Math.round(w.score * 100) + '%' : ''].filter(Boolean).join(' · ');
-          hit.appendChild(meta);
-          hit.addEventListener('click', function () {
-            desk.researchGetWorks([w.id]).then(function (rows) {
-              var detail = rows && rows[0];
-              if (!detail) return;
-              // R15：没有真摘要时展示网页片段并标明来源，不把片段说成摘要
-              var text = String(detail.abstract || '').slice(0, 400);
-              if (!text && detail.snippet) text = T('（网页片段）') + String(detail.snippet).slice(0, 400);
-              if (text) hit.appendChild(el('div', 'agent-hit-meta', text + '…'));
-              if (detail.pageUrl) {
-                var link = el('div', 'agent-hit-meta', '🔗 ' + String(detail.pageUrl).slice(0, 120));
-                hit.appendChild(link);
-              }
-            }).catch(function () {});
-          });
-          // 二期：手动模式也能直接收藏（走与 agent 工具相同的确认+去重链路）
-          if (deps.collectWorks) {
-            var collectBtn = el('button', 'btn', T('收藏'));
-            collectBtn.addEventListener('click', function (event) {
-              event.stopPropagation();
-              collectBtn.disabled = true;
-              deps.collectWorks([w.id], null).then(function (r2) {
-                collectBtn.textContent = (r2 && r2.canceled) ? T('收藏') : T('✓ 已收藏');
-                if (r2 && !r2.canceled && deps.toast) {
-                  deps.toast(T('✓ 已收藏 ') + (r2.added || 0) + T(' 篇，合并 ') + (r2.merged || 0) + T(' 篇'));
-                }
-              }).catch(function (error) {
-                collectBtn.disabled = false;
-                if (deps.toast) deps.toast(T('收藏失败：') + String(error && error.message || error));
-              });
-            });
-            hit.appendChild(collectBtn);
-          }
-          results.appendChild(hit);
-        });
-      }).catch(function (error) {
-        manualBusy = false;
-        results.innerHTML = '';
-        results.appendChild(el('div', 'agent-history-empty', T('检索失败：') + String(error && error.message || error)));
-      });
-    }
-    localBtn.addEventListener('click', function () { doSearch('local'); });
-    remoteBtn.addEventListener('click', function () { doSearch('remote'); });
-    if (s2Btn) s2Btn.addEventListener('click', function () { doSearch('s2'); });
-    input.addEventListener('keydown', function (event) {
-      if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); doSearch('local'); } // A08
-    });
   }
 
   /* ---------------- 历史视图 ---------------- */
@@ -1316,6 +1317,25 @@ window.LitAgentUi = (function () {
         });
       }
     }
+    if (deps.getCurrentSelection) {
+      var liveSel = deps.getCurrentSelection();
+      var sel = showFrozen ? frozen.selection : (chipState.selection ? liveSel : null);
+      // 无选区时 chip 不占位；开关关掉或冻结轮未带选区时仍显示（暗）留点回来的入口——与文献 chip 同纪律。
+      // 选中依附于文献上下文：文献 chip 关掉时选中不会发送（freezeContext 不捕获），亮态如实反映
+      var selText = (sel && sel.text) || (liveSel && liveSel.text) || '';
+      if (selText) {
+        // 位置段按形态取：PDF 显示页码，EPUB 无页码显示进度百分比（冻结值优先于实时值）
+        var selAny = sel || liveSel || {};
+        var selPos = selAny.page ? T('第 {n} 页', { n: selAny.page })
+          : (selAny.progress != null ? T('约 {n}%', { n: selAny.progress }) : '');
+        chips.push({
+          label: T('选中：') + selText.slice(0, 12) + (selText.length > 12 ? '…' : ''),
+          page: selPos,
+          on: !!(showFrozen ? sel : (chipState.selection && chipState.paper)),
+          toggle: function () { chipState.selection = !chipState.selection; }
+        });
+      }
+    }
     if (deps.getCurrentFolder) {
       var liveFolder = deps.getCurrentFolder();
       var folder = showFrozen ? frozen.folder : (chipState.folder ? liveFolder : null);
@@ -1391,7 +1411,8 @@ window.LitAgentUi = (function () {
 
   /* ---------------- 聊天公式渲染（MathJax tex-svg，懒加载） ----------------
    * 正文经 LitMarkdown 渲染：$...$ / $$...$$ 已被摘成 .lb-math / .lb-math-block
-   * span（内容 = 转义后的原始 LaTeX，textContent 即 TeX 源）。这里对聊天容器里的
+   * 节点（内容 = 转义后的原始 LaTeX，textContent 即 TeX 源）。独占行的块公式为 div，
+   * 其余为 span。这里对聊天容器里的
    * 这些节点逐个 tex2svgPromise 类型化——不扫全文定界符，不会误伤普通文本里的 $；
    * 失败（LaTeX 语法错等）保留原文，绝不打断消息显示。MathJax 只在首次出现公式时
    * 才注入（vendor/mathjax/tex-svg.js 单文件、SVG 输出无字体依赖），无公式的会话零开销。 */

@@ -355,9 +355,9 @@ function bibPayloadJson(entries) {
 }
 /* Fields saved by builds before the own-paragraph fix sit jammed right after the
  * citation ("[1][1]Tian J..." on one line). The paragraph text before the result
- * then holds foreign content; for a field that starts its own paragraph it is only
- * the field's own code plus the begin/separator markers (markers do not surface in
- * .Text, so codeLen + 2 covers both spellings). */
+ * then holds foreign visible content. Word's field begin/separator/end markers can
+ * surface in .Text, but the (much longer) field CODE does not; comparing against
+ * code length therefore lets a short citation such as [1-3] slip through forever. */
 function bibFieldIsJammed(field, doc) {
   var fr = null;
   try { fr = field.Result; } catch (e1) { return false; }
@@ -365,10 +365,10 @@ function bibFieldIsJammed(field, doc) {
   var head = -1;
   try { head = fr.Paragraphs.Item(1).Range.Start; } catch (e2) { return false; }
   if (head < 0) return false;
-  var before = '', codeLen = 0;
+  var before = '';
   try { before = doc.Range(head, fr.Start).Text; } catch (e3) { return false; }
-  try { codeLen = field.Code.Text.length; } catch (e4) { codeLen = 0; }
-  return before.length > codeLen + 2;
+  before = String(before || '').replace(/[\x13\x14\x15\r]/g, '');
+  return before.length > 0;
 }
 function updateBibliography(doc, encodedEntries, formatSpec) {
   var entries = [], i;

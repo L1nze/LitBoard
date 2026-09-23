@@ -78,10 +78,10 @@ test('pick：trim 后按键查译文；源语言或缺失返回 null', () => {
 
 // electron/ipc/ 下的域模块自动枚举：新增 IPC 域文件无需改这里即进 T() 键覆盖门禁
 const WRAPPED_FILES = [
-  'js/app.js', 'js/model.js', 'js/sync.js', 'js/query.js', 'js/zotero.js',
+  'js/app.js', 'js/app/note-panel.js', 'js/app/search-help.js', 'js/app/workspace-store.js', 'js/app/history.js', 'js/app/dialogs.js', 'js/app/theme.js', 'js/app/zotero-wizard.js', 'js/app/remote-plan.js', 'js/app/journal-rank.js', 'js/app/query-builder.js', 'js/app/word-panel.js', 'js/app/note-export.js', 'js/model.js', 'js/sync.js', 'js/query.js', 'js/zotero.js',
   'js/pdfimport.js', 'js/csldoc.js', 'js/cslcite.js', 'js/docx.js',
   'js/translators.js', 'js/noteeditor.js', 'js/epub.js', 'js/translate.js',
-  'js/ocr.js', 'js/pdfannot.js', 'electron/main.js'
+  'js/ocr.js', 'electron/main.js'
 ].concat(fs.readdirSync(path.join(ROOT, 'electron', 'ipc'))
   .filter(function (f) { return /\.js$/.test(f); })
   .map(function (f) { return 'electron/ipc/' + f; }));
@@ -123,4 +123,20 @@ test('词典健康：整段 HTML 键的译文保持标签结构', () => {
     if (!/^</.test(v) || !v.includes('>')) broken.push(k + ' => ' + v);
   }
   assert.strictEqual(broken.length, 0, 'HTML 译文结构异常：\n' + broken.slice(0, 10).join('\n'));
+});
+
+// A-followup #7：渲染层模块自建的 T 包装必须把第二个参数（插值数据）透传给 LitI18n.t，
+// 否则 T('第 {n} 页', {n: 7}) 会原样显示成「第 {n} 页」（阅读位置 chip 曾如此）。
+test('词典健康：自建 T 包装透传插值参数（否则 {n} 类键显示成字面占位符）', () => {
+  const broken = [];
+  for (const f of ['js/agentui.js', 'js/graphview.js']) {
+    const src = fs.readFileSync(path.join(ROOT, f), 'utf8');
+    const def = src.match(/var T = function \(([^)]*)\)/);
+    if (!def) continue;
+    const params = def[1].split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    if (params.length < 2) broken.push(f + '：包装只接受 ' + JSON.stringify(def[1]));
+    // 调用点也必须真的把第二个参数传下去
+    if (!/LitI18n\.t\(s,\s*params\)/.test(src)) broken.push(f + '：LitI18n.t 未收到插值参数');
+  }
+  assert.strictEqual(broken.length, 0, broken.join('\n'));
 });

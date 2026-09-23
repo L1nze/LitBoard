@@ -247,7 +247,7 @@ test('remote restore refuses to treat a missing library file as an empty library
   await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p', nutstoreFolder: 'LitBoard' });
   await assert.rejects(
     integrations.createNutstoreSyncPlan({ mode: 'restore', workspace: { papers: [{ id: 'p1', title: '本地' }], folders: [] } }),
-    /未找到远端库文件.*litboard-library\.json/
+    /未找到云端库文件.*litboard-library\.json/
   );
 });
 
@@ -501,7 +501,7 @@ test('sync rejects a successful PUT when the remote library did not persist the 
   await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
   await assert.rejects(
     integrations.nutstoreSync({ papers: [{ id: 'p1', title: '必须落到远端' }], folders: [] }),
-    /远端写入后校验失败/
+    /云端写入后校验失败/
   );
   assert.equal(libraryPuts, 1);
 });
@@ -893,6 +893,30 @@ test('EasyScholar journal-rank lookup uses encrypted secretKey, URL-encodes期�
   assert.ok(requests[1].at - requests[0].at >= 490, 'EasyScholar 请求未限速');
   const raw = await fs.readFile(path.join(dir, 'integrations.json'), 'utf8');
   assert.equal(raw.includes('es-secret'), false, 'EasyScholar key 以明文写入配置');
+});
+
+test('期刊分区服务商可双向切换：显式提交优先，缺省才沿用现值', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-rank-provider-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const integrations = createIntegrations({
+    baseDir: dir, homeDir: dir,
+    safeStorage: {
+      isEncryptionAvailable: function () { return true; },
+      encryptString: function (value) { return Buffer.from(value, 'utf8'); },
+      decryptString: function (value) { return value.toString('utf8'); }
+    }
+  });
+  await integrations.saveConfig({ rankProvider: 'easyscholar', easyscholarApiKey: 'es-secret' });
+  assert.equal((await integrations.getConfig()).rankProvider, 'easyscholar');
+  // 切回 OneScholar/SciGreat：以前这里会被现值挡回去，设置页回显仍是 EasyScholar
+  await integrations.saveConfig({ rankProvider: 'scigreat' });
+  assert.equal((await integrations.getConfig()).rankProvider, 'scigreat');
+  // 本次保存没提交该字段（设置页从未打开时渲染层交空对象）→ 保持现值
+  await integrations.saveConfig({ nutstoreUser: 'me' });
+  assert.equal((await integrations.getConfig()).rankProvider, 'scigreat');
+  // 非法值：回退到现值，不落进配置
+  await integrations.saveConfig({ rankProvider: 'nope' });
+  assert.equal((await integrations.getConfig()).rankProvider, 'scigreat');
 });
 
 test('EasyScholar test connection uses unsaved key without persisting credentials', async function (t) {

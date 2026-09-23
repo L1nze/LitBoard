@@ -972,7 +972,7 @@ function createLibraryDb(baseDir) {
       d.prepare(`INSERT INTO pdf_text(paper_id, attachment_id, fingerprint, method, pages, updated_at) VALUES(?, ?, ?, ?, ?, ?)
         ON CONFLICT(paper_id, attachment_id) DO UPDATE SET fingerprint=excluded.fingerprint, method=excluded.method,
           pages=excluded.pages, updated_at=excluded.updated_at`)
-        .run(paperId, attachmentId, String(entry.fingerprint || ''), String(entry.method || 'pdfjs'),
+        .run(paperId, attachmentId, String(entry.fingerprint || ''), String(entry.method || 'mupdf'),
           packed, Date.now());
       d.prepare('DELETE FROM pdf_fts WHERE paper_id = ? AND attachment_id = ?').run(paperId, attachmentId);
       const insert = d.prepare('INSERT INTO pdf_fts(paper_id, attachment_id, page, text) VALUES(?, ?, ?, ?)');
@@ -1013,12 +1013,21 @@ function createLibraryDb(baseDir) {
     return out;
   }
 
-  async function pdfTextGet(paperId, attachmentId) {
+  /**
+   * 读取某附件的全文索引：严格按 (paperId, attachmentId) 身份匹配。
+   *
+   * A-followup #2：旧版单 PDF 时代把索引写在 attachment_id='' 上，此前这里在「指定附件
+   * 查不到」时无条件回退到空 ID 行——于是「读补充材料」会静默返回主文献正文，调用成功且
+   * 没有任何提示。兼容回退改为**调用方显式选择**（options.legacyFallback === true）：
+   * 显式附件查询保持严格匹配，只有调用方确知自己问的是「该文献的主 PDF 旧索引」时才开。
+   */
+  async function pdfTextGet(paperId, attachmentId, options) {
     const d = requireDb();
     const id = String(paperId);
     const att = String(attachmentId || '');
+    const legacyOk = !!(options && options.legacyFallback === true);
     const row = d.prepare('SELECT attachment_id, fingerprint, method, pages FROM pdf_text WHERE paper_id = ? AND attachment_id = ?').get(id, att) ||
-      (att ? d.prepare('SELECT attachment_id, fingerprint, method, pages FROM pdf_text WHERE paper_id = ? AND attachment_id = \'\'').get(id) : null);
+      (att && legacyOk ? d.prepare('SELECT attachment_id, fingerprint, method, pages FROM pdf_text WHERE paper_id = ? AND attachment_id = \'\'').get(id) : null);
     if (!row) return null;
     return { paperId: id, attachmentId: row.attachment_id || '', fingerprint: row.fingerprint || '', method: row.method || '', pages: await unpackPages(row.pages) };
   }
@@ -1026,9 +1035,10 @@ function createLibraryDb(baseDir) {
   /** 按页区间读取（AI 阅读助手用）：只解压一次、只返回 [from, to] 闭区间内的页，
    *  每页截断 capChars——大文档不必把整篇 pages 数组拉过 IPC。页码 1 基。
    *  R4：fromChar 只作用于起始页的页内偏移（高密度页 >capChars 时分次读完整页文字），
-   *  每页带 charOffset/charTotal，调用方据此计算续读位置。 */
-  async function pdfTextGetRange(paperId, attachmentId, from, to, capChars, fromChar) {
-    const full = await pdfTextGet(paperId, attachmentId);
+   *  每页带 charOffset/charTotal，调用方据此计算续读位置。
+   *  options 透传给 pdfTextGet（legacyFallback 语义见上）。 */
+  async function pdfTextGetRange(paperId, attachmentId, from, to, capChars, fromChar, options) {
+    const full = await pdfTextGet(paperId, attachmentId, options);
     if (!full) return null;
     const total = full.pages.length;
     const start = Math.max(1, Number(from) || 1);
@@ -1089,59 +1099,128 @@ function createLibraryDb(baseDir) {
   /**
    * 子串全文检索（与原渲染层 indexOf 语义一致）：
    * - 查询 ≥3 字符走 trigram FTS（等价子串语义，含中文）；
-   * - 2 字符以内回退 LIKE 全扫（trigram 下限）。
+   * - 2 字符以内回退全表扫描（trigram 下限，中文短词如「量子」「算法」只能走这条）。
    * 返回 [{ paperId, pages:[页索引], count, snippets:[{page, text}] }]。
+   *
+   * 性能（主进程即窗口的消息泵，任何一段长同步工作都会让整个应用「未响应」）：
+   * - FTS 路径不再取 snippet(...)——它要为最多 2000 行分词并构建片段，实测占该查询约 85% 耗时，
+   *   而调用方（界面只显示页码；agent 工具每篇最多 2 条）用不到那么多片段：片段改为只对
+   *   排在前面的若干篇按需现算；
+   * - 短词路径的全表解压按批 await 让出事件循环（zlib.gunzip 异步 + 每 16 行一次让出），
+   *   结果与逐行同步解压完全一致。
    */
-  function pdfTextQuery(query, attachmentId) {
+  const QUERY_PAGE_LIMIT = 2000;
+  const SNIPPET_PAPER_LIMIT = 24;
+  const SNIPPET_PER_HIT = 3;
+  // 短词回退全表扫描时的让出节奏：按「行数」或「已扫描字节」谁先到就让出一次。
+  // 单看行数不够——有的行是一本书（数十 MB 解压后），十几行就能堵上几百毫秒
+  const SCAN_YIELD_ROWS = 16;
+  const SCAN_YIELD_BYTES = 8 * 1024 * 1024;
+
+  function yieldToLoop() {
+    return new Promise(function (resolve) { setImmediate(resolve); });
+  }
+
+  /** 解压 + 解析一行的 pages（BLOB 走 gunzip，历史 TEXT 行直接 JSON.parse）；失败返回 null */
+  async function unpackPageRow(value) {
+    try {
+      const buffer = value instanceof Uint8Array
+        ? await gunzipAsync(Buffer.from(value))
+        : Buffer.from(value == null ? '' : String(value), 'utf8');
+      const pages = JSON.parse(buffer.toString('utf8'));
+      return Array.isArray(pages) ? pages : null;
+    } catch (error) { return null; }
+  }
+
+  /** 命中片段：命中词两侧各 40 字，命中处用 ⟪⟫ 标出（与旧 FTS snippet 的可读性对齐） */
+  function snippetAround(text, at, length) {
+    const start = Math.max(0, at - 40);
+    const end = Math.min(text.length, at + length + 40);
+    return (start > 0 ? '…' : '') +
+      text.slice(start, at).replace(/\s+/g, ' ') + '⟪' +
+      text.slice(at, at + length).replace(/\s+/g, ' ') + '⟫' +
+      text.slice(at + length, end).replace(/\s+/g, ' ') +
+      (end < text.length ? '…' : '');
+  }
+
+  async function pdfTextQuery(query, attachmentId) {
     const d = requireDb();
     const needle = String(query || '').trim();
     const attachmentFilter = String(attachmentId || '');
     if (!needle) return [];
     const byPaper = {};
-    function addHit(paperId, attachmentId, page, snippetText) {
-      const key = paperId + ':' + attachmentId;
-      if (!byPaper[key]) byPaper[key] = { paperId: paperId, attachmentId: attachmentId, pageSet: {}, snippets: [] };
+    function addHit(paperId, attachId, page, snippetText) {
+      const key = paperId + ':' + attachId;
+      if (!byPaper[key]) byPaper[key] = { paperId: paperId, attachmentId: attachId, pageSet: {}, snippets: [] };
       byPaper[key].pageSet[page] = true;
-      if (snippetText && byPaper[key].snippets.length < 3) {
+      if (snippetText && byPaper[key].snippets.length < SNIPPET_PER_HIT) {
         byPaper[key].snippets.push({ page: page, text: snippetText });
       }
     }
     if ([...needle].length >= 3) {
       const phrase = '"' + needle.replace(/"/g, '""') + '"';
       const statement = attachmentFilter
-        ? d.prepare("SELECT paper_id, attachment_id, page, snippet(pdf_fts, 3, '⟪', '⟫', '…', 24) AS snip FROM pdf_fts WHERE pdf_fts MATCH ? AND attachment_id = ? LIMIT 2000")
-        : d.prepare("SELECT paper_id, attachment_id, page, snippet(pdf_fts, 3, '⟪', '⟫', '…', 24) AS snip FROM pdf_fts WHERE pdf_fts MATCH ? LIMIT 2000");
+        ? d.prepare('SELECT paper_id, attachment_id, page FROM pdf_fts WHERE pdf_fts MATCH ? AND attachment_id = ? LIMIT ' + QUERY_PAGE_LIMIT)
+        : d.prepare('SELECT paper_id, attachment_id, page FROM pdf_fts WHERE pdf_fts MATCH ? LIMIT ' + QUERY_PAGE_LIMIT);
       const rows = attachmentFilter ? statement.all(phrase, attachmentFilter) : statement.all(phrase);
-      rows.forEach(function (row) { addHit(row.paper_id, row.attachment_id || '', row.page, row.snip); });
+      rows.forEach(function (row) { addHit(row.paper_id, row.attachment_id || '', row.page, ''); });
+      await attachSnippets(d, byPaper, needle);
     } else {
       const lower = needle.toLowerCase();
       const textRows = attachmentFilter
         ? d.prepare('SELECT paper_id, attachment_id, pages FROM pdf_text WHERE attachment_id = ?').all(attachmentFilter)
         : d.prepare('SELECT paper_id, attachment_id, pages FROM pdf_text').all();
-      textRows.forEach(function (row) {
-        // <3 字符的回退查询走这里（低频路径）：逐行解压 + JSON 解析
-        let pages;
-        try {
-          const raw = row.pages instanceof Uint8Array
-            ? zlib.gunzipSync(row.pages)
-            : Buffer.from(row.pages == null ? '' : String(row.pages), 'utf8');
-          pages = JSON.parse(raw.toString('utf8'));
-        } catch (error) { return; }
-        pages.forEach(function (pageText, index) {
-          const textValue = String(pageText || '');
-          const at = textValue.toLowerCase().indexOf(lower);
-          if (at === -1) return;
-          const start = Math.max(0, at - 40);
-          addHit(row.paper_id, row.attachment_id || '', index,
-            (start > 0 ? '…' : '') + textValue.slice(start, at + needle.length + 40).replace(/\s+/g, ' ') + '…');
-        });
-      });
+      let scannedBytes = 0;
+      let rowsSinceYield = 0;
+      for (const row of textRows) {
+        scannedBytes += row.pages instanceof Uint8Array ? row.pages.byteLength : 0;
+        rowsSinceYield += 1;
+        const pages = await unpackPageRow(row.pages);
+        if (pages) {
+          pages.forEach(function (pageText, index) {
+            const textValue = String(pageText || '');
+            const at = textValue.toLowerCase().indexOf(lower);
+            if (at === -1) return;
+            addHit(row.paper_id, row.attachment_id || '', index, snippetAround(textValue, at, needle.length));
+          });
+        }
+        if (rowsSinceYield >= SCAN_YIELD_ROWS || scannedBytes >= SCAN_YIELD_BYTES) {
+          scannedBytes = 0;
+          rowsSinceYield = 0;
+          await yieldToLoop();
+        }
+      }
     }
     return Object.keys(byPaper).map(function (key) {
       const hit = byPaper[key];
       const pages = Object.keys(hit.pageSet).map(Number).sort(function (a, b) { return a - b; });
       return { paperId: hit.paperId, attachmentId: hit.attachmentId, pages: pages, count: pages.length, snippets: hit.snippets };
     });
+  }
+
+  /** 为前若干篇命中补片段：命中页正文单独取回（每篇一次解压），不做全库扫描 */
+  async function attachSnippets(d, byPaper, needle) {
+    const lower = needle.toLowerCase();
+    let budget = SNIPPET_PAPER_LIMIT;
+    const keys = Object.keys(byPaper);
+    const readPages = d.prepare('SELECT pages FROM pdf_text WHERE paper_id = ? AND attachment_id = ?');
+    for (let i = 0; i < keys.length && budget > 0; i++) {
+      const hit = byPaper[keys[i]];
+      if (hit.snippets.length) continue;
+      budget -= 1;
+      const row = readPages.get(hit.paperId, hit.attachmentId);
+      if (!row) continue;
+      const pages = await unpackPageRow(row.pages);
+      if (!pages) continue;
+      const wanted = Object.keys(hit.pageSet).map(Number).sort(function (a, b) { return a - b; });
+      for (const page of wanted) {
+        if (hit.snippets.length >= SNIPPET_PER_HIT) break;
+        const textValue = String(pages[page] == null ? '' : pages[page]);
+        const at = textValue.toLowerCase().indexOf(lower);
+        if (at === -1) continue;
+        hit.snippets.push({ page: page, text: snippetAround(textValue, at, needle.length) });
+      }
+    }
   }
 
   // ---------- 备份 ----------
@@ -1190,7 +1269,7 @@ function createLibraryDb(baseDir) {
             await pdfTextPut({
               paperId: paperId,
               fingerprint: entry.fingerprint || '',
-              method: entry.method || 'pdfjs',
+              method: entry.method || 'mupdf',
               pages: entry.pages
             });
           }

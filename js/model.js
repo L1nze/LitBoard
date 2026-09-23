@@ -1,9 +1,13 @@
 /* LitBoard 数据模型：校验、迁移与规范化（浏览器 / Node 共用） */
 (function (root, factory) {
-  var api = factory();
+  var pinyinPro = root && root.pinyinPro;
+  if (typeof module === 'object' && module.exports) {
+    try { pinyinPro = require('../vendor/pinyin-pro/pinyin-pro.js'); } catch (e) { /* 浏览器 bundle 不走 require */ }
+  }
+  var api = factory(pinyinPro);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.LitModel = api;
-})(typeof window !== 'undefined' ? window : null, function () {
+})(typeof window !== 'undefined' ? window : null, function (pinyinPro) {
   'use strict';
 
   var SCHEMA_VERSION = 14;
@@ -207,9 +211,15 @@
     var authors = paper && Array.isArray(paper.authors) ? paper.authors : [];
     var first = text(authors[0]).trim();
     var family = first ? (first.indexOf(',') !== -1 ? first.split(',')[0].trim() : first.split(/\s+/).pop()) : 'anon';
-    var normalized = family.normalize ? family.normalize('NFKD') : family;
+    // 自动 key 必须是 LaTeX/BibTeX 安全的 ASCII。中文姓名通过本地 vendored pinyin-pro
+    // 转为无声调拼音；既有导入 key 与用户手动钉住的 key 不走这里，保持原值和稳定性。
+    var romanized = family;
+    if (/[\u3400-\u9fff\uf900-\ufaff]/.test(romanized) && pinyinPro && typeof pinyinPro.pinyin === 'function') {
+      romanized = pinyinPro.pinyin(romanized, { toneType: 'none', mode: 'surname', separator: '' });
+    }
+    var normalized = romanized.normalize ? romanized.normalize('NFKD') : romanized;
     normalized = normalized.replace(/[̀-ͯ]/g, '').toLowerCase()
-      .replace(/[^a-z0-9㐀-鿿]+/g, '');
+      .replace(/[^a-z0-9]+/g, '');
     var year = finiteNumber(paper && paper.year);
     return (normalized || 'anon') + (year != null && year >= 1000 && year <= 3000 ? Math.trunc(year) : 'nodate');
   }

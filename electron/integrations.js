@@ -10,6 +10,7 @@ const LitZotero = require('../js/zotero.js');
 const LitNoteMl = require('../js/noteml.js');
 const LitTranslate = require('../js/translate.js');
 const LitEmbedCfg = require('../js/embedcfg.js');
+const LitAgentCfg = require('../js/agentcfg.js');
 
 /** 快照入口解析：目录 → 内部 index.html / 首个 .html；文件 → 原样返回（Zotero 快照是目录型附件，F12） */
 async function resolveSnapshotEntry(filePath) {
@@ -66,117 +67,47 @@ function extractFirstPdfFromZip(value) {
   throw new Error('Zotero ZIP 中没有 PDF');
 }
 
-/* ---------- stored-ZIP（不压缩）写入/全量解压：网页快照目录的云端载体 ---------- */
-const ZIP_CRC_TABLE = (function () {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-    table[n] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(buffer) {
-  let crc = 0xFFFFFFFF;
-  for (let i = 0; i < buffer.length; i++) crc = ZIP_CRC_TABLE[(crc ^ buffer[i]) & 0xFF] ^ (crc >>> 8);
-  return (crc ^ 0xFFFFFFFF) >>> 0;
-}
+/* ---------- stored-ZIP（不压缩）写入/全量解压：网页快照目录的云端载体（vendored JSZip） ---------- */
+const JSZip = require('../vendor/jszip/jszip.min.js');
+const ZIP_FIXED_DATE = new Date(1980, 0, 1, 0, 0, 0); // DOS 时间原点
 
 /**
- * 生成确定性的 stored-ZIP：条目按文件名排序、固定 DOS 日期（1980-01-01）、无压缩。
- * 同样的文件集合永远得到同样的字节，因此 cloudHash（zip 的 sha256）可直接当目录内容指纹。
+ * 生成确定性的 stored-ZIP：条目按文件名排序、固定 DOS 日期（1980-01-01）、无压缩、不落目录条目。
+ * 同样的文件集合在同一 JSZip 版本内永远得到同样的字节，因此 cloudHash（zip 的 sha256）可直接当
+ * 目录内容指纹。注意：字节布局与 2026-09 之前的自写实现不同——旧快照内容不变时靠
+ * syncSignature 快捷路径免重打包，一旦真的重打包即得新哈希并伴随一次上传（内容等价，仅容器字节变）。
  */
-function zipStoreEntries(entries) {
+async function zipStoreEntries(entries) {
   const sorted = (entries || []).slice().sort(function (a, b) {
     return String(a.name) < String(b.name) ? -1 : (String(a.name) > String(b.name) ? 1 : 0);
   });
-  const parts = [];
-  const centrals = [];
-  let offset = 0;
-  sorted.forEach(function (entry) {
-    const name = Buffer.from(String(entry.name).replace(/\\/g, '/').replace(/^\/+/, ''), 'utf8');
-    if (!name.length || name.toString('utf8').split('/').indexOf('..') !== -1) {
+  const zip = new JSZip();
+  for (const entry of sorted) {
+    const name = String(entry.name).replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!name || name.split('/').indexOf('..') !== -1) {
       throw new Error('非法 ZIP 条目名：' + String(entry.name));
     }
-    const data = Buffer.from(entry.data);
-    const crc = crc32(data);
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(0, 8);
-    local.writeUInt16LE(0, 10); local.writeUInt16LE(33, 12); // 1980-01-01 00:00
-    local.writeUInt32LE(crc, 14); local.writeUInt32LE(data.length, 18); local.writeUInt32LE(data.length, 22);
-    local.writeUInt16LE(name.length, 26); local.writeUInt16LE(0, 28);
-    const central = Buffer.alloc(46);
-    central.writeUInt32LE(0x02014b50, 0);  // 签名（4 字节）
-    central.writeUInt16LE(20, 4);          // version made by
-    central.writeUInt16LE(20, 6);          // version needed
-    central.writeUInt16LE(0, 8);           // flags
-    central.writeUInt16LE(0, 10);          // method = stored
-    central.writeUInt16LE(0, 12);          // time
-    central.writeUInt16LE(33, 14);         // date = 1980-01-01
-    central.writeUInt32LE(crc, 16);
-    central.writeUInt32LE(data.length, 20);
-    central.writeUInt32LE(data.length, 24);
-    central.writeUInt16LE(name.length, 28);
-    central.writeUInt16LE(0, 30);          // extra length
-    central.writeUInt16LE(0, 32);          // comment length
-    central.writeUInt16LE(0, 34);          // disk number
-    central.writeUInt16LE(0, 36);          // internal attrs
-    central.writeUInt32LE(0, 38);          // external attrs
-    central.writeUInt32LE(offset, 42);
-    parts.push(local, name, data);
-    centrals.push(central, name);
-    offset += 30 + name.length + data.length;
-  });
-  const centralSize = centrals.reduce(function (sum, buf) { return sum + buf.length; }, 0);
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0); eocd.writeUInt16LE(0, 4); eocd.writeUInt16LE(0, 6);
-  eocd.writeUInt16LE(sorted.length, 8); eocd.writeUInt16LE(sorted.length, 10);
-  eocd.writeUInt32LE(centralSize, 12); eocd.writeUInt32LE(offset, 16); eocd.writeUInt16LE(0, 20);
-  return Buffer.concat(parts.concat(centrals).concat([eocd]));
+    zip.file(name, Buffer.from(entry.data), { date: ZIP_FIXED_DATE, createFolders: false });
+  }
+  return zip.generateAsync({ type: 'nodebuffer', compression: 'STORE', createFolders: false });
 }
 
-/** 全量解压（method 0/8），跳过目录条目；非法条目名（.. / 绝对路径）直接拒绝 */
-function extractZipAll(value) {
-  const buffer = Buffer.from(value);
-  const minEocd = Math.max(0, buffer.length - 65557);
-  let eocd = -1;
-  for (let i = buffer.length - 22; i >= minEocd; i--) {
-    if (buffer.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
-  }
-  if (eocd === -1) throw new Error('不是有效 ZIP');
-  const entries = buffer.readUInt16LE(eocd + 10);
-  let offset = buffer.readUInt32LE(eocd + 16);
+/** 全量解压（method 0/8，JSZip 内置 inflate），跳过目录条目；非法条目名（.. / 绝对路径）直接拒绝 */
+async function extractZipAll(value) {
+  const zip = await JSZip.loadAsync(Buffer.from(value));
   const out = [];
-  for (let i = 0; i < entries; i++) {
-    if (offset + 46 > buffer.length || buffer.readUInt32LE(offset) !== 0x02014b50) break;
-    const flags = buffer.readUInt16LE(offset + 8);
-    const method = buffer.readUInt16LE(offset + 10);
-    const compressedSize = buffer.readUInt32LE(offset + 20);
-    const uncompressedSize = buffer.readUInt32LE(offset + 24);
-    const nameLength = buffer.readUInt16LE(offset + 28);
-    const extraLength = buffer.readUInt16LE(offset + 30);
-    const commentLength = buffer.readUInt16LE(offset + 32);
-    const localOffset = buffer.readUInt32LE(offset + 42);
-    const name = buffer.slice(offset + 46, offset + 46 + nameLength).toString('utf8').replace(/\\/g, '/');
-    offset += 46 + nameLength + extraLength + commentLength;
-    if (!name || name.endsWith('/')) continue;
-    if (path.isAbsolute(name) || name.split('/').indexOf('..') !== -1) {
+  for (const key of Object.keys(zip.files)) {
+    const file = zip.files[key];
+    if (file.dir) continue;
+    const name = String(file.name || '').replace(/\\/g, '/');
+    if (!name || path.isAbsolute(name) || name.split('/').indexOf('..') !== -1) {
       throw new Error('ZIP 包含非法条目名：' + name);
     }
-    if (flags & 1) throw new Error('不支持加密的 ZIP');
-    if (uncompressedSize > 500 * 1024 * 1024 || compressedSize > 500 * 1024 * 1024) throw new Error('ZIP 条目过大');
-    if (localOffset + 30 > buffer.length || buffer.readUInt32LE(localOffset) !== 0x04034b50) {
-      throw new Error('ZIP 结构损坏');
-    }
-    const localNameLength = buffer.readUInt16LE(localOffset + 26);
-    const localExtraLength = buffer.readUInt16LE(localOffset + 28);
-    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
-    const compressed = buffer.slice(dataStart, dataStart + compressedSize);
-    let data;
-    if (method === 0) data = Buffer.from(compressed);
-    else if (method === 8) data = zlib.inflateRawSync(compressed, { maxOutputLength: 500 * 1024 * 1024 });
-    else throw new Error('不支持的 ZIP 压缩格式');
+    // 解压前的大小上限（JSZip 内部字段，钉版 3.10.1 可用；缺字段时由解压后检查兜底）
+    const preSize = file._data && Number(file._data.uncompressedSize);
+    if (preSize > 500 * 1024 * 1024) throw new Error('ZIP 条目过大');
+    const data = await file.async('nodebuffer');
+    if (data.length > 500 * 1024 * 1024) throw new Error('ZIP 条目过大');
     out.push({ name: name, data: data });
   }
   return out;
@@ -309,6 +240,14 @@ function createIntegrations(options) {
     if (!value || !safeStorage.isEncryptionAvailable()) return '';
     try { return safeStorage.decryptString(Buffer.from(value, 'base64')); } catch (error) { return ''; }
   }
+
+  /** 给设置页的安全回显：仅暴露短前缀/后缀，完整凭据仍只在用户点「查看」后按需读取。 */
+  function secretHint(value) {
+    const secret = decrypt(value);
+    if (!secret) return '';
+    if (secret.length <= 4) return '****';
+    return secret.slice(0, Math.min(3, secret.length - 4)) + '****' + secret.slice(-4);
+  }
   /** AI 助手的上下文 / 输出预算（token）：0 或非法值 = 「留空」，由渲染层用
    *  js/agentcore DEFAULTS（256000 / 12800）。上限只挡手输的离谱值（1000 万 token 上下文 /
    *  100 万 token 输出已远超任何真实模型），不猜各模型自己的上限——那类边界由端点在 400 里说。 */
@@ -316,6 +255,101 @@ function createIntegrations(options) {
     const n = Math.floor(Number(value));
     if (!isFinite(n) || n <= 0) return 0;
     return Math.min(n, max);
+  }
+
+  /* ---------- AI 助手「服务商 + 模型」清单 ----------
+   * 语义（迁移/镜像/选择/增删）全在 js/agentcfg.js 的纯函数里，这里只管**凭据落盘**：
+   * 每个服务商一把自己的 Key（密文进配置文件，明文只在主进程内存里短暂出现）。
+   * 扁平字段 agentBaseUrl / agentApiDialect / agentModel / agentApiKey 降级为「当前生效
+   * 服务商」的镜像，写盘前由 agentMirror() 重算——agent-net、js/embedcfg 的 legacy-chat
+   * 回退、渲染层的就绪判定都还在读它们，因此这些老消费方一行都不用改。 */
+  const AGENT_PROVIDER_FIELDS = ['id', 'name', 'baseUrl', 'dialect', 'models', 'activeModel'];
+
+  /** 落盘形态的服务商（只留已知字段 + 密文 apiKey；缺 Key 时空串）。
+   *  hasApiKey 是给渲染层的占位，绝不写进配置文件——否则「密文存在但 hasApiKey=false」
+   * 这类自相矛盾的行会被后来的读者当成真话。 */
+  function storedShape(provider) {
+    const out = {};
+    AGENT_PROVIDER_FIELDS.forEach(function (key) { out[key] = provider[key]; });
+    out.apiKey = String(provider.apiKey || '');
+    return out;
+  }
+
+  /** 当前配置文件里的服务商清单（旧配置的扁平字段由 normalizeConfig 合成为内置服务商） */
+  function storedAgentProviders(raw) {
+    return LitAgentCfg.normalizeConfig(raw).providers.map(storedShape);
+  }
+
+  /** 提交给渲染层的服务商（带 hasApiKey 与脱敏提示，密文不出主进程） */
+  function publicAgentProviders(providers) {
+    return (providers || []).map(function (p) {
+      return {
+        id: p.id, name: p.name, baseUrl: p.baseUrl, dialect: p.dialect,
+        models: p.models, activeModel: p.activeModel, hasApiKey: !!p.apiKey, apiKeyHint: secretHint(p.apiKey)
+      };
+    });
+  }
+
+  /**
+   * 合并渲染层提交的服务商清单与当前配置。
+   * apiKey 语义与其余凭据一致：非空 = 更新为该值；缺省 / 空串 = 保持原值；
+   * clearApiKey:true = 清空。未提交的服务商（按 id 匹配）保留原样，被删掉的自然消失。
+   */
+  function mergeAgentProviders(currentList, inputList) {
+    const currentById = {};
+    (currentList || []).forEach(function (p) { if (p && p.id) currentById[String(p.id)] = p; });
+    const out = [];
+    (Array.isArray(inputList) ? inputList : []).forEach(function (item) {
+      const incoming = LitAgentCfg.normalizeProvider(item, '');
+      if (!incoming.id || out.length >= LitAgentCfg.MAX_PROVIDERS) return;
+      if (out.some(function (p) { return p.id === incoming.id; })) return;
+      const previous = currentById[incoming.id] || {};
+      let apiKey = String(previous.apiKey || '');
+      const submitted = item && item.apiKey != null ? String(item.apiKey) : '';
+      if (item && item.clearApiKey === true) apiKey = '';
+      else if (submitted) apiKey = encrypt(submitted);
+      out.push(storedShape(Object.assign({}, incoming, { apiKey: apiKey })));
+    });
+    if (!out.length) {
+      out.push(storedShape({ id: LitAgentCfg.DEFAULT_PROVIDER_ID }));
+    }
+    return out;
+  }
+
+  /** 扁平字段镜像（当前生效服务商）：必须在 providers / activeId 定稿之后调用 */
+  function agentMirror(providers, activeId) {
+    const cfg = LitAgentCfg.normalizeConfig({ agentProviders: providers, agentActiveProviderId: activeId });
+    const active = LitAgentCfg.activeProvider(cfg);
+    const flat = LitAgentCfg.mirror(cfg);
+    return {
+      agentActiveProviderId: cfg.activeId,
+      agentBaseUrl: flat.agentBaseUrl,
+      agentApiDialect: flat.agentApiDialect,
+      agentModel: flat.agentModel,
+      agentApiKey: String(active.apiKey || '')
+    };
+  }
+
+  /** 旧契约兼容：直接提交扁平 AI 助手字段（老渲染层 / 测试）→ 落到当前生效服务商上 */
+  function applyLegacyAgentFields(cfg, input) {
+    const touched = ['agentBaseUrl', 'agentModel', 'agentApiDialect', 'agentApiKey'].some(function (key) {
+      return input[key] != null;
+    });
+    if (!touched) return cfg;
+    const active = LitAgentCfg.activeProvider(cfg);
+    const patched = {
+      id: active.id, name: active.name,
+      baseUrl: input.agentBaseUrl != null ? String(input.agentBaseUrl).trim() : active.baseUrl,
+      dialect: input.agentApiDialect != null ? input.agentApiDialect : active.dialect,
+      models: active.models.slice(), activeModel: active.activeModel, apiKey: active.apiKey
+    };
+    if (input.agentModel != null) {
+      const model = String(input.agentModel).trim();
+      patched.activeModel = model;
+      if (model && patched.models.indexOf(model) === -1) patched.models = patched.models.concat([model]);
+    }
+    if (input.agentApiKey) patched.apiKey = encrypt(String(input.agentApiKey));
+    return LitAgentCfg.upsertProvider(cfg, patched);
   }
   async function loadRawConfig() {
     let raw = {};
@@ -343,15 +377,18 @@ function createIntegrations(options) {
   }
   async function getConfig() {
     const raw = await loadRawConfig();
+    // AI 助手当前生效的服务商（旧配置读取时由扁平字段合成内置服务商，见 js/agentcfg.js）
+    const agentCfg = LitAgentCfg.normalizeConfig(raw);
+    const agentActive = LitAgentCfg.activeProvider(agentCfg);
     // 向量模型目标解析（唯一权威规则在 js/embedcfg.js）：设置页据此显示「当前用谁的 Key」
-    // 与调研库向量是否可用——Key 只判有无，密文不出主进程。
+    // 与调研库向量是否可用——Key 只判有无，密文不出主进程。AI 助手端点取当前生效服务商。
     const embedTarget = LitEmbedCfg.resolveTarget({
       embedProvider: raw.embedProvider,
       embedBaseUrl: raw.embedBaseUrl,
       embedApiKey: raw.embedApiKey ? 'set' : '',
       embedModel: raw.embedModel,
-      agentBaseUrl: raw.agentBaseUrl,
-      agentApiKey: raw.agentApiKey ? 'set' : ''
+      agentBaseUrl: agentActive.baseUrl,
+      agentApiKey: agentActive.apiKey ? 'set' : ''
     });
     return {
       nutstoreUrl: raw.nutstoreUrl || 'https://dav.jianguoyun.com/dav/',
@@ -364,9 +401,12 @@ function createIntegrations(options) {
       translatorModel: String(raw.translatorModel || ''),
       translatorTarget: raw.translatorTarget === 'en' ? 'en' : 'zh',
       hasTranslatorApiKey: !!raw.translatorApiKey,
+      translatorApiKeyHint: secretHint(raw.translatorApiKey),
       rankProvider: 'easyscholar' === raw.rankProvider ? 'easyscholar' : 'scigreat',
       hasScigreatApiKey: !!raw.scigreatApiKey,
+      scigreatApiKeyHint: secretHint(raw.scigreatApiKey),
       hasEasyscholarApiKey: !!raw.easyscholarApiKey,
+      easyscholarApiKeyHint: secretHint(raw.easyscholarApiKey),
       pdfCacheDir: String(raw.pdfCacheDir || '').trim(),
       pdfDownloadDir: String(raw.pdfDownloadDir || '').trim(),
       renameTemplate: String(raw.renameTemplate || ''),
@@ -374,25 +414,33 @@ function createIntegrations(options) {
       trashRetentionDays: raw.trashRetentionDays == null ? null : Number(raw.trashRetentionDays),
       autoWriteBack: raw.autoWriteBack == null ? null : raw.autoWriteBack === true,
       bibExportPath: String(raw.bibExportPath || '').trim(),
-      agentBaseUrl: String(raw.agentBaseUrl || '').trim(),
-      agentModel: String(raw.agentModel || '').trim(),
+      agentBaseUrl: String(agentActive.baseUrl || '').trim(),
+      agentModel: String(agentActive.activeModel || '').trim(),
       // 接口协议：'' = 自动（按 URL 尾段/域名判定），chat | responses | messages 为显式指定
-      agentApiDialect: AGENT_DIALECTS.indexOf(raw.agentApiDialect) >= 0 ? raw.agentApiDialect : '',
+      agentApiDialect: AGENT_DIALECTS.indexOf(agentActive.dialect) >= 0 ? agentActive.dialect : '',
       // 上下文 / 单轮输出预算（token）：0 = 留空，用渲染层默认值（256000 / 12800）
       agentContextTokens: agentTokenBudget(raw.agentContextTokens, AGENT_CONTEXT_TOKENS_MAX),
       agentMaxOutputTokens: agentTokenBudget(raw.agentMaxOutputTokens, AGENT_MAX_OUTPUT_TOKENS_MAX),
-      hasAgentApiKey: !!raw.agentApiKey,
+      hasAgentApiKey: !!agentActive.apiKey,
+      agentApiKeyHint: secretHint(agentActive.apiKey),
+      // 「服务商 + 模型」清单（对话面板底部切换用；每项只报 hasApiKey，密文不出主进程）
+      agentProviders: publicAgentProviders(agentCfg.providers),
+      agentActiveProviderId: agentCfg.activeId,
       // 向量模型（调研库向量专用）：独立 provider / Base URL / API Key / 模型名
       embedProvider: String(raw.embedProvider || '').trim(),
       embedBaseUrl: String(raw.embedBaseUrl || '').trim(),
       embedModel: String(raw.embedModel || '').trim(),
       hasEmbedApiKey: !!raw.embedApiKey,
+      embedApiKeyHint: secretHint(raw.embedApiKey),
       embedReady: embedTarget.ok === true,
       embedSource: embedTarget.source,
       openalexEmail: String(raw.openalexEmail || '').trim(),
       hasOpenalexApiKey: !!raw.openalexApiKey,
+      openalexApiKeyHint: secretHint(raw.openalexApiKey),
       hasElsevierApiKey: !!raw.elsevierApiKey,
+      elsevierApiKeyHint: secretHint(raw.elsevierApiKey),
       hasTinyfishApiKey: !!raw.tinyfishApiKey,
+      tinyfishApiKeyHint: secretHint(raw.tinyfishApiKey),
       hasSemanticscholarApiKey: !!raw.semanticscholarApiKey
     };
   }
@@ -412,7 +460,9 @@ function createIntegrations(options) {
         ? (input.translatorTarget === 'en' ? 'en' : 'zh')
         : (current.translatorTarget === 'en' ? 'en' : 'zh'),
       translatorApiKey: input.translatorApiKey ? encrypt(String(input.translatorApiKey)) : current.translatorApiKey || '',
-      rankProvider: input.rankProvider === 'easyscholar' ? 'easyscholar' : (current.rankProvider === 'easyscholar' ? 'easyscholar' : 'scigreat'),
+      // 显式提交的合法服务商优先，只有未提交（老渲染层）才沿用现值：
+      // 反过来写会让「切回 SciGreat」被静默丢弃（存的一直是 easyscholar，回显也跟着错）
+      rankProvider: resolveRankProvider(current, input),
       scigreatApiKey: input.scigreatApiKey ? encrypt(String(input.scigreatApiKey)) : current.scigreatApiKey || '',
       easyscholarApiKey: input.easyscholarApiKey ? encrypt(String(input.easyscholarApiKey)) : current.easyscholarApiKey || '',
       configSyncPassword: input.configSyncPassword ? encrypt(String(input.configSyncPassword)) : current.configSyncPassword || '',
@@ -423,18 +473,13 @@ function createIntegrations(options) {
       trashRetentionDays: input.trashRetentionDays != null ? Math.max(0, Math.min(3650, Number(input.trashRetentionDays) || 0)) : current.trashRetentionDays,
       autoWriteBack: input.autoWriteBack != null ? input.autoWriteBack === true : current.autoWriteBack,
       bibExportPath: String(input.bibExportPath != null ? input.bibExportPath : current.bibExportPath || '').trim(),
-      agentBaseUrl: String(input.agentBaseUrl != null ? input.agentBaseUrl : current.agentBaseUrl || '').trim(),
-      agentModel: String(input.agentModel != null ? input.agentModel : current.agentModel || '').trim(),
-      agentApiDialect: AGENT_DIALECTS.indexOf(input.agentApiDialect != null ? input.agentApiDialect : current.agentApiDialect) >= 0
-        ? (input.agentApiDialect != null ? input.agentApiDialect : current.agentApiDialect)
-        : '',
+      // AI 助手凭据由下面的服务商清单统一承载（扁平字段是它的镜像，不直接接收输入）
       agentContextTokens: input.agentContextTokens != null
         ? agentTokenBudget(input.agentContextTokens, AGENT_CONTEXT_TOKENS_MAX)
         : agentTokenBudget(current.agentContextTokens, AGENT_CONTEXT_TOKENS_MAX),
       agentMaxOutputTokens: input.agentMaxOutputTokens != null
         ? agentTokenBudget(input.agentMaxOutputTokens, AGENT_MAX_OUTPUT_TOKENS_MAX)
         : agentTokenBudget(current.agentMaxOutputTokens, AGENT_MAX_OUTPUT_TOKENS_MAX),
-      agentApiKey: input.agentApiKey ? encrypt(String(input.agentApiKey)) : current.agentApiKey || '',
       // 向量模型（专用 Key 一旦填过就保留；留空 = 不改动，与其余 Key 同约定）
       embedProvider: String(input.embedProvider != null ? input.embedProvider : current.embedProvider || '').trim(),
       embedBaseUrl: String(input.embedBaseUrl != null ? input.embedBaseUrl : current.embedBaseUrl || '').trim(),
@@ -447,6 +492,18 @@ function createIntegrations(options) {
       semanticscholarApiKey: input.semanticscholarApiKey ? encrypt(String(input.semanticscholarApiKey)) : current.semanticscholarApiKey || '',
       configUpdatedAt: Number(current.configUpdatedAt) || 0
     };
+    /* AI 助手服务商清单：提交则按 id 合并（Key 语义见 mergeAgentProviders），未提交则保持原样；
+       旧契约的扁平字段（老渲染层 / 测试直接提交 agentBaseUrl 等）落到当前生效服务商上。
+       最后重算扁平镜像——顺序不能变：镜像必须看到定稿后的 providers 与 activeId。 */
+    let agentCfg = LitAgentCfg.normalizeConfig(current);
+    if (Array.isArray(input.agentProviders)) {
+      agentCfg = { providers: mergeAgentProviders(storedAgentProviders(current), input.agentProviders), activeId: agentCfg.activeId };
+    } else {
+      agentCfg = applyLegacyAgentFields(agentCfg, input);
+    }
+    const nextActiveId = input.agentActiveProviderId != null ? String(input.agentActiveProviderId) : agentCfg.activeId;
+    next.agentProviders = agentCfg.providers.map(storedShape);
+    Object.assign(next, agentMirror(agentCfg.providers, nextActiveId));
     const currentSynced = syncedConfigPayload(current);
     const nextSynced = syncedConfigPayload(next);
     delete currentSynced.updatedAt;
@@ -628,7 +685,7 @@ function createIntegrations(options) {
 
   class RemoteChangedError extends Error {
     constructor(message, url) {
-      super(message || '远端文件在同步期间发生变化，请重新读取后重试');
+      super(message || '云端文件在同步期间发生变化，请重新读取后重试');
       this.name = 'RemoteChangedError';
       this.code = 'REMOTE_CHANGED';
       this.url = url || '';
@@ -659,7 +716,7 @@ function createIntegrations(options) {
     const response = await request(url, { method: 'PUT', headers: putHeaders, body: body });
     throwIfWebDavRateLimited(response);
     if (response.status === 412 || (response.status === 409 && settings.conditional)) {
-      throw new RemoteChangedError('远端文件已被其他设备修改，请重新生成同步计划', url);
+      throw new RemoteChangedError('云端文件已被其他设备修改，请重新生成同步计划', url);
     }
     if (!response.ok) throw new Error((settings.label || '坚果云写入') + '失败（' + response.status + '）');
     return response;
@@ -748,7 +805,7 @@ function createIntegrations(options) {
         const latest = await request(configFileUrl, { method: 'GET', headers: headers });
         if (!latest.ok) throw new Error('坚果云配置复核失败（' + latest.status + '）');
         const latestText = await latest.text();
-        if (latestText !== remoteText) throw new RemoteChangedError('远端配置已被其他设备修改，请重新同步', configFileUrl);
+        if (latestText !== remoteText) throw new RemoteChangedError('云端配置已被其他设备修改，请重新同步', configFileUrl);
       }
       const encrypted = await encryptSyncedConfig(local, password, settings.envelopeVersion);
       await conditionalPut(configFileUrl, encrypted, headers, remoteEtag, {
@@ -875,7 +932,7 @@ function createIntegrations(options) {
     if (provider.free) {
       return { provider: providerName, translation: await translateFreeText(providerName, text, config) };
     }
-    if (!apiKey) throw new Error('请先在同步设置中填写翻译凭据');
+    if (!apiKey) throw new Error('请先在 设置 → 集成与服务 中填写划词翻译凭据');
     if (providerName === 'aliyun' && text.length > 5000) throw new Error('阿里云机器翻译单次不能超过 5000 个字符');
     if (providerName !== 'aliyun' && text.length > 12000) throw new Error('单次翻译不能超过 12000 个字符');
     if (providerName === 'aliyun') {
@@ -961,7 +1018,7 @@ function createIntegrations(options) {
   async function getScigreatRank(input) {
     const config = await loadRawConfig();
     const apiKey = decrypt(config.scigreatApiKey);
-    if (!apiKey) throw new Error('请先在同步设置中填写 SciGreat API Key');
+    if (!apiKey) throw new Error('请先在 设置 → 集成与服务 中填写 SciGreat API Key');
     return requestScigreat(apiKey, input || {});
   }
 
@@ -1179,7 +1236,7 @@ function createIntegrations(options) {
         return actual;
       }
     }
-    const error = new Error('远端写入后校验失败：坚果云未返回刚刚写入的文献库，请检查远端目录或稍后重试');
+    const error = new Error('云端写入后校验失败：坚果云未返回刚刚写入的文献库，请检查云端目录或稍后重试');
     error.code = 'REMOTE_WRITE_VERIFY_FAILED';
     error.remote = actual;
     throw error;
@@ -1494,7 +1551,7 @@ function createIntegrations(options) {
           };
           await Promise.all([readWorker(), readWorker(), readWorker(), readWorker(),
             readWorker(), readWorker(), readWorker(), readWorker()]);
-          const zip = zipStoreEntries(entries);
+          const zip = await zipStoreEntries(entries);
           const actualHash = await hashBuffer(zip);
           asset.cloudName = cloudName;
           if ((missingRemotely(cloudName) || String(asset.cloudHash || '').toLowerCase() !== actualHash ||
@@ -1535,7 +1592,7 @@ function createIntegrations(options) {
         const snapshotHash = await hashBuffer(body);
         const expectedHash = String(asset.cloudHash || '').toLowerCase();
         if (expectedHash && snapshotHash !== expectedHash) throw assetError('快照校验失败（SHA-256 不匹配）', item);
-        const files = extractZipAll(body);
+        const files = await extractZipAll(body);
         const tempDir = targetDir + '.part-' + process.pid + '-' + Date.now();
         const previousDir = targetDir + '.previous-' + process.pid + '-' + Date.now();
         let previousMoved = false, installed = false;
@@ -1797,8 +1854,8 @@ function createIntegrations(options) {
     const localValue = value.workspace || value.localValue || (value.papers ? value : { papers: [], folders: [] });
     const mode = value.mode === 'restore' || value.mode === 'pull' || value.mode === 'remote' ? 'restore' : 'merge';
     if (mode === 'restore' && !inspected.exists) {
-      throw new Error('未找到远端库文件：' + inspected.fileUrl + '（HTTP ' + inspected.status + '）。' +
-        '“远端恢复”不会再把缺失文件当作空库；如需从本机新建远端，请使用“同步对照”或“保存并同步”。');
+      throw new Error('未找到云端库文件：' + inspected.fileUrl + '（HTTP ' + inspected.status + '）。' +
+        '“云端恢复”不会再把缺失文件当作空库；如需从本机新建云端库，请使用“对比本机与云端”或“立即同步”。');
     }
     let base = await readSyncBase();
     const baseKey = remoteOptions.user + '\n' + remoteOptions.fileUrl;
@@ -2050,16 +2107,16 @@ function createIntegrations(options) {
   async function applyNutstoreSyncPlan(input) {
     const value = input && typeof input === 'object' ? input : {};
     const plan = pendingSyncPlans.get(String(value.planId || ''));
-    if (!plan) throw new Error('同步计划不存在或已过期，请重新检查远端');
+    if (!plan) throw new Error('同步计划不存在或已过期，请重新检查云端');
     const reportProgress = function (phase, extra) {
       emitSyncProgress(Object.assign({ scope: 'apply-plan', planId: plan.planId, phase: phase }, extra || {}));
     };
-    reportProgress('verify', { message: '正在校验远端版本…' });
+    reportProgress('verify', { message: '正在校验云端版本…' });
     const current = await readRemoteLibrary(plan._options);
     if (current.exists !== plan.remoteExists || current.etag !== plan.remoteEtag ||
         (!current.etag && current.exists && hashWorkspace(current.remote) !== hashWorkspace(plan.remote))) {
       pendingSyncPlans.delete(plan.planId);
-      const error = new RemoteChangedError('远端内容已变化，旧同步计划已失效，请重新生成', plan._options.fileUrl);
+      const error = new RemoteChangedError('云端内容已变化，旧同步计划已失效，请重新生成', plan._options.fileUrl);
       error.code = 'SYNC_PLAN_STALE';
       throw error;
     }
@@ -2079,7 +2136,7 @@ function createIntegrations(options) {
         workspace = LitSync.adoptRemoteEntities(workspace, plan.baseRecoveryAvailable ? plan.base : plan.remote);
       }
       else if (emptyChoice !== 'local') {
-        throw new Error('本机工作区为空而同步基线仍有内容：请先在对照中选择「采用远端版本」（把远端拉回本机）或「采用本机版本」（确认清空远端）');
+        throw new Error('本机工作区为空而同步基线仍有内容：请先在对照中选择「采用云端版本」（把云端拉回本机）或「采用本机版本」（确认清空云端）');
       }
     }
     // 云端保留结果：普通同步里用户选「采用本机版本」的实体在云端保持远端
@@ -2101,7 +2158,7 @@ function createIntegrations(options) {
       }
     }
     const knownRemoteAssets = await resolveRemoteAssetNames(current.remote, workspace, plan._options, function () {
-      reportProgress('scan-assets', { message: '正在读取远端附件清单，避免重复上传…' });
+      reportProgress('scan-assets', { message: '正在读取云端附件清单，避免重复上传…' });
     });
     const assetResult = await syncWorkspaceAssets(workspace, plan._options, {
       // 附件失败不阻断文献库 JSON 写入：附件靠台账续传，先把文献元数据救回来
@@ -2118,11 +2175,11 @@ function createIntegrations(options) {
     const remoteHadCurrentVersion = Number(current.remote && current.remote.syncVersion) >= LitSync.SYNC_VERSION;
     let uploaded = false, response = null, verifiedLibrary = null;
     if (hashWorkspace(cloudWorkspace) !== remoteHash || !remoteHadCurrentVersion || !current.exists) {
-      reportProgress('upload', { message: '正在写入远端库…' });
+      reportProgress('upload', { message: '正在写入云端库…' });
       const payload = LitSync.createSyncEnvelope(cloudWorkspace);
       response = await conditionalPut(plan._options.fileUrl, JSON.stringify(payload, null, 2), plan._options.headers,
         current.etag, { contentType: 'application/json; charset=utf-8', label: '坚果云写入', conditional: current.exists, createOnly: !current.exists });
-      reportProgress('verify-write', { message: '正在确认远端写入结果…' });
+      reportProgress('verify-write', { message: '正在确认云端写入结果…' });
       verifiedLibrary = await verifyRemoteLibraryWrite(plan._options, cloudWorkspace);
       uploaded = true;
     }
@@ -2163,7 +2220,7 @@ function createIntegrations(options) {
     const cloudWorkspace = LitSync.applyPinsToWorkspace(merged, pins);
     const remoteHash = hashWorkspace(remote);
     const knownRemoteAssets = await resolveRemoteAssetNames(remote, merged, remoteOptions, function () {
-      emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取远端附件清单，避免重复上传…' });
+      emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取云端附件清单，避免重复上传…' });
     });
     const assetResult = await syncWorkspaceAssets(merged, remoteOptions, {
       // 附件失败不阻断文献库 JSON 写入：附件靠台账续传，先把文献元数据救回来
@@ -2188,15 +2245,15 @@ function createIntegrations(options) {
       if (library.exists && !library.etag) {
         const latest = await readRemoteLibrary(remoteOptions);
         if (latest.exists !== library.exists || hashWorkspace(latest.remote) !== remoteHash) {
-          throw new RemoteChangedError('远端内容已变化，请重新生成同步计划', remoteOptions.fileUrl);
+          throw new RemoteChangedError('云端内容已变化，请重新生成同步计划', remoteOptions.fileUrl);
         }
       }
-      emitSyncProgress({ scope: 'sync', phase: 'upload', message: '正在写入远端库…' });
+      emitSyncProgress({ scope: 'sync', phase: 'upload', message: '正在写入云端库…' });
       const payload = LitSync.createSyncEnvelope(cloudWorkspace);
       response = await conditionalPut(remoteOptions.fileUrl, JSON.stringify(payload, null, 2), remoteOptions.headers, library.etag, {
         contentType: 'application/json; charset=utf-8', label: '坚果云写入', conditional: !!library.etag, createOnly: !library.exists
       });
-      emitSyncProgress({ scope: 'sync', phase: 'verify-write', message: '正在确认远端写入结果…' });
+      emitSyncProgress({ scope: 'sync', phase: 'verify-write', message: '正在确认云端写入结果…' });
       verifiedLibrary = await verifyRemoteLibraryWrite(remoteOptions, cloudWorkspace);
       uploaded = true;
     }
@@ -2237,7 +2294,7 @@ function createIntegrations(options) {
     if (!password) throw new Error('请先提供配置同步密码');
     const remoteConfig = await readRemoteConfig(remoteOptions.folderUrl, remoteOptions.headers, password, { publicOnly: false });
     if (!remoteConfig.exists) return { ok: true, found: false, config: await getConfig(), etag: '', value: null };
-    if (!remoteConfig.value) throw new Error('远端配置无法读取');
+    if (!remoteConfig.value) throw new Error('云端配置无法读取');
     const raw = await loadRawConfig();
     await applySyncedConfig(raw, remoteConfig.value);
     return { ok: true, found: true, config: await getConfig(), etag: remoteConfig.etag || '', value: portableConfigView(remoteConfig.value) };
@@ -2752,14 +2809,17 @@ function createIntegrations(options) {
   }
 
   /* 调研助手运行时配置：主进程内部使用（含解密后的 Key），不回渲染层。
-   * 与划词翻译凭据完全独立——AI 助手 / OpenAlex 检索各有各的 Key。 */
+   * 与划词翻译凭据完全独立——AI 助手 / OpenAlex 检索各有各的 Key。
+   * AI 助手三项取「当前生效服务商」（配置文件里的扁平字段即它的镜像，这里直接从清单解，
+   * 免得读到配置文件被外部工具改坏后的残留值）。 */
   async function getResearchRuntimeConfig() {
     const raw = await loadRawConfig();
+    const agentActive = LitAgentCfg.activeProvider(LitAgentCfg.normalizeConfig(raw));
     return {
-      agentBaseUrl: String(raw.agentBaseUrl || '').trim(),
-      agentModel: String(raw.agentModel || '').trim(),
-      agentApiDialect: AGENT_DIALECTS.indexOf(raw.agentApiDialect) >= 0 ? raw.agentApiDialect : '',
-      agentApiKey: decrypt(raw.agentApiKey),
+      agentBaseUrl: String(agentActive.baseUrl || '').trim(),
+      agentModel: String(agentActive.activeModel || '').trim(),
+      agentApiDialect: AGENT_DIALECTS.indexOf(agentActive.dialect) >= 0 ? agentActive.dialect : '',
+      agentApiKey: agentActive.apiKey ? decrypt(agentActive.apiKey) : '',
       // 向量模型（调研库向量专用；未配置时由 js/embedcfg.js 回退到上面的 AI 助手端点）
       embedProvider: String(raw.embedProvider || '').trim(),
       embedBaseUrl: String(raw.embedBaseUrl || '').trim(),
@@ -2773,7 +2833,62 @@ function createIntegrations(options) {
     };
   }
 
-  return { getConfig, saveConfig, getResearchRuntimeConfig, nutstoreSync,
+  /** 按 id 取某个服务商的运行期凭据（设置页「测试连接 / 拉取模型」用；用户没重填 Key 时
+   *  也要能测，故由主进程解自己存的那把）。返回 null 表示 id 不存在。 */
+  async function getAgentProviderRuntime(id) {
+    const wanted = String(id == null ? '' : id).trim();
+    if (!wanted) return null;
+    const raw = await loadRawConfig();
+    const cfg = LitAgentCfg.normalizeConfig(raw);
+    const found = cfg.providers.filter(function (p) { return p.id === wanted; })[0];
+    if (!found) return null;
+    return {
+      id: found.id,
+      name: found.name,
+      baseUrl: found.baseUrl,
+      dialect: found.dialect,
+      model: found.activeModel,
+      models: found.models.slice(),
+      apiKey: found.apiKey ? decrypt(found.apiKey) : ''
+    };
+  }
+
+  /** 仅供用户显式「查看 / 复制」的按需解密入口；常规 getConfig 永不返回完整凭据。 */
+  async function revealSecret(input) {
+    const request = input || {};
+    const kind = String(request.kind || '').trim();
+    const raw = await loadRawConfig();
+    const fields = {
+      translator: 'translatorApiKey', scigreat: 'scigreatApiKey', easyscholar: 'easyscholarApiKey',
+      openalex: 'openalexApiKey', elsevier: 'elsevierApiKey', tinyfish: 'tinyfishApiKey', embed: 'embedApiKey'
+    };
+    if (kind === 'agent') {
+      const providerId = String(request.providerId || '').trim();
+      const provider = LitAgentCfg.normalizeConfig(raw).providers.filter(function (item) { return item.id === providerId; })[0];
+      return provider && provider.apiKey ? decrypt(provider.apiKey) : '';
+    }
+    return fields[kind] ? decrypt(raw[fields[kind]]) : '';
+  }
+
+  /** 对话面板底部切换服务商 / 模型（不打开设置即生效）：只改选中项，凭据原样保留 */
+  async function setAgentSelection(input) {
+    const req = input || {};
+    const raw = await loadRawConfig();
+    const cfg = LitAgentCfg.normalizeConfig(raw);
+    const picked = LitAgentCfg.selectModel(cfg, req.providerId, req.model);
+    return saveConfig({
+      // 不带 apiKey：合并按 id 沿用已存的密文，避免把密文当明文二次加密
+      agentProviders: picked.providers.map(function (p) {
+        return {
+          id: p.id, name: p.name, baseUrl: p.baseUrl, dialect: p.dialect,
+          models: p.models, activeModel: p.activeModel
+        };
+      }),
+      agentActiveProviderId: picked.activeId
+    });
+  }
+
+  return { getConfig, saveConfig, getResearchRuntimeConfig, getAgentProviderRuntime, revealSecret, setAgentSelection, nutstoreSync,
     inspectNutstoreRemote, createNutstoreSyncPlan, applyNutstoreSyncPlan,
     pullPortableConfig, pullNutstoreConfig: pullPortableConfig, inspectRemote, createSyncPlan, applySyncPlan,
     testNutstoreConnection, translateText, testTranslationConnection, getScigreatRank, testScigreatConnection, getJournalRank, testJournalRankConnection, detectZoteroDataDir, setZoteroDataDir,

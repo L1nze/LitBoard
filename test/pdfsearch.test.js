@@ -64,7 +64,7 @@ test('reindex builds missing entries, reports progress, and skips fresh ones on 
   assert.equal(bridge.puts.length, 1);
   assert.equal(bridge.puts[0].paperId, 'p1');
   assert.equal(bridge.puts[0].attachmentId, 'a1');
-  assert.equal(bridge.puts[0].method, 'pdfjs');
+  assert.equal(bridge.puts[0].method, 'mupdf');
   assert.equal(bridge.puts[0].pages.length, 2);
   assert.equal(progress.length, 1);
   assert.deepEqual(Object.assign({}, progress[0]), { done: 1, total: 1, title: '' });

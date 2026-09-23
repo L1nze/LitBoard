@@ -2,19 +2,22 @@
  *
  * - 引文用复杂域保存：fldChar begin → instrText " ADDIN LitBoard.Citation.1 \"{json}\"" → separate → 渲染文本 → end。
  *   域命名版本化、独立命名（不冒充 Zotero 域），是下一轮 VBA 插件的定位契约；
- * - zip 为自写 stored 容器（CRC32 + 固定 DOS 时间，确定性输出）；读取侧 method 8（Word 产出）
- *   仅在 Node（zlib）环境支持，浏览器端只读自己产出的 stored 包；
+ * - ZIP 容器走 vendored JSZip（vendor/jszip/）：STORE 写入 + 条目排序 + 固定 DOS 时间，
+ *   同一 JSZip 版本内输出字节确定；读取 method 0/8 全平台可用（JSZip 自带 inflate，
+ *   浏览器端也能读 Word 产出的 deflate 包）。zipStore/zipRead 及依赖它们的导出均为 async；
  * - convertZoteroFields：把 Zotero 域（ADDIN ZOTERO_ITEM CSL_CITATION …）换成 LitBoard 域，只生成新表示、不动原件。
  */
 (function (root, factory) {
-  var zlib = null;
+  var JSZip = null;
   if (typeof module === 'object' && module.exports) {
-    try { zlib = require('node:zlib'); } catch (e) { zlib = null; }
+    try { JSZip = require('../vendor/jszip/jszip.min.js'); } catch (e) { JSZip = null; }
+  } else if (root) {
+    JSZip = root.JSZip || null;
   }
-  var api = factory(zlib);
+  var api = factory(JSZip);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.LitDocx = api;
-})(typeof window !== 'undefined' ? window : null, function (zlib) {
+})(typeof window !== 'undefined' ? window : null, function (JSZip) {
   'use strict';
   var T = (typeof window !== 'undefined' && window.LitI18n && window.LitI18n.t) || function (s) { return s == null ? '' : String(s); }; // i18n：中文源串为键，译文见 js/i18n-en.js
 
@@ -25,112 +28,63 @@
     return new TextEncoder().encode(text(data));
   }
   function bytesToString(bytes) { return new TextDecoder('utf-8').decode(bytes); }
-  function concatBytes(parts) {
-    var total = parts.reduce(function (sum, part) { return sum + part.length; }, 0);
-    var out = new Uint8Array(total);
-    var offset = 0;
-    parts.forEach(function (part) { out.set(part, offset); offset += part.length; });
-    return out;
+
+  /* ---------- ZIP 容器（vendored JSZip；STORE 写入 + 确定性输出） ---------- */
+  var FIXED_DATE = new Date(1980, 0, 1, 0, 0, 0); // DOS 时间原点：同一 JSZip 版本内输出字节确定
+
+  function requireZip() {
+    if (!JSZip) throw new Error(T('ZIP 组件未加载'));
+    return JSZip;
   }
 
-  /* ---------- stored-ZIP（确定性：条目排序 + 固定 DOS 时间） ---------- */
-  var CRC_TABLE = (function () {
-    var table = new Uint32Array(256);
-    for (var n = 0; n < 256; n++) {
-      var c = n;
-      for (var k = 0; k < 8; k++) c = c & 1 ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-      table[n] = c >>> 0;
+  /** 写侧条目名规范化与校验（在启动异步工作前同步抛错，保持同步抛错语义） */
+  function normalizeEntryName(name) {
+    var clean = text(name).replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!clean || clean.split('/').indexOf('..') !== -1) {
+      throw new Error(T('非法 ZIP 条目名：') + name);
     }
-    return table;
-  })();
-  function crc32(bytes) {
-    var crc = 0xFFFFFFFF;
-    for (var i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
-    return (crc ^ 0xFFFFFFFF) >>> 0;
+    return clean;
   }
-  function u16(value) { return new Uint8Array([value & 255, (value >>> 8) & 255]); }
-  function u32(value) { return new Uint8Array([value & 255, (value >>> 8) & 255, (value >>> 16) & 255, (value >>> 24) & 255]); }
 
-  /** entries: [{ name, data(Uint8Array|string) }] → 完整 zip 字节 */
+  function assertSafeReadName(name) {
+    if (!name || name.split('/').indexOf('..') !== -1 || /^(?:[A-Za-z]:)?[\\/]/.test(name)) {
+      throw new Error(T('ZIP 包含非法条目名：') + name);
+    }
+  }
+
+  /** entries: [{ name, data(Uint8Array|string) }] → Promise<完整 zip 字节>（STORE、条目排序、固定 DOS 时间） */
   function zipStore(entries) {
+    var Zip = requireZip();
     var sorted = (entries || []).slice().sort(function (a, b) {
       return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
     });
-    var parts = [];
-    var centrals = [];
-    var offset = 0;
+    var zip = new Zip();
     sorted.forEach(function (entry) {
-      var name = asBytes(entry.name.replace(/\\/g, '/').replace(/^\/+/, ''));
-      if (!name.length || name && bytesToString(name).split('/').indexOf('..') !== -1) {
-        throw new Error(T('非法 ZIP 条目名：') + entry.name);
-      }
-      var data = asBytes(entry.data);
-      var crc = crc32(data);
-      var local = concatBytes([
-        u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(33),
-        u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0),
-        name, data
-      ]);
-      var central = concatBytes([
-        u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(33),
-        u32(crc), u32(data.length), u32(data.length),
-        u16(name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset),
-        name
-      ]);
-      parts.push(local);
-      centrals.push(central);
-      offset += local.length;
+      zip.file(normalizeEntryName(entry.name), asBytes(entry.data), { date: FIXED_DATE, createFolders: false });
     });
-    var centralBytes = concatBytes(centrals);
-    var eocd = concatBytes([
-      u32(0x06054b50), u16(0), u16(0), u16(sorted.length), u16(sorted.length),
-      u32(centralBytes.length), u32(offset), u16(0)
-    ]);
-    return concatBytes(parts.concat([centralBytes, eocd]));
+    return zip.generateAsync({ type: 'uint8array', compression: 'STORE', createFolders: false });
   }
 
-  /** 解析 zip 中央目录 → [{ name, data(Uint8Array) }]。method 8 需 Node zlib。 */
+  /** 解析 zip → Promise<[{ name, data(Uint8Array) }]>；method 0/8 均可（JSZip 内置 inflate）。 */
   function zipRead(bytes) {
-    var buffer = asBytes(bytes);
-    var view = buffer;
-    function u16at(i) { return view[i] | (view[i + 1] << 8); }
-    function u32at(i) { return (view[i] | (view[i + 1] << 8) | (view[i + 2] << 16) | (view[i + 3] << 24)) >>> 0; }
-    var eocd = -1;
-    for (var i = buffer.length - 22; i >= Math.max(0, buffer.length - 65557); i--) {
-      if (u32at(i) === 0x06054b50) { eocd = i; break; }
-    }
-    if (eocd === -1) throw new Error(T('不是有效 ZIP'));
-    var count = u16at(eocd + 10);
-    var offset = u32at(eocd + 16);
-    var out = [];
-    for (var n = 0; n < count; n++) {
-      if (offset + 46 > buffer.length || u32at(offset) !== 0x02014b50) break;
-      var method = u16at(offset + 10);
-      var compressedSize = u32at(offset + 20);
-      var nameLength = u16at(offset + 28);
-      var extraLength = u16at(offset + 30);
-      var commentLength = u16at(offset + 32);
-      var localOffset = u32at(offset + 42);
-      var name = bytesToString(buffer.slice(offset + 46, offset + 46 + nameLength));
-      offset += 46 + nameLength + extraLength + commentLength;
-      if (!name || name.endsWith('/')) continue;
-      if (name.split('/').indexOf('..') !== -1 || /^(?:[A-Za-z]:)?[\\/]/.test(name)) {
-        throw new Error(T('ZIP 包含非法条目名：') + name);
-      }
-      if (u32at(localOffset) !== 0x04034b50) throw new Error(T('ZIP 结构损坏'));
-      var localNameLength = u16at(localOffset + 26);
-      var localExtraLength = u16at(localOffset + 28);
-      var dataStart = localOffset + 30 + localNameLength + localExtraLength;
-      var compressed = buffer.slice(dataStart, dataStart + compressedSize);
-      var data;
-      if (method === 0) data = compressed;
-      else if (method === 8) {
-        if (!zlib) throw new Error(T('解压 deflate 条目需要 Node 环境'));
-        data = new Uint8Array(zlib.inflateRawSync(Buffer.from(compressed)));
-      } else throw new Error(T('不支持的 ZIP 压缩格式：') + method);
-      out.push({ name: name, data: data });
-    }
-    return out;
+    var Zip = requireZip();
+    return Zip.loadAsync(asBytes(bytes)).then(function (zip) {
+      var names = Object.keys(zip.files);
+      var out = [];
+      var chain = Promise.resolve();
+      names.forEach(function (key) {
+        chain = chain.then(function () {
+          var file = zip.files[key];
+          if (file.dir) return;
+          var name = String(file.name || '').replace(/\\/g, '/');
+          assertSafeReadName(name);
+          return file.async('uint8array').then(function (data) {
+            out.push({ name: name, data: data });
+          });
+        });
+      });
+      return chain.then(function () { return out; });
+    });
   }
 
   /* ---------- OOXML ---------- */
@@ -252,7 +206,7 @@
     '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
     '</Relationships>';
 
-  /** paragraphs → docx 字节（最小包；图片 run 自动生成 media 部件与 rels） */
+  /** paragraphs → Promise<docx 字节>（最小包；图片 run 自动生成 media 部件与 rels） */
   function buildDocx(paragraphs) {
     var ctx = { images: [] };
     var body = (paragraphs || []).map(function (paragraph) { return paragraphXml(paragraph, ctx); }).join('');
@@ -327,25 +281,28 @@
   }
 
   function readDocxFields(bytes) {
-    var entries = zipRead(bytes);
-    var documentEntry = entries.filter(function (e) { return e.name === 'word/document.xml'; })[0];
-    if (!documentEntry) throw new Error(T('docx 缺少 word/document.xml'));
-    return readDocxFieldsXml(bytesToString(documentEntry.data));
+    return zipRead(bytes).then(function (entries) {
+      var documentEntry = entries.filter(function (e) { return e.name === 'word/document.xml'; })[0];
+      if (!documentEntry) throw new Error(T('docx 缺少 word/document.xml'));
+      return readDocxFieldsXml(bytesToString(documentEntry.data));
+    });
   }
 
   /** Read citation fields from the body, footnotes and endnotes in document order per story. */
   function readDocxFieldsAll(bytes) {
     var names = ['word/document.xml', 'word/footnotes.xml', 'word/endnotes.xml'];
-    var entries = zipRead(bytes), out = [];
-    names.forEach(function (name) {
-      var entry = entries.filter(function (item) { return item.name === name; })[0];
-      if (!entry) return;
-      readDocxFieldsXml(bytesToString(entry.data)).forEach(function (field) {
-        field.part = name;
-        out.push(field);
+    return zipRead(bytes).then(function (entries) {
+      var out = [];
+      names.forEach(function (name) {
+        var entry = entries.filter(function (item) { return item.name === name; })[0];
+        if (!entry) return;
+        readDocxFieldsXml(bytesToString(entry.data)).forEach(function (field) {
+          field.part = name;
+          out.push(field);
+        });
       });
+      return out;
     });
-    return out;
   }
 
   /* ---------- Zotero 引文域转换 ---------- */

@@ -4,7 +4,7 @@
  * 临时全文链、网页检索、段落找文献、引文网络（自 main.js registerIpc 平移）。
  * scheduleAutoEmbed 导出给 main.js 启动装配的 60s 空闲巡检 setInterval 用。 */
 
-const { app, dialog, net } = require('electron');
+const { app, dialog } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { storeFileInto } = require('../integrations.js');
@@ -14,6 +14,9 @@ const LitLitSearch = require('../../js/litsearch.js');
 const LitWebFetch = require('../../js/webfetch.js');
 const LitMarkdown = require('../../js/markdown.js');
 const ctx = require('./context.js');
+const { createSafePublicHttpsFetch } = require('../safe-fetch.js');
+
+const safePublicFetch = createSafePublicHttpsFetch();
 
 module.exports = { register: register, scheduleAutoEmbed: scheduleAutoEmbed };
 
@@ -73,8 +76,18 @@ function cacheFetchPage(key, entry) {
 }
 
 /* R15/R16：正式库已收藏索引（researchId + DOI 两路）——「调研库已有」与「正式库已收藏」
- * 是两件事，旧实现用一个 collected=!isNew 把前者冒充后者，模型据此误报「已在你库里」。 */
+ * 是两件事，旧实现用一个 collected=!isNew 把前者冒充后者，模型据此误报「已在你库里」。
+ * 结果按「正式库最后一次写入」缓存：loadState 要 JSON.parse + normalize 整库（实测 6k 篇
+ * ~110-130ms），而 web_search/find_literature 每次召回都要问一遍——主进程即窗口的消息泵，
+ * 每轮白付一次就会看到「一调工具就卡」。库一写 lastLibraryWriteAt 就变，缓存随之失效。 */
+const IN_LIBRARY_CACHE_MS = 30000;
+let inLibraryCache = { key: -1, at: 0, index: new Set() };
+
 async function inLibraryIndex() {
+  const key = Number(ctx.lastLibraryWriteAt) || 0;
+  if (inLibraryCache.key === key && Date.now() - inLibraryCache.at < IN_LIBRARY_CACHE_MS) {
+    return inLibraryCache.index;
+  }
   const out = new Set();
   try {
     const state = await ctx.libraryDb.loadState();
@@ -85,7 +98,11 @@ async function inLibraryIndex() {
       });
       if (p.doi) out.add('doi:' + LitResearch.normalizeDoi(p.doi));
     });
-  } catch (error) { /* 正式库读不到就报「未知已收藏」= 全部未命中，不阻断检索 */ }
+    inLibraryCache = { key: key, at: Date.now(), index: out };
+  } catch (error) {
+    // 正式库读不到就报「未知已收藏」= 全部未命中，不阻断检索（也不缓存这份空结果）
+    return out;
+  }
   return out;
 }
 
@@ -105,6 +122,9 @@ function ingestCandidates(rows) {
     let workId = String(row.id || '');
     if (!workId && row.doi) workId = ctx.researchDb.findByExtId('doi', row.doi) || '';
     if (!workId && row.s2Id) workId = ctx.researchDb.findByExtId('s2', row.s2Id) || '';
+    // A-followup #5：稳定标识优先——同一网页再次检索时先按已登记的 URL 找回身份，
+    // 不能只靠标题（标题变了/规范键不匹配就会另造一个 local: 身份，造成身份分裂）
+    if (!workId && row.pageUrl) workId = ctx.researchDb.findByExtId('url', row.pageUrl) || '';
     if (!workId) workId = ctx.researchDb.findIdByNormalizedTitle(row.title) || '';
     if (!workId) workId = 'local:' + require('node:crypto').randomBytes(8).toString('hex');
     const draft = Object.assign({}, row, { id: workId });
@@ -316,6 +336,9 @@ function register() {
     if (locals.length) ctx.researchDb.upsertWorks(locals);
     scheduleAutoBackfill(resolved.concat(locals)); // 本批缺摘要条目自动回填（后台）
     ctx.researchDb.recordSearch({ q: req.query, filters: { source: 'scopus', yearFrom: req.yearFrom, yearTo: req.yearTo }, count: result.count });
+    // A-followup #3：正式库收藏状态必须来自**正式库反查**——此前工具层拿「调研库已有」
+    // （existed）冒充「已收藏到正式库」，模型据此误报「已在你库里」或跳过用户想做的收藏
+    const inLibrary = await inLibraryIndex();
     return {
       count: result.count,
       stored: resolved.length + locals.length,
@@ -326,6 +349,7 @@ function register() {
           id: workId, doi: hit.doi, title: hit.title, year: hit.year,
           sourceName: hit.source, citedBy: hit.citedByScopus, isOa: false,
           existed: !!(hit.doi && byDoi[hit.doi]),
+          inLibrary: inLibrary.has(workId) || !!(hit.doi && inLibrary.has('doi:' + LitResearch.normalizeDoi(hit.doi))),
           hasAbstract: false
         };
       }).filter(function (w) { return w.id; })
@@ -393,20 +417,38 @@ function register() {
     if (embedTarget.ok && requested !== 'keyword' && ctx.researchEmbedder) {
       topUp = await ctx.researchEmbedder.topUp();
     }
-    const vectorPossible = embedTarget.ok && Number(ctx.researchDb.stats().vectors) > 0;
+    // A-followup #4：可用性按**当前模型 + 配方**的覆盖判定（不是全库向量总数）——
+    // 换过嵌入模型时旧向量还在，总数不为零，但 cosineSearch 只认同模型同配方的向量，
+    // 进了向量分支也一篇都命不中，用户看到的像「没有相关文献」。
+    const coverage = embedTarget.ok
+      ? ctx.researchDb.vecCoverage({ model: embedTarget.model, recipe: LitResearch.EMBED_RECIPE })
+      : { total: 0, matched: 0 };
+    const readiness = LitResearch.vectorReadiness(embedTarget, coverage);
+    const vectorPossible = readiness.ready;
     const useVector = requested === 'vector' ? vectorPossible : (requested === 'auto' && vectorPossible);
     if (!useVector) {
       // 关键词降级：LLM 无嵌入服务时的可用路径（不是「功能不可用」）
       const r = ctx.researchDb.queryWorks({ q: query, limit: limit, yearFrom: input && input.yearFrom, yearTo: input && input.yearTo });
       const rows = ctx.researchDb.getWorks((r.works || []).map(function (w) { return w.id; }));
       const topUpFailed = !!(topUp && topUp.skipped === 'failed');
+      // 四种原因分别如实说明：显式要关键词 / 没配模型 / 配了但当前模型还没有向量（库里有
+      // 别的模型的向量）/ 当前模型构建失败被跳过。含糊其辞会让模型把「索引没建好」
+      // 说成「没有相关文献」。
+      let note = '';
+      if (requested !== 'keyword') {
+        note = topUpFailed
+          ? ctx.T('向量构建上次失败（待手动重试），本次已按关键词检索')
+          : readiness.reason === 'stale-model'
+            ? ctx.T('当前向量模型（{model}）还没有可用向量（库内 {n} 条向量属于其它模型），本次已按关键词检索；构建当前模型的向量后即可语义检索', {
+              model: String(embedTarget.model || ''), n: coverage.total
+            })
+            : requested === 'vector'
+              ? ctx.T('未配置嵌入模型或向量索引为空，无法按向量检索')
+              : ctx.T('未配置嵌入模型或向量索引为空，已按关键词检索；配置后可用语义检索');
+      }
       return {
         mode: requested === 'vector' ? 'vector_unavailable' : 'keyword',
-        note: topUpFailed
-          ? ctx.T('向量构建上次失败（待手动重试），本次已按关键词检索')
-          : requested === 'vector'
-            ? ctx.T('未配置嵌入模型或向量索引为空，无法按向量检索')
-            : ctx.T('未配置嵌入模型或向量索引为空，已按关键词检索；配置后可用语义检索'),
+        note: note,
         total: r.total,
         works: rows.map(function (w) {
           return {
@@ -497,7 +539,9 @@ function register() {
         const work = works[i];
         if (!work.oaUrl) { out[i] = { workId: work.id, file: '', error: ctx.T('无开放获取链接') }; continue; }
         try {
-          const response = await net.fetch(work.oaUrl, { headers: { Accept: 'application/pdf,*/*' } });
+          const response = await safePublicFetch(work.oaUrl, {
+            headers: { Accept: 'application/pdf,*/*' }, maxBytes: 80 * 1024 * 1024
+          });
           if (!response.ok) { out[i] = { workId: work.id, file: '', error: ctx.T('下载失败（HTTP ') + response.status + '）' }; continue; }
           const bytes = Buffer.from(await response.arrayBuffer());
           if (bytes.length < 1000 || bytes[0] !== 0x25) { out[i] = { workId: work.id, file: '', error: ctx.T('返回内容不是 PDF') }; continue; }
@@ -561,7 +605,9 @@ function register() {
     if (!work.oaUrl) {
       return { cached: false, error: '该文献没有开放获取链接（oaUrl 为空），无法拉取全文；请改用摘要证据或让用户以其他途径获取原文' };
     }
-    const response = await net.fetch(work.oaUrl, { headers: { Accept: 'application/pdf,*/*' } });
+    const response = await safePublicFetch(work.oaUrl, {
+      headers: { Accept: 'application/pdf,*/*' }, maxBytes: 80 * 1024 * 1024
+    });
     if (!response.ok) return { cached: false, error: '全文下载失败（HTTP ' + response.status + '）' };
     const bytes = Buffer.from(await response.arrayBuffer());
     if (bytes.length > 80 * 1024 * 1024) return { cached: false, error: 'PDF 过大（>80MB），已跳过' };
@@ -604,6 +650,9 @@ function register() {
     for (const r of normalized.results) {
       let workId = r.doi ? ctx.researchDb.findByExtId('doi', r.doi) : null;
       let isNew = false;
+      // A-followup #5：稳定标识（DOI → 已登记 URL）优先于标题匹配——同一个页面重复检索
+      // 时不该再建一个新的 local: 身份
+      if (!workId && r.url) workId = ctx.researchDb.findByExtId('url', r.url);
       if (!workId) workId = ctx.researchDb.findIdByNormalizedTitle(r.title);
       const exts = [{ kind: 'url', value: r.url }].concat(r.doi ? [{ kind: 'doi', value: r.doi }] : []);
       if (workId) {
@@ -737,7 +786,6 @@ function register() {
     });
     // 预算：远端召回只覆盖前 N 条论点（OpenAlex 语义 1 req/s，条数一多会拖很久）
     const budget = Math.max(1, Math.min(FIND_MAX_CLAIMS, Number(req.remoteClaimBudget) || FIND_REMOTE_CLAIM_BUDGET));
-    const stats = ctx.researchDb.stats();
     const webOk = await webSearchGateOk();
     // 召回源：OpenAlex（关键词 + 语义）与 Semantic Scholar 常开——语义检索只作为 agent 工具
     // 存在，没有用户侧供应商开关；学术网页仍受开关 + 出境告知双重门控
@@ -748,7 +796,12 @@ function register() {
       web: webOk
     };
     const findEmbedTarget = await ctx.embedService.resolveTarget();
-    const vectorReady = findEmbedTarget.ok && Number(stats.vectors) > 0;
+    // A-followup #4：本地向量召回的就绪判定同样按当前模型 + 配方的覆盖（见 vecCoverage）
+    const findCoverage = findEmbedTarget.ok
+      ? ctx.researchDb.vecCoverage({ model: findEmbedTarget.model, recipe: LitResearch.EMBED_RECIPE })
+      : { total: 0, matched: 0 };
+    const findReadiness = LitResearch.vectorReadiness(findEmbedTarget, findCoverage);
+    const vectorReady = findReadiness.ready;
 
     const perClaim = [];
     for (let i = 0; i < claims.length; i++) {
@@ -805,7 +858,12 @@ function register() {
       count: merged.length
     });
     const notes = [];
-    if (!vectorReady) notes.push(ctx.T('本地向量检索未启用或索引为空：本地召回走关键词。配置嵌入模型并构建索引可提升同义改写召回。'));
+    if (!vectorReady) {
+      // 如实区分「没配/索引为空」与「索引属于别的模型」——后者不是没配，是当前向量空间未建
+      notes.push(findReadiness.reason === 'stale-model'
+        ? ctx.T('本地向量索引不属于当前嵌入模型（库内 {n} 条向量来自其它模型）：本地召回走关键词。重建当前模型的向量可提升同义改写召回。', { n: findCoverage.total })
+        : ctx.T('本地向量检索未启用或索引为空：本地召回走关键词。配置嵌入模型并构建索引可提升同义改写召回。'));
+    }
     if (!webOk) notes.push(ctx.T('科研网页检索未开启，未参与召回。'));
     if (claims.length > budget) {
       notes.push(ctx.T('远端召回只覆盖前 ') + budget + ctx.T(' 条论点（其余仅查本地库）；需要更多时把 text 拆小分次调用。'));
@@ -833,7 +891,7 @@ function register() {
   });
   ctx.handle('research:graph', async function (_event, input) {
     if (!ctx.researchDb || !ctx.researchNet) throw new Error(ctx.T('调研库未就绪'));
-    const seeds = (Array.isArray(input && input.workIds) ? input.workIds : []).map(String).filter(Boolean).slice(0, 50);
+    const seeds = (Array.isArray(input && input.workIds) ? input.workIds : []).map(String).filter(Boolean).slice(0, 500);
     if (!seeds.length) throw new Error(ctx.T('没有可作为种子的调研身份'));
     return LitGraphGen.buildGraphData(seeds, {
       depth: input && input.depth,
@@ -856,22 +914,48 @@ function register() {
     const candidates = (state.papers || []).filter(function (p) {
       return p && !p.deletedAt && !(Array.isArray(p.researchIds) && p.researchIds.length);
     }).slice(0, limit);
+    // 第一遍：本地 ext_ids 直查 DOI；查不到的收集起来批量向 OpenAlex 反查——
+    // 「DOI 直查」必须真的解析：从未检索过的带 DOI 条目此前在这里被整个跳过，
+    // 永远拿不到调研身份，右键构建引文网络就永远停在「还没有调研身份」
+    const missedDois = new Set();
+    for (const paper of candidates) {
+      const doi = paper.doi ? LitResearch.normalizeDoi(paper.doi) : '';
+      if (doi && !ctx.researchDb.findByExtId('doi', doi)) missedDois.add(doi);
+    }
+    if (missedDois.size && ctx.researchNet && typeof ctx.researchNet.fetchWorksByDois === 'function') {
+      try {
+        const fetched = await ctx.researchNet.fetchWorksByDois(Array.from(missedDois));
+        if (fetched.length) ctx.researchDb.upsertWorks(fetched);
+      } catch (error) {
+        // 在线反查失败（离线/限流）不阻断——标题认领与本地身份兜底照常，未解析数如实上报
+      }
+    }
     const proposals = [];
+    let unresolved = 0;
     for (const paper of candidates) {
       const doi = paper.doi ? LitResearch.normalizeDoi(paper.doi) : '';
       let researchId = doi ? ctx.researchDb.findByExtId('doi', doi) : null;
       let createdLocal = false;
+      if (!researchId && paper.title) {
+        // A-followup #5：先按规范化标题认领**既有**身份（检索早已入库的同一篇论文），
+        // 认不到才考虑分配本地身份——否则补登记会为同一篇论文造出第二个 local: 身份。
+        // 带 DOI 的条目同样先试这条：认领既有身份零分裂风险
+        researchId = ctx.researchDb.findIdByNormalizedTitle(paper.title);
+      }
       if (!researchId && !doi && paper.title) {
-        // 无 DOI：分配本地身份（代理键永不变更；日后匹配合并走 merge_log 重定向）
+        // 无 DOI：分配本地身份（代理键永不变更；日后匹配合并走 merge_log 重定向）。
+        // 带 DOI 的条目不建 local:——doi→local: 进了 ext_ids 会挡住日后的真实身份解析
         researchId = 'local:' + require('node:crypto').randomBytes(8).toString('hex');
         ctx.researchDb.upsertWorks([{ id: researchId, title: paper.title, year: paper.year || null, doi: '' }]);
         createdLocal = true;
       }
       if (researchId) {
         proposals.push({ paperId: paper.id, researchId: researchId, title: paper.title || '', createdLocal: createdLocal });
+      } else {
+        unresolved += 1;
       }
     }
-    return { proposals: proposals, scanned: candidates.length };
+    return { proposals: proposals, scanned: candidates.length, unresolved: unresolved };
   });
   /* R18 文献检索能力补齐（对照 literature-mcp）：精确取文献（DOI / OpenAlex ID / 标题精确）、
    * 实体名 → OpenAlex ID 联想、库内引文邻接。三个都是「检索即入库」幂等语义，不动正式库。 */

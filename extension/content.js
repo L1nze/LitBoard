@@ -39,8 +39,8 @@
   function topicText(selector, label) {
     var el = document.querySelector(selector);
     if (!el) return '';
-    var value = elText(el).replace(/^\\s+/, '');
-    var m = value.match(new RegExp('^(' + label + ')[：:\\\\s]*([\\\\s\\\\S]*)'));
+    var value = elText(el).replace(/^\s+/, '');
+    var m = value.match(new RegExp('^(' + label + ')[：:\\s]*([\\s\\S]*)'));
     return m ? m[2].trim() : value;
   }
 
@@ -60,7 +60,7 @@
       var label = elText(labelEl).replace(/[：:]$/, '');
       var clone = row.cloneNode(true);
       (clone.querySelectorAll('[class^="rowtit"]') || []).forEach(function (n) { n.remove(); });
-      data[label] = elText(clone).replace(/\\s+/g, ' ');
+      data[label] = elText(clone).replace(/\s+/g, ' ');
     });
     return data;
   }
@@ -70,7 +70,7 @@
     var label = cnkiLabeledData();
 
     var titleNode = document.querySelector('.wx-tit > h1, .wx-tit h1');
-    result.title = titleNode ? String(titleNode.textContent || '').replace(/[\\s]+/g, ' ').trim() : '';
+    result.title = titleNode ? String(titleNode.textContent || '').replace(/\s+/g, ' ').trim() : '';
 
     // 作者：#authorpart 内 span>a，或逗号分隔；去掉 sup 标注
     var authorEl = document.querySelector('#authorpart');
@@ -90,18 +90,14 @@
 
     // 期刊信息（journalArticle）：.top-tip 文本
     var pubInfo = elText(document.querySelector('.top-tip'));
-    if (pubInfo) {
-      var m = pubInfo.match(/^(\\S[\\s\\S]*?)\\s?\\.\\s?(\\d{4})?\\s?(,(\\d+))?\\s?(\\((\\d+)\\))?\\s?(:([0-9\\s,，-]+))?/);
-      if (m) {
-        result.venue = (m[1] || '').trim();
-        result.year = m[2] || '';
-        result.volume = m[4] || '';
-        result.issue = m[6] || '';
-        result.pages = (m[8] || '').trim();
-      }
-    } else {
-      result.venue = elText(document.querySelector('.top-tip > a, .top-tip a'));
-    }
+    var parsedPubInfo = window.LitTranslators && window.LitTranslators.parseCnkiPublicationInfo
+      ? window.LitTranslators.parseCnkiPublicationInfo(pubInfo) : {};
+    result.venue = parsedPubInfo.venue || label['来源期刊'] || label['期刊'] || label['刊名'] ||
+      meta(['citation_journal_title', 'dc.source']) || elText(document.querySelector('.top-tip > a, .top-tip a')) || '';
+    result.year = parsedPubInfo.year || ((label['发表时间'] || label['出版年'] || label['年'] || '').match(/(?:19|20)\d{2}/) || [])[0] || '';
+    result.volume = parsedPubInfo.volume || '';
+    result.issue = parsedPubInfo.issue || '';
+    result.pages = parsedPubInfo.pages || '';
 
     result.abstract = topicText('.abstract-text', '摘要') || label['摘要'] || '';
     var keywordsEl = document.querySelector('.keywords');

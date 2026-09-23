@@ -20,11 +20,32 @@ test/smoke-*.json
 extension/js/
 
 # ---------- 本地数据（绝不入库）----------
+# 这些文件默认写在配置目录（%APPDATA%\LitBoard 或自选目录），正常不会出现在仓库里；
+# 这里全部兜底忽略，防止把数据目录指到仓库内、或往仓库拷贝文件时误提交。
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite.bak
+*.bak
+*.stamp
 *.corrupt-*
+*.db
+# 凭据与同步状态（integrations.json 内含 safeStorage 加密的 WebDAV/API 凭据；
+# sync-conflicts.jsonl 含被覆盖版本的内容快照）
+integrations.json
+data-paths.json
+litboard-library.json
+sync-base.json
+sync-asset-ledger.json
+sync-conflicts.jsonl
+# AI 会话与调研库、受管附件等数据目录（仅兜底仓库根一级）
+/会话记录/
+/research/
+/ocr/
+/note-assets/
+/restored-assets/
+/tmp-fulltext/
+/attachments/
 .env
 .env.*
 *.local.json
@@ -42,3 +63,9 @@ Desktop.ini
 # ---------- 工具与预览残留（不入库）----------
 .icon-previews/
 .zcode/
+
+# ---------- AI 工作区说明（本机维护，不入库）----------
+# AGENTS.md 是给 AI 助手的精简版工程约定，AGENTS_DETAIL.md 是详细对照（踩坑/决策全记录）。
+# 两者随 OneDrive 同步；新机器 clone 后需手动放回仓库根目录。
+/AGENTS.md
+/AGENTS_DETAIL.md

@@ -14,7 +14,6 @@
   }
 
   var STORE_KEY = 'litboard.papers.v1';
-  var THEME_KEY = 'litboard.theme';
   var ONBOARD_DISMISS_KEY = 'litboard.onboardDismissed';
   var PANE_SIZES_KEY = 'litboard.paneSizes';
   var FOLDER_TREE_KEY = 'litboard.folderTree.v1';
@@ -22,10 +21,28 @@
   var HIDDEN_PURGED_KEY = 'litboard.hiddenPurged.v1';
   var SHORTCUTS_KEY = 'litboard.shortcuts.v1';
   var TABLE_PAGE_SIZE = 100;
-  var workspaceRevision = 0;
-  var persistedWorkspaceSignatures = null;
-  var baseSnapshotEntities = null;   // 最近一次被数据库确认的实体内容克隆（三方合并 base）
+  var workspaceStore = null;
   var desktop = window.litboardDesktop || null;
+  var FONT_SCALE_KEY = 'litboard.fontScale';
+  var FONT_SCALE_MIN = 0.8;
+  var FONT_SCALE_MAX = 1.3;
+  var fontScale = 1;
+
+  function applyFontScale(value) {
+    fontScale = Math.max(FONT_SCALE_MIN, Math.min(FONT_SCALE_MAX, Math.round(value * 10) / 10));
+    if (desktop && desktop.setZoomFactor) desktop.setZoomFactor(fontScale);
+    localStorage.setItem(FONT_SCALE_KEY, String(fontScale));
+    var output = $('#sync-font-size-value');
+    if (output) output.textContent = Math.round(fontScale * 100) + '%';
+    var down = $('#sync-font-size-down');
+    var up = $('#sync-font-size-up');
+    if (down) down.disabled = fontScale <= FONT_SCALE_MIN;
+    if (up) up.disabled = fontScale >= FONT_SCALE_MAX;
+  }
+
+  var savedFontScale = Number(localStorage.getItem(FONT_SCALE_KEY));
+  applyFontScale(Number.isFinite(savedFontScale) && savedFontScale >= FONT_SCALE_MIN && savedFontScale <= FONT_SCALE_MAX
+    ? savedFontScale : 1);
 
   var state = {
     papers: [],
@@ -168,12 +185,17 @@
 
   function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
 
+  /* 两侧栏可调范围：拖拽钳制、持久化回读、ARIA 三处共用一份，免得改一处漏两处。
+     右栏上限放宽到 800（详情/对话面板在宽屏下值得更宽）；实际能拖到多少还要过
+     applyPaneSizes 的「中间栏至少留 520px」——那是防止列表被挤扁的硬底线。 */
+  var PANE_LIMITS = { left: { min: 160, max: 360 }, right: { min: 300, max: 800 } };
+
   function readPaneSizes() {
     try {
       var value = JSON.parse(localStorage.getItem(PANE_SIZES_KEY) || '{}');
       return {
-        left: clamp(Number(value.left) || 220, 160, 360),
-        right: clamp(Number(value.right) || 370, 300, 560)
+        left: clamp(Number(value.left) || 220, PANE_LIMITS.left.min, PANE_LIMITS.left.max),
+        right: clamp(Number(value.right) || 370, PANE_LIMITS.right.min, PANE_LIMITS.right.max)
       };
     } catch (e) { return { left: 220, right: 370 }; }
   }
@@ -182,22 +204,23 @@
     var workspace = $('.workspace');
     if (!workspace) return;
     var available = Math.max(0, workspace.clientWidth - 520);
-    var left = clamp(sizes.left, 160, 360);
-    var right = clamp(sizes.right, 300, 560);
+    var left = clamp(sizes.left, PANE_LIMITS.left.min, PANE_LIMITS.left.max);
+    var right = clamp(sizes.right, PANE_LIMITS.right.min, PANE_LIMITS.right.max);
     if (left + right > available && available >= 460) {
-      if (right > 300) right = Math.max(300, available - left);
-      if (left + right > available) left = Math.max(160, available - right);
+      if (right > PANE_LIMITS.right.min) right = Math.max(PANE_LIMITS.right.min, available - left);
+      if (left + right > available) left = Math.max(PANE_LIMITS.left.min, available - right);
     }
     workspace.style.setProperty('--library-width', left + 'px');
     workspace.style.setProperty('--detail-width', right + 'px');
     workspace.dataset.leftWidth = left;
     workspace.dataset.rightWidth = right;
+    syncReadingRail(); // 阅读模式下拖宽侧栏时，PDF 让位宽度与把手位置实时跟随
     $('#resizer-left').setAttribute('aria-valuenow', left);
-    $('#resizer-left').setAttribute('aria-valuemin', '160');
-    $('#resizer-left').setAttribute('aria-valuemax', '360');
+    $('#resizer-left').setAttribute('aria-valuemin', String(PANE_LIMITS.left.min));
+    $('#resizer-left').setAttribute('aria-valuemax', String(PANE_LIMITS.left.max));
     $('#resizer-right').setAttribute('aria-valuenow', right);
-    $('#resizer-right').setAttribute('aria-valuemin', '300');
-    $('#resizer-right').setAttribute('aria-valuemax', '560');
+    $('#resizer-right').setAttribute('aria-valuemin', String(PANE_LIMITS.right.min));
+    $('#resizer-right').setAttribute('aria-valuemax', String(PANE_LIMITS.right.max));
   }
 
   function savePaneSizes() {
@@ -252,6 +275,102 @@
       var delta = e.key === 'ArrowRight' ? 10 : -10;
       resizeTo(current + (side === 'left' ? delta : -delta));
       savePaneSizes();
+    });
+  }
+
+  /* ---------- 弹窗拖拽改尺寸（右下角手柄） ----------
+   * 弹窗由遮罩居中，所以尺寸按「指针到弹窗中心的距离 ×2」换算：直接累加指针位移会让
+   * 手柄只走一半（居中布局把增量对半分给了两侧）。尺寸按弹窗键名存 localStorage
+   * （与栏宽 PANE_SIZES_KEY 同一条思路：纯界面布局偏好，不进库、不参与同步）。 */
+  var MODAL_SIZES_KEY = 'litboard.modalSizes';
+
+  function readModalSizes() {
+    try { return JSON.parse(localStorage.getItem(MODAL_SIZES_KEY) || '{}') || {}; } catch (e) { return {}; }
+  }
+  function writeModalSize(key, size) {
+    var all = readModalSizes();
+    if (size) all[key] = { w: Math.round(size.w), h: Math.round(size.h) };
+    else delete all[key];
+    try {
+      if (Object.keys(all).length) localStorage.setItem(MODAL_SIZES_KEY, JSON.stringify(all));
+      else localStorage.removeItem(MODAL_SIZES_KEY);
+    } catch (e) {}
+  }
+  /* 可拖范围：遮罩给了 20px 内边距，四边各让出来，弹窗不会贴边也不会溢出屏幕 */
+  function modalSizeBounds(minW, minH) {
+    var maxW = Math.max(320, window.innerWidth - 40);
+    var maxH = Math.max(240, window.innerHeight - 40);
+    return { minW: Math.min(minW, maxW), minH: Math.min(minH, maxH), maxW: maxW, maxH: maxH };
+  }
+  /* size 为空 = 复位到 CSS 默认尺寸（清掉内联样式） */
+  function applyModalSize(modal, size, minW, minH) {
+    if (!modal) return;
+    if (!size) { modal.style.width = ''; modal.style.height = ''; modal.style.maxHeight = ''; return; }
+    var b = modalSizeBounds(minW, minH);
+    var w = Math.round(clamp(size.w, b.minW, b.maxW));
+    var h = Math.round(clamp(size.h, b.minH, b.maxH));
+    modal.style.width = w + 'px';
+    modal.style.height = h + 'px';
+    modal.style.maxHeight = h + 'px'; // 覆盖 .sync-modal 自带的 max-height，否则拖不高
+  }
+
+  function bindModalResizer(modal, grip, key, minW, minH) {
+    if (!modal || !grip) return;
+    var centerX = 0, centerY = 0, dragId = null;
+    function saveCurrentSize() {
+      if (!modal.style.width) { writeModalSize(key, null); return; }
+      writeModalSize(key, { w: parseInt(modal.style.width, 10), h: parseInt(modal.style.height, 10) });
+    }
+    function currentSize() {
+      var rect = modal.getBoundingClientRect();
+      return { w: rect.width, h: rect.height };
+    }
+    grip.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      var rect = modal.getBoundingClientRect();
+      centerX = rect.left + rect.width / 2;
+      centerY = rect.top + rect.height / 2;
+      dragId = e.pointerId;
+      // 捕获失败（合成事件没有真实指针）不该让拖拽失效：下面的判定看 dragId，不看捕获
+      try { grip.setPointerCapture(e.pointerId); } catch (err) {}
+      grip.classList.add('dragging');
+      document.body.classList.add('resizing-modal');
+    });
+    grip.addEventListener('pointermove', function (e) {
+      if (dragId === null || e.pointerId !== dragId) return;
+      applyModalSize(modal, {
+        w: Math.abs(e.clientX - centerX) * 2,
+        h: Math.abs(e.clientY - centerY) * 2
+      }, minW, minH);
+    });
+    function finish(e) {
+      if (dragId === null || e.pointerId !== dragId) return;
+      dragId = null;
+      try { if (grip.hasPointerCapture(e.pointerId)) grip.releasePointerCapture(e.pointerId); } catch (err) {}
+      grip.classList.remove('dragging');
+      document.body.classList.remove('resizing-modal');
+      saveCurrentSize();
+    }
+    grip.addEventListener('pointerup', finish);
+    grip.addEventListener('pointercancel', finish);
+    grip.addEventListener('dblclick', function () {
+      applyModalSize(modal, null, minW, minH);
+      writeModalSize(key, null);
+    });
+    grip.addEventListener('keydown', function (e) {
+      var step = e.shiftKey ? 40 : 16;
+      var dx = e.key === 'ArrowRight' ? step : e.key === 'ArrowLeft' ? -step : 0;
+      var dy = e.key === 'ArrowDown' ? step : e.key === 'ArrowUp' ? -step : 0;
+      if (!dx && !dy) return;
+      e.preventDefault();
+      var size = currentSize();
+      applyModalSize(modal, { w: size.w + dx, h: size.h + dy }, minW, minH);
+      saveCurrentSize();
+    });
+    // 窗口变小后原尺寸可能已经超界：按新视口重新钳制（存的值不动，窗口变大再打开即恢复）
+    window.addEventListener('resize', function () {
+      if (modal.hidden || !modal.style.width) return;
+      applyModalSize(modal, currentSize(), minW, minH);
     });
   }
 
@@ -338,14 +457,35 @@
     });
   }
 
+  /* ---- 顶栏下拉菜单互斥 ----
+   * 通知中心 / 导出 / 更多三个下拉同在一个 .menu-wrap 内，都是 right:0 + top:100%，
+   * 同时展开会完全叠在一起。而每个开关的 click 都必须 stopPropagation（不挡冒泡的话，
+   * document 级「点击外部即关闭」会在按钮自己的 handler 之前把刚展开的面板关掉，表现为
+   * 「点了没反应」），于是「先开 A 再点 B」时 A 收不到 dismiss —— 两块面板一起留着。
+   * 这里统一登记顶栏下拉：展开任何一个之前先收起其余。关闭仍走各自的 document click
+   * （保留「点菜单项即收起」的语义）。 */
+  var topbarMenus = [];
+  function registerTopbarMenu(button, menu) {
+    if (!button || !menu) return;
+    topbarMenus = topbarMenus.filter(function (entry) { return entry.menu !== menu; });
+    topbarMenus.push({ button: button, menu: menu });
+  }
+  /** 切换一个已登记的顶栏下拉，返回切换后是否展开；展开前先收起同族的其它下拉。 */
+  function toggleTopbarMenu(menu) {
+    var willOpen = menu.hidden;
+    topbarMenus.forEach(function (entry) { if (entry.menu !== menu) entry.menu.hidden = true; });
+    menu.hidden = !willOpen;
+    return willOpen;
+  }
+
   function setupIssuesMenu() {
     var btn = $('#btn-issues');
     var menu = $('#issues-menu');
     if (!btn || !menu) return;
+    registerTopbarMenu(btn, menu);
     btn.addEventListener('click', function (e) {
       e.stopPropagation();
-      menu.hidden = !menu.hidden;
-      if (!menu.hidden) {
+      if (toggleTopbarMenu(menu)) {
         unseenIssues = 0;
         updateIssueBadge();
         renderIssuesMenu();
@@ -392,6 +532,34 @@
         toast(T('已恢复 ') + n + T(' 篇'));
       }
     });
+  }
+
+  /** 单一普通文件夹视图中的“删除”只解除当前位置软链；多文件夹联合视图保持全局删除语义。 */
+  function currentFolderLinkTarget() {
+    if (state.activeFolderIds.length) return null;
+    var folderId = currentImportFolderId();
+    if (!folderId) return null;
+    return state.folders.find(function (folder) { return folder.id === folderId; }) || null;
+  }
+
+  function removePapersFromFolder(papers, folder) {
+    if (!folder) return 0;
+    var linked = (papers || []).filter(function (paper) {
+      return paper && !paper.deletedAt && (paper.folderIds || []).indexOf(folder.id) !== -1;
+    });
+    if (!linked.length) return 0;
+    var ids = linked.map(function (paper) { return paper.id; });
+    var undoBefore = makeSnapshot({ papers: ids });
+    linked.forEach(function (paper) {
+      paper.folderIds = (paper.folderIds || []).filter(function (id) { return id !== folder.id; });
+      window.LitModel.touch(paper);
+      delete state.selected[paper.id];
+    });
+    commitUndo(T('从文件夹「') + folder.name + T('」移出'), undoBefore, { papers: ids });
+    if (drawerId && ids.indexOf(drawerId) !== -1) closeDrawer();
+    save(); renderAll();
+    toast(T('✓ 已从“') + folder.name + T('”移出 ') + linked.length + T(' 篇（文献与附件仍保留）'));
+    return linked.length;
   }
 
   /** 恢复回收站条目 */
@@ -442,69 +610,25 @@
   }
 
   // ---------- 存储 ----------
-  function workspacePayload() {
-    return {
-      papers: state.papers,
-      notes: state.notes,
-      folders: state.folders.concat(state.folderTombstones),
-      savedSearches: state.savedSearches.concat(state.savedSearchTombstones),
-      tagColors: state.tagColors,
-      tagColorRecords: state.tagColorRecords
-    };
-  }
-
-  function applyWorkspaceState(workspace) {
-    state.papers = workspace.papers;
-    state.notes = workspace.notes || [];
-    state.folders = (workspace.folders || []).filter(function (folder) { return !folder.deletedAt; });
-    state.folderTombstones = (workspace.folders || []).filter(function (folder) { return !!folder.deletedAt; });
-    state.savedSearches = (workspace.savedSearches || []).filter(function (search) { return !search.deletedAt; });
-    state.savedSearchTombstones = (workspace.savedSearches || []).filter(function (search) { return !!search.deletedAt; });
-    state.tagColors = workspace.tagColors || {};
-    state.tagColorRecords = workspace.tagColorRecords || [];
-    persistedWorkspaceSignatures = window.LitModel.workspaceSignatures(workspacePayload());
-    baseSnapshotEntities = cloneAllEntities(workspacePayload());
-  }
-
-  /** 实体内容克隆表（三方合并的 base）：id/tag → 最近一次被数据库确认的内容 */
-  function cloneAllEntities(workspace) {
-    var out = { papers: {}, notes: {}, folders: {}, savedSearches: {}, tagColorRecords: {} };
-    function cloneList(target, list, keyOf) {
-      (list || []).forEach(function (item) {
-        if (!item) return;
-        var key = keyOf(item);
-        try { target[key] = JSON.parse(JSON.stringify(item)); } catch (e) {}
-      });
-    }
-    cloneList(out.papers, workspace && workspace.papers, function (x) { return x.id; });
-    cloneList(out.notes, workspace && workspace.notes, function (x) { return x.id; });
-    cloneList(out.folders, workspace && workspace.folders, function (x) { return x.id; });
-    cloneList(out.savedSearches, workspace && workspace.savedSearches, function (x) { return x.id; });
-    cloneList(out.tagColorRecords, workspace && workspace.tagColorRecords, function (x) { return x.tag; });
-    return out;
-  }
-
-  /** 保存成功后，把签名相对旧 base 变化的实体克隆进 base 快照 */
-  function refreshBaseSnapshot(workspace, oldBase) {
-    if (!baseSnapshotEntities) { baseSnapshotEntities = cloneAllEntities(workspace); return; }
-    var sigs = window.LitModel.workspaceSignatures(workspace);
-    function keyOfCollection(collection) {
-      return collection === 'tagColorRecords' ? function (x) { return x.tag; } : function (x) { return x.id; };
-    }
-    ['papers', 'notes', 'folders', 'savedSearches', 'tagColorRecords'].forEach(function (collection) {
-      var keyOf = keyOfCollection(collection);
-      var seen = {};
-      (workspace[collection] || []).forEach(function (item) {
-        var key = keyOf(item);
-        seen[key] = true;
-        var changed = !oldBase || !oldBase[collection] || oldBase[collection][key] !== sigs[collection][key];
-        if (!changed) return;
-        try { baseSnapshotEntities[collection][key] = JSON.parse(JSON.stringify(item)); } catch (e) {}
-      });
-      Object.keys(baseSnapshotEntities[collection]).forEach(function (key) {
-        if (!seen[key]) delete baseSnapshotEntities[collection][key];
-      });
+  function initWorkspaceStore() {
+    if (!window.LitWorkspaceStore) return;
+    workspaceStore = window.LitWorkspaceStore.create({
+      state: state, model: window.LitModel, uid: uid, T: T, toast: toast,
+      storeKey: STORE_KEY, localStorage: localStorage, desktop: function () { return desktop; },
+      clearQueryCache: function () {
+        if (window.LitQuery && window.LitQuery.clearHaystackCache) window.LitQuery.clearHaystackCache();
+      },
+      scheduleSync: scheduleNutstoreSync,
+      resolveConflicts: resolveSaveConflicts,
+      onLoad: function (ok, error) {
+        libraryLoadFailed = !ok;
+        if (ok && desktop) window.litboardSqliteReady = true;
+        if (!ok) toast(T('⚠ 本地数据库读取失败：') + (error && error.message || error));
+      }
     });
+  }
+  function workspacePayload() {
+    return workspaceStore.payload();
   }
 
   function findLocalEntity(collection, id) {
@@ -571,7 +695,7 @@
    * 不重叠字段自动合并；同一标量字段/同 id 子项同时变化时逐项弹对话框让用户选择。
    * 全部解决后返回 true（调用方会以最新 base 重新提交）。用户取消返回 false。
    */
-  function resolveSaveConflicts(conflicts) {
+  function resolveSaveConflicts(conflicts, baseSnapshot) {
     if (!window.LitMerge || !conflicts || !conflicts.length) return Promise.resolve(true);
     var chain = Promise.resolve(true);
     conflicts.forEach(function (conflict) {
@@ -579,7 +703,7 @@
         if (!proceed) return false;
         var local = findLocalEntity(conflict.collection, conflict.id);
         if (!local) return true; // 本地没有该实体：保留库内版本即可
-        var base = baseSnapshotEntities[conflict.collection][conflict.id] || null;
+        var base = baseSnapshot && baseSnapshot[conflict.collection] && baseSnapshot[conflict.collection][conflict.id] || null;
         var remote = conflict.entity || {};
         var spec = conflict.collection === 'papers' ? window.LitMerge.PAPER_SPEC : window.LitMerge.PLAIN_SPEC;
         var mergedResult = window.LitMerge.mergeEntity(base, local, remote, spec);
@@ -617,104 +741,18 @@
     return chain;
   }
 
-  /* M1 保存链：串联每轮 save() 的落库结果。关闭收尾经 waitForLocalSave() 等它 settle，
-   * 区分「已进入队列」与「已持久化」。 */
-  var saveChain = Promise.resolve(true);
-  function trackSave(promise) {
-    saveChain = saveChain.then(function () { return promise; }, function () { return promise; })
-      .then(function (result) { return result !== false; }, function () { return false; });
-    return promise;
-  }
-
-  function signaturesContain(actual, expected) {
-    if (!actual || !expected) return false;
-    var collections = ['papers', 'notes', 'folders', 'savedSearches', 'tagColorRecords'];
-    for (var i = 0; i < collections.length; i++) {
-      var name = collections[i];
-      var expectedMap = expected[name] || {};
-      var actualMap = actual[name] || {};
-      var keys = Object.keys(expectedMap);
-      for (var j = 0; j < keys.length; j++) {
-        if (actualMap[keys[j]] !== expectedMap[keys[j]]) return false;
-      }
-    }
-    return true;
-  }
-
   function save(skipNutstoreSync) {
-    window.LitModel.assignCitationKeys(state.papers);
-    if (window.LitQuery && window.LitQuery.clearHaystackCache) window.LitQuery.clearHaystackCache();
-    var workspace = workspacePayload();
-    if (persistedWorkspaceSignatures) {
-      window.LitModel.touchWorkspaceChanges(workspace, persistedWorkspaceSignatures, Date.now());
-    }
-    var saveRevision = ++workspaceRevision;
-    var nextSignatures = window.LitModel.workspaceSignatures(workspace);
-    var oldBase = persistedWorkspaceSignatures;
-    function confirmSaved(result) {
-      if (desktop && (!result || !signaturesContain(result.signatures, nextSignatures))) {
-        throw new Error(T('SQLite 写入后校验失败：数据库返回的内容签名与当前工作区不一致'));
-      }
-      // 只有这轮保存仍是“最新一轮”时才更新确认状态，防止旧轮结果覆盖新轮
-      if (workspaceRevision !== saveRevision) return true;
-      persistedWorkspaceSignatures = (result && result.signatures) || nextSignatures;
-      refreshBaseSnapshot(workspace, oldBase);
-      if (!skipNutstoreSync) scheduleNutstoreSync();
-      return true;
-    }
-    if (desktop) {
-      return trackSave(desktop.saveLibrary(workspace, persistedWorkspaceSignatures).then(function (result) {
-        if (!result || !result.conflicts || !result.conflicts.length) return confirmSaved(result);
-        if (workspaceRevision !== saveRevision) return true; // 期间又有新编辑：留给下一次保存
-        // 有冲突：先把已写入的实体同步进 base，再合并解决冲突并以最新 base 重提
-        persistedWorkspaceSignatures = (result && result.signatures) || oldBase;
-        refreshBaseSnapshot(workspace, oldBase);
-        return resolveSaveConflicts(result.conflicts).then(function (resolved) {
-          if (!resolved) {
-            toast(T('⚠ 保存冲突未解决，本地修改已保留，请重试'));
-            return false;
-          }
-          return save(skipNutstoreSync);
-        });
-      }).catch(function (e) {
-        toast(T('⚠ 本地数据保存失败：') + (e && e.message || e));
-        return false;
-      }));
-    }
-    var localStorageOk = true;
-    try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(workspace));
-      confirmSaved(null);
-    } catch (e) {
-      localStorageOk = false;
-      toast(T('⚠ 本地存储已满，数据未能保存，请导出 JSON 备份'));
-    }
-    return trackSave(Promise.resolve(localStorageOk));
+    return workspaceStore.save(skipNutstoreSync);
   }
   /** 等待全部已排队的本地保存落库；resolve 布尔 = 是否全部成功 */
   function waitForLocalSave() {
     if (saveNotes && saveNotes.flush) saveNotes.flush();
-    return saveChain;
+    if (pdfNotePanel) pdfNotePanel.flush();
+    if (epubNotePanel) epubNotePanel.flush();
+    return workspaceStore.waitForIdle();
   }
   function load() {
-    if (desktop) {
-      return desktop.loadLibrary().then(function (value) {
-        var workspace = window.LitModel.normalizeWorkspace(value, uid);
-        applyWorkspaceState(workspace);
-        libraryLoadFailed = false;
-        window.litboardSqliteReady = true;
-      }).catch(function (e) {
-        libraryLoadFailed = true;
-        applyWorkspaceState(window.LitModel.normalizeWorkspace({}, uid));
-        toast(T('⚠ 本地数据库读取失败：') + (e && e.message || e));
-      });
-    }
-    try {
-      var raw = localStorage.getItem(STORE_KEY);
-      var workspace = window.LitModel.normalizeWorkspace(raw ? JSON.parse(raw) : {}, uid);
-      applyWorkspaceState(workspace);
-    } catch (e) { applyWorkspaceState(window.LitModel.normalizeWorkspace({}, uid)); }
-    return Promise.resolve();
+    return workspaceStore.load();
   }
 
   // ---------- 数据模型 ----------
@@ -852,7 +890,15 @@
           existing.pdfAnnotations = window.LitDedupe.merge([existing, base]).pdfAnnotations;
           changed = true;
         }
-        if (folderId && (existing.folderIds || []).indexOf(folderId) === -1) { existing.folderIds.push(folderId); changed = true; }
+        // 归属并集：options.folderId（传统单文件夹导入）+ base 自带 folderIds
+        //（拖入文件夹导入按目录逐条预盖，让整棵树一次 addPapers/一次 save 落库）
+        var incomingFolders = folderId ? [folderId] : [];
+        (base.folderIds || []).forEach(function (fid) {
+          if (fid && incomingFolders.indexOf(fid) === -1) incomingFolders.push(fid);
+        });
+        incomingFolders.forEach(function (fid) {
+          if ((existing.folderIds || []).indexOf(fid) === -1) { existing.folderIds.push(fid); changed = true; }
+        });
         if (attachedNow) {
           existing.attachments = mergedAttachments;
           changed = true;
@@ -895,84 +941,52 @@
    * 快照对（before/after）入栈；Undo 恢复 before、Redo 恢复 after；创建型操作以 __absent
    * 标记支持「撤销创建 = 删除」。覆盖：字段编辑、标签、文件夹移动/排序、软删除与恢复、
    * 批注新建/删除/标签。不覆盖：彻底删除（purge）、外部文件覆盖（PDF 写回/重命名）、远端同步写入。 */
-  var undoStack = [], redoStack = [];
-  var UNDO_LIMIT = 100;
-  function snapOne(list, id) {
-    for (var i = 0; i < list.length; i++) {
-      if (list[i] && list[i].id === id) return JSON.parse(JSON.stringify(list[i]));
-    }
-    return { __absent: true };
+  var history = null;
+  function initHistory() {
+    if (!window.LitHistory) return;
+    history = window.LitHistory.create({
+      state: state, payload: workspacePayload, normalizeWorkspace: window.LitModel.normalizeWorkspace, limit: 100
+    });
   }
   function makeSnapshot(ids) {
-    ids = ids || {};
-    var snap = { papers: {}, notes: {}, folders: {} };
-    (ids.papers || []).forEach(function (id) { snap.papers[id] = snapOne(state.papers, id); });
-    (ids.notes || []).forEach(function (id) { snap.notes[id] = snapOne(state.notes, id); });
-    (ids.folders || []).forEach(function (id) {
-      var rec = snapOne(state.folders, id);
-      snap.folders[id] = rec.__absent ? snapOne(state.folderTombstones, id) : rec;
-    });
-    return snap;
-  }
-  function applySnapshot(snap) {
-    function applyList(list, map) {
-      Object.keys(map || {}).forEach(function (id) {
-        var rec = map[id];
-        var idx = -1;
-        for (var i = 0; i < list.length; i++) { if (list[i] && list[i].id === id) { idx = i; break; } }
-        if (rec.__absent) { if (idx !== -1) list.splice(idx, 1); }
-        else if (idx === -1) list.push(JSON.parse(JSON.stringify(rec)));
-        else list[idx] = JSON.parse(JSON.stringify(rec));
-      });
-    }
-    applyList(state.papers, snap.papers);
-    applyList(state.notes, snap.notes);
-    applyList(state.folders, snap.folders);
-    applyList(state.folderTombstones, snap.folders);
-    // 归一化一次，修正兼容投影（paper.notes 等）
-    var norm = window.LitModel.normalizeWorkspace(workspacePayload());
-    state.papers = norm.papers;
-    state.notes = norm.notes;
+    return history.snapshot(ids);
   }
   function commitUndo(label, before, ids) {
-    undoStack.push({ label: label, before: before, after: makeSnapshot(ids) });
-    if (undoStack.length > UNDO_LIMIT) undoStack.shift();
-    redoStack = [];
-    updateUndoUi();
+    history.commit(label, before, ids);
   }
   function undoOnce() {
-    var entry = undoStack.pop();
-    if (!entry) return;
-    applySnapshot(entry.before);
-    redoStack.push(entry);
+    var result = history && history.undo();
+    if (!result) return;
     save(); renderAll();
     if (drawerId && getById(drawerId)) openDrawer(drawerId);
     updateUndoUi();
-    toast(T('↩ 已撤销：') + entry.label);
+    toast(T('↩ 已撤销：') + result.label);
   }
   function redoOnce() {
-    var entry = redoStack.pop();
-    if (!entry) return;
-    applySnapshot(entry.after);
-    undoStack.push(entry);
+    var result = history && history.redo();
+    if (!result) return;
     save(); renderAll();
     if (drawerId && getById(drawerId)) openDrawer(drawerId);
     updateUndoUi();
-    toast(T('↪ 已重做：') + entry.label);
+    toast(T('↪ 已重做：') + result.label);
   }
   function updateUndoUi() {
-    var u = $('#btn-undo'), r = $('#btn-redo');
-    if (u) {
-      u.disabled = !undoStack.length;
-      u.title = undoStack.length ? T('撤销：') + undoStack[undoStack.length - 1].label + '（Ctrl+Z）' : T('撤销（Ctrl+Z）');
+    if (!history) return;
+    var status = history.status();
+    var undo = $('#btn-undo'), redo = $('#btn-redo');
+    if (undo) {
+      undo.disabled = !status.undoLabel;
+      undo.title = status.undoLabel ? T('撤销：') + status.undoLabel + '（Ctrl+Z）' : T('撤销（Ctrl+Z）');
     }
-    if (r) {
-      r.disabled = !redoStack.length;
-      r.title = redoStack.length ? T('重做：') + redoStack[redoStack.length - 1].label + '（Ctrl+Y）' : T('重做（Ctrl+Y）');
+    if (redo) {
+      redo.disabled = !status.redoLabel;
+      redo.title = status.redoLabel ? T('重做：') + status.redoLabel + '（Ctrl+Y）' : T('重做（Ctrl+Y）');
     }
   }
   // ---------- 筛选 & 排序 ----------
   var querySyntaxError = false;
+  var plainSearchMatches = {};   // paperId → LitQuery.rankPlainText()，供相关度排序与命中说明
+  var searchSortOverride = false; // 用户点表头后，当前查询尊重显式列排序
   /* 排序用 collator 实例复用：localeCompare 每次调用都重解析 locale，万级文献排序时差一个数量级 */
   var SORT_COLLATOR = null;
 
@@ -981,9 +995,11 @@
     var inTrash = state.activeFolderId === 'trash';
     var isRecent = state.activeFolderId === 'recent';
     var q = window.LitQuery ? window.LitQuery.normalizeForSearch(f.q) : f.q.toLowerCase();
+    var plainSearch = !!(f.q && !state.ftEnabled && window.LitQuery && window.LitQuery.isPlainText(f.q) && window.LitQuery.rankPlainText);
+    plainSearchMatches = {};
     var parsed = null;
     querySyntaxError = false;
-    if (f.q && !state.ftEnabled && window.LitQuery) {
+    if (f.q && !state.ftEnabled && window.LitQuery && !plainSearch) {
       parsed = window.LitQuery.parse(f.q);
       if (parsed.error) { parsed = null; querySyntaxError = true; }
     }
@@ -1013,6 +1029,10 @@
       if (q) {
         if (state.ftEnabled) {
           if (!state.ftHits[p.id]) return false;
+        } else if (plainSearch) {
+          var ranked = window.LitQuery.rankPlainText(p, f.q);
+          if (!ranked.matched) return false;
+          plainSearchMatches[p.id] = ranked;
         } else if (parsed) {
           if (!parsed.matcher(p)) return false;
         } else {
@@ -1039,7 +1059,7 @@
     var key = state.sort.key, dir = state.sort.dir;
     var STATUS_ORDER = { unread: 0, reading: 1, read: 2 };
     var sortCollator = SORT_COLLATOR || (SORT_COLLATOR = new Intl.Collator());
-    out.sort(function (a, b) {
+    var compareCurrentSort = function (a, b) {
       var va, vb;
       if (key === 'firstAuthor') { va = (a.authors || [])[0] || ''; vb = (b.authors || [])[0] || ''; }
       else if (key === 'status') { va = STATUS_ORDER[a.status] || 0; vb = STATUS_ORDER[b.status] || 0; }
@@ -1050,7 +1070,22 @@
       if (vb == null) return -1;
       if (typeof va === 'string') return sortCollator.compare(va, vb) * dir;
       return (va - vb) * dir;
-    });
+    };
+    if (!searchSortOverride && state.ftEnabled && q) {
+      out.sort(function (a, b) {
+        var score = ((state.ftHits[b.id] && state.ftHits[b.id].count) || 0) -
+          ((state.ftHits[a.id] && state.ftHits[a.id].count) || 0);
+        return score || compareCurrentSort(a, b);
+      });
+    } else if (!searchSortOverride && plainSearch) {
+      out.sort(function (a, b) {
+        var score = ((plainSearchMatches[b.id] && plainSearchMatches[b.id].score) || 0) -
+          ((plainSearchMatches[a.id] && plainSearchMatches[a.id].score) || 0);
+        return score || compareCurrentSort(a, b);
+      });
+    } else {
+      out.sort(compareCurrentSort);
+    }
     // 最近阅读视图：按最后阅读时间倒序
     if (isRecent) {
       out.sort(function (a, b) { return (b.lastReadAt || 0) - (a.lastReadAt || 0); });
@@ -1106,6 +1141,7 @@
     state.filters = { q: '', status: '', tag: '', year: null, pdfOnly: false, bibkeys: [] };
     state.tablePage = 0;
     $('#search').value = '';
+    searchSortOverride = false;
     $all('#status-seg .seg-btn').forEach(function (x) { x.classList.toggle('active', !x.dataset.status); });
   }
 
@@ -1152,13 +1188,15 @@
     }
     if (!window.LitPdfSearch) return;
     var candidates = state.papers.filter(function (p) {
-      return (p.attachments || []).some(function (attachment) { return attachment.kind === 'pdf' && attachment.path; }) || !!p.pdfPath;
+      return (p.attachments || []).some(function (attachment) {
+        return (attachment.kind === 'pdf' || attachment.kind === 'epub') && attachment.path;
+      }) || !!p.pdfPath;
     });
     var statusEl = $('#ft-status');
     statusEl.hidden = false;
     statusEl.textContent = candidates.length
-      ? T('全文检索中…（') + candidates.length + T(' 篇 PDF，首次较慢）')
-      : T('库内没有带本地 PDF 的文献');
+      ? T('全文检索中…（') + candidates.length + T(' 篇，首次较慢）')
+      : T('库内没有带本地全文文件（PDF/EPUB）的文献');
     window.LitPdfSearch.search(query, candidates, function (progress) {
       if (token !== ftSearchToken) return;
       statusEl.textContent = T('全文检索中 ') + progress.done + '/' + progress.total + '…';
@@ -1178,7 +1216,7 @@
       state.tablePage = 0;
       statusEl.textContent = hits.length
         ? T('命中 ') + hits.length + T(' 篇 · ') + totalMatches + T(' 处')
-        : T('PDF 正文中未找到「') + query + '」';
+        : T('全文中未找到「') + query + '」';
       renderAll();
     }).catch(function () {
       if (token !== ftSearchToken) return;
@@ -1190,6 +1228,12 @@
     var query = state.filters.q;
     if (query) $('#pdf-search').value = query;
     if (hit && hit.attachmentId) {
+      var hitAtt = (paper.attachments || []).filter(function (a) { return a && a.id === hit.attachmentId; })[0];
+      if (hitAtt && hitAtt.kind === 'epub') {
+        // EPUB 命中：页 = spine 章节序号（0 基），epub.js display 直接接受序号定位
+        openEpubViewer(paper, hitAtt.id, (hit.pages && hit.pages[0]) || 0);
+        return;
+      }
       openPdfAt({ paperId: paper.id, attachmentId: hit.attachmentId, page: (hit.pages && hit.pages[0] || 0) + 1 });
     } else openPdfViewer(paper);
   }
@@ -1439,7 +1483,7 @@
     state.selected = {};
     state.selAnchor = null;
     state.tablePage = 0;
-    journalRankFreezeOrder = null;    // 切换视图即取消冻结（新列表按新排序渲染）
+    journalRankClearFrozen();          // 切换视图即取消冻结（新列表按新排序渲染）
     renderAll();
     refreshFolderJournalRanks(folderId);
     reportCurrentFolder();            // 同步给浏览器扩展（右键保存落点）
@@ -2110,6 +2154,7 @@
     var text = range ? String(range.toString() || '') : '';
     if (!text.trim()) { hideEpubSelPopover(); return; }
     epubState.pendingSelection = window.LitEpub.rangeToAnnotationData(range, cfiRange);
+    refreshAgentChips(); // 新选区落定，agent 上下文 chip 即时反映「选中」
     var pop = $('#epub-sel-popover');
     var x = 80, y = 90;
     try {
@@ -2125,8 +2170,10 @@
     pop.hidden = false;
   }
   function hideEpubSelPopover() {
+    var had = !!epubState.pendingSelection;
     epubState.pendingSelection = null;
     $('#epub-sel-popover').hidden = true;
+    if (had) refreshAgentChips(); // 选区清空，agent 上下文 chip 同步摘掉
   }
 
   function renderEpubToc(items) {
@@ -2163,7 +2210,6 @@
     if (!$('#pdf-overlay').hidden) {
       saveReadPos.flush();
       stashPdfTab();
-      ttsStop();
       $('#pdf-overlay').hidden = true;
     }
     epubTtsStop();
@@ -2183,6 +2229,7 @@
     $('#epub-view').innerHTML = T('<div class="pdf-loading">正在打开 EPUB…</div>');
     keepEpubProgress();
     recordPaperRead(tab.paper);
+    syncReadingDrawer(tab.paper);
     refreshAgentChips(); // R19：切标签 = 换了正在读的文献
     var target = cfiOverride || tab.cfi || undefined;
     var readBytes = desktop && (desktop.readFileBytes || desktop.readBytes);
@@ -2291,6 +2338,31 @@
 
   /* EPUB 朗读：本章句子播完自动 next() 翻章（ relocated 钩子续播，空章最多跳 3 个） */
   var epubTtsState = { sentences: [], index: 0, speaking: false, waitingChapter: false, emptyChapterTries: 0 };
+
+  /* 朗读状态栏：EPUB 朗读专用（PDF 朗读已裁撤），语速/暂停/停止共用一份 */
+  var ttsState = { rate: 1.2, paused: false, bar: null };
+  function ttsEnsureBar(parent) {
+    if (ttsState.bar) return ttsState.bar;
+    var bar = document.createElement('div');
+    bar.className = 'pdf-tts-bar';
+    bar.hidden = true;
+    bar.innerHTML = '<span id="tts-status"></span>' +
+      T('<select id="tts-rate" title="语速"><option value="0.8">0.8×</option><option value="1">1×</option><option value="1.2" selected>1.2×</option><option value="1.5">1.5×</option><option value="2">2×</option></select>') +
+      T('<button type="button" class="btn btn-ghost btn-xs" id="tts-pause">暂停</button>') +
+      T('<button type="button" class="btn btn-ghost btn-xs" id="tts-stop">停止</button>');
+    parent.appendChild(bar);
+    bar.querySelector('#tts-rate').addEventListener('change', function (e) {
+      ttsState.rate = Number(e.target.value) || 1.2;
+    });
+    bar.querySelector('#tts-pause').addEventListener('click', function () {
+      if (!epubTtsState.speaking) return;
+      if (!ttsState.paused) { window.speechSynthesis.pause(); ttsState.paused = true; this.textContent = T('继续'); }
+      else { window.speechSynthesis.resume(); ttsState.paused = false; this.textContent = T('暂停'); }
+    });
+    bar.querySelector('#tts-stop').addEventListener('click', function () { epubTtsStop(); });
+    ttsState.bar = bar;
+    return bar;
+  }
   function epubTtsCollect() {
     var t = epubState.api ? epubState.api.visibleText() : '';
     var sentences = [];
@@ -2467,164 +2539,28 @@
     if (!epubState.paper || !epubState.api) return;
     var annotation = annotationsForAttachment(epubState.paper, epubState.attachment).find(function (item) { return item.id === annotationId; });
     if (!annotation || !annotation.position || !annotation.position.cfi) return;
-    epubState.api.goTo(annotation.position.cfi);
+    // textAnchor 随行：旧 epub.js CFI 解析失败时的回退锚（findAnchorRange 章内查找）
+    epubState.api.goTo(annotation.position.cfi, annotation.position.textAnchor);
     renderEpubAnnotations(annotationId);
     var item = $('#epub-annotation-list [data-annotation-id="' + annotationId + '"]');
     if (item) item.scrollIntoView({ block: 'nearest' });
   }
 
-  /* ---- EPUB 侧栏笔记编辑器（与 PDF 面板同一交互，id 前缀 epub-） ---- */
-  var epubNoteCurrentId = '';
-  var saveEpubNoteSide = debounce(function () { save(); }, 500);
+  /* ---- 阅读器侧栏笔记：PDF / EPUB 共用 js/app/note-panel.js ---- */
+  var epubNotePanel = null;
+  var pdfNotePanel = null;
   var saveEpubAnnotationComment = debounce(function () { save(); }, 600);
 
   function currentEpubNote() {
-    if (!epubState.paper) return null;
-    var note = epubNoteCurrentId ? findNote(epubNoteCurrentId) : null;
-    if (note && (note.paperId === epubState.paper.id || !note.paperId)) return note;
-    var own = notesForPaper(epubState.paper.id);
-    return own.length ? own[0] : (topicNotes()[0] || null);
+    return epubNotePanel ? epubNotePanel.current() : null;
   }
 
   function renderEpubNoteEditor() {
-    var editor = $('#epub-note-editor');
-    if (!epubState.paper) { editor.hidden = true; return; }
-    editor.hidden = false;
-    var note = currentEpubNote();
-    epubNoteCurrentId = note ? note.id : '';
-    fillNoteSelect($('#epub-note-select'), epubState.paper.id, epubNoteCurrentId);
-    var ta = $('#epub-note-textarea');
-    ta.value = note ? note.content : '';
-    ta.disabled = !note;
-    setEpubNoteMode($('#epub-note-preview-tab').classList.contains('active') ? 'preview' : 'edit');
-    renderEpubNoteStale();
-  }
-
-  function setEpubNoteMode(mode) {
-    var preview = mode === 'preview';
-    $('#epub-note-textarea').hidden = preview;
-    $('#epub-note-preview').hidden = !preview;
-    $('#epub-note-edit-tab').classList.toggle('active', !preview);
-    $('#epub-note-preview-tab').classList.toggle('active', preview);
-    if (preview) {
-      var note = currentEpubNote();
-      if (!note || !note.content.trim()) {
-        $('#epub-note-preview').innerHTML = T('<p class="d-abstract none">暂无内容</p>');
-      } else if (note.format === 'richtext' && window.LitNoteMl) {
-        $('#epub-note-preview').innerHTML = window.LitNoteMl.sanitizeHtml(note.content);
-      } else {
-        $('#epub-note-preview').innerHTML = window.LitMarkdown.render(note.content);
-      }
-    }
+    if (epubNotePanel) epubNotePanel.render();
   }
 
   function renderEpubNoteStale() {
-    var box = $('#epub-note-stale');
-    var note = currentEpubNote();
-    if (!note) { box.hidden = true; box.innerHTML = ''; return; }
-    var items;
-    if (note.format === 'richtext' && window.LitNoteMl) {
-      items = window.LitNoteMl.parseExcerptBlocks(note.content).map(function (block) {
-        var found = findAnnotationAnywhere(block.annotationId, block.paperId, block.attachmentId);
-        if (!found) return { status: 'deleted', annotationId: block.annotationId, preview: block.quoteText };
-        if (block.sourceUpdatedAt != null && Number(found.annotation.updatedAt) !== Number(block.sourceUpdatedAt)) {
-          return { status: 'changed', annotationId: block.annotationId, preview: block.quoteText, current: found.annotation };
-        }
-        return { status: 'fresh', annotationId: block.annotationId, preview: block.quoteText };
-      }).filter(function (item) { return item.status !== 'fresh'; });
-    } else if (window.LitExcerpt) {
-      items = window.LitExcerpt.staleExcerpts(note.content, function (annotationId, excerpt) {
-        var found = findAnnotationAnywhere(annotationId, excerpt && excerpt.paperId, excerpt && excerpt.attachmentId);
-        return found ? found.annotation : null;
-      }).filter(function (item) { return item.status !== 'fresh'; })
-        .map(function (item) {
-          return { status: item.status, annotationId: item.excerpt.annotationId, preview: item.excerpt.quote, current: item.current || null };
-        });
-    } else {
-      box.hidden = true; box.innerHTML = ''; return;
-    }
-    box.innerHTML = '';
-    if (!items.length) { box.hidden = true; return; }
-    box.hidden = false;
-    items.slice(0, 10).forEach(function (item) {
-      var row = document.createElement('div');
-      row.className = 'pdf-note-stale-item';
-      var badge = document.createElement('span');
-      badge.className = 'pdf-note-stale-badge' + (item.status === 'deleted' ? ' deleted' : '');
-      badge.textContent = item.status === 'deleted' ? T('来源已删除') : T('来源已更新');
-      row.appendChild(badge);
-      var quote = document.createElement('span');
-      quote.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-      quote.textContent = (item.preview || '').split('\n')[0].slice(0, 40);
-      row.appendChild(quote);
-      var mkBtn = function (label, action) {
-        var btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'btn btn-ghost btn-xs';
-        btn.dataset.staleAction = action;
-        btn.dataset.annotationId = item.annotationId;
-        btn.textContent = label;
-        return btn;
-      };
-      if (item.status === 'changed') {
-        row.appendChild(mkBtn(T('采用更新'), 'adopt'));
-        row.appendChild(mkBtn(T('保留'), 'keep'));
-      } else {
-        row.appendChild(mkBtn(T('移除摘录'), 'remove'));
-      }
-      box.appendChild(row);
-    });
-  }
-
-  function epubHandleStaleAction(action, annotationId) {
-    var note = currentEpubNote();
-    if (!note) return;
-    if (note.format === 'richtext' && window.LitNoteMl) {
-      var richTarget = window.LitNoteMl.parseExcerptBlocks(note.content).find(function (block) {
-        return block.annotationId === annotationId;
-      });
-      var found = richTarget ? findAnnotationAnywhere(annotationId, richTarget.paperId, richTarget.attachmentId) : null;
-      if (action === 'adopt' && found) {
-        note.content = window.LitNoteMl.replaceExcerptBlock(note.content, annotationId, {
-          quoteText: annotationQuote(found.annotation),
-          commentText: found.annotation.comment || '',
-          sourceUpdatedAt: found.annotation.updatedAt
-        });
-        toast(T('✓ 已采用来源更新'));
-      } else if (action === 'keep' && found) {
-        note.content = window.LitNoteMl.markExcerptBlockCurrent(note.content, annotationId, found.annotation.updatedAt);
-      } else if (action === 'remove') {
-        note.content = window.LitNoteMl.removeExcerptBlock(note.content, annotationId);
-      } else return;
-      window.LitModel.touch(note);
-      save();
-      $('#epub-note-textarea').value = note.content;
-      renderEpubNoteStale();
-      if (!$('#epub-note-preview').hidden) setEpubNoteMode('preview');
-      return;
-    }
-    if (!window.LitExcerpt) return;
-    var target = window.LitExcerpt.parseExcerpts(note.content)
-      .find(function (x) { return x.annotationId === annotationId; });
-    if (!target) return;
-    var foundMarkdown = findAnnotationAnywhere(annotationId, target.paperId, target.attachmentId);
-    if (action === 'adopt' && foundMarkdown) {
-      note.content = window.LitExcerpt.replaceExcerpt(note.content, target, {
-        quote: annotationQuote(foundMarkdown.annotation),
-        comment: foundMarkdown.annotation.comment || '',
-        sourceUpdatedAt: foundMarkdown.annotation.updatedAt
-      });
-      toast(T('✓ 已采用来源更新'));
-    } else if (action === 'keep' && foundMarkdown) {
-      note.content = window.LitExcerpt.markExcerptCurrent(note.content, target, foundMarkdown.annotation);
-    } else if (action === 'remove') {
-      note.content = window.LitExcerpt.removeExcerpt(note.content, target);
-    } else return;
-    window.LitModel.touch(note);
-    save();
-    $('#epub-note-textarea').value = note.content;
-    renderEpubNoteStale();
-    if (!$('#epub-note-preview').hidden) setEpubNoteMode('preview');
+    if (epubNotePanel) epubNotePanel.renderStale();
   }
 
   function addAttachmentsTo(paper) {
@@ -2659,7 +2595,8 @@
     list = list.filter(function (f) { return !/\.lnk$/i.test(f.name); });
     if (!list.length) return;
     var pdfs = list.filter(function (f) { return /\.pdf$/i.test(f.name); });
-    var supps = list.filter(function (f) { return !/\.pdf$/i.test(f.name); });
+    var epubs = list.filter(function (f) { return /\.epub$/i.test(f.name); });
+    var supps = list.filter(function (f) { return !/\.pdf$/i.test(f.name) && !/\.epub$/i.test(f.name); });
     paper.attachments = paper.attachments || [];
     var chain = Promise.resolve();
     pdfs.forEach(function (f) {
@@ -2698,7 +2635,7 @@
       if (idx !== -1) state.papers[idx] = norm;
       save(); renderAll();
       toast(T('✓ 已附加 ') + list.length + T(' 个文件到「') + String(paper.title || '').slice(0, 24) + '」');
-      if (pdfs.length) {
+      if (pdfs.length || epubs.length) {
         indexPaperFulltext(norm);
         backfillPdfFingerprints().then(renderAll).catch(function () {});
       }
@@ -2709,7 +2646,7 @@
     if (!desktop || !desktop.renameFile || !window.LitRename) { toast(T('重命名需要桌面版')); return; }
     var att = (paper.attachments || []).find(function (a) { return a.id === attId; });
     if (!att || !att.path) { toast(T('该附件没有本地文件')); return; }
-    var template = (integrationConfig && integrationConfig.renameTemplate) || window.LitRename.DEFAULT_TEMPLATE;
+    var template = window.LitRename.DEFAULT_TEMPLATE;
     var base = window.LitRename.buildName(paper, template);
     desktop.renameFile({ path: att.path, baseName: base }).then(function (result) {
       if (!result || result.error) { toast(T('⚠ 重命名失败：') + (result && result.error || T('未知错误'))); return; }
@@ -2729,7 +2666,7 @@
     if (!desktop || !desktop.renameFile || !window.LitRename) { toast(T('重命名需要桌面版')); return; }
     var targets = papers.filter(function (p) { return primaryAttachment(p) && primaryAttachment(p).path; });
     if (!targets.length) { toast(T('选中文献没有本地 PDF 附件')); return; }
-    var template = (integrationConfig && integrationConfig.renameTemplate) || window.LitRename.DEFAULT_TEMPLATE;
+    var template = window.LitRename.DEFAULT_TEMPLATE;
     var renamed = 0, failed = 0;
     toast(T('正在按模板重命名 ') + targets.length + T(' 个 PDF…'));
     var chain = Promise.resolve();
@@ -2999,6 +2936,8 @@
     }
   }
 
+  var chartShowAllYears = false;
+  var chartRecentStart = null;
   function renderChart() {
     var body = $('#year-chart');
     body.innerHTML = '';
@@ -3009,15 +2948,43 @@
     var years = Object.keys(counts).map(Number).sort(function (a, b) { return a - b; });
     if (!years.length) {
       body.innerHTML = T('<div class="chart-empty">导入文献后显示年份分布</div>');
+      $('#chart-peak').textContent = '';
+      $('#chart-range').hidden = true;
       return;
     }
     var minY = years[0], maxY = years[years.length - 1];
+    var recentStart = maxY - 19;
+    chartRecentStart = recentStart;
+    var showAll = chartShowAllYears;
+    $('#chart-range').hidden = minY >= recentStart;
+    $('#chart-range').textContent = showAll ? T('只看近 20 年') : T('查看全部年份');
+    $('#chart-range').setAttribute('aria-pressed', String(showAll));
     var seq = [];
-    if (maxY - minY <= 50) { for (var y = minY; y <= maxY; y++) seq.push(y); }
-    else seq = years; // 跨度太大时只画有数据的年份
-    var maxCount = Math.max.apply(null, years.map(function (y) { return counts[y]; }));
+    if (showAll && maxY - minY > 50) seq = years; // 全时段跨度太大时只画有数据的年份
+    else for (var y = showAll ? minY : Math.max(minY, recentStart); y <= maxY; y++) seq.push(y);
+    var maxCount = Math.max.apply(null, seq.map(function (y) { return counts[y] || 0; }));
+    var peakYear = seq.reduce(function (best, y) { return (counts[y] || 0) > (counts[best] || 0) ? y : best; }, seq[0]);
+    $('#chart-peak').textContent = T('峰值 ') + peakYear + T(' 年 · ') + counts[peakYear] + T(' 篇');
 
     var tooltip = $('#chart-tooltip');
+    if (!showAll && minY < recentStart) {
+      var earlierCount = years.filter(function (y) { return y < recentStart; })
+        .reduce(function (sum, y) { return sum + counts[y]; }, 0);
+      var earlierBar = document.createElement('div');
+      earlierBar.className = 'ybar earlier';
+      earlierBar.style.height = '16px';
+      earlierBar.setAttribute('aria-label', recentStart + T(' 年前 · ') + earlierCount + T(' 篇'));
+      earlierBar.addEventListener('mouseenter', function () {
+        tooltip.textContent = T('更早') + ' · ' + earlierCount + T(' 篇');
+        tooltip.hidden = false;
+        var cardRect = earlierBar.closest('.chart-card').getBoundingClientRect();
+        var r = earlierBar.getBoundingClientRect();
+        tooltip.style.left = (r.left - cardRect.left + r.width / 2) + 'px';
+        tooltip.style.top = (r.top - cardRect.top - 6) + 'px';
+      });
+      earlierBar.addEventListener('mouseleave', function () { tooltip.hidden = true; });
+      body.appendChild(earlierBar);
+    }
     seq.forEach(function (y) {
       var c = counts[y] || 0;
       var bar = document.createElement('div');
@@ -3046,10 +3013,15 @@
     // x 轴刻度：首尾年份 + 中间一个
     var axis = document.createElement('div');
     axis.className = 'ybar-x';
+    if (!showAll && minY < recentStart) {
+      var earlierLabel = document.createElement('span');
+      earlierLabel.textContent = T('更早');
+      axis.appendChild(earlierLabel);
+    }
     var mid = seq[Math.floor(seq.length / 2)];
     seq.forEach(function (y) {
       var s = document.createElement('span');
-      if (y === minY || y === maxY || (seq.length > 4 && y === mid)) s.textContent = y;
+      if (y === seq[0] || y === maxY || (seq.length > 4 && y === mid)) s.textContent = y;
       axis.appendChild(s);
     });
     body.parentNode.appendChild(axis);
@@ -3127,8 +3099,6 @@
     if (rank.xrTop) score += 100;
     return score + Math.min(Number(rank.imf) || 0, 9.9) / 10;
   }
-  var journalRankPending = Object.create(null);   // venueKey → true，正在查询的期刊
-  var journalRankFreezeOrder = null;              // 分区补查期间冻结的行顺序（paper id 数组）
   function isArxivPaper(paper) {
     if (!paper) return false;
     var doi = String(paper.doi || '').toLowerCase();
@@ -3163,7 +3133,7 @@
     if (!paper.venue) {
       return T('<span class="rank-cell-empty" title="该文献未填写期刊名，补全元数据后会自动查询分区">—<span class="rank-cell-hint">无期刊名</span></span>');
     }
-    if (journalRankPending[venueKey]) {
+    if (journalRankIsPending(venueKey)) {
       return T('<span class="rank-cell-pending" title="正在查询期刊分区…">…</span>');
     }
     if (shouldRefreshJournalRank(paper)) {
@@ -3265,9 +3235,10 @@
     $('#table-wrap').hidden = false;
     list = list || filteredPapers();
     // 分区补查期间冻结当前行顺序：数据更新不会让行立即跳位
-    if (journalRankFreezeOrder) {
+    var journalRankFrozen = journalRankFrozenOrder();
+    if (journalRankFrozen) {
       var pos = {};
-      journalRankFreezeOrder.forEach(function (id, i) { pos[id] = i; });
+      journalRankFrozen.forEach(function (id, i) { pos[id] = i; });
       var frozen = list.slice().sort(function (a, b) {
         var pa = pos[a.id], pb = pos[b.id];
         if (pa != null && pb != null) return pa - pb;
@@ -3300,9 +3271,11 @@
     $('#table-page-next').disabled = state.tablePage >= pageCount - 1;
 
     // 排序指示
+    var relevanceSorted = !searchSortOverride && !!state.filters.q &&
+      (state.ftEnabled || (window.LitQuery && window.LitQuery.isPlainText(state.filters.q)));
     $all('.lit-table th.sortable').forEach(function (th) {
-      th.classList.toggle('sorted', th.dataset.sort === state.sort.key);
-      th.classList.toggle('desc', th.dataset.sort === state.sort.key && state.sort.dir === -1);
+      th.classList.toggle('sorted', !relevanceSorted && th.dataset.sort === state.sort.key);
+      th.classList.toggle('desc', !relevanceSorted && th.dataset.sort === state.sort.key && state.sort.dir === -1);
     });
 
     var rows = [];
@@ -3324,15 +3297,26 @@
         sub.push(T('<button type="button" class="ft-badge" data-act="ft-open" title="在 PDF 阅读器中打开到命中页">') + svgUse('lb-i-ft') + T('全文 ×') + ftHit.count +
           T('（第 ') + shownPages + T(' 页') + more + '）</button>');
       }
+      var searchMatch = plainSearchMatches[p.id];
+      var searchMatchHtml = '';
+      if (searchMatch && searchMatch.field && searchMatch.field !== 'title' && searchMatch.snippet) {
+        var fieldLabels = {
+          tags: T('标签'), key: T('引用键'), authors: T('作者'), venue: T('期刊'),
+          abstract: T('摘要'), notes: T('笔记')
+        };
+        searchMatchHtml = '<div class="search-match-reason"><span>' + T('命中') +
+          esc(fieldLabels[searchMatch.field] || searchMatch.field) + '：</span>' + esc(searchMatch.snippet) + '</div>';
+      }
       var cls = 'lit-row' + (state.selected[p.id] ? ' selected' : '') + (p.id === state.focusId ? ' focused' : '') +
         (p.id === drawerId ? ' detail-active' : '');
       rows.push('<tr class="' + cls.trim() + '" data-id="' + p.id + T('" draggable="true" title="拖动到左侧文件夹可归类">') +
         '<td class="col-attachment">' + attachmentHtml(p) + '</td>' +
         '<td class="col-title"><div class="t-title-row">' + expandHtml + '<div class="t-title">' + esc(p.title) + '</div></div>' +
+          searchMatchHtml +
           (sub.length ? '<div class="t-sub">' + sub.join(' · ') + '</div>' : '') + '</td>' +
         '<td class="cell-authors">' + esc(authorsShort(p.authors)) + '</td>' +
         '<td class="num">' + (p.year != null ? p.year : '—') + '</td>' +
-        '<td>' + esc(p.venue || '—') + '</td>' +
+        '<td class="col-venue"><div class="t-venue" title="' + esc(p.venue || '') + '">' + esc(p.venue || '—') + '</div></td>' +
         '<td class="cell-rank">' + journalRankCellHtml(p) + '</td>' +
         '<td>' + (p.rating ? starsHtml(p.rating) : '<span class="stars"><span class="off">—</span></span>') + '</td>' +
         '</tr>');
@@ -3374,19 +3358,130 @@
         });
       }
     });
+    // 筛选后零结果：空库（无任何文献）仍走 onboard 空态，这里只提示「筛选无命中」
+    var filterActive = hasActiveFilters() || (state.activeFolderId && state.activeFolderId !== 'all');
+    if (!rows.length && filterActive) {
+      rows.push('<tr class="lit-row"><td colspan="7">' +
+        T('<p class="field-hint">当前筛选下没有匹配的条目。</p>') + '</td></tr>');
+    }
     tbody.innerHTML = rows.join('');
     syncCheckAll(list);
   }
 
   // ---------- 通用对话框（替代原生 confirm / prompt） ----------
-  var dlgState = null;
+  var dialogs = null;
+  function initDialogs() {
+    if (!window.LitDialogs) return;
+    dialogs = window.LitDialogs.create({ $: $, T: T });
+  }
+  function dlgCancel() { if (dialogs) dialogs.cancel(); }
 
-  function dlgCancel() {
-    if (!dlgState) return;
-    var s = dlgState;
-    dlgState = null;
-    $('#dlg-mask').hidden = true;
-    s.resolve(s.mode === 'confirm' ? false : null);
+  /* ---- Zotero 导入向导（js/app/zotero-wizard.js）：适配层 ---- */
+  var zoteroWizard = null;
+  function initZoteroWizard() {
+    if (!window.LitZoteroWizard) return;
+    zoteroWizard = window.LitZoteroWizard.create({
+      T: T, $: $, $all: $all, esc: esc, toast: toast,
+      desktop: function () { return desktop; },
+      state: function () { return state; },
+      mergeZoteroImport: mergeZoteroImport,
+      applySyncedWorkspace: applySyncedWorkspace,
+      download: download,
+      stamp: stamp
+    });
+    zoteroWizard.bind();
+  }
+
+  /* ---- 远端同步对照（js/app/remote-plan.js）：适配层 ---- */
+  var remotePlan = null;
+  function initRemotePlan() {
+    if (!window.LitRemotePlan) return;
+    remotePlan = window.LitRemotePlan.create({
+      T: T, $: $, esc: esc, toast: toast, debounce: debounce,
+      desktop: function () { return desktop; },
+      syncFormValue: syncFormValue,
+      workspacePayload: workspacePayload,
+      setSyncInlineStatus: setSyncInlineStatus,
+      applySyncedWorkspace: applySyncedWorkspace,
+      applyPortableConfigRuntime: applyPortableConfigRuntime,
+      fillSyncForm: fillSyncForm,
+      setSyncIndicator: setSyncIndicator,
+      setIntegrationConfig: function (config) { integrationConfig = config; },
+      isSyncBusy: function () { return syncBusy; },
+      download: download,
+      stamp: stamp
+    });
+    remotePlan.bind();
+  }
+  function showSyncConflicts(conflicts) { if (remotePlan) remotePlan.showConflicts(conflicts); }
+  function showRemotePlan(plan) { if (remotePlan) remotePlan.show(plan); }
+  function closeRemotePlanDialog() { if (remotePlan) remotePlan.close(); }
+  function handleSyncProgress(payload) { if (remotePlan) remotePlan.handleProgress(payload); }
+
+  /* ---- 期刊分区（js/app/journal-rank.js）：适配层 ---- */
+  var journalRank = null;
+  function initJournalRank() {
+    if (!window.LitJournalRank) return;
+    journalRank = window.LitJournalRank.create({
+      T: T, $: $, toast: toast, save: save, renderTable: renderTable,
+      getById: getById, drawerId: function () { return drawerId; },
+      filteredPapers: filteredPapers, state: state,
+      desktop: function () { return desktop; },
+      isArxivPaper: isArxivPaper,
+      tablePageSize: TABLE_PAGE_SIZE,
+      model: window.LitModel,
+      journalRankTier: journalRankTier, rankXrValue: rankXrValue
+    });
+    journalRank.bind();
+  }
+  function renderJournalRank(paper, message) { if (journalRank) journalRank.renderRank(paper, message); }
+  function refreshFolderJournalRanks(folderId) { if (journalRank) journalRank.refreshFolder(folderId); }
+  function refreshJournalRank(silent) { if (journalRank) journalRank.refresh(silent); }
+  function rankResultData(response) { return journalRank ? journalRank.resultData(response) : null; }
+  function journalRankSummary(data) { return journalRank ? journalRank.summary(data) : ''; }
+  function shouldRefreshJournalRank(paper) { return journalRank ? journalRank.shouldRefresh(paper) : false; }
+  function journalRankIsPending(key) { return journalRank ? journalRank.isPending(key) : false; }
+  function journalRankFrozenOrder() { return journalRank ? journalRank.frozenOrder() : null; }
+  function journalRankClearFrozen() { if (journalRank) journalRank.clearFrozenOrder(); }
+
+  /* ---- 查询构建器 / 批量编辑（js/app/query-builder.js）：适配层 ---- */
+  var queryBuilder = null;
+  function initQueryBuilder() {
+    if (!window.LitQueryBuilder) return;
+    queryBuilder = window.LitQueryBuilder.create({
+      T: T, $: $, esc: esc, toast: toast, state: state,
+      save: save, renderAll: renderAll,
+      makeSnapshot: makeSnapshot, commitUndo: commitUndo,
+      query: window.LitQuery, model: window.LitModel
+    });
+  }
+  function openBulkEdit(papers) { if (queryBuilder) queryBuilder.openBulkEdit(papers); }
+
+  /* ---- 笔记导出 Word（js/app/note-export.js）：适配层 ---- */
+  var noteExport = null;
+  function initNoteExport() {
+    if (!window.LitNoteExport) return;
+    noteExport = window.LitNoteExport.create({
+      T: T, toast: toast, desktop: function () { return desktop; },
+      state: state, getById: getById, stamp: stamp,
+      docxLib: window.LitDocx, csldoc: window.LitCslDoc, csl: window.LitCsl,
+      noteml: window.LitNoteMl, excerpt: window.LitExcerpt
+    });
+  }
+  function exportNoteToWord(note) { if (noteExport) noteExport.exportWord(note); }
+
+  /* ---- Word 写作面板（js/app/word-panel.js）：适配层 ---- */
+  var wordPanel = null;
+  function initWordPanel() {
+    if (!window.LitWordPanel) return;
+    wordPanel = window.LitWordPanel.create({
+      T: T, $: $, toast: toast, dlgPrompt: dlgPrompt, dlgConfirm: dlgConfirm,
+      desktop: function () { return desktop; }, state: state, normHit: normHit,
+      csl: window.LitCsl, csldoc: window.LitCslDoc, docx: window.LitDocx,
+      query: window.LitQuery,
+      citeSplitName: window.LitCite && window.LitCite._splitName
+    });
+    wordPanel.bind();
   }
 
   /* ---- M1 弹窗栈：所有覆盖层注册进 LitModal（js/modal.js），Esc 只关最顶层。
@@ -3401,7 +3496,8 @@
       ['authors-mask', '#authors-close'], ['tags-mask', '#tags-close'], ['shortcuts-mask', '#shortcuts-close'],
       ['bibkey-search-mask', '#bibkey-search-cancel'], ['sync-mask', '#sync-close'],
       ['sync-conflict-mask', '#sync-conflict-close'], ['word-cite-mask', '#word-cite-cancel'],
-      ['word-panel-mask', '#word-panel-close'], ['bridge-panel-mask', '#bridge-panel-close']
+      ['word-panel-mask', '#word-panel-close'], ['bridge-panel-mask', '#bridge-panel-close'],
+      ['graph-mask', '#graph-close'], ['snapshot-mask', '#snapshot-close']
     ].forEach(function (pair) {
       var mask = $('#' + pair[0]);
       var btn = $(pair[1]);
@@ -3439,69 +3535,16 @@
     if (pdfOverlay) m.watch(pdfOverlay, function () { closePdfViewer(); });
   }
 
-  function dlgSettle(value) {
-    if (!dlgState) return;
-    var s = dlgState;
-    dlgState = null;
-    $('#dlg-mask').hidden = true;
-    s.resolve(value);
-  }
+  function dlgConfirm(title, body, okText, danger) { return dialogs.confirm(title, body, okText, danger); }
+  function dlgPrompt(title, body, placeholder, value) { return dialogs.prompt(title, body, placeholder, value); }
+  function dlgPick(title, body, items) { return dialogs.pick(title, body, items); }
 
-  /**
-   * options: { title, body, okText, danger, input: {placeholder, value}, list: [{id, label}] }
-   * confirm 模式 resolve true/false；input 模式 resolve 字符串/null；list 模式 resolve 选中 id/null（点击即选）。
-   */
-  function dlgOpen(options) {
-    if (dlgState) dlgCancel();
-    return new Promise(function (resolve) {
-      var mode = options.list ? 'list' : (options.input ? 'input' : 'confirm');
-      dlgState = { resolve: resolve, mode: mode };
-      $('#dlg-title').textContent = options.title || T('确认');
-      var body = $('#dlg-body');
-      body.textContent = options.body || '';
-      body.hidden = !options.body;
-      var input = $('#dlg-input');
-      input.hidden = !options.input;
-      if (options.input) {
-        input.placeholder = options.input.placeholder || '';
-        input.value = options.input.value || '';
-      }
-      var list = $('#dlg-list');
-      list.innerHTML = '';
-      list.hidden = !options.list;
-      if (options.list) {
-        options.list.forEach(function (item) {
-          var b = document.createElement('button');
-          b.type = 'button';
-          b.className = 'dlg-option';
-          b.textContent = item.label;
-          b.addEventListener('click', function () { dlgSettle(item.id); });
-          list.appendChild(b);
-        });
-      }
-      var okBtn = $('#dlg-ok');
-      okBtn.hidden = mode === 'list';
-      okBtn.textContent = options.okText || T('确定');
-      okBtn.className = 'btn ' + (options.danger ? 'btn-danger-solid' : 'btn-primary');
-      $('#dlg-mask').hidden = false;
-      setTimeout(function () {
-        if (mode === 'input') { input.focus(); input.select(); }
-        else if (mode === 'list') { var first = list.querySelector('.dlg-option'); if (first) first.focus(); }
-        else okBtn.focus();
-      }, 0);
-    });
-  }
-
-  function dlgConfirm(title, body, okText, danger) {
-    return dlgOpen({ title: title, body: body, okText: okText, danger: danger });
-  }
-
-  function dlgPrompt(title, body, placeholder, value) {
-    return dlgOpen({ title: title, body: body, input: { placeholder: placeholder, value: value } });
-  }
-
-  function dlgPick(title, body, items) {
-    return dlgOpen({ title: title, body: body, list: items });
+  // ---------- 检索语法速查（主检索与 Word 引文弹窗共用） ----------
+  var searchHelp = null;
+  function initSearchHelp() {
+    if (!window.LitSearchHelp) return;
+    searchHelp = window.LitSearchHelp.create({ $: $, T: T, esc: esc, clamp: clamp });
+    searchHelp.bind();
   }
 
   // ---------- 右键快捷菜单 ----------
@@ -3630,7 +3673,9 @@
     ctxSubEl = el;
   }
 
-  function showCtxMenu(x, y, items) {
+  /** 通用弹出菜单。opts.anchor（元素 rect）= 贴着该元素展开：空间不够时向上弹，
+   *  对话面板底部的模型菜单靠它贴在按钮上方（否则会盖住输入框）。 */
+  function showCtxMenu(x, y, items, opts) {
     hideCtxMenu();
     var el = document.createElement('div');
     el.id = 'ctx-menu';
@@ -3683,6 +3728,16 @@
     el.style.top = '0px';
     document.body.appendChild(el);
     var rect = el.getBoundingClientRect();
+    var anchor = opts && opts.anchor;
+    if (anchor) {
+      // 贴着锚元素展开：默认在其上方（底部工具条），上方放不下才落到下方
+      var above = anchor.top - rect.height - 6;
+      if (above < 8) above = Math.min(anchor.bottom + 6, window.innerHeight - rect.height - 8);
+      el.style.left = clamp(anchor.left, 8, Math.max(8, window.innerWidth - rect.width - 8)) + 'px';
+      el.style.top = clamp(above, 8, Math.max(8, window.innerHeight - rect.height - 8)) + 'px';
+      ctxMenuEl = el;
+      return;
+    }
     el.style.left = clamp(x, 8, Math.max(8, window.innerWidth - rect.width - 8)) + 'px';
     el.style.top = clamp(y, 8, Math.max(8, window.innerHeight - rect.height - 8)) + 'px';
     ctxMenuEl = el;
@@ -3815,7 +3870,16 @@
     items.push({ label: T('编辑…'), icon: 'lb-i-pencil', fn: function () { openEditModal(target); } });
     items.push({ label: T('一键补全'), icon: 'lb-i-sparkle', fn: function () { bulkEnrich(papers); } });
     items.push('sep');
-    items.push({ label: T('移入回收站'), icon: 'lb-i-trash', danger: true, fn: function () {
+    var linkFolder = currentFolderLinkTarget();
+    if (linkFolder) {
+      items.push({ label: T('从当前文件夹移出'), icon: 'lb-i-trash', fn: function () {
+        dlgConfirm(T('从当前文件夹移出'), T('将选中的 ') + papers.length + T(' 篇从“') + linkFolder.name +
+          T('”移出？文献、附件及其它文件夹中的链接都会保留。'), T('移出')).then(function (ok) {
+          if (ok) removePapersFromFolder(papers, linkFolder);
+        });
+      } });
+    }
+    items.push({ label: linkFolder ? T('移入回收站（所有文件夹）') : T('移入回收站'), icon: 'lb-i-trash', danger: true, fn: function () {
       dlgConfirm(T('移入回收站'), T('删除选中的 ') + papers.length + T(' 篇？可在提示条点「撤销」恢复，也可稍后在回收站找回。'), T('移入回收站')).then(function (ok) {
         if (!ok) return;
         removePapers(papers.map(function (p) { return p.id; }));
@@ -3883,7 +3947,7 @@
 
   function writeBackPdfAnnotations(paper, attachment, silent) {
     if (typeof attachment === 'boolean') { silent = attachment; attachment = pdfAttachment(paper, ''); }
-    if (!desktop || !desktop.writePdf || !window.PDFLib || !window.LitPdfAnnot) {
+    if (!desktop || !desktop.writePdf || !window.LitPdf || !window.LitPdf.writeAnnotations) {
       if (!silent) toast(T('写回批注需要桌面版'));
       return Promise.resolve(false);
     }
@@ -3893,7 +3957,7 @@
     }
     var annotations = annotationsForAttachment(paper, attachment);
     return desktop.readFileBytes(attachment.path).then(function (bytes) {
-      return window.LitPdfAnnot.writeAnnotations(new Uint8Array(bytes), annotations);
+      return window.LitPdf.writeAnnotations(new Uint8Array(bytes), annotations);
     }).then(function (result) {
       if (!result.written) {
         if (!silent) toast(T('所有批注已在 PDF 中（幂等跳过）'));
@@ -3924,9 +3988,9 @@
   }
 
   /** 打开 PDF 后检测文件内已有的标准批注，提示导入到库 */
-  function maybeImportPdfAnnotations(paper, doc, attachment) {
-    if (!window.LitPdfAnnot || !doc || !paper || !attachment) return;
-    window.LitPdfAnnot.readAnnotations(doc).then(function (found) {
+  function maybeImportPdfAnnotations(paper, attachment) {
+    if (!window.LitPdf || !window.LitPdf.readAnnotations || !paper || !attachment) return;
+    window.LitPdf.readAnnotations(attachment.path).then(function (found) {
       if (!found || !found.length) return;
       found = found.map(function (annotation) { return Object.assign({}, annotation, { attachmentId: attachment.id }); });
       var existing = {};
@@ -3941,7 +4005,7 @@
         return !existing[a.id] && !existingFp[window.LitModel.annotationFingerprint(a)];
       });
       if (!fresh.length) return;
-      toast(T('PDF 内含 ') + fresh.length + T(' 条标准批注'), 9000, {
+      toast(T('PDF 里自带 ') + fresh.length + T(' 条批注'), 9000, {
         label: T('导入到库'), fn: function () {
           paper.pdfAnnotations = window.LitModel.normalizePdfAnnotations(
             (paper.pdfAnnotations || []).concat(fresh));
@@ -3959,9 +4023,94 @@
   // ---------- 常驻详情栏 ----------
   var drawerId = null;
   var saveNotes = null;
+  var drawerInlineEditing = false;
+
+  function setDrawerInlineEditControls(editing) {
+    var editButton = $('#d-edit');
+    editButton.innerHTML = svgUse(editing ? 'lb-i-x' : 'lb-i-pencil') + T(editing ? '取消' : '编辑');
+    editButton.title = editing ? T('放弃未保存的修改') : T('编辑字段');
+    $('#d-inline-save').hidden = !editing;
+  }
+
+  function renderDrawerEditableFields(p) {
+    var title = $('#d-title');
+    var meta = $('#d-meta');
+    var abstract = $('#d-abstract');
+    var extract = $('#d-extract');
+    if (drawerInlineEditing) {
+      title.innerHTML = '<input class="d-title-input" id="d-inline-title" type="text" value="' + esc(p.title || '') + '">';
+      var rows = [
+        [T('作者：'), 'authors', (p.authors || []).join('; '), T('多位作者以分号分隔')],
+        [T('年份：'), 'year', p.year != null ? p.year : '', ''],
+        [T('期刊：'), 'venue', p.venue || '', ''],
+        ['bibkey: ', 'key', p.key || '', '']
+      ];
+      meta.innerHTML = rows.map(function (row) {
+        var attrs = row[1] === 'year' ? ' inputmode="numeric"' : row[1] === 'key' ? ' spellcheck="false"' : '';
+        return '<label class="d-meta-row d-inline-meta"><strong>' + esc(row[0]) + '</strong><input class="d-inline-input" data-inline-field="' +
+          row[1] + '" type="text" value="' + esc(row[2]) + '" placeholder="' + esc(row[3]) + '"' + attrs + '></label>';
+      }).join('');
+      abstract.classList.remove('none');
+      abstract.innerHTML = '<textarea class="d-inline-abstract" id="d-inline-abstract" placeholder="' + esc(T('暂无摘要')) + '">' + esc(p.abstract || '') + '</textarea>';
+      extract.hidden = true;
+      return;
+    }
+    title.textContent = p.title;
+    var metaRows = [
+      [T('作者：'), p.authors && p.authors.length ? p.authors.join(', ') : '—'],
+      [T('年份：'), p.year != null ? p.year : '—'],
+      [T('期刊：'), p.venue || '—'],
+      ['bibkey: ', p.key || '—']
+    ];
+    meta.innerHTML = metaRows.map(function (row) {
+      return '<span class="d-meta-row"><strong>' + esc(row[0]) + '</strong>' + esc(row[1]) + '</span>';
+    }).join('');
+    if (p.abstract) { abstract.textContent = p.abstract; abstract.classList.remove('none'); }
+    else { abstract.textContent = T('（无摘要 — 试试「补全」按钮）'); abstract.classList.add('none'); }
+    var n = window.LitEnrich.guessSampleSize(p.abstract);
+    extract.textContent = n ? T('从摘要识别的样本量（供参考）：n = ') + n : '';
+    extract.hidden = false;
+  }
+
+  function startDrawerInlineEdit() {
+    var p = getById(drawerId);
+    if (!p) return;
+    drawerInlineEditing = true;
+    renderDrawerEditableFields(p);
+    setDrawerInlineEditControls(true);
+    $('#d-inline-title').focus();
+  }
+
+  function cancelDrawerInlineEdit() {
+    var p = getById(drawerId);
+    drawerInlineEditing = false;
+    if (p) renderDrawerEditableFields(p);
+    setDrawerInlineEditControls(false);
+  }
+
+  function saveDrawerInlineEdit() {
+    var p = getById(drawerId);
+    if (!p) return;
+    var title = $('#d-inline-title').value.trim();
+    if (!title) { toast(T('标题不能为空')); $('#d-inline-title').focus(); return; }
+    var fields = {};
+    $all('[data-inline-field]').forEach(function (input) { fields[input.dataset.inlineField] = input.value; });
+    var result = applyPaperEdits(p, {
+      title: title,
+      authors: parseAuthorInput(fields.authors),
+      year: String(fields.year || '').trim() ? parseInt(fields.year, 10) : null,
+      venue: String(fields.venue || '').trim(),
+      abstract: $('#d-inline-abstract').value
+    }, String(fields.key || '').trim());
+    if (!result) return;
+    drawerInlineEditing = false;
+    openDrawer(drawerId);
+    toast(T('✓ 已保存'));
+    if (result.venueChanged) refreshFolderJournalRanks(state.activeFolderId);
+  }
 
   /** 用户主动打开某条文献（点列表行 / Enter / 右键「打开详情」/ 相关文献链接）：
-   * 右栏可能正停在 AI 对话或手动检索面板，此时必须切回详情页——否则详情写进了隐藏面板，
+   * 右栏可能正停在 AI 对话面板，此时必须切回详情页——否则详情写进了隐藏面板，
    * 用户看到的是「点了没反应」。内部的「刷新当前抽屉」调用仍走 openDrawer（不动右栏），
    * 否则撤销、补全、编辑保存这类刷新会把正在对话的用户拽出 AI 面板。 */
   function openDrawerAndReveal(id) {
@@ -3973,19 +4122,14 @@
     var p = getById(id);
     if (!p) return;
     drawerId = id;
+    drawerInlineEditing = false;
+    setDrawerInlineEditControls(false);
     drawerFolderFilter = '';
     $('#drawer').hidden = false;
     $('#detail-empty').hidden = true;
 
     $('#d-status').value = p.status;
-    $('#d-title').textContent = p.title;
-    var metaParts = [];
-    if (p.authors && p.authors.length) metaParts.push(p.authors.join(', '));
-    if (p.venue) metaParts.push(p.venue);
-    if (p.year != null) metaParts.push(p.year);
-    if (p.key) metaParts.push('bibkey: ' + p.key);
-    if (p.citations != null) metaParts.push(T('被引 ') + p.citations + (p.citationSource ? '（' + p.citationSource + '）' : ''));
-    $('#d-meta').textContent = metaParts.join(' · ') || T('（暂无元数据，可点右上角「补全」）');
+    renderDrawerEditableFields(p);
     renderJournalRank(p);
 
     var links = [];
@@ -3995,14 +4139,6 @@
     if (p.oaUrl) links.push('<a href="' + esc(p.oaUrl) + T('" target="_blank" rel="noopener">开放获取全文</a>'));
     if (p.url) links.push('<a href="' + esc(p.url) + T('" target="_blank" rel="noopener">原始链接</a>'));
     if (p.openalexId) links.push('<a href="' + esc(p.openalexId) + '" target="_blank" rel="noopener">OpenAlex</a>');
-    if (p.doi && integrationConfig && integrationConfig.proxyPrefix) {
-      var proxyTarget = 'https://doi.org/' + p.doi;
-      var proxyPrefix = integrationConfig.proxyPrefix;
-      var proxyHref = proxyPrefix.indexOf('%U') !== -1
-        ? proxyPrefix.replace('%U', encodeURIComponent(proxyTarget))
-        : proxyPrefix + proxyTarget;
-      links.push('<a href="' + esc(proxyHref) + T('" target="_blank" rel="noopener" title="经机构代理访问出版商全文">') + svgUse('lb-i-bank') + T('机构访问</a>'));
-    }
     if (p.pdfPath && desktop) links.push(T('<button type="button" data-act="read-pdf" title="使用 LitBoard 内置阅读器打开">') + svgUse('lb-i-book') + T('内置 PDF 打开</button>'));
     if (p.pdfPath && desktop) links.push(T('<button type="button" data-act="open-pdf" title="使用系统默认 PDF 程序打开">') + svgUse('lb-i-external') + T('外部程序打开</button>'));
     if (p.title) links.push('<a href="https://scholar.google.com/scholar?q=' + encodeURIComponent(p.title) + T('" target="_blank" rel="noopener">Google 学术</a>'));
@@ -4014,13 +4150,6 @@
     renderFolderAssignments(p);
     renderAttachments(p);
     renderRelated(p);
-    var absEl = $('#d-abstract');
-    if (p.abstract) { absEl.textContent = p.abstract; absEl.classList.remove('none'); }
-    else { absEl.textContent = T('（无摘要 — 试试「补全」按钮）'); absEl.classList.add('none'); }
-
-    var n = window.LitEnrich.guessSampleSize(p.abstract);
-    $('#d-extract').textContent = n ? T('从摘要识别的样本量（供参考）：n = ') + n : '';
-
     $('#d-notes').value = paperNoteContent(p);
     $('#d-notes-saved').textContent = '';
     setNotesMode('edit');
@@ -4033,332 +4162,11 @@
     });
   }
 
-  function addJournalRankItem(container, label, value, kind) {
-    if (value == null || value === '') return;
-    var item = document.createElement('span');
-    item.className = 'journal-rank-item' + (kind ? ' ' + kind : '');
-    var title = document.createElement('strong');
-    title.textContent = label + ' ';
-    item.appendChild(title);
-    item.appendChild(document.createTextNode(String(value)));
-    container.appendChild(item);
-  }
-  function addJournalRankFlag(container, label, kind) {
-    var item = document.createElement('span');
-    item.className = 'journal-rank-item' + (kind ? ' ' + kind : '');
-    item.textContent = label;
-    container.appendChild(item);
-  }
-  function renderJournalRank(paper, message) {
-    var wrap = $('#d-journal-rank');
-    var values = $('#d-journal-rank-values');
-    values.innerHTML = '';
-    if (!paper || !paper.venue) { wrap.hidden = true; return; }
-    var rank = paper.journalRank;
-    if (rank) {
-      if (rank.beihe) addJournalRankFlag(values, T('北核'), 'rank-core');
-      if (rank.xr) addJournalRankItem(values, T('新锐'), rankXrValue(rank.xr), journalRankTier(rank.xr));
-      if (rank.xrTop) addJournalRankFlag(values, 'Top', 'rank-top');
-      if (rank.jcr) addJournalRankItem(values, 'JCR', rank.jcr, 'rank-jcr');
-      if (rank.imf != null) addJournalRankItem(values, 'IF', rank.imf, 'rank-if');
-    }
-    if (!values.childNodes.length && message) {
-      var empty = document.createElement('span');
-      empty.className = 'journal-rank-empty';
-      empty.textContent = message;
-      values.appendChild(empty);
-    }
-    wrap.hidden = !values.childNodes.length;
-  }
-  /** 统一取期刊等级数据：兼容 SciGreat({results:[{data}]}) 与 EasyScholar({code,msg,data}) */
-  function rankResultData(response) {
-    if (!response) return null;
-    if (Array.isArray(response.results)) {
-      var result = response.results[0];
-      return result && result.data && typeof result.data === 'object' ? result.data : null;
-    }
-    if (Number(response.code) === 200 && response.data && typeof response.data === 'object') return response.data;
-    return null;
-  }
-  /** 把不同提供商的等级数据归一为 journalRank 模型字段 */
-  function journalRankFromData(data) {
-    if (!data) return null;
-    var o = data.officialRank && data.officialRank.all ? data.officialRank.all : data;
-    return window.LitModel.normalizeJournalRank({
-      abbr: data.abbr || o.abbr || '',
-      jcr: data.jcr || o.sci || '',
-      cas: data.cas || o.sciBase || o.sciUp || '',
-      casTop: data.cas_top || o.sciUpTop || '',
-      xr: data.xr || o.xr || '',
-      xrTop: data.xr_top || o.xrTop || '',
-      beihe: data.pku || data.pku_core || data.beihe || data.beida_core || data.core || o.pku || '',
-      imf: data.imf != null ? data.imf : o.sciif,
-      jci: data.jci != null ? data.jci : o.jci,
-      updatedAt: Date.now()
-    });
-  }
-  function journalRankSummary(data) {
-    var rank = journalRankFromData(data);
-    if (!rank) return T('无分区数据');
-    var parts = [];
-    if (rank.xr) parts.push(T('新锐 ') + rank.xr);
-    if (rank.xrTop) parts.push('Top');
-    if (rank.beihe) parts.push(T('北核'));
-    if (rank.cas) parts.push(T('中科院 ') + rank.cas);
-    if (rank.imf != null) parts.push('IF ' + rank.imf);
-    return parts.length ? parts.join(' · ') : T('有数据');
-  }
-  function shouldRefreshJournalRank(paper) {
-    var checkedAt = Number(paper && paper.journalRankCheckedAt) || 0;
-    return !!(paper && paper.venue) && (!checkedAt || Date.now() - checkedAt > 7 * 24 * 60 * 60 * 1000);
-  }
-  // 文件夹切换时自动查询当前列表；同一期刊在一次刷新中只请求一次。
-  var journalRankRequests = Object.create(null);
-  var journalRankAutoRun = 0;
-  function requestFolderJournalRank(paper) {
-    if (!desktop || !desktop.getScigreatRank || !paper || !paper.venue) return Promise.resolve(null);
-    var key = String(paper.venue).trim().toLowerCase();
-    if (!key) return Promise.resolve(null);
-    if (!journalRankRequests[key]) {
-      journalRankRequests[key] = Promise.resolve()
-        .then(function () { return desktop.getScigreatRank({ journal: paper.venue }); })
-        .finally(function () { delete journalRankRequests[key]; });
-    }
-    return journalRankRequests[key].then(function (response) {
-      var data = rankResultData(response);
-      paper.journalRankCheckedAt = Date.now();
-      paper.journalRank = journalRankFromData(data);
-      return response;
-    });
-  }
-  function refreshFolderJournalRanks(folderId) {
-    if (!desktop || !desktop.getScigreatRank) return Promise.resolve();
-    var run = ++journalRankAutoRun;
-    var list = filteredPapers();
-    var start = state.tablePage * TABLE_PAGE_SIZE;
-    var papers = list.slice(start, start + TABLE_PAGE_SIZE).filter(function (paper) { return !!paper.venue; });
-    if (!papers.length) return Promise.resolve();
-    var groups = Object.create(null);
-    var venueKeys = [];
-    papers.forEach(function (paper) {
-      var key = String(paper.venue).trim().toLowerCase();
-      if (!groups[key]) { groups[key] = []; venueKeys.push(key); }
-      groups[key].push(paper);
-    });
-    var changed = false;
-    var cursor = 0;
-    function updateGroup(group, source) {
-      group.forEach(function (paper) {
-        if (paper !== source && (paper.journalRank !== source.journalRank ||
-            paper.journalRankCheckedAt !== source.journalRankCheckedAt)) changed = true;
-        paper.journalRank = source.journalRank;
-        paper.journalRankCheckedAt = source.journalRankCheckedAt;
-        if (drawerId === paper.id) renderJournalRank(paper);
-      });
-      if (run === journalRankAutoRun && state.activeFolderId === folderId) renderTable();
-    }
-    function worker() {
-      if (run !== journalRankAutoRun || state.activeFolderId !== folderId) return Promise.resolve();
-      var key = venueKeys[cursor++];
-      if (key == null) return Promise.resolve();
-      var group = groups[key];
-      var cached = group.find(function (paper) { return !shouldRefreshJournalRank(paper); });
-      if (cached) {
-        updateGroup(group, cached);
-        return worker();
-      }
-      journalRankPending[key] = true;
-      if (run === journalRankAutoRun && state.activeFolderId === folderId) renderTable();
-      return requestFolderJournalRank(group[0]).then(function () {
-        changed = true;
-        delete journalRankPending[key];
-        updateGroup(group, group[0]);
-      }).catch(function () {
-        delete journalRankPending[key];
-        if (run === journalRankAutoRun && state.activeFolderId === folderId) renderTable();
-        /* 自动刷新保持静默，保留已有缓存 */
-      }).then(worker);
-    }
-    var workerCount = Math.min(3, venueKeys.length);
-    var workers = [];
-    for (var i = 0; i < workerCount; i++) workers.push(worker());
-    return Promise.all(workers).then(function () {
-      if (changed && run === journalRankAutoRun) save();
-    });
-  }
-  var journalRankRefreshBusy = false;
-  function refreshJournalRank(silent) {
-    var paper = getById(drawerId);
-    if (!paper || !paper.venue) return;
-    if (!desktop || !desktop.getScigreatRank) { toast(T('期刊分区查询仅在桌面版可用')); return; }
-    if (journalRankRefreshBusy) return;
-    journalRankRefreshBusy = true;
-    var button = $('#d-journal-rank-refresh');
-    button.disabled = true;
-    renderJournalRank(paper, T('正在查询期刊分区…'));
-    desktop.getScigreatRank({ journal: paper.venue }).then(function (response) {
-      var data = rankResultData(response);
-      paper.journalRankCheckedAt = Date.now();
-      if (!data) {
-        paper.journalRank = null;
-        save();
-        renderTable();
-        if (drawerId === paper.id) renderJournalRank(paper, T('未找到该期刊的分区信息'));
-        return;
-      }
-      paper.journalRank = journalRankFromData(data);
-      save();
-      renderTable();
-      if (drawerId === paper.id) renderJournalRank(paper);
-    }).catch(function (error) {
-      if (!silent && drawerId === paper.id) renderJournalRank(paper, error && error.message || String(error));
-    }).finally(function () { journalRankRefreshBusy = false; button.disabled = false; });
-  }
-
-  /**
-   * 仅补查"没有分区数据"的期刊，严格控制 API 访问次数：
-   * - 已有分区数据的（=有分区标签）一律跳过，不重刷
-   * - 近 7 天内已查过但仍无数据的也跳过（避免反复请求空结果）
-   * - 同期刊只请求一次；串行 + 每批 600ms 间隔，避免服务商限流
-   * 表头那颗圆圈按钮是开关：点一下开始，跑的时候再点一下暂停（队列与进度留着），
-   * 再点继续。因此运行期间按钮**不能** disabled——否则第二次点击根本不会触发。
-   */
-  var rankRefreshRun = null;          // { venues, cursor, done, total, failed, paused }
-  var rankRefreshInterval = 600;      // 串行批间隔：EasyScholar（≤2 次/秒）等契约下绝对安全
-
-  function updateRankRefreshUi() {
-    var run = rankRefreshRun;
-    var stateName = !run ? 'idle' : (run.paused ? 'paused' : 'running');
-    var button = $('#rank-refresh-all');
-    if (button) {
-      button.disabled = false;        // 运行中也必须可点：点一下就是暂停
-      button.dataset.rankState = stateName;
-      var label = stateName === 'running' ? T('正在补查期刊分区（点一下暂停）')
-        : stateName === 'paused' ? T('分区补查已暂停（点一下继续）')
-          : T('补查当前文件夹缺失的期刊分区');
-      button.title = label;
-      button.setAttribute('aria-label', label);
-      button.setAttribute('aria-pressed', stateName === 'running' ? 'true' : 'false');
-      var icon = button.querySelector('use');
-      if (icon) {
-        icon.setAttribute('href', stateName === 'running' ? '#lb-i-pause'
-          : (stateName === 'paused' ? '#lb-i-play' : '#lb-i-refresh'));
-      }
-    }
-    var progress = $('#rank-refresh-progress');
-    if (progress) {
-      progress.hidden = !run;
-      progress.classList.toggle('paused', stateName === 'paused');
-      progress.textContent = run ? run.done + '/' + run.total : '';
-    }
-  }
-
-  function delayThenRankRefresh(fn, ms) {
-    return new Promise(function (resolve) {
-      setTimeout(function () { resolve(fn()); }, ms);
-    });
-  }
-
-  function finishRankRefresh() {
-    var run = rankRefreshRun;
-    rankRefreshRun = null;
-    journalRankFreezeOrder = null;
-    updateRankRefreshUi();
-    save();
-    renderTable();
-    if (!run) return;
-    toast(run.failed
-      ? T('当前文件夹分区补查完成：') + (run.total - run.failed) + T(' 成功，') + run.failed + T(' 无数据')
-      : T('✓ 当前文件夹分区补查完成：') + run.total + T(' 个期刊'));
-  }
-
-  function pauseRankRefresh() {
-    var run = rankRefreshRun;
-    if (!run) return;
-    run.paused = true;
-    // 冻结只在跑的时候有意义：暂停后让表格回到常规排序，同时把已查到的结果落盘
-    journalRankFreezeOrder = null;
-    save();
-    renderTable();
-    updateRankRefreshUi();
-    toast(T('已暂停分区补查：') + run.done + '/' + run.total + T('（再点一下继续）'));
-  }
-
-  function runRankRefreshStep() {
-    var run = rankRefreshRun;
-    if (!run || run.paused) return Promise.resolve();
-    if (run.cursor >= run.venues.length) { finishRankRefresh(); return Promise.resolve(); }
-    var entry = run.venues[run.cursor++];
-    var key = entry.key;
-    journalRankPending[key] = true;
-    renderTable();
-    return desktop.getScigreatRank({ journal: entry.venue }).then(function (response) {
-      var data = rankResultData(response);
-      var now = Date.now();
-      state.papers.forEach(function (paper) {
-        if (paper.deletedAt || !paper.venue) return;
-        if (String(paper.venue).trim().toLowerCase() !== key) return;
-        paper.journalRankCheckedAt = now;
-        paper.journalRank = data ? journalRankFromData(data) : null;
-      });
-      if (!data) run.failed++;
-    }).catch(function () { run.failed++; })
-      .finally(function () {
-        delete journalRankPending[key];
-        run.done++;
-        updateRankRefreshUi();
-        renderTable();
-        if (rankRefreshRun === run && run.paused) {
-          save();                     // 暂停瞬间正在飞的那次请求也要落地，别随进程丢掉
-        } else {
-          toast(T('分区补查中 ') + run.done + '/' + run.total + (run.failed ? T('，失败 ') + run.failed : '') + '…', 1200);
-        }
-      })
-      .then(function () { return delayThenRankRefresh(runRankRefreshStep, rankRefreshInterval); });
-  }
-
-  function refreshAllJournalRanks() {
-    if (!desktop || !desktop.getScigreatRank) { toast(T('期刊分区查询仅在桌面版可用')); return Promise.resolve(); }
-    if (rankRefreshRun) {
-      // 已有任务：这一下是暂停；暂停中则是继续（队列接着跑，不重新扫描文件夹）
-      if (rankRefreshRun.paused) {
-        rankRefreshRun.paused = false;
-        journalRankFreezeOrder = Array.prototype.map.call(
-          document.querySelectorAll('#table-body tr.lit-row'), function (tr) { return tr.dataset.id; }
-        );
-        updateRankRefreshUi();
-        toast(T('继续分区补查：') + rankRefreshRun.done + '/' + rankRefreshRun.total);
-        return runRankRefreshStep();
-      }
-      pauseRankRefresh();
-      return Promise.resolve();
-    }
-    var oneWeek = 7 * 24 * 60 * 60 * 1000;
-    var seen = Object.create(null);
-    var venues = [];
-    // 只补查当前文件夹（当前视图）下没有分区数据的期刊，不做全库扫描
-    filteredPapers().forEach(function (paper) {
-      if (paper.deletedAt || !paper.venue) return;
-      if (isArxivPaper(paper)) return;
-      if (paper.journalRank) return;                     // 已有分区数据 → 不刷
-      var checkedAt = Number(paper.journalRankCheckedAt) || 0;
-      if (Date.now() - checkedAt < oneWeek) return;      // 近 7 天查过仍无数据 → 不刷
-      var key = String(paper.venue).trim().toLowerCase();
-      if (!key || seen[key]) return;
-      seen[key] = true;
-      venues.push({ key: key, venue: paper.venue });
-    });
-    if (!venues.length) {
-      toast(T('当前文件夹没有需要补查的期刊（已有分区数据或近 7 天查过）'));
-      return Promise.resolve();
-    }
-    rankRefreshRun = { venues: venues, cursor: 0, done: 0, total: venues.length, failed: 0, paused: false };
-    // 冻结当前显示顺序（按分区列排序时数据更新也不会让行跳位）
-    journalRankFreezeOrder = Array.prototype.map.call(
-      document.querySelectorAll('#table-body tr.lit-row'), function (tr) { return tr.dataset.id; }
-    );
-    updateRankRefreshUi();
-    return runRankRefreshStep();
+  /** 阅读标签切换时，详情内容必须跟随当前文献；不调用 openDrawerAndReveal，
+   * 以免用户正在使用 AI / 批注页签时被强制切回详情页。 */
+  function syncReadingDrawer(paper) {
+    if (!paper || drawerId === paper.id) return;
+    openDrawer(paper.id);
   }
 
   function setNotesMode(mode) {
@@ -4494,7 +4302,6 @@
     });
   }
 
-
   function renderImportFolderChooser(defaultFolderId) {
     chosenImportFolderId = defaultFolderId || '';
     var list = $('#import-folder-list');
@@ -4589,7 +4396,7 @@
     state.papers.forEach(function (paper) {
       if (paper.deletedAt) return;
       (paper.attachments || []).forEach(function (att) {
-        if (att && att.kind === 'pdf' && att.path && !att.fingerprint) targets.push({ paper: paper, attachment: att });
+        if (att && (att.kind === 'pdf' || att.kind === 'epub') && att.path && !att.fingerprint) targets.push({ paper: paper, attachment: att });
       });
     });
     var cursor = 0;
@@ -4616,24 +4423,15 @@
     });
   }
   function restoreJsonWorkspace(workspace) {
-    applyWorkspaceState(workspace);
+    var replacing = workspaceStore.replace(workspace);
     resetActiveFolder();
     closeDrawer();
     renderAll();
-    // 显式整库恢复：走 library:replace（保留“替换整个资料库”语义），普通编辑不影响
-    if (desktop && desktop.replaceLibrary) {
-      var payload = workspacePayload();
-      desktop.replaceLibrary(payload).then(function () {
-        persistedWorkspaceSignatures = window.LitModel.workspaceSignatures(workspacePayload());
-        baseSnapshotEntities = cloneAllEntities(workspacePayload());
-        toast(T('✓ 已从备份恢复 ') + state.papers.length + T(' 篇文献'));
-      }).catch(function (e) {
-        toast(T('⚠ 整库恢复失败：') + (e && e.message || e));
-      });
-    } else {
-      save();
+    replacing.then(function () {
       toast(T('✓ 已从备份恢复 ') + state.papers.length + T(' 篇文献'));
-    }
+    }).catch(function (e) {
+      toast(T('⚠ 整库恢复失败：') + (e && e.message || e));
+    });
   }
 
   function importBibText(text, folderId) {
@@ -4682,59 +4480,140 @@
     toast(T('JSON 中没有文献数据'));
   }
 
-  /** 把解析出的 PDF 逐个拷进配置目录/synced-attachments（主进程按 z 键格式命名，原文件保留），再交给 addPapers。
+  /** 把解析出的新 PDF 拷进配置目录/synced-attachments，再交给 addPapers。
+   *  已在库中或同批次出现的相同指纹只合并文件夹归属，不再制造第二份受管文件。
    *  4 worker 并发拷贝：各条目只改自己附件对象的 path/fileName，互不依赖；与解析段（3 worker）同量级，不给主进程压队列 */
   function storeImportedPdfFiles(papers) {
     if (!desktop || !desktop.storePdf) return Promise.resolve();
-    var tasks = [];
-    papers.forEach(function (paper) {
-      var att = primaryAttachment(paper);
-      if (att && att.path && /\.pdf$/i.test(att.path)) tasks.push(att);
+    return window.LitPdfImportFlow.storePdfAttachments(papers, state.papers, function (path) {
+      return desktop.storePdf({ path: path });
+    }).catch(function (error) {
+      throw new Error(T('PDF 复制失败：') + (error && error.message || error));
     });
-    var cursor = 0;
-    function worker() {
-      var att = tasks[cursor++];
-      if (!att) return Promise.resolve();
-      return desktop.storePdf({ path: att.path }).then(function (result) {
-        if (result && !result.error && !result.unchanged) {
-          att.path = result.path;
-          att.fileName = result.name;
-        }
-      }).catch(function () {}).then(worker);
-    }
-    return Promise.all([worker(), worker(), worker(), worker()]);
+  }
+
+  /** PDF 导入落库后增量建全文索引：新建/被挂 PDF 的条目交给 reindex（stale 语义，
+   *  已最新的附件不重复提取）；与调研侧 importStagedPdfs 的收尾同款，别处导入不建索引 */
+  function queueImportedPdfIndex(result) {
+    if (!window.LitPdfSearch || !LitPdfSearch.reindex) return;
+    var affectedIds = {};
+    ((result && result.addedIds) || []).concat(((result && result.matches) || []).map(function (m) { return m.id; }))
+      .forEach(function (pid) { affectedIds[pid] = true; });
+    var affected = state.papers.filter(function (p) { return affectedIds[p.id]; });
+    if (affected.length) LitPdfSearch.reindex(affected, function () {}).catch(function () {});
+  }
+
+  function parsePdfEntries(entries, inputOf, assignPaper) {
+    return window.LitPdfImportFlow.parseMany(entries, function (entry) {
+      return window.LitPdf.pdfToPaper(inputOf(entry)).then(function (paper) {
+        if (assignPaper) assignPaper(paper, entry);
+        return paper;
+      });
+    }, {
+      concurrency: 3,
+      timeoutMs: 75000,
+      onError: function (entry, error) {
+        toast('⚠ ' + entry.name + T(' 解析失败：') +
+          (error && error.message === 'timeout' ? T('解析超时（可能是网络请求挂起）') : (error && error.message || error)));
+      }
+    });
+  }
+
+  function finishPdfImport(papers, folderId) {
+    if (!papers.length) return Promise.resolve(null);
+    return storeImportedPdfFiles(papers).then(function () {
+      var result = addPapers(papers, { folderId: folderId || '' });
+      renderAll();
+      return waitForLocalSave().then(function (saved) {
+        if (!saved) throw new Error(T('导入结果未能保存到本地'));
+        // 指纹回填和全文索引可在导入成功后后台进行，不阻塞下一批目录。
+        backfillPdfFingerprints().then(function () {
+          renderAll();
+          queueImportedPdfIndex(result);
+        }).catch(function () {});
+        return result;
+      });
+    });
   }
 
   function importPdfFiles(files, folderId) {
     toast(T('正在解析 ') + files.length + T(' 个 PDF…'));
-    var papers = [];
-    var cursor = 0;
-    // 3 个 worker 并行解析（指纹/前 2 页文本/联网补全），与 backfillPdfFingerprints 同级并发
-    function worker() {
-      var f = files[cursor++];
-      if (!f) return Promise.resolve();
-      // 单文件看门狗：联网补全最坏情况 = 3 源 × 15s 超时 + 解析，75s 兜底不卡死整批导入
-      var watchdog = new Promise(function (_, reject) {
-        setTimeout(function () { reject(new Error(T('解析超时（可能是网络请求挂起）'))); }, 75000);
-      });
-      return Promise.race([window.LitPdf.pdfToPaper(f), watchdog])
-        .then(function (p) { papers.push(p); })
-        .catch(function (err) {
-          toast('⚠ ' + f.name + T(' 解析失败：') + (err && err.message || err));
-        })
-        .then(worker);
-    }
-    Promise.all([worker(), worker(), worker()]).then(function () {
-      if (!papers.length) return;
-      storeImportedPdfFiles(papers).then(function () {
-        var r = addPapers(papers, { folderId: folderId });
-        toast(T('✓ PDF 导入 ') + r.added + T(' 篇') + (r.merged ? T('，匹配已有 ') + r.merged + T(' 篇') : '') +
-          (r.attached ? T('，其中 ') + r.attached + T(' 个 PDF 已挂到原条目') : '') +
-          importFolderLabel(folderId) + mergedPdfLocationText(r.matches), r.matches.length ? 7000 : undefined);
-        renderAll();
+    return parsePdfEntries(files, function (file) { return file; })
+      .then(function (papers) { return finishPdfImport(papers, folderId); })
+      .then(function (result) {
+        if (!result) return;
+        toast(T('✓ PDF 导入 ') + result.added + T(' 篇') + (result.merged ? T('，匹配已有 ') + result.merged + T(' 篇') : '') +
+          (result.attached ? T('，其中 ') + result.attached + T(' 个 PDF 已挂到原条目') : '') +
+          importFolderLabel(folderId) + mergedPdfLocationText(result.matches), result.matches.length ? 7000 : undefined);
         if (desktop && desktop.getScigreatRank) refreshFolderJournalRanks(folderId);
-        backfillPdfFingerprints().then(function () { renderAll(); });
+        return result;
+      }).catch(function (error) {
+        toast('⚠ ' + (error && error.message || error));
+        return null;
       });
+  }
+
+  /* 拖入文件夹导入：目录树 → LitBoard 文件夹（同名复用，重复拖入幂等）+ PDF 识别建条目并建全文索引。
+   * 源文件全程只读：storePdf 走 fs.copyFile 拷入受管 synced-attachments，原目录不动；
+   * 目录树不落磁盘，以 folders 实体表达（与同步/备份口径一致）。规划逻辑在 js/folderimport.js。 */
+  function importDroppedFolder(dirPath, targetFolderId) {
+    if (!desktop || !desktop.scanFolder) {
+      toast(T('导入文件夹需要桌面版'));
+      return Promise.resolve();
+    }
+    toast(T('正在扫描文件夹…'));
+    return desktop.scanFolder({ path: dirPath }).then(function (scan) {
+      if (!scan || scan.error) {
+        toast('⚠ ' + ((scan && scan.error) || T('扫描失败')));
+        return;
+      }
+      var plan = window.LitFolderImport.planFolderImport({
+        scan: scan, folders: state.folders, targetFolderId: targetFolderId
+      });
+      if (!plan.pdfs.length) {
+        toast(plan.skippedNonPdf
+          ? T('文件夹中没有可导入的 PDF（跳过 {n} 个非 PDF 文件）', { n: plan.skippedNonPdf })
+          : T('文件夹中没有可导入的 PDF'));
+        return;
+      }
+      // 建文件夹：root + createList（BFS 序，父先于子），与建文件夹表单同款字段
+      var folderIdByKey = {};
+      var rootId = plan.root.id;
+      if (!rootId) {
+        rootId = folderUid();
+        state.folders.push({ id: rootId, name: plan.root.name, parentId: targetFolderId, sortIndex: folderChildren(targetFolderId).length });
+      }
+      plan.createList.forEach(function (spec) {
+        var parentId = spec.parentKey ? (plan.reuseMap[spec.parentKey] || folderIdByKey[spec.parentKey]) : rootId;
+        var id = folderUid();
+        state.folders.push({ id: id, name: spec.name, parentId: parentId, sortIndex: folderChildren(parentId).length });
+        folderIdByKey[spec.key] = id;
+      });
+      save(); renderFolders();
+      selectFolder(rootId);
+      return waitForLocalSave().then(function (saved) {
+        if (!saved) throw new Error(T('导入文件夹未能保存到本地'));
+        toast(T('正在解析 ') + plan.pdfs.length + T(' 个 PDF…'));
+        return parsePdfEntries(plan.pdfs, function (entry) {
+          return { name: entry.name, path: entry.abs };
+        }, function (paper, entry) {
+          var folderId = entry.dirRel ? (plan.reuseMap[entry.dirRel] || folderIdByKey[entry.dirRel] || rootId) : rootId;
+          paper.folderIds = [folderId];
+        });
+      }).then(function (papers) { return finishPdfImport(papers, ''); })
+        .then(function (result) {
+          if (!result) return;
+          toast(T('✓ 已导入文件夹「') + plan.root.name + '」' + T('新增 ') + result.added + T(' 篇') +
+            (result.merged ? T('，匹配已有 ') + result.merged + T(' 篇') : '') +
+            (result.attached ? T('，其中 ') + result.attached + T(' 个 PDF 已挂到原条目') : '') +
+            T('，新建文件夹 {a} 个、复用 {b} 个', { a: plan.createdCount, b: plan.reusedCount }) +
+            (plan.skippedNonPdf ? T('，跳过 {n} 个非 PDF 文件', { n: plan.skippedNonPdf }) : ''),
+            result.matches.length ? 7000 : undefined);
+          if (desktop && desktop.getScigreatRank) refreshFolderJournalRanks(rootId);
+          return result;
+        });
+    }).catch(function (err) {
+      toast('⚠ ' + (err && err.message || err));
     });
   }
 
@@ -4967,7 +4846,15 @@
 
   function exportBib() {
     var out = state.papers.filter(function (p) { return !p.deletedAt; }).map(window.LitBib.paperToBibtex).join('\n\n');
-    download('litboard-' + stamp() + '.bib', out);
+    var name = 'litboard-' + stamp() + '.bib';
+    if (!desktop || !desktop.saveFile) { download(name, out); return; }
+    desktop.saveFile({
+      name: name,
+      bytes: new TextEncoder().encode(out),
+      filters: [{ name: T('BibTeX 文件'), extensions: ['bib'] }]
+    }).catch(function (error) {
+      toast(T('⚠ BibTeX 导出失败：') + (error && error.message || error));
+    });
   }
 
   function exportRis() {
@@ -5046,8 +4933,7 @@
       return !!(att && att.path && /\.pdf$/i.test(att.path));
     });
     if (!targets.length) { toast(T('所选条目没有本地 PDF 附件')); return; }
-    var template = (integrationConfig && integrationConfig.renameTemplate) ||
-      (window.LitRename && window.LitRename.DEFAULT_TEMPLATE) || '{author} - {year} - {title}';
+    var template = (window.LitRename && window.LitRename.DEFAULT_TEMPLATE) || '{author} - {year} - {title}';
     desktop.chooseDirectory({ title: T('选择导出 PDF 的文件夹') }).then(function (dir) {
       if (!dir) return;
       var files = targets.map(function (p) {
@@ -5112,6 +4998,8 @@
     var input = String(raw || '').trim();
     var statusEl = $('#add-status');
     if (!input) { statusEl.textContent = T('请输入 DOI、arXiv 编号、PMID、ISBN 或标题。'); return; }
+    var fetchBtn = $('#add-fetch');
+    if (fetchBtn) fetchBtn.disabled = true;      // 抓取期间禁连点，避免重复请求
     statusEl.textContent = T('正在联网抓取…');
     var doi = extractDoi(input);
     var ax = arxivId(input);
@@ -5136,6 +5024,8 @@
       renderAll();
     }).catch(function (err) {
       statusEl.textContent = T('⚠ 抓取失败：') + (err && err.message || T('网络错误'));
+    }).finally(function () {
+      if (fetchBtn) fetchBtn.disabled = false;
     });
   }
 
@@ -5192,56 +5082,14 @@
       abstract: $('#e-abstract').value
     };
     if (!data.title) { toast(T('标题不能为空')); return; }
-    var venueChanged = false;
     if (editingId) {
       var p = getById(editingId); if (!p) { $('#edit-mask').hidden = true; return; }
-      var undoBefore = makeSnapshot({ papers: [p.id] });
-      var venueBefore = String(p.venue || '').trim().toLowerCase();
-      // creators/date 是权威字段，authors/year 是投影：用户改投影须同步权威，否则 normalize 会用旧权威值还原（F03）
-      var authorsBefore = JSON.stringify(p.authors || []);
-      var yearBefore = p.year != null ? p.year : null;
-      Object.keys(data).forEach(function (k) { p[k] = data[k]; });
-      if (JSON.stringify(data.authors) !== authorsBefore) {
-        var preservedCreators = (p.creators || []).filter(function (c) { return c && c.creatorType !== 'author'; });
-        var authorCreators = data.authors.map(function (a) {
-          var c = window.LitModel.parseCreatorName(a);
-          if (c) c.creatorType = 'author';
-          return c;
-        }).filter(Boolean);
-        p.creators = preservedCreators.concat(authorCreators);
-      }
-      if (data.year !== yearBefore) {
-        p.date = data.year != null ? String(data.year) : '';
-      }
-      // 期刊名变化 → 作废分区缓存并重查（旧数据已无意义）
-      var venueAfter = String(p.venue || '').trim().toLowerCase();
-      if (venueBefore !== venueAfter) {
-        p.journalRank = null;
-        p.journalRankCheckedAt = 0;
-        venueChanged = true;
-      }
-      // citekey 被修改则钉住（防止自动重排）；与库内他人冲突时拒绝
-      if (citekey && citekey !== p.key) {
-        var conflict = state.papers.some(function (other) {
-          return other.id !== p.id && String(other.key || '').toLowerCase() === citekey.toLowerCase();
-        });
-        if (conflict) { toast('citekey「' + citekey + T('」已被其他文献使用')); return; }
-        p.key = citekey;
-        p.keyPinned = true;
-      } else if (!citekey) {
-        p.key = '';
-        p.keyPinned = false;
-      }
-      var norm = window.LitModel.normalizePaper(p, uid);
-      norm.id = p.id;
-      var idx = state.papers.indexOf(p);
-      if (idx !== -1) state.papers[idx] = norm;
-      commitUndo(T('编辑字段'), undoBefore, { papers: [p.id] });
-      save(); renderAll();
+      var result = applyPaperEdits(p, data, citekey);
+      if (!result) return;
       $('#edit-mask').hidden = true;
       if (drawerId === editingId) openDrawer(editingId);
       toast(T('✓ 已保存'));
-      if (venueChanged) refreshFolderJournalRanks(state.activeFolderId);
+      if (result.venueChanged) refreshFolderJournalRanks(state.activeFolderId);
     } else {
       if (citekey) { data.key = citekey; data.keyPinned = true; }
       var r = addPapers([data]);
@@ -5249,6 +5097,56 @@
       toast(r.added ? T('✓ 已新建文献') : T('与已有文献重复，已合并'));
       renderAll();
     }
+  }
+
+  /** 编辑弹窗与详情区原位编辑共用这一条保存路径，防止 creators/date 投影或 citekey
+   * 冲突校验在两处漂移。data 只需携带本次实际可编辑的字段。 */
+  function applyPaperEdits(p, data, citekey) {
+    // 先检查冲突，避免被拒绝的保存把未规范化草稿留在内存对象上。
+    if (citekey && citekey !== p.key) {
+      var conflict = state.papers.some(function (other) {
+        return other.id !== p.id && String(other.key || '').toLowerCase() === citekey.toLowerCase();
+      });
+      if (conflict) { toast('citekey「' + citekey + T('」已被其他文献使用')); return null; }
+    }
+    var undoBefore = makeSnapshot({ papers: [p.id] });
+    var venueBefore = String(p.venue || '').trim().toLowerCase();
+    var hasAuthors = Object.prototype.hasOwnProperty.call(data, 'authors');
+    var hasYear = Object.prototype.hasOwnProperty.call(data, 'year');
+    var authorsBefore = JSON.stringify(p.authors || []);
+    var yearBefore = p.year != null ? p.year : null;
+    Object.keys(data).forEach(function (k) { p[k] = data[k]; });
+    // creators/date 是权威字段，authors/year 是投影：改投影时同步权威字段，避免 normalize 还原旧值。
+    if (hasAuthors && JSON.stringify(data.authors) !== authorsBefore) {
+      var preservedCreators = (p.creators || []).filter(function (c) { return c && c.creatorType !== 'author'; });
+      var authorCreators = data.authors.map(function (a) {
+        var c = window.LitModel.parseCreatorName(a);
+        if (c) c.creatorType = 'author';
+        return c;
+      }).filter(Boolean);
+      p.creators = preservedCreators.concat(authorCreators);
+    }
+    if (hasYear && data.year !== yearBefore) p.date = data.year != null ? String(data.year) : '';
+    var venueChanged = venueBefore !== String(p.venue || '').trim().toLowerCase();
+    if (venueChanged) {
+      p.journalRank = null;
+      p.journalRankCheckedAt = 0;
+    }
+    // citekey 被修改则钉住（防止自动重排）；与库内他人冲突时拒绝。
+    if (citekey && citekey !== p.key) {
+      p.key = citekey;
+      p.keyPinned = true;
+    } else if (!citekey) {
+      p.key = '';
+      p.keyPinned = false;
+    }
+    var norm = window.LitModel.normalizePaper(p, uid);
+    norm.id = p.id;
+    var idx = state.papers.indexOf(p);
+    if (idx !== -1) state.papers[idx] = norm;
+    commitUndo(T('编辑字段'), undoBefore, { papers: [p.id] });
+    save(); renderAll();
+    return { venueChanged: venueChanged };
   }
 
   // ---------- 引用生成 ----------
@@ -5288,27 +5186,44 @@
     citePaperId = paper.id;
     var wrap = $('#cite-list');
     wrap.innerHTML = '';
-    window.LitCite.formats.forEach(function (fmt) {
-      var text = fmt.fn(paper);
-      var item = document.createElement('div');
-      item.className = 'cite-item';
-      var head = document.createElement('div');
-      head.className = 'cite-item-head';
-      var label = document.createElement('span');
-      label.className = 'cite-item-label';
-      label.textContent = fmt.label;
-      var copy = document.createElement('button');
-      copy.className = 'cite-copy';
-      copy.textContent = T('复制');
-      copy.addEventListener('click', function () {
-        copyToClipboard(text).then(function () { toast(T('✓ 已复制 ') + fmt.label); });
+    var loading = document.createElement('div');
+    loading.className = 'cite-item';
+    loading.textContent = T('渲染中…');
+    wrap.appendChild(loading);
+    // 样式渲染走 citeproc（异步）：单样式失败只影响该条目，其余照常
+    Promise.allSettled(window.LitCite.formats.map(function (fmt) {
+      return window.LitCite.renderFormat(fmt.styleId, paper);
+    })).then(function (results) {
+      if (citePaperId !== paper.id) return; // 等待期间已改开别的文献
+      wrap.innerHTML = '';
+      window.LitCite.formats.forEach(function (fmt, i) {
+        var res = results[i];
+        var ok = res.status === 'fulfilled';
+        var text = ok ? res.value : '';
+        var item = document.createElement('div');
+        item.className = 'cite-item';
+        var head = document.createElement('div');
+        head.className = 'cite-item-head';
+        var label = document.createElement('span');
+        label.className = 'cite-item-label';
+        label.textContent = fmt.label;
+        head.appendChild(label);
+        if (ok) {
+          var copy = document.createElement('button');
+          copy.className = 'cite-copy';
+          copy.textContent = T('复制');
+          copy.addEventListener('click', function () {
+            copyToClipboard(text).then(function () { toast(T('✓ 已复制 ') + fmt.label); });
+          });
+          head.appendChild(copy);
+        }
+        var body = document.createElement('div');
+        body.className = 'cite-text';
+        body.textContent = ok ? (text || T('（无输出）'))
+          : T('CSL 渲染失败：') + (res.reason && res.reason.message || res.reason);
+        item.appendChild(head); item.appendChild(body);
+        wrap.appendChild(item);
       });
-      head.appendChild(label); head.appendChild(copy);
-      var body = document.createElement('div');
-      body.className = 'cite-text';
-      body.textContent = text;
-      item.appendChild(head); item.appendChild(body);
-      wrap.appendChild(item);
     });
     // CSL 样式区
     var select = $('#cite-csl-style');
@@ -5330,11 +5245,8 @@
   // ---------- 内置 PDF 阅读器 ----------
   var pdfState = {
     handle: null, scale: 1.35, rotation: 0, paper: null, attachment: null, attachmentId: '', layout: 'single', currentPage: 1, pageCount: 0,
-    renderer: 'auto',
     selectedText: '', selectionPositions: [], annotationColor: '#ffd400', translationRequest: 0,
-    renderToken: 0, searchResults: [], searchMatches: [], searchIndex: -1,
-    snapshotMode: false, inkMode: false,
-    reflowMode: false, reflowFont: 13, reflowPages: {}, reflowNextPage: 1, reflowBusy: false, reflowMarks: [], reflowEpoch: 0
+    renderToken: 0, searchResults: [], searchMatches: [], searchIndex: -1
   };
   var pdfTabs = [];              // [{ paper, attachment, page, scale, layout, rotation, scrollTop }]
   var pdfThumbsObserver = null;
@@ -5348,7 +5260,6 @@
       scale: pdfState.scale,
       layout: pdfState.layout,
       rotation: pdfState.rotation,
-      renderer: pdfState.renderer,
       scrollTop: $('#pdf-scroll').scrollTop || 0
     }).catch(function () {});
   }
@@ -5387,7 +5298,6 @@
       tab.scale = pdfState.scale;
       tab.layout = pdfState.layout;
       tab.rotation = pdfState.rotation;
-      tab.renderer = pdfState.renderer;
       tab.scrollTop = $('#pdf-scroll').scrollTop || 0;
     }
   }
@@ -5400,7 +5310,6 @@
     setPdfPageLocked(false);
     $('#pdf-overlay').hidden = true;
     $('#epub-overlay').hidden = true;
-    ttsStop();
     epubTtsStop();
     renderPdfTabs();
   }
@@ -5414,14 +5323,14 @@
     bar.innerHTML = '';
     var pdfActive = !$('#pdf-overlay').hidden && !!pdfState.paper;
     var epubActive = !$('#epub-overlay').hidden && !!epubState.paper;
-    // 第一个标签固定为「资料库」
+    // 第一个标签固定为「文献库」
     var libChip = document.createElement('span');
     libChip.className = 'pdf-tab' + ((pdfActive || epubActive) ? '' : ' active');
     var libTitle = document.createElement('button');
     libTitle.type = 'button';
     libTitle.className = 'pdf-tab-title';
-    libTitle.title = T('返回资料库');
-    libTitle.textContent = T('▤ 资料库');
+    libTitle.title = T('返回文献库');
+    libTitle.textContent = T('▤ 文献库');
     libTitle.addEventListener('click', goToLibraryTab);
     libChip.appendChild(libTitle);
     bar.appendChild(libChip);
@@ -5473,7 +5382,6 @@
 
   function activatePdfTab(tab) {
     setPdfPageLocked(true);
-    resetPdfReflow();
     if (!$('#epub-overlay').hidden) { stashEpubTab(); persistEpubReadPos.flush(); epubTtsStop(); hideEpubSelPopover(); $('#epub-overlay').hidden = true; }
     $('#pdf-overlay').hidden = false;
     if (pdfState.handle) { pdfState.handle.cancel(); pdfState.handle = null; }
@@ -5484,17 +5392,13 @@
     pdfState.scale = tab.scale || 1.35;
     pdfState.layout = tab.layout || 'single';
     pdfState.rotation = tab.rotation || 0;
-    pdfState.renderer = tab.renderer === 'pdfjs' || tab.renderer === 'pdfium' ? tab.renderer : 'auto';
     pdfState.searchResults = [];
     pdfState.searchMatches = [];
     pdfState.searchIndex = -1;
-    pdfState.snapshotMode = false;
-    pdfState.inkMode = false;
-    $('#pdf-snapshot-toggle').setAttribute('aria-pressed', 'false');
-    $('#pdf-ink-toggle').setAttribute('aria-pressed', 'false');
     $('#pdf-title').textContent = (tab.paper.title || tab.paper.pdfFileName || 'PDF') +
       (pdfState.attachment && pdfState.attachment.fileName ? ' · ' + pdfState.attachment.fileName : '');
     recordPaperRead(tab.paper);
+    syncReadingDrawer(tab.paper);
     refreshAgentChips(); // R19：切标签 = 换了正在读的文献
     renderPdfAnnotations();
     renderPdfNoteEditor();
@@ -5517,7 +5421,6 @@
 
   function hidePdfOverlay() {
     savePdfAnnotationComment.flush();
-    resetPdfReflow();
     if (pdfState.handle) { pdfState.handle.cancel(); pdfState.handle = null; }
     if (pdfThumbsObserver) { pdfThumbsObserver.disconnect(); pdfThumbsObserver = null; }
     $('#pdf-scroll').innerHTML = '';
@@ -5594,7 +5497,6 @@
           tab.scale = pos.scale || 1.35;
           tab.layout = pos.layout || 'single';
           tab.rotation = pos.rotation || 0;
-          tab.renderer = pos.renderer === 'pdfjs' || pos.renderer === 'pdfium' ? pos.renderer : 'auto';
           tab.scrollTop = pos.scrollTop || 0;
         }
         activatePdfTab(tab);
@@ -5606,13 +5508,26 @@
 
   var savePdfAnnotationComment = debounce(function () { save(); }, 600);
   var runPdfSearch = debounce(function () { performPdfSearch(false); }, 350);
-  var pdfWheelZoomSteps = 0;
   var pdfSelectionFrame = 0;
-  var applyPdfWheelZoom = debounce(function () {
-    var steps = pdfWheelZoomSteps;
-    pdfWheelZoomSteps = 0;
-    if (steps) zoomPdf(steps * 0.1);
-  }, 80);
+  // Ctrl+滚轮缩放两段式：每个滚轮刻度立即走 zoomPreview——只改 CSS（旧位图拉伸、
+  // 文本/链接/批注层 transform 等比跟随），零重绘零光栅，手势期间跟手不卡帧；
+  // 停顿 160ms 后 settle 走一次完整 relayout 出清晰位图。旧实现每 80ms 一档
+  // 全量重排 + 主线程同步光栅，连续缩放必然掉帧。
+  function previewPdfWheelZoom(direction) {
+    var next = Math.max(0.6, Math.min(3, Math.round((pdfState.scale + direction * 0.1) * 100) / 100));
+    if (next === pdfState.scale) return;
+    pdfState.scale = next;
+    updatePdfViewUi();
+    var current = pdfState.handle;
+    if (current && current.zoomPreview) current.zoomPreview(next); // 文档未就绪时静默失败，settle 兜底
+  }
+  var settlePdfWheelZoom = debounce(function () {
+    applyPdfViewChange(); // 预览已就位，此处补一次原位重排出清晰页
+  }, 160);
+  function applyPdfWheelZoom(direction) {
+    previewPdfWheelZoom(direction);
+    settlePdfWheelZoom();
+  }
   function annotationUid() { return 'a' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
 
   function updatePdfPageUi(page, total) {
@@ -5668,20 +5583,22 @@
     if (ocrBusy) { toast(T('OCR 正在进行中…')); return; }
     var doc = pdfState.handle.doc;
     var paper = pdfState.paper;
+    // OCR 是跨多个异步边界的长任务。目标身份必须在启动时冻结；用户切换阅读标签后
+    // pdfState 会指向另一附件，若落库时再读它，会把旧文档正文写进新附件索引。
+    var attachmentId = pdfState.attachmentId;
+    var attachment = pdfState.attachment;
+    var fingerprint = attachment && attachment.fingerprint || paper.pdfFingerprint || '';
     ocrBusy = true;
     var banner = $('#pdf-ocr-banner');
     var textEl = $('#pdf-ocr-banner-text');
     banner.hidden = false;
-    textEl.textContent = T('OCR 准备中（首次需下载约 15MB 语言包）…');
+    textEl.textContent = T('OCR 准备中（首次需下载约 21MB 识别模型）…');
     window.LitOcr.ensureData().then(function (status) {
       return window.LitOcr.ocrPages(pageIndexes, status.dir, function (pageIndex) {
         return doc.getPage(pageIndex + 1).then(function (page) {
           var viewport = page.getViewport({ scale: 2 });
           var canvas = document.createElement('canvas');
-          canvas.width = Math.ceil(viewport.width);
-          canvas.height = Math.ceil(viewport.height);
-          return page.render({ canvasContext: canvas.getContext('2d'), viewport: viewport }).promise
-            .then(function () { return canvas; });
+          return page.renderToCanvas(canvas, viewport.scale, viewport.rotation);
         });
       }, function (progress) {
         textEl.textContent = T('OCR 识别中 ') + progress.done + '/' + progress.total + T('（第 ') + progress.page + T(' 页）…');
@@ -5689,13 +5606,17 @@
     }).then(function (result) {
       var pages = result && result.pages || {};
       if (!Object.keys(pages).length) return null;
-      return desktop.pdfSearchGetPages(paper.id, pdfState.attachmentId).then(function (existing) {
+      // A-followup #2：旧版单 PDF 时代的索引行写在 attachmentId='' 上。只有当前打开的
+      // 正是该文献主 PDF 时才允许读它——读补充材料的索引绝不能被主文献正文顶上。
+      var ocrMainAtt = primaryAttachment(paper);
+      var ocrLegacy = !!ocrMainAtt && ocrMainAtt.id === attachmentId;
+      return desktop.pdfSearchGetPages(paper.id, attachmentId, ocrLegacy).then(function (existing) {
         var merged = Array.isArray(existing) ? existing.slice() : [];
         Object.keys(pages).forEach(function (idx) { merged[Number(idx)] = pages[idx]; });
         return desktop.pdfSearchPut({
           paperId: paper.id,
-          attachmentId: pdfState.attachmentId,
-          fingerprint: pdfState.attachment && pdfState.attachment.fingerprint || paper.pdfFingerprint || '',
+          attachmentId: attachmentId,
+          fingerprint: fingerprint,
           method: 'ocr',
           pages: merged
         });
@@ -5730,16 +5651,10 @@
           row.title = item.title || '';
           row.textContent = item.title || T('(未命名)');
           row.addEventListener('click', function () {
-            var destPromise = typeof item.dest === 'string'
-              ? doc.getDestination(item.dest)
-              : Promise.resolve(item.dest);
-            Promise.resolve(destPromise).then(function (dest) {
-              if (!dest || !dest[0]) return;
-              return doc.getPageIndex(dest[0]).then(function (index) { goToPdfPage(index + 1); });
-            }).catch(function () {});
+            if (Number.isFinite(Number(item.page)) && Number(item.page) >= 0) goToPdfPage(Number(item.page) + 1);
           });
           wrap.appendChild(row);
-          if (item.items && item.items.length) addItems(item.items, depth + 1);
+          if (item.down && item.down.length) addItems(item.down, depth + 1);
         });
       }
       addItems(outline, 0);
@@ -5783,12 +5698,10 @@
           var scale = 96 / viewport.width;
           var thumbViewport = page.getViewport({ scale: scale });
           var canvas = document.createElement('canvas');
-          canvas.width = Math.ceil(thumbViewport.width);
-          canvas.height = Math.ceil(thumbViewport.height);
           var holder = item.querySelector('.pdf-thumb-canvas-wrap');
           holder.innerHTML = '';
           holder.appendChild(canvas);
-          return page.render({ canvasContext: canvas.getContext('2d'), viewport: thumbViewport }).promise;
+          return page.renderToCanvas(canvas, thumbViewport.scale, thumbViewport.rotation);
         }).catch(function () {});
       });
     }, { root: wrap, rootMargin: '200px 0px' });
@@ -5812,184 +5725,10 @@
     }
   }
 
-  // ---------- 区域截图 / 手写 ----------
-  function captureSnapshot(sheet, rectClient) {
-    var canvas = sheet.querySelector('canvas');
-    var viewport = sheet._litViewport;
-    if (!canvas || !viewport) { toast(T('页面尚未渲染完成，稍后再试')); return; }
-    var bounds = sheet.getBoundingClientRect();
-    var x = Math.max(0, rectClient.left - bounds.left);
-    var y = Math.max(0, rectClient.top - bounds.top);
-    var w = Math.min(rectClient.width, bounds.width - x);
-    var h = Math.min(rectClient.height, bounds.height - y);
-    if (w < 8 || h < 8) { toast(T('选区太小')); return; }
-    // 画布像素与 CSS 尺寸的比例
-    var ratio = canvas.width / bounds.width;
-    var crop = document.createElement('canvas');
-    crop.width = Math.round(w * ratio);
-    crop.height = Math.round(h * ratio);
-    crop.getContext('2d').drawImage(canvas,
-      Math.round(x * ratio), Math.round(y * ratio), crop.width, crop.height,
-      0, 0, crop.width, crop.height);
-    var a = viewport.convertToPdfPoint(x, y);
-    var b = viewport.convertToPdfPoint(x + w, y + h);
-    var pdfRect = [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[0], b[0]), Math.max(a[1], b[1])];
-    var dataUrl = crop.toDataURL('image/png');
-    var name = 'snap-' + Date.now();
-    desktop.saveAnnotationImage({ name: name, dataUrl: dataUrl }).then(function (result) {
-      if (!result || result.error) { toast(T('⚠ 截图保存失败：') + (result && result.error || '')); return; }
-      var now = Date.now();
-      var annotation = {
-        id: annotationUid(), type: 'snapshot', color: pdfState.annotationColor,
-        attachmentId: pdfState.attachmentId,
-        text: T('区域截图'), comment: '', imagePath: result.path,
-        position: { pageIndex: Number(sheet.dataset.page) - 1, rects: [pdfRect] },
-        createdAt: now, updatedAt: now
-      };
-      pdfState.paper.pdfAnnotations = window.LitModel.normalizePdfAnnotations(
-        (pdfState.paper.pdfAnnotations || []).concat([annotation]));
-      syncViewerAnnotations();
-      save();
-      renderPdfAnnotations(annotation.id);
-      toast(T('✓ 已保存区域截图批注'));
-    }).catch(function (e) { toast(T('⚠ 截图保存失败：') + (e && e.message || e)); });
-  }
-
-  function startSnapshotDrag(e) {
-    var sheet = e.target.closest('.pdf-page-sheet');
-    if (!sheet) return;
-    e.preventDefault();
-    var scroll = $('#pdf-scroll');
-    var startX = e.clientX, startY = e.clientY;
-    var marker = document.createElement('div');
-    marker.className = 'pdf-snapshot-rect';
-    scroll.appendChild(marker);
-    function place(ev) {
-      var rect = {
-        left: Math.min(startX, ev.clientX), top: Math.min(startY, ev.clientY),
-        width: Math.abs(ev.clientX - startX), height: Math.abs(ev.clientY - startY)
-      };
-      var scrollBounds = scroll.getBoundingClientRect();
-      marker.style.left = (rect.left - scrollBounds.left + scroll.scrollLeft) + 'px';
-      marker.style.top = (rect.top - scrollBounds.top + scroll.scrollTop) + 'px';
-      marker.style.width = rect.width + 'px';
-      marker.style.height = rect.height + 'px';
-      marker.dataset.rect = JSON.stringify(rect);
-    }
-    place(e);
-    function onMove(ev) { place(ev); }
-    function onUp(ev) {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-      var rect = JSON.parse(marker.dataset.rect || 'null');
-      marker.remove();
-      toggleSnapshotMode(false);
-      if (rect && rect.width >= 8 && rect.height >= 8) captureSnapshot(sheet, rect);
-    }
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-  }
-
-  function toggleSnapshotMode(force) {
-    if (pdfState.reflowMode) { toast(T('重排模式下不可用截图批注')); return; }
-    pdfState.snapshotMode = typeof force === 'boolean' ? force : !pdfState.snapshotMode;
-    if (pdfState.snapshotMode) toggleInkMode(false);
-    $('#pdf-snapshot-toggle').setAttribute('aria-pressed', pdfState.snapshotMode ? 'true' : 'false');
-    $('#pdf-scroll').classList.toggle('snapshot-mode', pdfState.snapshotMode);
-  }
-
-  function startInkStroke(e) {
-    var sheet = e.target.closest('.pdf-page-sheet');
-    if (!sheet || !sheet._litViewport) return;
-    e.preventDefault();
-    var bounds = sheet.getBoundingClientRect();
-    var canvas = document.createElement('canvas');
-    canvas.className = 'pdf-ink-overlay';
-    canvas.width = Math.round(bounds.width);
-    canvas.height = Math.round(bounds.height);
-    canvas.style.width = bounds.width + 'px';
-    canvas.style.height = bounds.height + 'px';
-    sheet.appendChild(canvas);
-    var ctx = canvas.getContext('2d');
-    ctx.strokeStyle = pdfState.annotationColor;
-    ctx.lineWidth = 2;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    var points = [];
-    function addPoint(ev) {
-      var x = ev.clientX - bounds.left, y = ev.clientY - bounds.top;
-      points.push([x, y]);
-      if (points.length > 1) {
-        ctx.beginPath();
-        ctx.moveTo(points[points.length - 2][0], points[points.length - 2][1]);
-        ctx.lineTo(x, y);
-        ctx.stroke();
-      }
-    }
-    addPoint(e);
-    if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
-    function onMove(ev) { addPoint(ev); }
-    function onUp() {
-      canvas.removeEventListener('pointermove', onMove);
-      canvas.removeEventListener('pointerup', onUp);
-      canvas.removeEventListener('pointercancel', onUp);
-      if (points.length < 3) { canvas.remove(); return; }
-      var viewport = sheet._litViewport;
-      var pdfPoints = points.map(function (pt) { return viewport.convertToPdfPoint(pt[0], pt[1]); });
-      var xs = pdfPoints.map(function (p) { return p[0]; });
-      var ys = pdfPoints.map(function (p) { return p[1]; });
-      var now = Date.now();
-      var annotation = {
-        id: annotationUid(), type: 'ink', color: pdfState.annotationColor,
-        attachmentId: pdfState.attachmentId,
-        text: T('手写批注'), comment: '',
-        position: {
-          pageIndex: Number(sheet.dataset.page) - 1,
-          rects: [[Math.min.apply(null, xs), Math.min.apply(null, ys),
-            Math.max.apply(null, xs), Math.max.apply(null, ys)]],
-          points: pdfPoints
-        },
-        createdAt: now, updatedAt: now
-      };
-      pdfState.paper.pdfAnnotations = window.LitModel.normalizePdfAnnotations(
-        (pdfState.paper.pdfAnnotations || []).concat([annotation]));
-      canvas.remove(); // 由批注层统一重绘
-      syncViewerAnnotations();
-      save();
-      renderPdfAnnotations(annotation.id);
-    }
-    canvas.addEventListener('pointermove', onMove);
-    canvas.addEventListener('pointerup', onUp);
-    canvas.addEventListener('pointercancel', onUp);
-  }
-
-  function toggleInkMode(force) {
-    if (pdfState.reflowMode) { toast(T('重排模式下不可用手写批注')); return; }
-    pdfState.inkMode = typeof force === 'boolean' ? force : !pdfState.inkMode;
-    if (pdfState.inkMode) toggleSnapshotMode(false);
-    $('#pdf-ink-toggle').setAttribute('aria-pressed', pdfState.inkMode ? 'true' : 'false');
-    $('#pdf-scroll').classList.toggle('ink-mode', pdfState.inkMode);
-  }
-
   function updatePdfViewUi() {
     $('#pdf-zoom').textContent = Math.round(pdfState.scale * 100) + '%';
     $('#pdf-layout-toggle').setAttribute('aria-pressed', pdfState.layout === 'spread' ? 'true' : 'false');
     $('#pdf-layout-toggle').title = pdfState.layout === 'spread' ? T('切换为单栏阅读') : T('切换为双栏阅读');
-    var rendererButton = $('#pdf-renderer-toggle');
-    rendererButton.textContent = pdfState.renderer === 'auto' ? T('自动渲染') : (pdfState.renderer === 'pdfium' ? 'PDFium' : 'PDF.js');
-    rendererButton.title = T('切换 PDF 渲染器') + (pdfState.handle && pdfState.handle.renderer
-      ? ' · ' + T('当前：') + pdfState.handle.renderer : '');
-  }
-
-  function togglePdfRenderer() {
-    var modes = ['auto', 'pdfium', 'pdfjs'];
-    pdfState.renderer = modes[(modes.indexOf(pdfState.renderer) + 1) % modes.length];
-    var tab = pdfTabs.find(function (item) {
-      return item.key === (pdfState.paper && pdfState.paper.id + ':' + pdfState.attachmentId);
-    });
-    if (tab) tab.renderer = pdfState.renderer;
-    renderPdfViewer();
-    saveReadPos();
   }
 
   // 视图参数（缩放/版式/旋转）变化：优先走 relayout 原位重排（复用文档、保留旧位图
@@ -6022,7 +5761,6 @@
       scale: pdfState.scale,
       layout: pdfState.layout,
       rotation: pdfState.rotation,
-      renderer: pdfState.renderer,
       textLayer: true,
       annotations: annotationsForAttachment(pdfState.paper, attachment),
       onPageChange: updatePdfPageUi,
@@ -6035,7 +5773,7 @@
       updatePdfViewUi();
       if (targetPage > 1) pdfState.handle.goToPage(targetPage);
       if ($('#pdf-search').value.trim()) performPdfSearch(true);
-      maybeImportPdfAnnotations(pdfState.paper, doc, pdfState.attachment);
+      maybeImportPdfAnnotations(pdfState.paper, pdfState.attachment);
       detectScannedPdf(doc);
       if (!$('#pdf-side').hidden) {
         if ($('#pdf-side').dataset.tab === 'thumbs') renderPdfThumbs(doc);
@@ -6133,9 +5871,6 @@
   }
 
   /* ---- 阅读器侧栏笔记编辑器（阶段三）：目标笔记选择/新建、Markdown 编辑+预览、来源更新提示 ---- */
-  var pdfNoteCurrentId = '';
-  var savePdfNoteSide = debounce(function () { save(); }, 500);
-
   function fillNoteSelect(select, paperId, currentId) {
     select.innerHTML = '';
     [{ label: T('本篇笔记'), list: notesForPaper(paperId) }, { label: T('主题笔记'), list: topicNotes() }]
@@ -6161,154 +5896,33 @@
     else select.selectedIndex = 0;
   }
 
-  function currentPdfNote() {
-    if (!pdfState.paper) return null;
-    var note = pdfNoteCurrentId ? findNote(pdfNoteCurrentId) : null;
-    // 本篇笔记必须属于当前文献；主题笔记（paperId=''）跨文献保持
-    if (note && (note.paperId === pdfState.paper.id || !note.paperId)) return note;
-    var own = notesForPaper(pdfState.paper.id);
-    return own.length ? own[0] : (topicNotes()[0] || null);
-  }
-
-  function renderPdfNoteEditor() {
-    var editor = $('#pdf-note-editor');
-    if (!pdfState.paper) { editor.hidden = true; return; }
-    editor.hidden = false;
-    var note = currentPdfNote();
-    pdfNoteCurrentId = note ? note.id : '';
-    fillNoteSelect($('#pdf-note-select'), pdfState.paper.id, pdfNoteCurrentId);
-    var ta = $('#pdf-note-textarea');
-    ta.value = note ? note.content : '';
-    ta.disabled = !note;
-    setPdfNoteMode($('#pdf-note-preview-tab').classList.contains('active') ? 'preview' : 'edit');
-    renderPdfNoteStale();
-  }
-
-  function setPdfNoteMode(mode) {
-    var preview = mode === 'preview';
-    $('#pdf-note-textarea').hidden = preview;
-    $('#pdf-note-preview').hidden = !preview;
-    $('#pdf-note-edit-tab').classList.toggle('active', !preview);
-    $('#pdf-note-preview-tab').classList.toggle('active', preview);
-    if (preview) {
-      var note = currentPdfNote();
-      if (!note || !note.content.trim()) {
-        $('#pdf-note-preview').innerHTML = T('<p class="d-abstract none">暂无内容</p>');
-      } else if (note.format === 'richtext' && window.LitNoteMl) {
-        $('#pdf-note-preview').innerHTML = window.LitNoteMl.sanitizeHtml(note.content);
-      } else {
-        $('#pdf-note-preview').innerHTML = window.LitMarkdown.render(note.content);
-      }
-    }
-  }
-
-  function renderPdfNoteStale() {
-    var box = $('#pdf-note-stale');
-    var note = currentPdfNote();
-    if (!note) { box.hidden = true; box.innerHTML = ''; return; }
-    var items;
-    if (note.format === 'richtext' && window.LitNoteMl) {
-      items = window.LitNoteMl.parseExcerptBlocks(note.content).map(function (block) {
-        var found = findAnnotationAnywhere(block.annotationId, block.paperId, block.attachmentId);
-        if (!found) return { status: 'deleted', annotationId: block.annotationId, preview: block.quoteText };
-        if (block.sourceUpdatedAt != null && Number(found.annotation.updatedAt) !== Number(block.sourceUpdatedAt)) {
-          return { status: 'changed', annotationId: block.annotationId, preview: block.quoteText, current: found.annotation };
-        }
-        return { status: 'fresh', annotationId: block.annotationId, preview: block.quoteText };
-      }).filter(function (item) { return item.status !== 'fresh'; });
-    } else if (window.LitExcerpt) {
-      items = window.LitExcerpt.staleExcerpts(note.content, function (annotationId, excerpt) {
-        var found = findAnnotationAnywhere(annotationId, excerpt && excerpt.paperId, excerpt && excerpt.attachmentId);
-        return found ? found.annotation : null;
-      }).filter(function (item) { return item.status !== 'fresh'; })
-        .map(function (item) {
-          return { status: item.status, annotationId: item.excerpt.annotationId, preview: item.excerpt.quote, current: item.current || null };
-        });
-    } else {
-      box.hidden = true; box.innerHTML = ''; return;
-    }
-    box.innerHTML = '';
-    if (!items.length) { box.hidden = true; return; }
-    box.hidden = false;
-    items.slice(0, 10).forEach(function (item) {
-      var row = document.createElement('div');
-      row.className = 'pdf-note-stale-item';
-      var badge = document.createElement('span');
-      badge.className = 'pdf-note-stale-badge' + (item.status === 'deleted' ? ' deleted' : '');
-      badge.textContent = item.status === 'deleted' ? T('来源已删除') : T('来源已更新');
-      row.appendChild(badge);
-      var quote = document.createElement('span');
-      quote.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-      quote.textContent = (item.preview || '').split('\n')[0].slice(0, 40);
-      row.appendChild(quote);
-      var mkBtn = function (label, action) {
-        var btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'btn btn-ghost btn-xs';
-        btn.dataset.staleAction = action;
-        btn.dataset.annotationId = item.annotationId;
-        btn.textContent = label;
-        return btn;
-      };
-      if (item.status === 'changed') {
-        row.appendChild(mkBtn(T('采用更新'), 'adopt'));
-        row.appendChild(mkBtn(T('保留'), 'keep'));
-      } else {
-        row.appendChild(mkBtn(T('移除摘录'), 'remove'));
-      }
-      box.appendChild(row);
+  function createReaderNotePanel(prefix, getPaper) {
+    if (!window.LitNotePanel) return null;
+    return window.LitNotePanel.create({
+      $: $, T: T, debounce: debounce, prefix: prefix, getPaper: getPaper,
+      notesForPaper: notesForPaper, topicNotes: topicNotes, findNote: findNote,
+      findAnnotationAnywhere: findAnnotationAnywhere, annotationQuote: annotationQuote,
+      fillSelect: fillNoteSelect, noteMl: window.LitNoteMl, markdown: window.LitMarkdown,
+      excerpt: window.LitExcerpt, touch: function (note) { window.LitModel.touch(note); },
+      save: save, toast: toast, createNote: createNote,
+      prompt: function (title, body, placeholder) { return dlgPrompt(title, body, placeholder); },
+      openRichtext: openNoteEditor, exportWord: exportNoteToWord
     });
   }
 
-  function handleStaleAction(action, annotationId) {
-    var note = currentPdfNote();
-    if (!note) return;
-    if (note.format === 'richtext' && window.LitNoteMl) {
-      var richTarget = window.LitNoteMl.parseExcerptBlocks(note.content).find(function (block) {
-        return block.annotationId === annotationId;
-      });
-      var found = richTarget ? findAnnotationAnywhere(annotationId, richTarget.paperId, richTarget.attachmentId) : null;
-      if (action === 'adopt' && found) {
-        note.content = window.LitNoteMl.replaceExcerptBlock(note.content, annotationId, {
-          quoteText: annotationQuote(found.annotation),
-          commentText: found.annotation.comment || '',
-          sourceUpdatedAt: found.annotation.updatedAt
-        });
-        toast(T('✓ 已采用来源更新'));
-      } else if (action === 'keep' && found) {
-        note.content = window.LitNoteMl.markExcerptBlockCurrent(note.content, annotationId, found.annotation.updatedAt);
-      } else if (action === 'remove') {
-        note.content = window.LitNoteMl.removeExcerptBlock(note.content, annotationId);
-      } else return;
-      window.LitModel.touch(note);
-      save();
-      $('#pdf-note-textarea').value = note.content;
-      renderPdfNoteStale();
-      if (!$('#pdf-note-preview').hidden) setPdfNoteMode('preview');
-      return;
-    }
-    if (!window.LitExcerpt) return;
-    var target = window.LitExcerpt.parseExcerpts(note.content)
-      .find(function (x) { return x.annotationId === annotationId; });
-    if (!target) return;
-    var foundMarkdown = findAnnotationAnywhere(annotationId, target.paperId, target.attachmentId);
-    if (action === 'adopt' && foundMarkdown) {
-      note.content = window.LitExcerpt.replaceExcerpt(note.content, target, {
-        quote: annotationQuote(foundMarkdown.annotation),
-        comment: foundMarkdown.annotation.comment || '',
-        sourceUpdatedAt: foundMarkdown.annotation.updatedAt
-      });
-      toast(T('✓ 已采用来源更新'));
-    } else if (action === 'keep' && foundMarkdown) {
-      note.content = window.LitExcerpt.markExcerptCurrent(note.content, target, foundMarkdown.annotation);
-    } else if (action === 'remove') {
-      note.content = window.LitExcerpt.removeExcerpt(note.content, target);
-    } else return;
-    window.LitModel.touch(note);
-    save();
-    $('#pdf-note-textarea').value = note.content;
-    renderPdfNoteStale();
-    if (!$('#pdf-note-preview').hidden) setPdfNoteMode('preview');
+  function initReaderNotePanels() {
+    epubNotePanel = createReaderNotePanel('epub', function () { return epubState.paper; });
+    pdfNotePanel = createReaderNotePanel('pdf', function () { return pdfState.paper; });
+    if (epubNotePanel) epubNotePanel.bind();
+    if (pdfNotePanel) pdfNotePanel.bind();
+  }
+
+  function currentPdfNote() {
+    return pdfNotePanel ? pdfNotePanel.current() : null;
+  }
+
+  function renderPdfNoteEditor() {
+    if (pdfNotePanel) pdfNotePanel.render();
   }
 
   /* ---- 批注多选加入笔记弹窗（#excerpt-mask） ---- */
@@ -6399,7 +6013,8 @@
       list.appendChild(row);
     });
     // 目标笔记
-    fillNoteSelect($('#excerpt-target'), paper.id, pdfNoteCurrentId);
+    var currentNote = currentPdfNote();
+    fillNoteSelect($('#excerpt-target'), paper.id, currentNote ? currentNote.id : '');
   }
 
   function confirmExcerptDialog() {
@@ -6415,12 +6030,12 @@
     }
     var n = addAnnotationsToNote(note, chosen, paper);
     if (!$('#epub-overlay').hidden) {
-      epubNoteCurrentId = note.id;
+      if (epubNotePanel) epubNotePanel.setCurrentId(note.id);
       $('#excerpt-mask').hidden = true;
       excerptDlg = null;
       renderEpubNoteEditor();
     } else {
-      pdfNoteCurrentId = note.id;
+      if (pdfNotePanel) pdfNotePanel.setCurrentId(note.id);
       $('#excerpt-mask').hidden = true;
       excerptDlg = null;
       renderPdfNoteEditor();
@@ -6531,839 +6146,7 @@
     });
   }
 
-  /* ---- 笔记导出 Word（阶段三下半）：文本/图片混排 + 摘录块与引用节点 → 可刷新引文域 ---- */
-  function exportNoteToWord(note) {
-    if (!desktop) { toast(T('导出 Word 需要桌面版')); return; }
-    if (!note) { toast(T('请先选择或新建一篇笔记')); return; }
-    if (!window.LitDocx || !window.LitCslDoc || !window.LitNoteMl || !window.LitCsl || !window.LitExcerpt) {
-      toast(T('导出模块未加载')); return;
-    }
-    var html = note.format === 'richtext'
-      ? window.LitNoteMl.sanitizeHtml(note.content)
-      : window.LitNoteMl.markdownToHtml(note.content);
-    var md = window.LitNoteMl.htmlToMarkdown(html);
-    var styleId = localStorage.getItem('litboard.cslStyle') || 'apa';
-    var isBuiltin = window.LitCsl.BUILTIN_STYLES.some(function (s) { return s.id === styleId; });
-    var stylePromise = isBuiltin
-      ? fetch('vendor/citeproc/styles/' + styleId + '.csl').then(function (r) {
-          if (!r.ok) throw new Error(T('样式文件缺失'));
-          return r.text();
-        })
-      : desktop.fetchCslStyle(styleId);
-    Promise.all([
-      stylePromise,
-      fetch('vendor/citeproc/locales/zh-CN.xml').then(function (r) { return r.text(); }),
-      desktop.getDataPaths()
-    ]).then(function (values) {
-      return buildNoteDocx(md, {
-        styleXml: values[0], localeXml: values[1], styleId: styleId,
-        configDir: values[2] && values[2].configDir || ''
-      });
-    }).then(function (bytes) {
-      return desktop.saveFile({
-        name: 'litboard-note-' + stamp() + '.docx',
-        bytes: bytes,
-        filters: [{ name: T('Word 文档'), extensions: ['docx'] }]
-      });
-    }).then(function (saved) {
-      if (saved) toast(T('✓ 笔记已导出为 Word'));
-    }).catch(function (error) {
-      toast(T('⚠ 导出失败：') + (error && error.message || error));
-    });
-  }
-
-  function buildNoteDocx(md, env) {
-    var doc = window.LitCslDoc.createDocument({
-      styleXml: env.styleXml, localeXml: env.localeXml, styleId: env.styleId, localeId: 'zh-CN'
-    });
-    // 预读图片字节（note-assets 相对路径）
-    var rels = [];
-    md.replace(/!\[[^\]]*\]\((note-assets\/[^)\s]+)\)/g, function (_, rel) { rels.push(rel); return _; });
-    var uniqueRels = rels.filter(function (rel, index) { return rels.indexOf(rel) === index; });
-    var imageMap = {};
-    return doc.updateLibrary(state.papers.filter(function (p) { return !p.deletedAt; }))
-      .then(function () {
-        return Promise.all(uniqueRels.map(function (rel) {
-          if (!env.configDir) return Promise.resolve(null);
-          var abs = env.configDir.replace(/[\\/]+$/, '') + '\\' + rel.replace(/\//g, '\\');
-          var readBytes = desktop && (desktop.readFileBytes || desktop.readBytes);
-          if (!readBytes) return Promise.resolve(null);
-          return readBytes.call(desktop, abs).then(function (bytes) {
-            var ext = (rel.match(/\.[a-z0-9]{1,8}$/i) || ['.png'])[0].toLowerCase();
-            imageMap[rel] = { data: bytes, ext: ext };
-          }).catch(function () {});
-        }));
-      })
-      .then(function () {
-        // 块级切分：lbex 摘录块与正文交错
-        var spans = window.LitExcerpt.parseExcerpts(md);
-        var segments = [];
-        var pos = 0;
-        spans.forEach(function (span) {
-          if (span.start > pos) segments.push({ type: 'text', md: md.slice(pos, span.start) });
-          segments.push({ type: 'excerpt', span: span });
-          pos = span.end;
-        });
-        if (pos < md.length) segments.push({ type: 'text', md: md.slice(pos) });
-        // 顺序执行：每个引用节点一次 addCitation
-        var paragraphs = [];
-        var chain = Promise.resolve();
-        function pushCitationRun(paperId, extras, fallbackText) {
-          return doc.addCitation({ items: [Object.assign({ paperId: paperId }, extras || {})] })
-            .then(function (result) {
-              var cluster = doc.toJSON().citations.filter(function (c) { return c.id === result.citationId; })[0];
-              paragraphs.push({ runs: [{ citation: { payload: cluster, text: result.text } }] });
-            })
-            .catch(function () {
-              paragraphs.push({ text: fallbackText || (T('（未找到文献 ') + paperId + '）') });
-            });
-        }
-        segments.forEach(function (segment) {
-          if (segment.type === 'excerpt') {
-            chain = chain.then(function () {
-              if (!getById(segment.span.paperId)) {
-                paragraphs.push({ text: segment.span.quote || T('（来源文献不在库中）') });
-                return;
-              }
-              return pushCitationRun(segment.span.paperId, {}, segment.span.quote);
-            });
-            return;
-          }
-          mdSegmentToParagraphs(segment.md).forEach(function (para) {
-            chain = chain.then(function () {
-              var runChain = Promise.resolve();
-              var runs = [];
-              para.parts.forEach(function (part) {
-                runChain = runChain.then(function () {
-                  if (part.text != null) {
-                    runs.push(part.bold ? { text: part.text, bold: true } : { text: part.text });
-                  } else if (part.imageRel) {
-                    if (imageMap[part.imageRel]) runs.push({ image: imageMap[part.imageRel] });
-                  } else if (part.cite) {
-                    return pushCitationRunInto(runs, part.cite);
-                  }
-                });
-              });
-              return runChain.then(function () {
-                if (runs.length) paragraphs.push({ runs: runs });
-              });
-            });
-          });
-        });
-        function pushCitationRunInto(runs, cite) {
-          if (!getById(cite.paperId)) {
-            runs.push({ text: cite.label || (T('（未找到文献 ') + cite.paperId + '）') });
-            return Promise.resolve();
-          }
-          return doc.addCitation({ items: [{
-            paperId: cite.paperId,
-            locator: cite.locator || '',
-            label: cite.labelParam || '',
-            prefix: cite.prefix || '',
-            suffix: cite.suffix || '',
-            suppressAuthor: !!cite.suppressAuthor
-          }] }).then(function (result) {
-            var cluster = doc.toJSON().citations.filter(function (c) { return c.id === result.citationId; })[0];
-            runs.push({ citation: { payload: cluster, runs: window.LitCsl.htmlToRuns(result.text) } });
-          }).catch(function () {
-            runs.push({ text: cite.label || cite.paperId });
-          });
-        }
-        return chain.then(function () {
-          if (doc.citationCount() > 0) {
-            paragraphs.push({ runs: [{ text: T('参考文献'), bold: true }] });
-            var bibFormat = doc.getBibliographyFormat();
-            doc.getBibliography().forEach(function (entry) {
-              paragraphs.push(Object.assign({ runs: window.LitCsl.htmlToRuns(entry) }, bibFormat));
-            });
-          }
-          return window.LitDocx.buildDocx(paragraphs);
-        });
-      });
-  }
-
-  /** markdown 文本段 → 段落计划（纯文本/图片/引用链接拆 run；标题加粗） */
-  function mdSegmentToParagraphs(md) {
-    var lines = md.replace(/\r\n?/g, '\n').split('\n');
-    var out = [];
-    var buffer = [];
-    function flush() {
-      if (!buffer.length) return;
-      var raw = buffer.join('\n');
-      buffer = [];
-      out.push({ parts: inlineMdParts(raw) });
-    }
-    lines.forEach(function (line) {
-      var trimmed = line.trim();
-      if (!trimmed) { flush(); return; }
-      if (/^```/.test(trimmed)) { flush(); return; }
-      var heading = trimmed.match(/^(#{1,4})\s+(.+)$/);
-      if (heading) {
-        flush();
-        out.push({ parts: [{ text: heading[2], bold: true }] });
-        return;
-      }
-      var imageOnly = trimmed.match(/^!\[[^\]]*\]\((note-assets\/[^)\s]+)\)$/);
-      if (imageOnly) {
-        flush();
-        out.push({ parts: [{ imageRel: imageOnly[1] }] });
-        return;
-      }
-      buffer.push(trimmed.replace(/^[-*+]\s+|^\d+[.)]\s+/, ''));
-    });
-    flush();
-    return out;
-  }
-
-  var CITE_LINK_RE = /\[([^\]]+)\]\(litboard:\/\/open\/paper\/([A-Za-z0-9_-]{1,120})(?:\?([^\s)]+))?\)/g;
-  function inlineMdParts(raw) {
-    var parts = [];
-    var last = 0;
-    var match;
-    CITE_LINK_RE.lastIndex = 0;
-    while ((match = CITE_LINK_RE.exec(raw))) {
-      if (match.index > last) parts.push({ text: raw.slice(last, match.index) });
-      var params = {};
-      if (match[3]) {
-        match[3].split('&').forEach(function (pair) {
-          var kv = pair.split('=');
-          try { params[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || ''); } catch (e) {}
-        });
-      }
-      parts.push({
-        cite: {
-          paperId: match[2],
-          label: match[1],
-          locator: params.locator || '',
-          labelParam: params.label || '',
-          prefix: params.prefix || '',
-          suffix: params.suffix || '',
-          suppressAuthor: params.suppressAuthor === '1'
-        }
-      });
-      last = match.index + match[0].length;
-    }
-    if (last < raw.length) parts.push({ text: raw.slice(last) });
-    // 清掉残留 md 记号（加粗等）
-    parts.forEach(function (part) {
-      if (part.text != null) {
-        part.text = part.text.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/[`*_]/g, '').trim();
-        if (!part.text) part.text = '';
-      }
-    });
-    return parts.filter(function (part) { return part.text == null || part.text !== ''; });
-  }
-
-  /* ---- Word 写作（COM 自动化；协议见 word/wordbridge.js 头部注释） ---- */
-  function b64utf8(s) {
-    var bytes = new TextEncoder().encode(String(s == null ? '' : s));
-    var bin = '';
-    bytes.forEach(function (b) { bin += String.fromCharCode(b); });
-    return btoa(bin);
-  }
-  function unb64(s) {
-    var bin = atob(String(s || ''));
-    var bytes = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return new TextDecoder().decode(bytes);
-  }
-  function wordFail(error) {
-    $('#word-status').textContent = '⚠ ' + (error && error.message || String(error));
-    toast('⚠ Word：' + (error && error.message || error));
-  }
-  function wordDetect() {
-    if (!desktop || !desktop.wordInvoke) { wordFail(new Error(T('当前版本不支持 Word 集成'))); return; }
-    $('#word-status').textContent = T('正在连接 Word…');
-    desktop.wordInvoke({ line: 'INFO', timeout: 20000 }).then(function (rest) {
-      var parts = String(rest || '').split('|');
-      var version = parts[0] ? unb64(parts[0]) : '';
-      var names = (parts[2] || '').split(';').filter(Boolean).map(unb64);
-      var select = $('#word-doc-select');
-      select.innerHTML = '';
-      names.forEach(function (name) {
-        var opt = document.createElement('option');
-        opt.value = name;
-        opt.textContent = name.split(/[\\/]/).pop();
-        select.appendChild(opt);
-      });
-      if (!names.length) {
-        var empty = document.createElement('option');
-        empty.value = '';
-        empty.textContent = T('（Word 中没有打开的文档）');
-        select.appendChild(empty);
-      }
-      $('#word-status').textContent = version
-        ? T('已连接 Word ') + version + T('，打开文档 ') + names.length + T(' 个。') +
-          T('插入引文前请把光标放到目标位置；引文格式跟随 LitBoard 当前 CSL 样式。')
-        : T('未检测到正在运行的 Microsoft Word；请打开 Word 与目标文档后重新点击「检测 Word」。');
-      wordSyncStyleSelect();
-    }).catch(wordFail);
-  }
-  function wordTargetPath() {
-    var path = $('#word-doc-select').value;
-    if (!path) throw new Error(T('请先在 Word 中打开一个文档并重新检测'));
-    return path;
-  }
-  function wordParseFieldsPayloads(codes) {
-    // 域指令 → CitationCluster payload（与 docx.readDocxFields 同一契约）
-    return codes.map(function (code) {
-      var m = /^\s*ADDIN\s+LitBoard\.Citation\.1\s+"([\s\S]*)"\s*$/.exec(String(code || '').trim());
-      if (!m) return null;
-      try { return JSON.parse(m[1]); } catch (e) { return null; }
-    }).filter(Boolean);
-  }
-  function wordCurrentStyle(documentId) {
-    var styleMap = {};
-    try { styleMap = JSON.parse(localStorage.getItem('litboard.wordStyles') || '{}') || {}; } catch (e) {}
-    var styleId = styleMap[documentId] || localStorage.getItem('litboard.cslStyle') || 'apa';
-    var localePromise = fetch('vendor/citeproc/locales/zh-CN.xml').then(function (r) { return r.text(); });
-    var custom = wordCustomStyles()[styleId];
-    if (custom) {
-      return localePromise.then(function (localeXml) {
-        return { styleXml: custom.xml, localeXml: localeXml, styleId: styleId };
-      });
-    }
-    var isBuiltin = window.LitCsl.BUILTIN_STYLES.some(function (s) { return s.id === styleId; });
-    var stylePromise = isBuiltin
-      ? fetch('vendor/citeproc/styles/' + styleId + '.csl').then(function (r) {
-          if (!r.ok) throw new Error(T('样式文件缺失'));
-          return r.text();
-        })
-      : desktop.fetchCslStyle(styleId);
-    return Promise.all([stylePromise, localePromise])
-      .then(function (texts) { return { styleXml: texts[0], localeXml: texts[1], styleId: styleId }; });
-  }
-  /** 从文档现有域重建 csldoc 会话（统一刷新/参考文献表/插入的渲染口径） */
-  function wordBuildSession(payloads, documentId) {
-    return wordCurrentStyle(documentId).then(function (env) {
-      var doc = window.LitCslDoc.createDocument({ styleXml: env.styleXml, localeXml: env.localeXml, styleId: env.styleId, localeId: 'zh-CN' });
-      return doc.updateLibrary(state.papers.filter(function (p) { return !p.deletedAt; })).then(function () {
-        return doc.restore(payloads).then(function () { return doc; });
-      });
-    });
-  }
-  /* Word 的域结果只认纯文本：citeproc 的 HTML 得先转成 RTF（上标/斜体/小型大写才真正生效），
-     再包成最小 RTF 文档交给桥用 InsertFile 读进域——桥按 '{\rtf' 前缀识别，纯文本回退不受影响。 */
-  function wordRtfDocument(html) { return '{\\rtf ' + window.LitCsl.htmlToRtf(html) + '}'; }
-  /* 参考文献条目：转成 RTF 片段后逐条交给桥（桥负责 \par 连接与外层包装） */
-  function wordRtfEntries(entries) {
-    return (entries || []).map(function (entry) { return b64utf8(window.LitCsl.htmlToRtf(entry)); });
-  }
-  /* 参考文献段落格式负载：'rtf,indent,firstLineIndent,entrySpacing,lineSpacing,tabStops'
-     （twips；行距是倍数：1 = 单倍，不设时不发送） */
-  function wordBibliographyFormatSpec(session) {
-    var format = session.getBibliographyFormat();
-    return ['rtf', format.indent, format.firstLineIndent, format.entrySpacing, format.lineSpacing, format.tabStops.join('+')].join(',');
-  }
-  function wordRefresh() {
-    try { wordTargetPath(); } catch (e) { wordFail(e); return; }
-    var path = $('#word-doc-select').value;
-    $('#word-status').textContent = T('正在读取文档引文域…');
-    desktop.wordInvoke({ line: 'FIELDS|' + b64utf8(path) })
-      .then(function (rest) {
-        var parts = String(rest).split('|');
-        var fields = (parts[1] || '').split(';').filter(Boolean).map(function (item) {
-          var pair = item.split('~');
-          return { code: unb64(pair[0] || ''), text: unb64(pair[1] || '') };
-        });
-        if (!fields.length) { toast(T('该文档没有 LitBoard 引文域')); $('#word-status').textContent = T('文档中没有 LitBoard 引文域。'); return; }
-        var payloads = wordParseFieldsPayloads(fields.map(function (f) { return f.code; }));
-        return wordBuildSession(payloads, path).then(function (session) {
-          var clusters = session.toJSON().citations;
-          var texts = clusters.map(function (c) { return b64utf8(wordRtfDocument(session.getCitationText(c.id))); });
-          // 快照回写：会话已用库内最新文献刷新 cslItem，同时更新域内嵌快照（F10）
-          var codes = clusters.map(function (c) { return b64utf8(JSON.stringify({ version: 1, items: c.items })); });
-          // 参考文献条目按 rtf 片段原样传递（剥标签会连 \tab/\super 一起毁掉）；
-          // 段落格式由会话按 CSL 样式算出，桥负责落到 Word 段落格式
-          var bib = wordRtfEntries(session.getBibliography());
-          var line = 'APPLY|' + b64utf8(path) + '|' + texts.join(';') + '|' + bib.join(';') + '|' + codes.join(';') +
-            '|' + wordBibliographyFormatSpec(session);
-          return desktop.wordInvoke({ line: line, timeout: 60000 }).then(function () {
-            var missing = session.missingItemIds();
-            $('#word-status').textContent = T('✓ 已刷新 ') + clusters.length + T(' 个引文') +
-              (bib.length ? T('，参考文献表 ') + bib.length + T(' 条') : '') +
-              (missing.length ? T('；有 ') + missing.length + T(' 条文献不在库中（按文档内快照渲染）') : '');
-            toast(T('✓ Word 引文已刷新'));
-          });
-        });
-      }).catch(wordFail);
-  }
-  /* Word 引文插入：文献多选弹窗（勾选顺序即同一处引文的合并顺序） */
-  var wordCiteChosen = {};
-  var wordCiteHayCache = null;
-  /* 检索 haystack：标题 + 年份 + 作者的多种形态（姓/名分列、姓名倒序、「王, 小明」→「王小明」去分隔形态），
-     走 normalizeForSearch 折叠大小写/变音符/全半角；按 paperId 缓存，弹窗打开时重置 */
-  function wordCiteHaystack(p) {
-    if (!wordCiteHayCache) wordCiteHayCache = {};
-    var hit = wordCiteHayCache[p.id];
-    if (hit != null) return hit;
-    var parts = [String(p.title || ''), String(p.year == null ? '' : p.year)];
-    (p.authors || []).forEach(function (a) {
-      var n = window.LitCite && LitCite._splitName ? LitCite._splitName(a) : { family: String(a || ''), given: '' };
-      var fam = String(n.family || ''), giv = String(n.given || '');
-      parts.push(String(a || ''), fam, giv, giv + ' ' + fam, String(a || '').replace(/[,\s，]+/g, ''));
-    });
-    hit = normHit(parts.join(' '));
-    wordCiteHayCache[p.id] = hit;
-    return hit;
-  }
-  function wordCiteUpdateCount() {
-    $('#word-cite-count').textContent = T('已选 ') + Object.keys(wordCiteChosen).length + T(' 篇');
-  }
-  function renderWordCiteList() {
-    var query = normHit(String($('#word-cite-search').value || '').trim());
-    var tokens = query ? query.split(/\s+/).filter(Boolean) : [];
-    var box = $('#word-cite-list');
-    box.innerHTML = '';
-    state.papers.forEach(function (p) {
-      if (p.deletedAt) return;
-      if (tokens.length && !tokens.every(function (t) { return wordCiteHaystack(p).indexOf(t) !== -1; })) return;
-      var label = (p.authors && p.authors.length ? String(p.authors[0]).split(',')[0] : T('匿名')) +
-        (p.year ? ', ' + p.year : '') + ' · ' + String(p.title || '').slice(0, 60);
-      var row = document.createElement('div');
-      row.className = 'excerpt-item wordcite-row' + (wordCiteChosen[p.id] ? ' wordcite-row-on' : '');
-      var checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
-      checkbox.checked = !!wordCiteChosen[p.id];
-      var quote = document.createElement('span');
-      quote.className = 'excerpt-item-quote';
-      quote.textContent = label;
-      row.appendChild(checkbox);
-      row.appendChild(quote);
-      checkbox.addEventListener('change', function () {
-        if (checkbox.checked) wordCiteChosen[p.id] = true;
-        else delete wordCiteChosen[p.id];
-        row.classList.toggle('wordcite-row-on', checkbox.checked);
-        wordCiteUpdateCount();
-      });
-      row.addEventListener('click', function () {
-        checkbox.checked = !checkbox.checked;
-        checkbox.dispatchEvent(new Event('change'));
-      });
-      box.appendChild(row);
-    });
-    wordCiteUpdateCount();
-  }
-  function wordInsertCitation() {
-    try { wordTargetPath(); } catch (e) { wordFail(e); return; }
-    var live = state.papers.filter(function (p) { return !p.deletedAt; });
-    if (!live.length) { toast(T('文献库为空')); return; }
-    wordCiteChosen = {};
-    wordCiteHayCache = null;
-    $('#word-cite-search').value = '';
-    renderWordCiteList();
-    $('#word-cite-mask').hidden = false;
-  }
-  function wordInsertCitationConfirm() {
-    var targetPath;
-    try { targetPath = wordTargetPath(); } catch (e) { wordFail(e); return; }
-    var items = state.papers.filter(function (p) { return !p.deletedAt && wordCiteChosen[p.id]; })
-      .map(function (p) { return { paperId: p.id }; });
-    if (!items.length) { toast(T('请先勾选要引用的文献')); return; }
-    $('#word-cite-mask').hidden = true;
-    $('#word-status').textContent = T('正在渲染引文…');
-    var payload = { version: 1, items: items };
-    wordBuildSession([payload], targetPath).then(function (session) {
-      var cluster = session.toJSON().citations[0];
-      var text = wordRtfDocument(session.getCitationText(cluster.id));
-      return desktop.wordInvoke({ command: 'INSERT', documentId: targetPath,
-        args: { payload: JSON.stringify(cluster), text: text }, timeout: 30000 })
-        .then(function () {
-          $('#word-status').textContent = T('已插入 ') + items.length + T(' 条，正在按全文顺序重算引文编号…');
-          wordRefresh(); // 插入后立即按文档序重算（数字制编号与既有引文顺序一致，F10）
-          toast(T('✓ 已插入引文（') + items.length + T(' 篇）'));
-        });
-    }).catch(wordFail);
-  }
-  /* 引文格式：内置 CSL 样式；按目标文档记忆（litboard.wordStyles），未选文档时改全局默认。
-   * 支持导入本地 .csl 自定义样式（localStorage 存 XML，key 前缀 custom-）。 */
-  function wordStyleMap() {
-    try { return JSON.parse(localStorage.getItem('litboard.wordStyles') || '{}') || {}; } catch (e) { return {}; }
-  }
-  function wordCustomStyles() {
-    try { return JSON.parse(localStorage.getItem('litboard.customCslStyles') || '{}') || {}; } catch (e) { return {}; }
-  }
-  function wordImportCustomStyle() {
-    if (!desktop || !desktop.chooseFiles || !desktop.readFileBytes) { wordFail(new Error(T('当前版本不支持导入'))); return; }
-    desktop.chooseFiles({ title: T('选择 CSL 样式文件（.csl）') }).then(function (files) {
-      if (!files || !files[0]) return;
-      return desktop.readFileBytes(files[0]).then(function (bytes) {
-        var xml = new TextDecoder('utf-8').decode(new Uint8Array(bytes));
-        if (!/<style[\s>]/.test(xml)) throw new Error(T('不是有效的 CSL 样式文件'));
-        var m = /<title>([^<]+)<\/title>/.exec(xml);
-        var title = (m ? m[1] : '').trim() || files[0].split(/[\\/]/).pop().replace(/\.csl$/i, '');
-        var map = wordCustomStyles();
-        var key = 'custom-' + Date.now().toString(36);
-        var count = Object.keys(map).filter(function (k) { return map[k].title === title; }).length;
-        if (count) key = Object.keys(map).find(function (k) { return map[k].title === title; }); // 同名重导入覆盖
-        map[key] = { title: title, xml: xml };
-        try { localStorage.setItem('litboard.customCslStyles', JSON.stringify(map)); }
-        catch (e) { throw new Error(T('样式过大或本地存储已满，无法保存')); }
-        wordInitStyleSelect();
-        var sel = $('#word-style-select');
-        sel.value = key;
-        sel.dispatchEvent(new Event('change'));
-        $('#word-status').textContent = T('✓ 已导入样式「') + title + T('」，新插入引文立即生效。');
-        toast(T('✓ 已导入 CSL 样式：') + title);
-      });
-    }).catch(wordFail);
-  }
-  function wordSyncStyleSelect() {
-    var path = $('#word-doc-select').value;
-    var styleId = (path ? wordStyleMap()[path] : null) || localStorage.getItem('litboard.cslStyle') || 'apa';
-    var sel = $('#word-style-select');
-    var known = Array.prototype.some.call(sel.options, function (o) { return o.value === styleId; });
-    sel.value = known ? styleId : 'apa';
-    $('#word-style-hint').textContent = path ? T('格式跟随当前目标文档保存。') : '';
-  }
-  function wordInitStyleSelect() {
-    var sel = $('#word-style-select');
-    sel.innerHTML = '';
-    window.LitCsl.BUILTIN_STYLES.forEach(function (style) {
-      var opt = document.createElement('option');
-      opt.value = style.id;
-      opt.textContent = style.label;
-      sel.appendChild(opt);
-    });
-    var customs = wordCustomStyles();
-    Object.keys(customs).forEach(function (key) {
-      var opt = document.createElement('option');
-      opt.value = key;
-      opt.textContent = (customs[key].title || key) + T('（自定义）');
-      sel.appendChild(opt);
-    });
-    sel.addEventListener('change', function () {
-      var path = $('#word-doc-select').value;
-      if (path) {
-        var map = wordStyleMap();
-        map[path] = sel.value;
-        localStorage.setItem('litboard.wordStyles', JSON.stringify(map));
-        $('#word-style-hint').textContent = T('已切换（仅此文档）；已有引文点「刷新引文与参考文献表」按新格式重排。');
-      } else {
-        localStorage.setItem('litboard.cslStyle', sel.value);
-        $('#word-style-hint').textContent = T('未选目标文档，已设为全局默认引文格式。');
-      }
-    });
-    wordSyncStyleSelect();
-  }
-  function wordBibliography() {
-    try { wordTargetPath(); } catch (e) { wordFail(e); return; }
-    var path = $('#word-doc-select').value;
-    desktop.wordInvoke({ line: 'FIELDS|' + b64utf8(path) })
-      .then(function (rest) {
-        var parts = String(rest).split('|');
-        var payloads = wordParseFieldsPayloads((parts[1] || '').split(';').filter(Boolean).map(function (item) { return unb64(item.split('~')[0] || ''); }));
-        return wordBuildSession(payloads, path).then(function (session) {
-          var bib = wordRtfEntries(session.getBibliography());
-          if (!bib.length) { toast(T('没有可引用的文献（先插入引文）')); return; }
-          return desktop.wordInvoke({ command: 'BIB', documentId: path, args: { entries: bib.join(';'), format: wordBibliographyFormatSpec(session) }, timeout: 30000 }).then(function () {
-            toast(T('✓ 已插入参考文献表（') + bib.length + T(' 条）'));
-          });
-        });
-      }).catch(wordFail);
-  }
-  function wordUnlink() {
-    try { wordTargetPath(); } catch (e) { wordFail(e); return; }
-    var path = $('#word-doc-select').value;
-    dlgPrompt(T('副本文件名'), T('例如 manuscript-plain.docx（保存在原文档同目录）'), 'manuscript-plain.docx').then(function (name) {
-      if (name == null) return;
-      name = String(name).trim();
-      if (!/\.docx$/i.test(name)) name += '.docx';
-      var dir = path.replace(/[\\/][^\\/]*$/, '');
-      var newPath = dir + '\\' + name.replace(/[\\/:*?"<>|]/g, '_');
-      return desktop.wordInvoke({ line: 'UNLINKCOPY|' + b64utf8(path) + '|' + b64utf8(newPath), timeout: 30000 })
-        .then(function () {
-          $('#word-status').textContent = T('✓ 已生成解除关联副本：') + newPath;
-          toast(T('✓ 已生成解除关联副本（原件未改动）'));
-          wordDetect();
-        });
-    }).catch(wordFail);
-  }
-  function wordConvertZotero() {
-    if (!desktop || !desktop.wordZoteroConvertRead) { wordFail(new Error(T('当前版本不支持转换'))); return; }
-    desktop.chooseFiles({ filters: [{ name: T('Word 文档'), extensions: ['docx'] }] }).then(function (files) {
-      if (!files || !files[0]) return;
-      var source = files[0];
-      return desktop.wordZoteroConvertRead(source).then(function (fields) {
-        var keyToId = {};
-        state.papers.forEach(function (p) { if (p.zoteroKey) keyToId[p.zoteroKey] = p.id; });
-        var converted = window.LitDocx.convertZoteroFields(fields, {
-          resolveKey: function (key) { return keyToId[key] || null; }
-        });
-        var r = converted.report;
-        var message = T('共识别 Zotero 引文 ') + r.citations + T(' 处：匹配库内文献 ') + r.matched +
-          T('，未匹配 ') + r.unmatched + T('（保留嵌入快照，仍可读可刷新）。') +
-          (r.missingKeys.length ? T('\n未匹配：') + r.missingKeys.slice(0, 10).join('、') : '');
-        return dlgConfirm(T('转换 Zotero 引文'), message, T('生成 LitBoard 副本')).then(function (ok) {
-          if (!ok) return;
-          return dlgPrompt(T('副本文件名'), T('例如 manuscript-litboard.docx（保存在原文档同目录）'), 'manuscript-litboard.docx').then(function (name) {
-            if (name == null) return;
-            name = String(name).trim();
-            if (!/\.docx$/i.test(name)) name += '.docx';
-            var dir = source.replace(/[\\/][^\\/]*$/, '');
-            var target = dir + '\\' + name.replace(/[\\/:*?"<>|]/g, '_');
-            return desktop.wordZoteroConvertWrite({ source: source, target: target, fields: converted.fields })
-              .then(function () {
-                toast(T('✓ 已生成转换副本：') + target + T('（原件未改动）'));
-                $('#word-status').textContent = T('✓ Zotero 引文转换完成：') + target;
-              });
-          });
-        });
-      });
-    }).catch(wordFail);
-  }
-
-  $('#word-detect').addEventListener('click', wordDetect);
-  $('#word-insert-citation').addEventListener('click', wordInsertCitation);
-  $('#word-refresh').addEventListener('click', wordRefresh);
-  $('#word-bibliography').addEventListener('click', wordBibliography);
-  $('#word-unlink').addEventListener('click', wordUnlink);
-  $('#word-convert-zotero').addEventListener('click', wordConvertZotero);
-  $('#word-cite-search').addEventListener('input', renderWordCiteList);
-  $('#word-cite-cancel').addEventListener('click', function () { $('#word-cite-mask').hidden = true; });
-  $('#word-cite-confirm').addEventListener('click', wordInsertCitationConfirm);
-  $('#word-doc-select').addEventListener('change', wordSyncStyleSelect);
-  $('#word-style-import').addEventListener('click', wordImportCustomStyle);
-  wordInitStyleSelect();
-
   /* ---- 可视化查询构建器（阶段四余项；生成文本与搜索框共享同一求值逻辑） ---- */
-  var qbRows = [];
-  var QB_KINDS = [['field', T('字段')], ['flag', T('具备')], ['missing', T('缺失字段')], ['text', T('关键词')], ['ann', T('批注组')], ['note', T('笔记组')], ['attachment', T('附件组')], ['count', T('数量比较')]];
-  var QB_FIELDS = ['title', 'author', 'venue', 'tag', 'type', 'status', 'year', 'citations', 'rating', 'doi', 'key', 'notes', 'abstract', 'folderid', 'lastread', 'annotations', 'attachments'];
-  var QB_FIELD_LABELS = { title: T('标题'), author: T('作者'), venue: T('期刊/会议'), tag: T('标签'), type: T('类型'), status: T('状态'),
-    year: T('年份'), citations: T('被引次数'), rating: T('评分'), doi: 'DOI', key: T('引用键'), notes: T('笔记'), abstract: T('摘要'),
-    folderid: T('文件夹 ID'), lastread: T('最近阅读'), annotations: T('批注数'), attachments: T('附件数') };
-  var QB_FLAGS = ['pdf', 'notes', 'annotations', 'epub', 'snapshot', 'doi', 'abstract', 'unread', 'reading', 'read'];
-
-  function openQueryBuilder() {
-    qbRows = [{ join: 'AND', kind: 'field', field: 'title', cmp: ':', value: '' }];
-    $('#query-builder-mask').hidden = false;
-    renderQbRows();
-  }
-  function renderQbRows() {
-    var box = $('#qb-rows');
-    box.innerHTML = '';
-    qbRows.forEach(function (row, index) {
-      var div = document.createElement('div');
-      div.className = 'qb-row';
-      var join = document.createElement('select');
-      join.className = 'qb-join';
-      join.innerHTML = T('<option value="AND">且</option><option value="OR">或</option>');
-      join.value = row.join || 'AND';
-      join.hidden = index === 0;
-      join.addEventListener('change', function () { row.join = join.value; updateQbPreview(); });
-      div.appendChild(join);
-      var kind = document.createElement('select');
-      kind.className = 'qb-kind';
-      kind.innerHTML = QB_KINDS.map(function (k) { return '<option value="' + k[0] + '">' + k[1] + '</option>'; }).join('');
-      kind.value = row.kind;
-      div.appendChild(kind);
-      var dynamic = document.createElement('span');
-      dynamic.style.cssText = 'display:flex;gap:6px;flex:1;align-items:center';
-      function valueInput(placeholder) {
-        var input = document.createElement('input');
-        input.className = 'qb-value';
-        input.value = row.value || '';
-        input.placeholder = placeholder || '';
-        input.addEventListener('input', function () { row.value = input.value; updateQbPreview(); });
-        return input;
-      }
-      function rebuild() {
-        dynamic.innerHTML = '';
-        if (row.kind === 'field') {
-          var field = document.createElement('select');
-          field.className = 'qb-field';
-           field.innerHTML = QB_FIELDS.map(function (f) { return '<option value="' + f + '">' + (QB_FIELD_LABELS[f] || f) + '</option>'; }).join('');
-          field.value = row.field || 'title';
-          field.addEventListener('change', function () { row.field = field.value; updateQbPreview(); });
-          dynamic.appendChild(field);
-          var cmp = document.createElement('select');
-          cmp.className = 'qb-cmp';
-          cmp.innerHTML = T('<option value=":">包含</option><option value="=">等于</option><option value=">=">≥</option><option value="<=">≤</option><option value=">">&gt;</option><option value="<">&lt;</option>');
-          cmp.value = row.cmp || ':';
-          cmp.addEventListener('change', function () { row.cmp = cmp.value; updateQbPreview(); });
-          dynamic.appendChild(cmp);
-          dynamic.appendChild(valueInput(T('匹配值')));
-        } else if (row.kind === 'flag') {
-          var flag = document.createElement('select');
-          flag.className = 'qb-field';
-          flag.innerHTML = QB_FLAGS.map(function (f) { return '<option value="' + f + '">' + f + '</option>'; }).join('');
-          flag.value = row.value || 'pdf';
-          row.value = flag.value;
-          flag.addEventListener('change', function () { row.value = flag.value; updateQbPreview(); });
-          dynamic.appendChild(flag);
-        } else if (row.kind === 'missing') {
-          var mf = document.createElement('select');
-          mf.className = 'qb-field';
-           mf.innerHTML = QB_FIELDS.map(function (f) { return '<option value="' + f + '">' + (QB_FIELD_LABELS[f] || f) + '</option>'; }).join('');
-          mf.value = row.field || 'doi';
-          row.field = mf.value;
-          mf.addEventListener('change', function () { row.field = mf.value; updateQbPreview(); });
-          dynamic.appendChild(mf);
-        } else if (row.kind === 'ann' || row.kind === 'note') {
-           dynamic.appendChild(valueInput(T('组内条件，如 "量子" color:#ffd400（须同一对象满足）')));
-        } else if (row.kind === 'attachment') {
-          dynamic.appendChild(valueInput(T('组内条件，如 kind:pdf 或 name:"supp"')));
-        } else if (row.kind === 'count') {
-          var countField = document.createElement('select');
-          countField.className = 'qb-field';
-          countField.innerHTML = T('<option value="annotations">批注</option><option value="notes">笔记</option><option value="attachments">附件</option>');
-          countField.value = row.field || 'annotations'; row.field = countField.value;
-          countField.addEventListener('change', function () { row.field = countField.value; updateQbPreview(); });
-          dynamic.appendChild(countField);
-          var countCmp = document.createElement('select');
-          countCmp.className = 'qb-cmp';
-          countCmp.innerHTML = '<option value=">=">≥</option><option value="=">=</option><option value=">">&gt;</option><option value="<=">≤</option><option value="<">&lt;</option>';
-          countCmp.value = row.cmp || '>=';
-          countCmp.addEventListener('change', function () { row.cmp = countCmp.value; updateQbPreview(); });
-          dynamic.appendChild(countCmp);
-          dynamic.appendChild(valueInput(T('数量')));
-        } else {
-          dynamic.appendChild(valueInput(T('关键词')));
-        }
-      }
-      kind.addEventListener('change', function () {
-        row.kind = kind.value;
-        row.value = ''; row.field = 'title'; row.cmp = ':';
-        rebuild(); updateQbPreview();
-      });
-      rebuild();
-      div.appendChild(dynamic);
-      var del = document.createElement('button');
-      del.type = 'button';
-      del.className = 'btn btn-ghost btn-xs';
-      del.textContent = '×';
-      del.title = T('删除条件');
-      del.addEventListener('click', function () { qbRows.splice(index, 1); renderQbRows(); });
-      div.appendChild(del);
-      box.appendChild(div);
-    });
-    updateQbPreview();
-  }
-  function updateQbPreview() {
-    var text = window.LitQuery ? window.LitQuery.rowsToText(qbRows) : '';
-    var preview = $('#qb-preview');
-    preview.textContent = text || T('（无条件）');
-    preview.classList.remove('error');
-    if (text && window.LitQuery) {
-      var parsed = window.LitQuery.parseAst(text);
-      if (parsed.error) { preview.textContent += T(' —— 语法错误：') + parsed.error; preview.classList.add('error'); }
-    }
-  }
-
-  /* ---- 批量字段编辑（阶段四余项：展示不同值 / 明确清空 / 预览影响条目） ---- */
-  var bulkEditPapers = [];
-  function bulkEditCurrentValue(paper, field) {
-    if (field === 'tags') return (paper.tags || []).join(', ');
-    if (field === 'authors') return (paper.authors || []).join(', ');
-    var v = paper[field];
-    return v == null ? '' : String(v);
-  }
-  function openBulkEdit(papers) {
-    bulkEditPapers = papers.filter(function (p) { return !p.deletedAt; });
-    if (!bulkEditPapers.length) { toast(T('请先选择文献')); return; }
-    $('#bulk-edit-summary').textContent = T('已选 ') + bulkEditPapers.length + T(' 篇文献。选择字段并输入新值；「明确清空」会把该字段置空。');
-    $('#bulk-edit-value').value = '';
-    $('#bulk-edit-clear').checked = false;
-    $('#bulk-edit-mask').hidden = false;
-    updateBulkEditView();
-  }
-  function updateBulkEditView() {
-    var field = $('#bulk-edit-field').value;
-    var counts = {}, order = [];
-    bulkEditPapers.forEach(function (p) {
-      var v = bulkEditCurrentValue(p, field) || T('（空）');
-      if (!counts[v]) { counts[v] = 0; order.push(v); }
-      counts[v]++;
-    });
-    $('#bulk-edit-distinct').innerHTML = T('<span class="field-hint">当前不同值：</span>') +
-      order.slice(0, 12).map(function (v) {
-        return '<span class="distinct-item">' + esc(v.length > 30 ? v.slice(0, 30) + '…' : v) + ' ×' + counts[v] + '</span>';
-      }).join('') + (order.length > 12 ? '<span class="field-hint">…</span>' : '');
-    updateBulkEditPreview();
-  }
-  function updateBulkEditPreview() {
-    var field = $('#bulk-edit-field').value;
-    var clear = $('#bulk-edit-clear').checked;
-    var value = $('#bulk-edit-value').value.trim();
-    if (!clear && !value) { $('#bulk-edit-preview').textContent = T('输入新值后可预览影响条目数。'); return; }
-    var affected = bulkEditPapers.filter(function (p) {
-      return bulkEditCurrentValue(p, field) !== (clear ? '' : value);
-    }).length;
-    $('#bulk-edit-preview').textContent = T('将影响 ') + affected + ' / ' + bulkEditPapers.length + T(' 篇') + (clear ? T('（清空 ') + field + '）' : '');
-  }
-  function confirmBulkEdit() {
-    var field = $('#bulk-edit-field').value;
-    var clear = $('#bulk-edit-clear').checked;
-    var value = $('#bulk-edit-value').value.trim();
-    if (!clear && !value) { toast(T('请输入新值或勾选「明确清空」')); return; }
-    var changed = 0;
-    var undoBefore = makeSnapshot({ papers: bulkEditPapers.map(function (p) { return p.id; }) });
-    bulkEditPapers.forEach(function (p) {
-      var next = clear ? '' : value;
-      if (bulkEditCurrentValue(p, field) === next) return;
-      if (field === 'status') {
-        if (['unread', 'reading', 'read'].indexOf(next) === -1 && !clear) return;
-        p.status = clear ? 'unread' : next;
-      } else if (field === 'rating') {
-        var r = clear ? 0 : Number(next);
-        if (!Number.isFinite(r) || r < 0 || r > 5) return;
-        p.rating = Math.trunc(r);
-      } else if (field === 'year') {
-        var y = clear ? null : Number(next);
-        p.year = y != null && Number.isFinite(y) && y >= 1000 && y <= 3000 ? Math.trunc(y) : null;
-        if (!clear && p.year == null) return;
-        p.date = p.year != null ? String(p.year) : '';
-      } else if (field === 'tags') {
-        p.tags = clear ? [] : window.LitModel.cleanTags(next.split(/[,，]/));
-      } else if (field === 'authors') {
-        var preservedCreators = (p.creators || []).filter(function (creator) { return creator.creatorType !== 'author'; });
-        var authorCreators = clear ? [] : next.split(/\r?\n/).map(function (line) {
-          return window.LitModel.parseCreatorName(line.trim());
-        }).filter(Boolean);
-        authorCreators.forEach(function (creator) { creator.creatorType = 'author'; });
-        p.creators = preservedCreators.concat(authorCreators);
-        var norm = window.LitModel.normalizePaper(p);
-        norm.id = p.id;
-        Object.keys(p).forEach(function (k) { delete p[k]; });
-        Object.assign(p, norm);
-      } else {
-        if (!clear && ['title', 'venue', 'doi', 'abstract', 'language'].indexOf(field) === -1) return;
-        p[field] = next;
-      }
-      window.LitModel.touch(p);
-      changed++;
-    });
-    commitUndo(T('批量编辑') + field, undoBefore, { papers: bulkEditPapers.map(function (p) { return p.id; }) });
-    save(); renderAll();
-    $('#bulk-edit-mask').hidden = true;
-    toast(T('✓ 批量编辑完成：') + changed + T(' 篇已更新'));
-  }
-
-  $('#btn-query-builder').addEventListener('click', openQueryBuilder);
-  $('#qb-add-row').addEventListener('click', function () {
-    qbRows.push({ join: 'AND', kind: 'field', field: 'title', cmp: ':', value: '' });
-    renderQbRows();
-  });
-  $('#qb-cancel').addEventListener('click', function () { $('#query-builder-mask').hidden = true; });
-  $('#qb-apply').addEventListener('click', function () {
-    var text = window.LitQuery ? window.LitQuery.rowsToText(qbRows) : '';
-    if (text) {
-      var parsed = window.LitQuery.parseAst(text);
-      if (parsed.error) { toast(T('语法错误：') + parsed.error); return; }
-    }
-    $('#search').value = text;
-    state.filters.q = text;
-    state.tablePage = 0;
-    $('#query-builder-mask').hidden = true;
-    renderAll();
-  });
-  $('#bulk-edit-cancel').addEventListener('click', function () { $('#bulk-edit-mask').hidden = true; });
-  $('#bulk-edit-confirm').addEventListener('click', confirmBulkEdit);
-  $('#bulk-edit-field').addEventListener('change', updateBulkEditView);
-  $('#bulk-edit-value').addEventListener('input', updateBulkEditPreview);
-  $('#bulk-edit-clear').addEventListener('change', updateBulkEditPreview);
-
   // 阶段四尾巴：撤销/重做入口（按钮 + Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z）
   $('#btn-undo').addEventListener('click', undoOnce);
   $('#btn-redo').addEventListener('click', redoOnce);
@@ -7381,92 +6164,6 @@
   updateUndoUi();
 
   /* ---- 阶段六切片：PDF 朗读（本机 speechSynthesis）+ 网页快照安全阅读 ---- */
-  var ttsState = { sentences: [], index: 0, rate: 1.2, speaking: false, paused: false, bar: null };
-  function ttsCollect() {
-    var sentences = [];
-    // 重排模式：文本来自 .reflow-doc 分页块
-    if (pdfState.reflowMode) {
-      $all('#pdf-scroll .reflow-doc .reflow-page').forEach(function (pageEl) {
-        var pageText = (pageEl.textContent || '').replace(/\s+/g, ' ').trim();
-        if (!pageText) return;
-        (pageText.match(/[^。！？.!?]+[。！？.!?]?/g) || []).forEach(function (s) {
-          s = s.trim();
-          if (s.length > 1) sentences.push({ page: Number(pageEl.dataset.page) || 1, text: s });
-        });
-      });
-      return sentences;
-    }
-    $all('#pdf-scroll .pdf-page-sheet').forEach(function (sheet) {
-      var divs = sheet._litTextDivs || [];
-      var pageText = divs.map(function (d) { return d.textContent || ''; }).join(' ').replace(/\s+/g, ' ').trim();
-      if (!pageText) return;
-      var parts = pageText.match(/[^。！？.!?]+[。！？.!?]?/g) || [];
-      parts.forEach(function (s) {
-        s = s.trim();
-        if (s.length > 1) sentences.push({ page: Number(sheet.dataset.page) || 1, text: s });
-      });
-    });
-    return sentences;
-  }
-  function ttsEnsureBar(parent) {
-    if (ttsState.bar) return ttsState.bar;
-    var bar = document.createElement('div');
-    bar.className = 'pdf-tts-bar';
-    bar.hidden = true;
-    bar.innerHTML = '<span id="tts-status"></span>' +
-      T('<select id="tts-rate" title="语速"><option value="0.8">0.8×</option><option value="1">1×</option><option value="1.2" selected>1.2×</option><option value="1.5">1.5×</option><option value="2">2×</option></select>') +
-      T('<button type="button" class="btn btn-ghost btn-xs" id="tts-pause">暂停</button>') +
-      T('<button type="button" class="btn btn-ghost btn-xs" id="tts-stop">停止</button>');
-    (parent || $('#pdf-overlay')).appendChild(bar);
-    bar.querySelector('#tts-rate').addEventListener('change', function (e) {
-      ttsState.rate = Number(e.target.value) || 1.2;
-    });
-    bar.querySelector('#tts-pause').addEventListener('click', function () {
-      if (!ttsState.speaking && !epubTtsState.speaking) return; // EPUB 朗读同样可暂停（F15）
-      if (!ttsState.paused) { window.speechSynthesis.pause(); ttsState.paused = true; this.textContent = T('继续'); }
-      else { window.speechSynthesis.resume(); ttsState.paused = false; this.textContent = T('暂停'); }
-    });
-    bar.querySelector('#tts-stop').addEventListener('click', function () { ttsStop(); epubTtsStop(); });
-    ttsState.bar = bar;
-    return bar;
-  }
-  function ttsSpeakNext() {
-    if (!ttsState.speaking) return;
-    if (ttsState.index >= ttsState.sentences.length) { ttsStop(); $('#tts-status').textContent = T('朗读完成'); return; }
-    var s = ttsState.sentences[ttsState.index];
-    var u = new window.SpeechSynthesisUtterance(s.text);
-    u.lang = /[㐀-鿿]/.test(s.text) ? 'zh-CN' : 'en-US';
-    u.rate = ttsState.rate;
-    u.onend = function () { ttsState.index++; ttsSpeakNext(); };
-    u.onerror = function () { ttsState.index++; ttsSpeakNext(); };
-    $('#tts-status').textContent = T('第 ') + (ttsState.index + 1) + '/' + ttsState.sentences.length + T(' 句 · 第 ') + s.page + T(' 页');
-    if (pdfState.reflowMode) {
-      var block = $('#pdf-scroll .reflow-doc .reflow-page[data-page="' + s.page + '"]');
-      if (block) block.scrollIntoView({ block: 'start' });
-    } else {
-      goToPdfPage(s.page);
-    }
-    window.speechSynthesis.speak(u);
-  }
-  function ttsStop() {
-    ttsState.speaking = false;
-    window.speechSynthesis.cancel();
-    if (ttsState.bar) ttsState.bar.hidden = true;
-  }
-  function ttsToggle() {
-    if (ttsState.speaking) { ttsStop(); return; }
-    var sentences = ttsCollect();
-    if (!sentences.length) { toast(T('没有可朗读的文本（请先渲染页面或做 OCR）')); return; }
-    ttsState.sentences = sentences;
-    ttsState.index = 0;
-    ttsState.speaking = true;
-    ttsState.paused = false;
-    var pdfBar = ttsEnsureBar();
-    pdfBar.hidden = false;
-    var pdfPause = pdfBar.querySelector('#tts-pause');
-    if (pdfPause) pdfPause.textContent = T('暂停');
-    ttsSpeakNext();
-  }
   /* 网页快照安全阅读：禁脚本（sandbox 空值）、禁远端资源（CSP default-src none） */
   function openSnapshotViewer(filePath, title) {
     var readBytes = desktop && (desktop.readFileBytes || desktop.readBytes);
@@ -7481,7 +6178,6 @@
     }).catch(function (e) { toast(T('⚠ 快照读取失败：') + (e && e.message || e)); });
   }
 
-  $('#pdf-tts').addEventListener('click', ttsToggle);
   // EPUB 阅读器工具栏（阶段六）
   $('#epub-close').addEventListener('click', closeEpubViewer);
   $('#epub-external').addEventListener('click', function () {
@@ -7570,7 +6266,7 @@
       var note = currentEpubNote() || createNote(epubState.paper.id, '');
       var added = addAnnotationsToNote(note, [source], epubState.paper);
       if (added) {
-        epubNoteCurrentId = note.id;
+        if (epubNotePanel) epubNotePanel.setCurrentId(note.id);
         renderEpubNoteEditor();
         toast(T('✓ 已加入「') + (note.title || T('笔记')) + T('」（可在预览中点 ↩ 定位）'));
       }
@@ -7617,36 +6313,6 @@
     annotation.updatedAt = Date.now();
     saveEpubAnnotationComment();
   });
-  // EPUB 侧栏笔记编辑器
-  $('#epub-note-select').addEventListener('change', function (e) {
-    epubNoteCurrentId = e.target.value;
-    renderEpubNoteEditor();
-  });
-  $('#epub-note-new').addEventListener('click', function () {
-    if (!epubState.paper) return;
-    dlgPrompt(T('新建笔记'), T('标题；留空则创建跨文献主题笔记'), '').then(function (title) {
-      if (title == null) return;
-      var note = createNote(title.trim() ? epubState.paper.id : '', title.trim());
-      epubNoteCurrentId = note.id;
-      save(); renderEpubNoteEditor();
-      toast(T('✓ 已创建笔记'));
-    });
-  });
-  $('#epub-note-edit-tab').addEventListener('click', function () { setEpubNoteMode('edit'); });
-  $('#epub-note-preview-tab').addEventListener('click', function () { setEpubNoteMode('preview'); });
-  $('#epub-note-richtext').addEventListener('click', function () { openNoteEditor(currentEpubNote()); });
-  $('#epub-note-export-word').addEventListener('click', function () { exportNoteToWord(currentEpubNote()); });
-  $('#epub-note-textarea').addEventListener('input', function (e) {
-    var note = currentEpubNote();
-    if (!note) return;
-    note.content = e.target.value;
-    window.LitModel.touch(note);
-    saveEpubNoteSide();
-  });
-  $('#epub-note-stale').addEventListener('click', function (e) {
-    var btn = e.target.closest('[data-stale-action]');
-    if (btn) epubHandleStaleAction(btn.dataset.staleAction, btn.dataset.annotationId);
-  });
   $('#epub-annotations-to-note').addEventListener('click', function () {
     if (epubState.paper) openExcerptDialog(epubState.paper);
   });
@@ -7656,7 +6322,7 @@
     if (!annotations.length) { toast(T('本篇还没有批注')); return; }
     var note = createNote(epubState.paper.id, '《' + epubState.paper.title + T('》批注笔记'));
     var n = addAnnotationsToNote(note, annotations.slice(), epubState.paper);
-    epubNoteCurrentId = note.id;
+    if (epubNotePanel) epubNotePanel.setCurrentId(note.id);
     renderEpubNoteEditor();
     toast(T('✓ 已生成批注笔记（') + n + T(' 条摘录）'));
   });
@@ -7693,8 +6359,22 @@
     toast(T('已添加') + ({ highlight: T('高亮'), underline: T('下划线'), note: T('批注') }[type] || T('批注')));
   }
 
+  var pdfTranslationAnchor = null;
+  function positionPdfTranslation() {
+    var popover = $('#pdf-translation-popover');
+    if (popover.hidden || !pdfTranslationAnchor) return;
+    var view = readingViewport();
+    var rect = pdfTranslationAnchor;
+    popover.style.maxHeight = Math.max(0, Math.min(330, view.bottom - view.top - 24)) + 'px';
+    var top = rect.bottom + 10;
+    if (top + popover.offsetHeight > view.bottom - 12) top = Math.max(view.top + 12, rect.top - popover.offsetHeight - 10);
+    var left = Math.max(view.left + 12, Math.min(view.right - popover.offsetWidth - 12, rect.left));
+    popover.style.left = left + 'px';
+    popover.style.top = Math.max(view.top + 12, Math.min(view.bottom - popover.offsetHeight - 12, top)) + 'px';
+  }
   function hidePdfTranslation() {
     pdfState.translationRequest++;
+    pdfTranslationAnchor = null;
     $('#pdf-translation-popover').hidden = true;
     $('#pdf-translation-result').hidden = true;
     $('#pdf-note-composer').hidden = true;
@@ -7702,6 +6382,7 @@
     pdfState.selectedText = '';
     pdfState.selectionPositions = [];
     if (pdfState.handle && pdfState.handle.clearSelection) pdfState.handle.clearSelection();
+    refreshAgentChips(); // 选区清空，agent 上下文 chip 同步摘掉
   }
   // 自动翻译偏好：阅读器弹层与设置页两处勾选共享同一状态，落 DB settings 表
   var translatorAutoTranslate = false;
@@ -7731,6 +6412,7 @@
     if (!positions.length) return hidePdfTranslation();
     pdfState.selectedText = text.slice(0, 12000);
     pdfState.selectionPositions = positions;
+    refreshAgentChips(); // 新选区落定，agent 上下文 chip 即时反映「选中：第 N 页」
     $('#pdf-translation-source').textContent = pdfState.selectedText;
     $('#pdf-translation-provider').textContent = T('可批注或翻译');
     $('#pdf-translation-result').hidden = true;
@@ -7739,11 +6421,9 @@
     $('#pdf-translate-selection').textContent = T('翻译');
     var popover = $('#pdf-translation-popover');
     popover.hidden = false;
-    var rect = range.getBoundingClientRect();
-    var top = rect.bottom + 10;
-    if (top + popover.offsetHeight > window.innerHeight - 12) top = Math.max(12, rect.top - popover.offsetHeight - 10);
-    popover.style.left = Math.max(12, Math.min(window.innerWidth - popover.offsetWidth - 12, rect.left)) + 'px';
-    popover.style.top = top + 'px';
+    // 译文异步填入会改变高度；保留选区位置，让 ResizeObserver 在尺寸变化后重新定位。
+    pdfTranslationAnchor = range.getBoundingClientRect();
+    positionPdfTranslation();
     if (translatorAutoTranslate) translatePdfSelection();
   }
   function translatePdfSelection() {
@@ -7789,26 +6469,18 @@
     }
   }
   function zoomPdf(delta) {
-    if (pdfState.reflowMode) {
-      pdfState.reflowFont = Math.max(10, Math.min(22, pdfState.reflowFont + (delta > 0 ? 1 : -1)));
-      applyReflowFont();
-      return;
-    }
     pdfState.scale = Math.max(0.6, Math.min(3, Math.round((pdfState.scale + delta) * 100) / 100));
     applyPdfViewChange();
   }
   function togglePdfLayout() {
-    if (pdfState.reflowMode) { toast(T('重排模式下不可切换版式')); return; }
     pdfState.layout = pdfState.layout === 'single' ? 'spread' : 'single';
     applyPdfViewChange();
   }
   function rotatePdf() {
-    if (pdfState.reflowMode) { toast(T('重排模式下不可旋转')); return; }
     pdfState.rotation = (pdfState.rotation + 90) % 360;
     applyPdfViewChange();
   }
   function fitPdfWidth() {
-    if (pdfState.reflowMode) { toast(T('重排模式下无需适宽')); return; }
     if (!pdfState.handle || !pdfState.handle.doc) return;
     var scroll = $('#pdf-scroll');
     var pageNumber = pdfState.currentPage || 1;
@@ -7822,139 +6494,12 @@
   }
   function goToPdfPage(page) {
     if (!pdfState.handle || !pdfState.pageCount) return;
-    if (pdfState.reflowMode) {
-      var block = $('#pdf-scroll .reflow-doc .reflow-page[data-page="' + page + '"]');
-      if (block) { block.scrollIntoView({ block: 'start' }); return; }
-    }
     page = Math.max(1, Math.min(pdfState.pageCount, Number(page) || 1));
     pdfState.handle.goToPage(page);
     updatePdfPageUi(page, pdfState.pageCount);
     saveReadPos();
   }
 
-  /* ---- PDF 重排阅读模式（阶段六）：栏检测重建纯文本流；位图不动（CSS 隐藏 sheet），切回即原位 ---- */
-  function resetPdfReflow() {
-    pdfState.reflowMode = false;
-    pdfState.reflowBusy = false;
-    pdfState.reflowMarks = [];
-    pdfState.reflowPages = {};
-    pdfState.reflowEpoch++; // 使在飞提取回调失效（F13：旧页内容不得落地）
-    var scroll = $('#pdf-scroll');
-    if (scroll) scroll.classList.remove('reflow-on');
-    var doc = scroll && scroll.querySelector('.reflow-doc');
-    if (doc) doc.remove();
-    var btn = $('#pdf-reflow-toggle');
-    if (btn) btn.setAttribute('aria-pressed', 'false');
-  }
-  function togglePdfReflow() {
-    if (!pdfState.handle || !pdfState.pageCount) { toast(T('PDF 尚未渲染完成')); return; }
-    if (pdfState.reflowMode) {
-      pdfState.reflowMode = false;
-      resetPdfReflow();
-      $('#pdf-zoom').textContent = Math.round(pdfState.scale * 100) + '%';
-      return;
-    }
-    pdfState.reflowMode = true;
-    pdfState.reflowEpoch++;
-    pdfState.reflowPages = {};
-    pdfState.reflowNextPage = 1;
-    pdfState.reflowBusy = false;
-    $('#pdf-scroll').classList.add('reflow-on');
-    $('#pdf-reflow-toggle').setAttribute('aria-pressed', 'true');
-    applyReflowFont();
-    toast(T('重排模式：纯文本流（批注 / 搜索 / 手写暂不可用），缩放键调字号'));
-    ensureReflowPages();
-  }
-  function applyReflowFont() {
-    var doc = $('#pdf-scroll .reflow-doc');
-    if (doc) doc.style.setProperty('--reflow-font', pdfState.reflowFont + 'px');
-    $('#pdf-zoom').textContent = pdfState.reflowFont + 'pt';
-  }
-  function reflowDocEl() {
-    var scroll = $('#pdf-scroll');
-    var doc = scroll.querySelector('.reflow-doc');
-    if (!doc) {
-      doc = document.createElement('div');
-      doc.className = 'reflow-doc';
-      scroll.appendChild(doc);
-      applyReflowFont();
-    }
-    return doc;
-  }
-  function renderReflowPage(pageNum, blocks) {
-    var doc = reflowDocEl();
-    var loading = doc.querySelector('.reflow-loading');
-    var pageEl = document.createElement('div');
-    pageEl.className = 'reflow-page';
-    pageEl.dataset.page = pageNum;
-    var h = document.createElement('h4');
-    h.textContent = T('第 ') + pageNum + T(' 页');
-    pageEl.appendChild(h);
-    if (!blocks.length) {
-      var emptyP = document.createElement('p');
-      emptyP.className = 'reflow-loading';
-      emptyP.textContent = T('（本页无文本）');
-      pageEl.appendChild(emptyP);
-    }
-    blocks.forEach(function (b) {
-      var p = document.createElement('p');
-      p.textContent = b.text;
-      pageEl.appendChild(p);
-    });
-    doc.insertBefore(pageEl, loading || null);
-  }
-  /* 懒提取：每批 5 页串行（getTextContent 已是异步），视口不满自动续提；epoch 防在飞旧回调落地（F13） */
-  function ensureReflowPages() {
-    if (!pdfState.reflowMode || pdfState.reflowBusy) return;
-    if (pdfState.reflowNextPage > pdfState.pageCount) return;
-    var epoch = pdfState.reflowEpoch;
-    var handle = pdfState.handle;
-    function live() {
-      return pdfState.reflowMode && pdfState.reflowEpoch === epoch && pdfState.handle === handle;
-    }
-    pdfState.reflowBusy = true;
-    var doc = reflowDocEl();
-    var loading = document.createElement('div');
-    loading.className = 'reflow-loading';
-    doc.appendChild(loading);
-    var n = pdfState.reflowNextPage;
-    var batchEnd = Math.min(pdfState.pageCount, n + 4);
-    function step() {
-      if (!live()) { loading.remove(); pdfState.reflowBusy = false; return; }
-      if (n > batchEnd) {
-        loading.remove();
-        pdfState.reflowBusy = false;
-        pdfState.reflowNextPage = n;
-        // 搜索激活时：重扫高亮并继续全量提取（搜索需要全文）
-        if (reflowSearchActive()) {
-          performReflowSearch(true);
-          ensureReflowPages();
-          return;
-        }
-        var scroll = $('#pdf-scroll');
-        if (scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 600) ensureReflowPages();
-        return;
-      }
-      var pageNum = n;
-      n++;
-      loading.textContent = T('正在提取第 ') + pageNum + T(' 页…');
-      handle.doc.getPage(pageNum).then(function (page) {
-        return page.getTextContent();
-      }).then(function (content) {
-        if (!live()) return;
-        var blocks = window.LitReflow.readingOrder(
-          window.LitReflow.linesFromItems(content.items, pageNum), null);
-        pdfState.reflowPages[pageNum] = blocks;
-        renderReflowPage(pageNum, blocks);
-        step();
-      }).catch(function () {
-        if (!live()) return;
-        pdfState.reflowPages[pageNum] = [];
-        step();
-      });
-    }
-    step();
-  }
   function markPdfSearchPage(page) {
     $all('#pdf-scroll .pdf-page-sheet.pdf-search-hit-page').forEach(function (sheet) { sheet.classList.remove('pdf-search-hit-page'); });
     var sheet = $('#pdf-scroll .pdf-page-sheet[data-page="' + page + '"]');
@@ -7972,6 +6517,15 @@
     var pageResult = pageSearchResult(pageIndex);
     window.LitPdf.renderSearchLayer(sheet, pageResult ? pageResult.matches : [], activeIndex == null ? -1 : activeIndex);
   }
+  /** 换查询后重画全部已渲染页：goToPdfSearchResult 只重画当前命中页，其它页上一轮
+   *  查询的高亮会残留（逐字输入时每个中间态各跳一次页，残留更多）；renderSearchLayer
+   *  对空结果也会先移除旧层，无命中的页借此一并清干净 */
+  function repaintAllPdfSearchHighlights() {
+    $all('#pdf-scroll .pdf-page-sheet').forEach(function (sheet) {
+      var page = Number(sheet.dataset.page);
+      if (page) applyPdfSearchHighlights(page - 1, -1);
+    });
+  }
   function clearPdfSearchHighlights() {
     $all('#pdf-scroll .pdf-search-layer').forEach(function (layer) { layer.remove(); });
   }
@@ -7983,7 +6537,6 @@
     applyPdfSearchHighlights(pageIndex, activeIndex);
   }
   function goToPdfSearchResult(delta) {
-    if (pdfState.reflowMode) { goToReflowSearchResult(delta); return; }
     if (!pdfState.searchMatches.length) return;
     pdfState.searchIndex = (pdfState.searchIndex + delta + pdfState.searchMatches.length) % pdfState.searchMatches.length;
     var match = pdfState.searchMatches[pdfState.searchIndex];
@@ -7995,87 +6548,23 @@
     });
     updatePdfPageUi(match.pageIndex + 1, pdfState.pageCount);
   }
-  /* ---- 重排模式搜索：DOM 文本高亮（懒提取页随批次递增重扫） ---- */
-  function clearReflowSearchMarks() {
-    $all('#pdf-scroll .reflow-hit').forEach(function (mark) {
-      var parent = mark.parentNode;
-      if (!parent) return;
-      parent.replaceChild(document.createTextNode(mark.textContent), mark);
-      parent.normalize();
-    });
-    pdfState.reflowMarks = [];
+  /** 检索选项开关（区分大小写 / 全字匹配）：aria-pressed 是唯一状态源，偏好存 localStorage */
+  function pdfSearchOptionOn(id) {
+    var button = $(id);
+    return !!(button && button.getAttribute('aria-pressed') === 'true');
   }
-  function reflowSearchActive() {
-    return !!(pdfState.reflowMode && $('#pdf-search').value.trim());
-  }
-  function goToReflowSearchResult(delta) {
-    var marks = pdfState.reflowMarks || [];
-    if (!marks.length) return;
-    pdfState.searchIndex = (pdfState.searchIndex + delta + marks.length) % marks.length;
-    marks.forEach(function (m, i) { m.classList.toggle('active', i === pdfState.searchIndex); });
-    marks[pdfState.searchIndex].scrollIntoView({ block: 'center' });
-    $('#pdf-search-status').textContent = (pdfState.searchIndex + 1) + '/' + marks.length + T(' 匹配');
-  }
-  function performReflowSearch(preserveIndex) {
-    var query = $('#pdf-search').value.trim();
-    var prevIndex = pdfState.searchIndex;
-    clearReflowSearchMarks();
-    pdfState.searchMatches = [];
-    pdfState.searchIndex = -1;
-    if (!query) { $('#pdf-search-status').textContent = ''; return; }
-    var doc = $('#pdf-scroll .reflow-doc');
-    if (!doc) { $('#pdf-search-status').textContent = T('无结果'); return; }
-    var lower = query.toLocaleLowerCase();
-    var walker = document.createTreeWalker(doc, window.NodeFilter.SHOW_TEXT);
-    var byNode = new Map();
-    var node;
-    while ((node = walker.nextNode())) {
-      if (!node.nodeValue || !node.nodeValue.trim()) continue;
-      var tl = node.nodeValue.toLocaleLowerCase();
-      var pos = 0;
-      var idx;
-      while ((idx = tl.indexOf(lower, pos)) !== -1) {
-        if (!byNode.has(node)) byNode.set(node, []);
-        byNode.get(node).push({ start: idx, end: idx + query.length });
-        pos = idx + query.length;
-      }
-    }
-    // 每节点从后往前替换（surroundContents 后原节点保留前段，后续小偏移仍有效）
-    byNode.forEach(function (hits, textNode) {
-      hits.sort(function (a, b) { return b.start - a.start; });
-      hits.forEach(function (hit) {
-        var range = document.createRange();
-        try {
-          range.setStart(textNode, hit.start);
-          range.setEnd(textNode, hit.end);
-          var mark = document.createElement('mark');
-          mark.className = 'reflow-hit';
-          range.surroundContents(mark);
-          pdfState.reflowMarks.unshift(mark);
-        } catch (e) { /* 跨元素边界等异常：跳过该处 */ }
-      });
+  function bindPdfSearchOption(id, key) {
+    var button = $(id);
+    if (!button) return;
+    button.setAttribute('aria-pressed', localStorage.getItem(key) === '1' ? 'true' : 'false');
+    button.addEventListener('click', function () {
+      var on = button.getAttribute('aria-pressed') !== 'true';
+      button.setAttribute('aria-pressed', on ? 'true' : 'false');
+      try { localStorage.setItem(key, on ? '1' : '0'); } catch (e) {}
+      performPdfSearch(false);
     });
-    pdfState.reflowMarks.sort(function (a, b) {
-      return a.compareDocumentPosition(b) & window.Node.DOCUMENT_POSITION_PRECEDING ? 1 : -1;
-    });
-    var totalPages = pdfState.pageCount || 0;
-    var extracted = Object.keys(pdfState.reflowPages || {}).length;
-    if (!pdfState.reflowMarks.length) {
-      $('#pdf-search-status').textContent = T('无结果') + (extracted < totalPages ? T('（提取中 ') + extracted + '/' + totalPages + T(' 页）') : '');
-      return;
-    }
-    if (preserveIndex && prevIndex >= 0) {
-      pdfState.searchIndex = Math.min(prevIndex, pdfState.reflowMarks.length - 1);
-      goToReflowSearchResult(0);
-    } else {
-      goToReflowSearchResult(1);
-    }
-    if (extracted < totalPages) {
-      $('#pdf-search-status').textContent += T(' · 已提取 ') + extracted + '/' + totalPages + T(' 页');
-    }
   }
   function performPdfSearch(preserveIndex) {
-    if (pdfState.reflowMode) { performReflowSearch(preserveIndex); return; }
     var query = $('#pdf-search').value.trim();
     if (!pdfState.handle || !query) {
       pdfState.searchResults = []; pdfState.searchMatches = []; pdfState.searchIndex = -1;
@@ -8086,7 +6575,10 @@
     }
     var handle = pdfState.handle;
     $('#pdf-search-status').textContent = T('搜索中');
-    handle.search(query).then(function (results) {
+    handle.search(query, {
+      caseSensitive: pdfSearchOptionOn('#pdf-search-case'),
+      wholeWord: pdfSearchOptionOn('#pdf-search-word')
+    }).then(function (results) {
       if (handle !== pdfState.handle) return;
       var matches = [];
       results.forEach(function (pageResult) {
@@ -8103,6 +6595,7 @@
         clearPdfSearchHighlights();
         return;
       }
+      repaintAllPdfSearchHighlights();
       goToPdfSearchResult(1);
     }).catch(function () { $('#pdf-search-status').textContent = T('搜索失败'); });
   }
@@ -8158,10 +6651,10 @@
     list.innerHTML = '';
     $('#dedupe-merge-all').hidden = groups.length === 0;
     $('#dedupe-summary').textContent = groups.length
-      ? T('发现 ') + groups.length + T(' 组重复（按 PDF 内容、DOI 或标题匹配）。合并保留信息最完整的一条，其余条目的空缺字段、标签、笔记并入后删除。')
+      ? T('发现 ') + groups.length + T(' 组重复（按 PDF 内容或 DOI 精确匹配）。合并保留信息最完整的一条，其余条目的空缺字段、标签、笔记并入后删除。')
       : '';
     if (!groups.length) {
-      list.innerHTML = T('<div class="dedupe-empty">未发现重复文献（按 PDF 内容 / DOI / 标题匹配）</div>');
+      list.innerHTML = T('<div class="dedupe-empty">未发现重复文献（按 PDF 内容 / DOI 精确匹配）</div>');
       return;
     }
     groups.forEach(function (group, gi) {
@@ -8238,7 +6731,7 @@
   // ---------- 坚果云 / Zotero 同步 ----------
   var syncBusy = false;
   var libraryLoadFailed = false; // 本地库最近一次读取失败时置位：阻止联网同步，防止把空库传上云端
-  var autoSyncEnabled = true; // 「内容变化时自动同步」开关；关闭后仅手动「保存并同步」/对照应用触发
+  var autoSyncEnabled = true; // 「内容变化时自动同步」开关；关闭后仅手动「立即同步」/对照应用触发
   var integrationConfig = null;
   var dataPathInfo = null;
   var nutstoreSyncTimer = null;
@@ -8332,7 +6825,14 @@
     }, 1200);
   }
 
+  /* 设置表单是否已按配置装载过（fillSyncForm 收尾置位）。未装载时表单里只有 HTML 默认值
+     ——下拉首项、空输入框、默认勾选态；把这些提交上去等于用默认值覆盖已存配置
+     （打开设置页时读配置失败就停在这种状态，见 openSyncSettings 的错误分支）。
+     未装载时提交空对象：saveConfig 逐字段「缺省沿用现值」，即整份配置原样不动。 */
+  var syncFormLoaded = false;
+
   function syncFormValue() {
+    if (!syncFormLoaded) return {};
     return {
       nutstoreUrl: $('#sync-nutstore-url').value.trim(),
       nutstoreUser: $('#sync-nutstore-user').value.trim(),
@@ -8343,31 +6843,153 @@
       translatorProvider: $('#sync-translator-provider').value,
       translatorModel: $('#sync-translator-model').value.trim(),
       translatorTarget: $('#sync-translator-target').value,
-      translatorApiKey: $('#sync-translator-api-key').value,
+      translatorApiKey: secretInputValue('sync-translator-api-key'),
       rankProvider: $('#sync-rank-provider').value,
-      scigreatApiKey: $('#sync-scigreat-api-key').value,
-      easyscholarApiKey: $('#sync-easyscholar-api-key').value,
-      renameTemplate: $('#sync-rename-template').value.trim(),
-      pdfDownloadDir: $('#sync-pdf-download-dir').value.trim(),
-      proxyPrefix: $('#sync-proxy-prefix').value.trim(),
-      bibExportPath: $('#sync-bib-export-path').value.trim(),
-      agentBaseUrl: $('#sync-agent-base-url') ? $('#sync-agent-base-url').value.trim() : '',
-      agentModel: $('#sync-agent-model') ? $('#sync-agent-model').value.trim() : '',
-      agentApiDialect: $('#sync-agent-dialect') ? $('#sync-agent-dialect').value : '',
-      agentApiKey: $('#sync-agent-api-key') ? $('#sync-agent-api-key').value : '',
-      // 留空 = 用默认值（256000 / 12800，权威在 js/agentcore DEFAULTS）：空串交给主进程归一为 0
-      agentContextTokens: $('#sync-agent-context-tokens') ? $('#sync-agent-context-tokens').value.trim() : '',
-      agentMaxOutputTokens: $('#sync-agent-max-output-tokens') ? $('#sync-agent-max-output-tokens').value.trim() : '',
+      scigreatApiKey: secretInputValue('sync-scigreat-api-key'),
+      easyscholarApiKey: secretInputValue('sync-easyscholar-api-key'),
+      /* AI 助手「服务商 + 模型」：清单由本页草稿承载（含刚敲、尚未保存的明文 Key），
+       * 主进程按 id 合并。草稿还没装载（设置从未打开）时两项都不提交——提交空清单会把
+       * 服务商全删掉，提交空 activeProviderId 会把当前选中项打回内置服务商。 */
+      agentProviders: agentProvidersForForm(),
+      agentActiveProviderId: agentProvidersDraft ? agentProvidersActiveId : undefined,
+      // 默认值也会展示给用户；若用户未改默认显示值，仍提交空串保持「未显式设置」的存储语义。
+      agentContextTokens: agentBudgetFormValue('sync-agent-context-tokens'),
+      agentMaxOutputTokens: agentBudgetFormValue('sync-agent-max-output-tokens'),
       openalexEmail: $('#sync-openalex-email') ? $('#sync-openalex-email').value.trim() : '',
-      openalexApiKey: $('#sync-openalex-key') ? $('#sync-openalex-key').value : '',
+      openalexApiKey: secretInputValue('sync-openalex-key'),
       embedProvider: $('#sync-embed-provider') ? $('#sync-embed-provider').value : '',
       embedBaseUrl: $('#sync-embed-base-url') ? $('#sync-embed-base-url').value.trim() : '',
       embedModel: $('#sync-embed-model') ? $('#sync-embed-model').value.trim() : '',
-      embedApiKey: $('#sync-embed-api-key') ? $('#sync-embed-api-key').value : '',
-      elsevierApiKey: $('#sync-elsevier-key') ? $('#sync-elsevier-key').value : '',
-      tinyfishApiKey: $('#sync-tinyfish-key') ? $('#sync-tinyfish-key').value : '',
-      semanticscholarApiKey: $('#sync-semanticscholar-key') ? $('#sync-semanticscholar-key').value : ''
+      embedApiKey: secretInputValue('sync-embed-api-key'),
+      elsevierApiKey: secretInputValue('sync-elsevier-key'),
+      tinyfishApiKey: secretInputValue('sync-tinyfish-key')
     };
+  }
+
+  function agentBudgetDefaults() {
+    var defaults = window.LitAgentCore && LitAgentCore.DEFAULTS;
+    return {
+      contextTokens: Number(defaults && defaults.contextTokens) || 256000,
+      maxOutputTokens: Number(defaults && defaults.maxOutputTokens) || 12800
+    };
+  }
+
+  function fillAgentBudgetInput(id, configuredValue, fallback) {
+    var input = $('#' + id);
+    if (!input) return;
+    var explicit = Number(configuredValue) > 0;
+    input.value = String(explicit ? configuredValue : fallback);
+    input.dataset.defaultValue = String(fallback);
+    input.dataset.usingDefault = explicit ? '0' : '1';
+  }
+
+  function agentBudgetFormValue(id) {
+    var input = $('#' + id);
+    if (!input) return '';
+    var value = input.value.trim();
+    return input.dataset.usingDefault === '1' && value === input.dataset.defaultValue ? '' : value;
+  }
+
+  function secretInputValue(id) {
+    var input = $('#' + id);
+    return input && input.dataset.secretState !== 'masked' ? input.value : '';
+  }
+
+  function secretInputShell(input) {
+    if (!input) return null;
+    if (input.parentNode && input.parentNode.classList.contains('secret-key-shell')) return input.parentNode;
+    var shell = document.createElement('div');
+    shell.className = 'secret-key-shell';
+    input.parentNode.insertBefore(shell, input);
+    shell.appendChild(input);
+    return shell;
+  }
+
+  function secretRefOf(input) {
+    return { kind: input.dataset.secretKind || '', providerId: input.dataset.secretProviderId || '' };
+  }
+
+  function replaceSecretInput(input) {
+    input.dataset.secretState = 'editing';
+    input.value = '';
+    input.type = 'password';
+    input.readOnly = false;
+    input.classList.remove('key-retained');
+    input.placeholder = input.dataset.emptyPlaceholder || T('粘贴 API Key');
+    input.title = '';
+    var actions = secretInputShell(input).querySelector('.secret-key-actions');
+    if (actions) actions.hidden = true;
+    input.focus();
+  }
+
+  function bindSecretActions(input) {
+    if (!input || input.dataset.secretBound === '1') return;
+    input.dataset.secretBound = '1';
+    var shell = secretInputShell(input);
+    var actions = document.createElement('span');
+    actions.className = 'secret-key-actions';
+    var copy = document.createElement('button');
+    copy.type = 'button'; copy.className = 'btn btn-ghost btn-xs'; copy.textContent = T('复制');
+    copy.addEventListener('click', function () {
+      var ref = secretRefOf(input);
+      var job = input.dataset.secretState === 'revealed' ? copyToClipboard(input.value)
+        : (desktop && desktop.copyIntegrationSecret ? desktop.copyIntegrationSecret(ref) : Promise.reject(new Error('not available')));
+      Promise.resolve(job).then(function () { toast(T('✓ 已复制')); }).catch(function (error) { toast(String(error && error.message || error)); });
+    });
+    var view = document.createElement('button');
+    view.type = 'button'; view.className = 'btn btn-ghost btn-xs'; view.textContent = T('查看');
+    view.addEventListener('click', function () {
+      if (input.dataset.secretState === 'revealed') { renderMaskedSecret(input); return; }
+      if (!desktop || !desktop.revealIntegrationSecret) return;
+      desktop.revealIntegrationSecret(secretRefOf(input)).then(function (secret) {
+        if (!secret) throw new Error(T('未找到已保存的 API Key'));
+        input.value = secret; input.type = 'text'; input.readOnly = true;
+        input.dataset.secretState = 'revealed'; input.classList.add('key-retained');
+        input.title = T('已显示完整 Key；再次点“查看”恢复脱敏显示');
+      }).catch(function (error) { toast(String(error && error.message || error)); });
+    });
+    var edit = document.createElement('button');
+    edit.type = 'button'; edit.className = 'btn btn-ghost btn-xs'; edit.textContent = T('编辑');
+    edit.addEventListener('click', function () { replaceSecretInput(input); });
+    actions.appendChild(copy); actions.appendChild(view); actions.appendChild(edit);
+    shell.appendChild(actions);
+  }
+
+  function renderMaskedSecret(input) {
+    input.value = input.dataset.secretHint || '****';
+    input.type = 'text'; input.readOnly = true;
+    input.dataset.secretState = 'masked'; input.classList.add('key-retained');
+    input.placeholder = ''; input.title = T('已保存 Key（留空则保持不变）');
+    var actions = secretInputShell(input).querySelector('.secret-key-actions');
+    if (actions) actions.hidden = false;
+  }
+
+  function markRetainedKey(id, saved, hint, ref) {
+    var input = $('#' + id);
+    if (!input) return;
+    if (!input.dataset.emptyPlaceholder) input.dataset.emptyPlaceholder = input.placeholder;
+    if (!saved) {
+      input.dataset.secretState = '';
+      input.type = 'password'; input.readOnly = false;
+      input.placeholder = input.dataset.emptyPlaceholder; input.title = '';
+      input.classList.remove('key-retained');
+      var hiddenActions = secretInputShell(input).querySelector('.secret-key-actions');
+      if (hiddenActions) hiddenActions.hidden = true;
+      return;
+    }
+    input.dataset.secretKind = ref && ref.kind || '';
+    input.dataset.secretProviderId = ref && ref.providerId || '';
+    input.dataset.secretHint = hint || '****';
+    bindSecretActions(input);
+    renderMaskedSecret(input);
+  }
+
+  /** 期刊分区只展示当前服务商需要的那把凭据；两把已存 Key 都保留，切换不会清空。 */
+  function updateRankProviderFields() {
+    var provider = $('#sync-rank-provider').value;
+    $all('[data-rank-provider-key]').forEach(function (field) {
+      field.hidden = field.dataset.rankProviderKey !== provider;
+    });
   }
 
   function fillSyncForm(config) {
@@ -8386,35 +7008,27 @@
     $('#sync-rank-provider').value = config.rankProvider || 'scigreat';
     $('#sync-scigreat-api-key').value = '';
     $('#sync-easyscholar-api-key').value = '';
-    $('#sync-rename-template').value = config.renameTemplate || '';
-    $('#sync-pdf-download-dir').value = config.pdfDownloadDir || '';
-    $('#sync-proxy-prefix').value = config.proxyPrefix || '';
-    $('#sync-bib-export-path').value = config.bibExportPath || '';
-    if (config.trashRetentionDays != null) $('#sync-trash-days').value = Number(config.trashRetentionDays);
-    if (config.autoWriteBack != null) $('#sync-auto-writeback').checked = config.autoWriteBack === true;
-    if ($('#sync-agent-base-url')) {
-      $('#sync-agent-base-url').value = config.agentBaseUrl || '';
-      $('#sync-agent-model').value = config.agentModel || '';
-      if ($('#sync-agent-dialect')) $('#sync-agent-dialect').value = config.agentApiDialect || '';
-      // 0 = 留空（用默认值）：输入框显示空，而不是把默认值写成一个会被保存的数字
-      if ($('#sync-agent-context-tokens')) {
-        $('#sync-agent-context-tokens').value = config.agentContextTokens ? String(config.agentContextTokens) : '';
-      }
-      if ($('#sync-agent-max-output-tokens')) {
-        $('#sync-agent-max-output-tokens').value = config.agentMaxOutputTokens ? String(config.agentMaxOutputTokens) : '';
-      }
-      $('#sync-agent-api-key').value = '';
-      $('#sync-agent-preset').value = '';
-      refreshAgentDialectHint();
+    markRetainedKey('sync-scigreat-api-key', !!config.hasScigreatApiKey, config.scigreatApiKeyHint, { kind: 'scigreat' });
+    markRetainedKey('sync-easyscholar-api-key', !!config.hasEasyscholarApiKey, config.easyscholarApiKeyHint, { kind: 'easyscholar' });
+    updateRankProviderFields();
+    if ($('#agent-provider-items')) {
+      // AI 助手服务商清单：草稿从配置装载（含 hasApiKey 占位），明文 Key 只在用户重填时进草稿
+      loadAgentProviders(config);
+      var budgets = agentBudgetDefaults();
+      fillAgentBudgetInput('sync-agent-context-tokens', config.agentContextTokens, budgets.contextTokens);
+      fillAgentBudgetInput('sync-agent-max-output-tokens', config.agentMaxOutputTokens, budgets.maxOutputTokens);
       $('#sync-openalex-email').value = config.openalexEmail || '';
       $('#sync-openalex-key').value = '';
+      markRetainedKey('sync-openalex-key', !!config.hasOpenalexApiKey, config.openalexApiKeyHint, { kind: 'openalex' });
       if ($('#sync-embed-provider')) $('#sync-embed-provider').value = config.embedProvider || '';
       if ($('#sync-embed-base-url')) $('#sync-embed-base-url').value = config.embedBaseUrl || '';
       $('#sync-embed-model').value = config.embedModel || '';
       if ($('#sync-embed-api-key')) $('#sync-embed-api-key').value = '';
+      markRetainedKey('sync-embed-api-key', !!config.hasEmbedApiKey, config.embedApiKeyHint, { kind: 'embed' });
       $('#sync-elsevier-key').value = '';
+      markRetainedKey('sync-elsevier-key', !!config.hasElsevierApiKey, config.elsevierApiKeyHint, { kind: 'elsevier' });
       $('#sync-tinyfish-key').value = '';
-      $('#sync-semanticscholar-key').value = '';
+      markRetainedKey('sync-tinyfish-key', !!config.hasTinyfishApiKey, config.tinyfishApiKeyHint, { kind: 'tinyfish' });
     }
     if (desktop.getSetting && $('#sync-web-search-enabled')) {
       desktop.getSetting('webSearchEnabled').then(function (value) {
@@ -8423,6 +7037,8 @@
     }
     refreshEmbedUsageLine();
     refreshEmbedSourceHint();
+    // 表单已按真实配置装载：从这里起才允许把表单值提交回配置
+    syncFormLoaded = true;
   }
 
   /** 向量嵌入用量行（设置页常驻展示） */
@@ -8439,7 +7055,7 @@
   function refreshEmbedSourceHint() {
     var target = $('#sync-embed-source');
     if (!target || !window.LitEmbedCfg) return;
-    var pendingKey = $('#sync-embed-api-key') ? $('#sync-embed-api-key').value : '';
+    var pendingKey = secretInputValue('sync-embed-api-key');
     var known = integrationConfig || {};
     var target_ = LitEmbedCfg.resolveTarget({
       embedProvider: $('#sync-embed-provider') ? $('#sync-embed-provider').value : '',
@@ -8469,16 +7085,17 @@
   /** 接口格式提示：如实显示「当前 Base URL + 模型名会按哪种协议、发到哪个地址」。
    * 配 opencode / anthropic 兼容端点时最容易踩的坑就是「URL 看着对、协议不对」。 */
   function refreshAgentDialectHint() {
-    var target = $('#sync-agent-dialect-hint');
+    var target = $('#agent-p-dialect-hint');
     if (!target) return;
-    var base = $('#sync-agent-base-url') ? $('#sync-agent-base-url').value.trim() : '';
+    var base = $('#agent-p-base-url') ? $('#agent-p-base-url').value.trim() : '';
     if (!base || !window.LitAgentProto) {
       target.textContent = T('填好 Base URL 后会显示实际使用的接口协议与请求地址');
       return;
     }
+    var provider = agentProviderDraft(agentProviderSelected);
     var dialect = LitAgentProto.detectDialect(base, {
-      dialect: $('#sync-agent-dialect') ? $('#sync-agent-dialect').value : '',
-      model: $('#sync-agent-model') ? $('#sync-agent-model').value.trim() : ''
+      dialect: $('#agent-p-dialect') ? $('#agent-p-dialect').value : '',
+      model: (provider && provider.activeModel) || ''
     });
     // 协议名是专有名词（与品牌名同例：界面语言 ≠ 协议名），不进词典
     var labels = {
@@ -8492,88 +7109,409 @@
     });
   }
 
-  function bindAgentSettings() {
-    var preset = $('#sync-agent-preset');
+  /* ===== AI 助手「模型与服务商」（设置 → 集成与服务 → AI 助手） =====
+   * 配置语义全在 js/agentcfg.js（浏览器/Node 共用纯函数）；这里只维护**草稿**：
+   * 服务商清单 + 当前选中项 + 详情区正在编辑的那一个。任何改动都走既有的自动保存
+   * 通道（syncFormValue → integrations:save-config），主进程按 id 合并 Key
+   * （非空 = 更新，留空/缺省 = 保持原值），所以清单里的 Key 只在用户重填时进草稿。 */
+  var agentProvidersDraft = null;     // 未打开过设置时为 null：此时不提交清单，免得清空配置
+  var agentProvidersActiveId = '';    // 当前生效的服务商（对话面板底部显示的就是它）
+  var agentProviderSelected = '';     // 详情区正在编辑的服务商
+  var AGENT_PRESET_HINTS = {          // 选预设时顺手填进「添加模型」输入框的建议值（不落配置）
+    'https://opencode.ai/zen/go/v1': 'deepseek-flash',
+    'https://opencode.ai/zen/v1': 'deepseek-flash',
+    'https://api.openai.com/v1': 'gpt-5',
+    'https://api.anthropic.com': 'claude-sonnet-4-5',
+    'https://api.deepseek.com': 'deepseek-flash',
+    'https://api.deepseek.com/anthropic': 'deepseek-flash',
+    'https://api.moonshot.cn/v1': 'kimi-k2.7-code',
+    'https://open.bigmodel.cn/api/paas/v4': 'glm-5.2',
+    'https://open.bigmodel.cn/api/anthropic': 'glm-5.2',
+    'https://api.z.ai/api/anthropic': 'glm-5.2',
+    'https://dashscope.aliyuncs.com/compatible-mode/v1': 'qwen-plus',
+    'http://localhost:11434/v1': 'qwen3'
+  };
+
+  function agentCfgMod() { return window.LitAgentCfg || null; }
+
+  /** Base URL 预设（每次渲染时构造：标签随界面语言即时变化）。
+   *  纯品牌名不包 T()——界面语言 ≠ 品牌名。 */
+  function agentPresetOptions() {
+    return [
+      { value: 'https://opencode.ai/zen/go/v1', label: T('OpenCode Go（订阅套餐）') },
+      { value: 'https://opencode.ai/zen/v1', label: 'OpenCode Zen' },
+      { value: 'https://api.openai.com/v1', label: 'OpenAI' },
+      { value: 'https://api.anthropic.com', label: 'Anthropic (Claude)' },
+      { value: 'https://api.deepseek.com', label: 'DeepSeek' },
+      { value: 'https://api.deepseek.com/anthropic', label: T('DeepSeek（Anthropic 兼容）') },
+      { value: 'https://api.moonshot.cn/v1', label: T('Kimi（Moonshot）') },
+      { value: 'https://open.bigmodel.cn/api/paas/v4', label: T('智谱 GLM') },
+      { value: 'https://open.bigmodel.cn/api/anthropic', label: T('智谱 GLM（Anthropic 兼容）') },
+      { value: 'https://api.z.ai/api/anthropic', label: T('Z.ai（Anthropic 兼容）') },
+      { value: 'https://dashscope.aliyuncs.com/compatible-mode/v1', label: T('通义千问（DashScope）') },
+      { value: 'https://openrouter.ai/api/v1', label: 'OpenRouter' },
+      { value: 'https://api.siliconflow.cn/v1', label: T('硅基流动 SiliconFlow') },
+      { value: 'http://localhost:11434/v1', label: T('本地 ollama') }
+    ];
+  }
+
+  /** 从配置装载草稿（打开设置、或非自动保存成功后回填） */
+  function loadAgentProviders(config) {
+    var mod = agentCfgMod();
+    if (!mod) { agentProvidersDraft = null; return; }
+    var cfg = mod.normalizeConfig(config || {});
+    agentProvidersDraft = cfg.providers;
+    agentProvidersActiveId = cfg.activeId;
+    if (!agentProviderDraft(agentProviderSelected)) agentProviderSelected = cfg.activeId;
+    renderAgentProviderList();
+    renderAgentProviderDetail();
+  }
+
+  function agentProviderDraft(id) {
+    return (agentProvidersDraft || []).filter(function (p) { return p.id === id; })[0] || null;
+  }
+
+  /** 提交给主进程的清单：只在用户重填过 Key 时带上明文（主进程加密后落盘） */
+  function agentProvidersForForm() {
+    if (!agentProvidersDraft) return undefined;
+    return agentProvidersDraft.map(function (p) {
+      var out = {
+        id: p.id, name: p.name, baseUrl: p.baseUrl, dialect: p.dialect,
+        models: (p.models || []).slice(), activeModel: p.activeModel
+      };
+      if (p.apiKey) out.apiKey = p.apiKey;
+      return out;
+    });
+  }
+
+  /** 保存成功后：草稿里的明文已落盘，就地清掉（输入框没焦点时才清，免得打断正在输入的人） */
+  function afterAgentProvidersSaved() {
+    (agentProvidersDraft || []).forEach(function (p) {
+      if (!p.apiKey) return;
+      p.hasApiKey = true;
+      if ($('#agent-p-api-key') && document.activeElement !== $('#agent-p-api-key')) $('#agent-p-api-key').value = '';
+      delete p.apiKey;
+    });
+    renderAgentProviderList();
+    var input = $('#agent-p-api-key');
+    var provider = agentProviderDraft(agentProviderSelected);
+    if (input && provider && !input.value) input.placeholder = agentKeyPlaceholder(provider);
+  }
+
+  function agentKeyPlaceholder(provider) {
+    return provider && (provider.hasApiKey || provider.apiKey)
+      ? T('已保存 Key（留空则保持不变）')
+      : T('粘贴 API Key');
+  }
+
+  function agentProviderLabelOf(provider) {
+    var mod = agentCfgMod();
+    var label = mod ? mod.providerLabel(provider, window.LitAgentProto) : '';
+    return label || T('未命名服务商');
+  }
+
+  function renderAgentProviderList() {
+    var host = $('#agent-provider-items');
+    if (!host || !agentProvidersDraft) return;
+    var mod = agentCfgMod();
+    host.innerHTML = '';
+    agentProvidersDraft.forEach(function (provider) {
+      var row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'agent-provider-row' + (provider.id === agentProviderSelected ? ' active' : '');
+      row.title = provider.baseUrl || T('未填写 Base URL');
+      var status = mod ? mod.providerStatus(provider) : 'empty';
+      row.innerHTML = '<span class="agent-provider-dot ' + status + '" aria-hidden="true"></span>' +
+        '<span class="agent-provider-name">' + esc(agentProviderLabelOf(provider)) + '</span>' +
+        (provider.id === agentProvidersActiveId
+          ? '<span class="agent-provider-current">' + esc(T('当前')) + '</span>' : '');
+      row.addEventListener('click', function () {
+        agentProviderSelected = provider.id;
+        renderAgentProviderList();
+        renderAgentProviderDetail();
+      });
+      host.appendChild(row);
+    });
+  }
+
+  function renderAgentModelList(provider) {
+    var host = $('#agent-p-models');
+    if (!host) return;
+    host.innerHTML = '';
+    if (!(provider.models || []).length) {
+      var empty = document.createElement('div');
+      empty.className = 'agent-model-empty';
+      empty.textContent = T('还没有模型：填一个模型名点「添加模型」，或点「拉取模型」从端点取回清单。');
+      host.appendChild(empty);
+      return;
+    }
+    provider.models.forEach(function (model) {
+      var row = document.createElement('div');
+      row.className = 'agent-model-row' + (provider.activeModel === model ? ' active' : '');
+      var pick = document.createElement('button');
+      pick.type = 'button';
+      pick.className = 'agent-model-pick';
+      pick.title = T('点选即设为当前使用的模型');
+      pick.innerHTML = '<span class="agent-model-radio" aria-hidden="true"></span><span class="agent-model-id">' +
+        esc(model) + '</span>' +
+        (provider.activeModel === model
+          ? '<span class="agent-model-badge">' + esc(provider.id === agentProvidersActiveId ? T('当前') : T('待启用')) + '</span>'
+          : '');
+      pick.addEventListener('click', function () { selectAgentModel(provider.id, model); });
+      var remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'btn btn-ghost agent-model-del';
+      remove.textContent = '✕';
+      remove.title = T('移除该模型');
+      remove.addEventListener('click', function () { removeAgentModel(provider.id, model); });
+      row.appendChild(pick);
+      row.appendChild(remove);
+      host.appendChild(row);
+    });
+  }
+
+  /** 详情区（每次渲染重建：字段少、状态简单，重建比增量同步更不容易出错） */
+  function renderAgentProviderDetail() {
+    var host = $('#agent-provider-detail');
+    if (!host || !agentProvidersDraft) return;
+    var mod = agentCfgMod();
+    var provider = agentProviderDraft(agentProviderSelected) || agentProvidersDraft[0];
+    if (!provider) { host.innerHTML = ''; return; }
+    agentProviderSelected = provider.id;
+    var isDefault = !mod || provider.id === mod.DEFAULT_PROVIDER_ID;
+    var presets = '<option value="">' + esc(T('常用预设…')) + '</option>' +
+      agentPresetOptions().map(function (item) {
+        return '<option value="' + esc(item.value) + '">' + esc(item.label) + '</option>';
+      }).join('');
+    host.innerHTML =
+      '<div class="agent-detail-head">' +
+        '<input type="text" class="text-input" id="agent-p-name" maxlength="60" value="' + esc(provider.name || '') +
+          '" placeholder="' + esc(T('服务商名称（可留空）')) + '">' +
+      '</div>' +
+      '<label class="agent-field">Base URL' +
+        '<div class="inline-row">' +
+          '<select id="agent-p-preset">' + presets + '</select>' +
+          '<input type="text" id="agent-p-base-url" value="' + esc(provider.baseUrl || '') +
+            '" placeholder="' + esc(T('https://api.deepseek.com（本地服务可用 http://localhost）')) + '">' +
+        '</div>' +
+      '</label>' +
+      '<label class="agent-field">' + esc(T('接口格式')) +
+        '<select id="agent-p-dialect">' +
+          '<option value="">' + esc(T('自动识别（推荐）')) + '</option>' +
+          '<option value="chat">OpenAI Chat Completions</option>' +
+          '<option value="responses">OpenAI Responses</option>' +
+          '<option value="messages">Anthropic Messages</option>' +
+        '</select>' +
+      '</label>' +
+      '<div class="field-hint" id="agent-p-dialect-hint">—</div>' +
+      '<label class="agent-field">API Key' +
+        '<input type="password" id="agent-p-api-key" autocomplete="new-password" placeholder="' +
+          esc(agentKeyPlaceholder(provider)) + '">' +
+      '</label>' +
+      '<div class="agent-model-block">' +
+        '<div class="agent-model-head"><span>' + esc(T('模型')) + '</span>' +
+          '<span class="agent-model-hint">' + esc(T('点选即设为当前使用')) + '</span></div>' +
+        '<div class="agent-model-list" id="agent-p-models"></div>' +
+        '<div class="inline-row">' +
+          '<input type="text" id="agent-p-model-input" placeholder="' + esc(T('如 deepseek-flash')) + '">' +
+          '<button type="button" class="btn" id="agent-p-model-add">' + esc(T('添加模型')) + '</button>' +
+          '<button type="button" class="btn" id="agent-p-fetch-models">' + esc(T('拉取模型')) + '</button>' +
+        '</div>' +
+        '<div class="sync-inline-status" id="agent-p-status" role="status" aria-live="polite"></div>' +
+      '</div>' +
+      '<div class="sync-inline-actions">' +
+        '<button type="button" class="btn" id="agent-p-test">' + esc(T('测试连接')) + '</button>' +
+        (isDefault ? '' : '<button type="button" class="btn agent-provider-delete" id="agent-p-delete">' +
+          esc(T('删除该服务商')) + '</button>') +
+      '</div>';
+    if ($('#agent-p-dialect')) $('#agent-p-dialect').value = provider.dialect || '';
+    if (provider.hasApiKey && !provider.apiKey) {
+      markRetainedKey('agent-p-api-key', true, provider.apiKeyHint, { kind: 'agent', providerId: provider.id });
+    }
+    renderAgentModelList(provider);
+    refreshAgentDialectHint();
+    bindAgentProviderDetail(provider, isDefault);
+  }
+
+  /** 详情区事件：所有改动 = 改草稿 → 重画 → 自动保存（与设置页其余字段同一条通道） */
+  function bindAgentProviderDetail(provider, isDefault) {
+    function commit() {
+      renderAgentProviderList();
+      refreshAgentDialectHint();
+      queueSyncAutoSave();
+    }
+    [['agent-p-name', 'name'], ['agent-p-base-url', 'baseUrl']].forEach(function (pair) {
+      var input = $('#' + pair[0]);
+      if (!input) return;
+      input.addEventListener('input', function () { provider[pair[1]] = input.value.trim(); renderAgentProviderList(); refreshAgentDialectHint(); });
+      input.addEventListener('change', function () { provider[pair[1]] = input.value.trim(); commit(); });
+    });
+    var keyInput = $('#agent-p-api-key');
+    if (keyInput) {
+      keyInput.addEventListener('input', function () { provider.apiKey = keyInput.value; });
+      keyInput.addEventListener('change', function () { provider.apiKey = keyInput.value; commit(); });
+    }
+    var dialect = $('#agent-p-dialect');
+    if (dialect) {
+      dialect.addEventListener('change', function () { provider.dialect = dialect.value; commit(); });
+    }
+    var preset = $('#agent-p-preset');
     if (preset) {
       preset.addEventListener('change', function () {
         if (!preset.value) return;
-        $('#sync-agent-base-url').value = preset.value;
-        if (!$('#sync-agent-model').value.trim()) {
-          var hints = {
-            'https://opencode.ai/zen/go/v1': 'deepseek-flash',
-            'https://opencode.ai/zen/v1': 'deepseek-flash',
-            'https://api.openai.com/v1': 'gpt-5',
-            'https://api.anthropic.com': 'claude-sonnet-4-5',
-            'https://api.deepseek.com': 'deepseek-flash',
-            'https://api.deepseek.com/anthropic': 'deepseek-flash',
-            'https://api.moonshot.cn/v1': 'kimi-k2.7-code',
-            'https://open.bigmodel.cn/api/paas/v4': 'glm-5.2',
-            'https://open.bigmodel.cn/api/anthropic': 'glm-5.2',
-            'https://api.z.ai/api/anthropic': 'glm-5.2',
-            'https://dashscope.aliyuncs.com/compatible-mode/v1': 'qwen-plus',
-            'http://localhost:11434/v1': 'qwen3'
-          };
-          if (hints[preset.value]) $('#sync-agent-model').value = hints[preset.value];
-        }
-        refreshAgentDialectHint();
+        provider.baseUrl = preset.value;
+        var baseInput = $('#agent-p-base-url');
+        if (baseInput) baseInput.value = preset.value;
+        // 预设顺带把「添加模型」输入框填上建议模型名（要点「添加模型」才进清单，不静默落配置）
+        var hint = AGENT_PRESET_HINTS[preset.value];
+        var modelInput = $('#agent-p-model-input');
+        if (hint && modelInput && !modelInput.value.trim() && !(provider.models || []).length) modelInput.value = hint;
+        preset.value = '';
+        commit();
       });
     }
-    var dialectSelect = $('#sync-agent-dialect');
-    if (dialectSelect) dialectSelect.addEventListener('change', refreshAgentDialectHint);
-    var baseInput = $('#sync-agent-base-url');
-    if (baseInput) baseInput.addEventListener('input', refreshAgentDialectHint);
-    var modelInput = $('#sync-agent-model');
-    if (modelInput) modelInput.addEventListener('input', refreshAgentDialectHint);
-    var testBtn = $('#sync-agent-test');
+    var addBtn = $('#agent-p-model-add');
+    if (addBtn) {
+      addBtn.addEventListener('click', function () {
+        var input = $('#agent-p-model-input');
+        var value = input ? input.value.trim() : '';
+        if (!value) { setSyncInlineStatus('agent-p-status', T('请先填写模型名'), 'error'); return; }
+        if (provider.models.indexOf(value) === -1) {
+          provider.models.push(value);
+          if (!provider.activeModel) provider.activeModel = value;
+        }
+        provider.activeModel = value;
+        agentProvidersActiveId = provider.id;
+        if (input) input.value = '';
+        setSyncInlineStatus('agent-p-status', T('已添加：') + value, 'success');
+        renderAgentProviderDetail();
+        commit();
+      });
+      var modelInput = $('#agent-p-model-input');
+      if (modelInput) {
+        modelInput.addEventListener('keydown', function (event) {
+          if (event.key === 'Enter') { event.preventDefault(); addBtn.click(); }
+        });
+      }
+    }
+    var fetchBtn = $('#agent-p-fetch-models');
+    if (fetchBtn) {
+      fetchBtn.addEventListener('click', function () {
+        var button = this;
+        button.disabled = true;
+        setSyncInlineStatus('agent-p-status', T('正在拉取模型清单…'), 'pending');
+        // 先把手上的改动落盘：主进程要按 id 取该服务商存的 Key（没重填也能测）
+        Promise.resolve(flushSyncAutoSave()).then(function () {
+          return desktop.agentListModels({
+            providerId: provider.id,
+            baseUrl: provider.baseUrl,
+            apiKey: provider.apiKey || '',
+            model: provider.activeModel,
+            dialect: provider.dialect
+          });
+        }).then(function (result) {
+          var models = (result && result.models) || [];
+          var added = 0;
+          models.forEach(function (id) {
+            if (provider.models.indexOf(id) === -1) { provider.models.push(id); added++; }
+          });
+          if (!provider.activeModel && provider.models.length) provider.activeModel = provider.models[0];
+          renderAgentProviderDetail();
+          commit();
+          setSyncInlineStatus('agent-p-status',
+            T('✓ 拉取到 ') + models.length + T(' 个模型') + (added ? T('，其中 ') + added + T(' 个已加入清单') : T('，清单已是最新')), 'success');
+        }).catch(function (error) {
+          setSyncInlineStatus('agent-p-status', error && error.message || String(error), 'error');
+        }).finally(function () { button.disabled = false; });
+      });
+    }
+    var testBtn = $('#agent-p-test');
     if (testBtn) {
       testBtn.addEventListener('click', function () {
         var button = this;
         button.disabled = true;
-        setSyncInlineStatus('sync-agent-test-status', T('正在连接…'), 'pending');
-        desktop.agentTest({
-          baseUrl: $('#sync-agent-base-url').value.trim(),
-          apiKey: $('#sync-agent-api-key').value,
-          model: $('#sync-agent-model').value.trim(),
-          dialect: $('#sync-agent-dialect') ? $('#sync-agent-dialect').value : ''
-        }).then(function (result) {
-          setSyncInlineStatus('sync-agent-test-status', T('连接成功') + (result.model ? ' · ' + result.model : ''), 'success');
-        }).catch(function (error) {
-          setSyncInlineStatus('sync-agent-test-status', error && error.message || String(error), 'error');
-        }).finally(function () { button.disabled = false; });
-      });
-    }
-    var fetchModelsBtn = $('#sync-agent-fetch-models');
-    if (fetchModelsBtn) {
-      fetchModelsBtn.addEventListener('click', function () {
-        var button = this;
-        button.disabled = true;
-        setSyncInlineStatus('sync-agent-test-status', T('正在拉取模型清单…'), 'pending');
-        desktop.agentListModels({
-          baseUrl: $('#sync-agent-base-url').value.trim(),
-          apiKey: $('#sync-agent-api-key').value,
-          model: $('#sync-agent-model').value.trim(),
-          dialect: $('#sync-agent-dialect') ? $('#sync-agent-dialect').value : ''
-        }).then(function (result) {
-          var models = (result && result.models) || [];
-          var list = $('#sync-agent-model-list');
-          list.innerHTML = '';
-          models.forEach(function (id) {
-            var option = document.createElement('option');
-            option.value = id;
-            list.appendChild(option);
+        setSyncInlineStatus('agent-p-status', T('正在连接…'), 'pending');
+        Promise.resolve(flushSyncAutoSave()).then(function () {
+          return desktop.agentTest({
+            providerId: provider.id,
+            baseUrl: provider.baseUrl,
+            apiKey: provider.apiKey || '',
+            model: provider.activeModel,
+            dialect: provider.dialect
           });
-          // 当前为空或不在清单里时，自动选中第一个（免手输）
-          var input = $('#sync-agent-model');
-          if (!input.value.trim() || models.indexOf(input.value.trim()) === -1) {
-            if (models.length) input.value = models[0];
-          }
-          setSyncInlineStatus('sync-agent-test-status',
-            T('✓ 拉取到 ') + models.length + T(' 个模型，点模型名输入框可下拉选择'), 'success');
+        }).then(function (result) {
+          setSyncInlineStatus('agent-p-status', T('连接成功') + (result && result.model ? ' · ' + result.model : ''), 'success');
         }).catch(function (error) {
-          setSyncInlineStatus('sync-agent-test-status', error && error.message || String(error), 'error');
+          setSyncInlineStatus('agent-p-status', error && error.message || String(error), 'error');
         }).finally(function () { button.disabled = false; });
       });
     }
+    var deleteBtn = $('#agent-p-delete');
+    if (deleteBtn && !isDefault) {
+      deleteBtn.addEventListener('click', function () {
+        dlgConfirm(T('删除该服务商'), T('「') + agentProviderLabelOf(provider) + T('」的 Base URL、API Key 与模型清单都会从本机删除。'), T('删除'), true).then(function (ok) {
+          if (!ok) return;
+          var mod = agentCfgMod();
+          var next = mod ? mod.removeProvider({ providers: agentProvidersDraft, activeId: agentProvidersActiveId }, provider.id) : null;
+          if (!next) return;
+          agentProvidersDraft = next.providers;
+          agentProvidersActiveId = next.activeId;
+          agentProviderSelected = next.activeId;
+          renderAgentProviderList();
+          renderAgentProviderDetail();
+          queueSyncAutoSave();
+          toast(T('✓ 已删除服务商'));
+        });
+      });
+    }
+  }
+
+  /** 底部模型菜单（对话面板）与设置页共同的选择入口：选中即改当前服务商与模型 */
+  function selectAgentModel(providerId, model) {
+    var mod = agentCfgMod();
+    if (!mod || !agentProvidersDraft) return;
+    var next = mod.selectModel({ providers: agentProvidersDraft, activeId: agentProvidersActiveId }, providerId, model);
+    agentProvidersDraft = next.providers;
+    agentProvidersActiveId = next.activeId;
+    renderAgentProviderList();
+    renderAgentProviderDetail();
+    queueSyncAutoSave();
+  }
+
+  function removeAgentModel(providerId, model) {
+    var provider = agentProviderDraft(providerId);
+    if (!provider) return;
+    provider.models = provider.models.filter(function (id) { return id !== model; });
+    if (provider.activeModel === model) provider.activeModel = provider.models[0] || '';
+    renderAgentProviderDetail();
+    renderAgentProviderList();
+    queueSyncAutoSave();
+  }
+
+  function addAgentProvider() {
+    var mod = agentCfgMod();
+    if (!mod || !agentProvidersDraft) return;
+    if (agentProvidersDraft.length >= mod.MAX_PROVIDERS) {
+      toast(T('服务商数量已达上限'));
+      return;
+    }
+    var provider = {
+      id: mod.newProviderId(agentProvidersDraft),
+      name: '', baseUrl: '', dialect: '', models: [], activeModel: '', hasApiKey: false
+    };
+    agentProvidersDraft = agentProvidersDraft.concat([provider]);
+    agentProviderSelected = provider.id;
+    renderAgentProviderList();
+    renderAgentProviderDetail();
+    var nameInput = $('#agent-p-name');
+    if (nameInput) nameInput.focus();
+    queueSyncAutoSave();
+  }
+
+  function bindAgentSettings() {
+    /* AI 助手服务商清单的入口按钮（详情区与模型行的监听在每次渲染时挂） */
+    var addProvider = $('#agent-provider-add');
+    if (addProvider) addProvider.addEventListener('click', addAgentProvider);
     var embedPreset = $('#sync-embed-provider');
     if (embedPreset) {
       embedPreset.addEventListener('change', function () {
@@ -8598,7 +7536,7 @@
         desktop.embedTest({
           embedProvider: $('#sync-embed-provider') ? $('#sync-embed-provider').value : '',
           embedBaseUrl: $('#sync-embed-base-url') ? $('#sync-embed-base-url').value.trim() : '',
-          embedApiKey: $('#sync-embed-api-key') ? $('#sync-embed-api-key').value : '',
+          embedApiKey: secretInputValue('sync-embed-api-key'),
           embedModel: $('#sync-embed-model') ? $('#sync-embed-model').value.trim() : ''
         }).then(function (result) {
           setSyncInlineStatus('sync-embed-test-status',
@@ -8614,30 +7552,12 @@
         if (window.LitAgentUi) LitAgentUi.refreshResearchStats();
       });
     }
-    var importBtn = $('#sync-research-import');
-    if (importBtn) {
-      importBtn.addEventListener('click', function () {
-        var button = this;
-        button.disabled = true;
-        setSyncInlineStatus('sync-research-status', T('正在导入…'), 'pending');
-        desktop.researchImportHarness().then(function (result) {
-          if (result && result.canceled) {
-            setSyncInlineStatus('sync-research-status', T('已取消'), '');
-          } else {
-            setSyncInlineStatus('sync-research-status',
-              T('✓ 已导入 ') + (result && result.imported || 0) + T(' 篇（可重复执行，不会产生重复）'), 'success');
-          }
-          if (window.LitAgentUi) LitAgentUi.refreshResearchStats();
-        }).catch(function (error) {
-          setSyncInlineStatus('sync-research-status', error && error.message || String(error), 'error');
-        }).finally(function () { button.disabled = false; });
-      });
-    }
     var browseBtn = $('#sync-agent-session-browse');
     if (browseBtn) {
       browseBtn.addEventListener('click', function () {
         desktop.chooseDirectory({ title: T('选择会话记录根目录') }).then(function (picked) {
-          if (picked) $('#sync-agent-session-root').value = picked;
+          // 程序写值不触发 change：手动补一次自动保存，否则选完目录不算数
+          if (picked) { $('#sync-agent-session-root').value = picked; queueSyncAutoSave(); }
         }).catch(function () {});
       });
     }
@@ -8647,28 +7567,22 @@
         desktop.sessionOpenRoot().catch(function (error) { toast(T('打开失败：') + String(error && error.message || error)); });
       });
     }
-    // 调研库导入进度 → 状态行
-    if (desktop.onResearchImportProgress && !bindAgentSettings.progressBound) {
-      bindAgentSettings.progressBound = true;
-      desktop.onResearchImportProgress(function (p) {
-        setSyncInlineStatus('sync-research-status',
-          T('导入中 ') + (p.done || 0) + '/' + (p.total || 0), 'pending');
-      });
-    }
     /* M9-4：科研网页检索——首次开启弹出境告知，确认落 webSearchEgressAcknowledged */
     var webSearchBox = $('#sync-web-search-enabled');
     if (webSearchBox) {
       webSearchBox.addEventListener('change', function () {
-        if (!webSearchBox.checked) return; // 关闭无需确认
-        if (!desktop.getSetting) return;
+        if (!webSearchBox.checked) { queueSyncAutoSave(); return; } // 关闭无需确认
+        if (!desktop.getSetting) { queueSyncAutoSave(); return; }
         desktop.getSetting('webSearchEgressAcknowledged').then(function (ack) {
-          if (ack === true) return;
+          if (ack === true) { queueSyncAutoSave(); return; }
           return dlgConfirm(T('启用科研网页检索'),
             T('开启后，AI 助手的检索词与抓取的 URL 将发送到 TinyFish 服务器（第三方数据出境，故默认关闭、需你知情确认）。') +
             T('\n\n抓取仅限公开学术域白名单内的 URL；关闭开关后不再有任何该主机外呼。'),
             T('知晓并开启')).then(function (yes) {
+            // 落盘必须等告知确认之后：先存的话，用户点「取消」时后台已带着出境开关跑起来了
             if (yes) {
               desktop.setSetting('webSearchEgressAcknowledged', true).catch(function () {});
+              queueSyncAutoSave();
             } else {
               webSearchBox.checked = false;
             }
@@ -8707,8 +7621,10 @@
         setSyncInlineStatus('sync-research-status', T('补登记中（DOI 直查 + 本地身份）…'), 'pending');
         desktop.researchRegister({ limit: 200 }).then(function (r) {
           var applied = applyResearchProposals(r.proposals || []);
-          setSyncInlineStatus('sync-research-status',
-            T('✓ 扫描 ') + (r.scanned || 0) + T(' 条，补登记 ') + applied + T(' 条'), 'success');
+          var msg = T('✓ 扫描 ') + (r.scanned || 0) + T(' 条，补登记 ') + applied + T(' 条');
+          // 带 DOI 但在线反查也没解析到的条目如实报出——否则「补登记 0 条」会把用户搞糊涂
+          if (r.unresolved) msg += T('；有 ') + r.unresolved + T(' 条带 DOI 但暂未解析到调研身份（需联网反查 OpenAlex，稍后再试）');
+          setSyncInlineStatus('sync-research-status', msg, r.unresolved ? 'warning' : 'success');
         }).catch(function (error) {
           setSyncInlineStatus('sync-research-status', error && error.message || String(error), 'error');
         }).finally(function () { button.disabled = false; });
@@ -8731,7 +7647,7 @@
             : '';
           return dlgConfirm(T('构建向量索引'),
             T('将为 ') + est.count + T(' 条文献嵌入向量，约 ') + est.approxTokens +
-            T(' tokens（按内容 hash 增量：未变化的条目不会重复嵌入）。') + failedNote,
+            T(' tokens（按内容比对增量：未变化的条目不会重复嵌入）。') + failedNote,
             T('开始构建')).then(function (yes) {
             if (!yes) { setSyncInlineStatus('sync-embed-status', T('已取消'), ''); return null; }
             setSyncInlineStatus('sync-embed-status', T('构建中…'), 'pending');
@@ -8795,8 +7711,28 @@
     var detail = 0;
     if (ws && !ws.classList.contains('rail-collapsed')) {
       detail = parseFloat(getComputedStyle(ws).getPropertyValue('--detail-width')) || 0;
+      // 阅读模式侧栏是浮层（CSS 另有 vw 视觉钳制会生效）——按实际渲染宽让位，
+      // 拖动把手时 PDF 让位宽度与侧栏左缘严格贴合、不出现缝隙
+      if (reading) {
+        var sidebar = document.querySelector('.detail-sidebar');
+        if (sidebar) detail = Math.round(sidebar.getBoundingClientRect().width);
+      }
     }
     document.body.style.setProperty('--reading-rail-w', Math.round(railW + detail) + 'px');
+  }
+
+  /** 阅读视图的可用矩形（阅读层实际占用的那块）：阅读模式下右栏让位后，阅读区内的
+   *  临时浮层（划词翻译等）必须收在里面——右栏浮层 z-index 高于阅读层，越界部分会被它
+   *  盖掉；越到顶栏上也会被顶栏压住。非阅读模式退化为整窗。 */
+  function readingViewport() {
+    var overlay = $('#pdf-overlay');
+    if (document.body.classList.contains('reading-open') && overlay && !overlay.hidden) {
+      var rect = overlay.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+      }
+    }
+    return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
   }
 
   /** 观察两个阅读层的 hidden 与 workspace 的 rail-collapsed 类，保持 body 状态与让位宽度实时同步 */
@@ -8828,6 +7764,58 @@
     return null;
   }
 
+  /* 阅读器当前划词选区（VSCode 式「当前选中」上下文）：复用划词翻译面板维护的
+   * pdfState.selectedText / selectionPositions——选区塌陷或阅读层关闭时它们已被清空，
+   * 生命周期天然一致。页码按 R1 契约转成 1 基物理页。 */
+  function currentPdfSelectionContext() {
+    try {
+      var overlay = document.getElementById('pdf-overlay');
+      if (!overlay || overlay.hidden || !pdfState || !pdfState.paper) return null;
+      var text = String(pdfState.selectedText || '').trim();
+      var positions = pdfState.selectionPositions || [];
+      if (!text || !positions.length) return null;
+      return {
+        paperId: pdfState.paper.id,
+        attachmentId: pdfState.attachmentId || '',
+        page: (positions[0].pageIndex || 0) + 1,
+        pageTo: (positions[positions.length - 1].pageIndex || 0) + 1,
+        pageCount: pdfState.pageCount || 0,
+        text: text
+      };
+    } catch (error) { return null; }
+  }
+
+  /* EPUB 划词选区：位置身份是 CFI + 章节名 + 进度百分比（流式排版没有固定页码）。
+   * 章节标签与 #epub-location 用同一算法（TOC href 前缀匹配），与阅读器显示一致。 */
+  function currentEpubSelectionContext() {
+    try {
+      var overlay = document.getElementById('epub-overlay');
+      if (!overlay || overlay.hidden || !epubState || !epubState.paper) return null;
+      var sel = epubState.pendingSelection;
+      var selText = String((sel && sel.text) || '').trim();
+      if (!sel || !selText || !sel.cfi) return null;
+      var progress = null;
+      var chapter = '';
+      if (epubState.api) {
+        var prog = epubState.api.progress ? epubState.api.progress() : null;
+        if (prog && isFinite(prog.percent)) progress = prog.percent;
+        var href = epubState.api.currentHref ? epubState.api.currentHref() : '';
+        (epubState.tocItems || []).forEach(function (item) {
+          if (item.href && href && (href === item.href || href.indexOf(item.href.split('#')[0]) === 0)) chapter = item.label;
+        });
+      }
+      return {
+        kind: 'epub',
+        paperId: epubState.paper.id,
+        attachmentId: epubState.attachmentId || '',
+        cfi: sel.cfi,
+        chapter: chapter,
+        progress: progress,
+        text: selText
+      };
+    } catch (error) { return null; }
+  }
+
   /* R19：阅读位置 / 列表焦点变化后刷新 AI 面板上下文 chips（面板未开或未初始化时安全） */
   function refreshAgentChips() {
     if (window.LitAgentUi && LitAgentUi.refreshChips) LitAgentUi.refreshChips();
@@ -8848,6 +7836,9 @@
       },
       /* 正在读的文献与位置（PDF 页码 / EPUB 进度）；无阅读层时返回 null */
       getCurrentReading: function () { return currentReadingContext(); },
+      /* 阅读器当前划词选区（PDF 文字 + 页码 / EPUB 文字 + CFI·章节·进度）；无选区时 null。
+       * 两个阅读层互斥可见，各 getter 自守卫，按序取第一个命中的即可 */
+      getCurrentSelection: function () { return currentPdfSelectionContext() || currentEpubSelectionContext(); },
       getCurrentPaper: function () {
         // R2：阅读层可见时以「正在读的那篇」为准（PDF/EPUB 标签切到谁就是谁），
         // 否则回落列表焦点——先开 A 再开 B 又切回 A 时，提问「这篇」必须指向 A，
@@ -8868,19 +7859,24 @@
       confirm: function (title, body) { return dlgConfirm(title, body); },
       showCtxMenu: showCtxMenu,
       toast: toast,
-      /* M9 二期：收藏桥 / PDF 收入（agent 写类工具与手动模式共用同一链路） */
+      /* 对话面板底部「管理模型…」：直接打开 设置 → 集成与服务 → AI 助手（服务商与模型） */
+      openAgentSettings: function () { openSyncSettings('agent'); },
+      /* M9 二期：收藏桥 / PDF 收入（供 agent 写类工具共用） */
       collectWorks: collectWorks,
       importStagedPdfs: importStagedPdfs,
       /* M9 三期：引文网络面板（agent build_graph 工具的展示与快照出口） */
       openGraphPanel: function (data, title) {
         if (window.LitGraphView) LitGraphView.showData(data, title);
       },
+      reopenGraphPanel: function () {
+        return !!(window.LitGraphView && LitGraphView.reopen && LitGraphView.reopen());
+      },
       saveGraphHtmlToSession: function (data, sessionId) {
         return window.LitGraphView ? LitGraphView.saveHtmlToSession(data, sessionId) : Promise.resolve({ file: '' });
       },
       /* M9-4：网页快照挂载（主进程已落盘 + 已入 pdf_fts，这里补附件记录并走 save 管线） */
       attachSnapshot: attachSnapshotFromResearch,
-      /* M9-5（R11）：页面渲染生产端——PDF.js 离屏渲染指定页为 PNG（agent render_pdf_pages
+      /* M9-5（R11）：页面渲染生产端——MuPDF 离屏渲染指定页为 PNG（agent render_pdf_pages
        *  工具用）；agentui 只在 vision 模型时启用。
        *  R1：工具层传的已是 1 基物理页，renderPageToPng 也按 1 基消费——适配器不得再 +1
        *  （曾把请求的第 1 页渲染成第 2 页，末页则直接超界） */
@@ -8888,8 +7884,14 @@
         if (!window.LitPdf || !LitPdf.renderPageToPng || !input || !input.path) return Promise.resolve(null);
         return LitPdf.renderPageToPng(input.path, Math.max(1, Math.floor(Number(input.pageIndex) || 1)), input.scale);
       },
+      /* 多页一次开文档（agent 视觉工具用）：逐页调用会为每页重读整份 PDF 并重新解析，
+       *  大 PDF 上就是「渲染截图时整个界面卡住」——文档只开一次的批量口子在这里 */
+      renderPagesImage: function (input) {
+        if (!window.LitPdf || !LitPdf.renderPagesToPng || !input || !input.path) return Promise.resolve([]);
+        return LitPdf.renderPagesToPng(input.path, input.pages, input.scale);
+      },
       /* R19 临时全文链：按路径抽取 PDF 全文文本（agent read_work_fulltext 用；临时文件
-       *  抽取完主进程即删）。与全文索引同一条 LitPdf.extractText 管线（PDF.js），
+       *  抽取完主进程即删）。与全文索引同一条 LitPdf.extractText 管线（MuPDF），
        *  页数/单页长度上限与 pdfsearch.extractPages 一致；带「第 N 页」标记供引用页码 */
       extractPdfTextByPath: function (filePath) {
         if (!window.LitPdf || !LitPdf.extractText || !desktop.readFileBytes || !filePath) return Promise.resolve(null);
@@ -8928,7 +7930,7 @@
     if (!desktop || !desktop.researchGraph) { toast(T('引文网络需要桌面版')); return; }
     var seeds = researchSeedsForPapers(papers);
     if (!seeds.length) {
-      toast(T('所选文献还没有调研身份：请先在 设置 → 调研库 →「补登记正式库」，或通过 AI 助手收藏'));
+      toast(T('所选文献还没登记到调研库：请先在 设置 → 调研库 →「补登记文献库」，或通过 AI 助手收藏'));
       return;
     }
     if (window.LitGraphView) LitGraphView.build(seeds, papers.length > 1 ? T('已选文献的引文网络') : (papers[0].title || T('引文网络')).slice(0, 40));
@@ -9001,10 +8003,11 @@
   }
 
   /**
-   * 收藏桥（agent 工具 collect_papers / 手动模式「收藏」按钮共用）：
+   * 收藏桥（供 agent 工具 collect_papers 使用）：
    * 确认 → addPapers（LitDedupe 去重）→ researchIds 回写 → 返回 {added, merged, canceled}。
+   * opts.isCancelled：同 importStagedPdfs——确认框后的取消复核（A-followup #6）。
    */
-  function collectWorks(workIds, folderId) {
+  function collectWorks(workIds, folderId, opts) {
     if (!desktop || !desktop.researchGetWorks) return Promise.reject(new Error(T('需要桌面版')));
     var ids = (Array.isArray(workIds) ? workIds : []).map(String).filter(Boolean).slice(0, 50);
     if (!ids.length) return Promise.resolve({ added: 0, merged: 0 });
@@ -9016,10 +8019,13 @@
       var folderName = target
         ? ((state.folders.filter(function (f) { return f.id === target; })[0] || {}).name || '')
         : T('未归档');
-      return dlgConfirm(T('收藏到正式库'),
+      return dlgConfirm(T('收藏到文献库'),
         T('将 ') + works.length + T(' 篇文献收藏到「') + folderName + T('」；已存在的自动去重合并。'),
         T('收藏')).then(function (yes) {
         if (!yes) return { canceled: true, added: 0, merged: 0 };
+        if (opts && typeof opts.isCancelled === 'function' && opts.isCancelled()) {
+          return { canceled: true, stopped: true, added: 0, merged: 0 };
+        }
         var idByWork = {};
         works.forEach(function (w) { idByWork[w.id] = w; });
         var r = addPapers(works.map(workToDraft), { folderId: target });
@@ -9036,8 +8042,10 @@
     });
   }
 
-  /** PDF 第二步：已暂存进受管目录的 PDF → 建/并条目挂附件（researchIds 同样回写） */
-  function importStagedPdfs(storedList, folderId) {
+  /** PDF 第二步：已暂存进受管目录的 PDF → 建/并条目挂附件（researchIds 同样回写）。
+   *  opts.isCancelled：A-followup #6——确认框挂着时用户可能点了「停止」，确认通过后、
+   *  实际写库前必须再核一次同一取消信号（返回 { canceled:true, stopped:true }）。 */
+  function importStagedPdfs(storedList, folderId, opts) {
     if (!desktop || !desktop.researchGetWorks) return Promise.reject(new Error(T('需要桌面版')));
     var stored = (Array.isArray(storedList) ? storedList : []).filter(function (s) { return s && s.path; });
     if (!stored.length) return Promise.resolve({ added: 0, merged: 0 });
@@ -9059,9 +8067,12 @@
       var target = validFolderId(folderId) ||
         (state.activeFolderId && validFolderId(state.activeFolderId)) || '';
       return dlgConfirm(T('收入 PDF 到文献库'),
-        T('将 ') + pairs.length + T(' 个 PDF 收入正式库（创建或合并条目并挂载附件）。'),
+        T('将 ') + pairs.length + T(' 个 PDF 收入文献库（创建或合并条目并挂载附件）。'),
         T('收入')).then(function (yes) {
         if (!yes) return { canceled: true, added: 0, merged: 0 };
+        if (opts && typeof opts.isCancelled === 'function' && opts.isCancelled()) {
+          return { canceled: true, stopped: true, added: 0, merged: 0 };
+        }
         var r = addPapers(pairs.map(function (pair) { return pair.draft; }), { folderId: target });
         var touched = false;
         pairs.forEach(function (pair, i) {
@@ -9135,7 +8146,16 @@
     $('#sync-translator-credential-label').textContent = free ? T('凭据') : (aliyun ? 'AccessKey ID@AccessKey Secret' : 'API Key');
     var keyInput = $('#sync-translator-api-key');
     keyInput.disabled = free;
-    keyInput.placeholder = free ? T('免费接口无需凭据') : (aliyun ? T('留空则保持原 AK/SK') : T('留空则保持原 Key'));
+    var hasSavedKey = integrationConfig && integrationConfig.hasTranslatorApiKey;
+    if (free) {
+      markRetainedKey('sync-translator-api-key', false);
+      keyInput.placeholder = T('免费接口无需凭据');
+    } else if (hasSavedKey) {
+      markRetainedKey('sync-translator-api-key', true, integrationConfig.translatorApiKeyHint, { kind: 'translator' });
+    } else {
+      markRetainedKey('sync-translator-api-key', false);
+      keyInput.placeholder = aliyun ? T('留空则保持原 AK/SK') : T('留空则保持原 Key');
+    }
     var keyHelp = $('#sync-translator-key-help');
     if (keyHelp) keyHelp.hidden = free;
     var helpEl = $('#sync-translator-provider-help');
@@ -9172,12 +8192,7 @@
 
   /* 顶栏快捷入口：Word 写作与浏览器扩展（原来埋在设置 → 集成与服务，主界面看不到）。
    * 面板元素从设置弹窗整体搬了出来，ID 不变，处理器照旧工作。 */
-  function openWordPanel() {
-    $('#word-panel-mask').hidden = false;
-    // 打开即检测一次：从外面进来没有「先点检测」的前置步骤，开箱就要能看到文档列表
-    wordDetect();
-  }
-  function closeWordPanel() { $('#word-panel-mask').hidden = true; }
+  function openWordPanel() { if (wordPanel) wordPanel.open(); }
 
   function openBridgePanel() {
     if (!desktop) { toast(T('浏览器扩展仅在桌面版可用')); return; }
@@ -9194,6 +8209,14 @@
   function openSyncSettings(sectionId) {
     if (!desktop || !desktop.getIntegrationConfig) { toast(T('同步功能仅在桌面版可用')); return; }
     $('#sync-mask').hidden = false;
+    // 设置弹窗版本号（index.html 的 <span id="settings-version"></span>；取不到就留空）
+    var vEl = $('#settings-version');
+    if (vEl && window.litboardDesktop && litboardDesktop.getAppVersion) {
+      litboardDesktop.getAppVersion().then(function (v) {
+        if (vEl && v) vEl.textContent = T('版本') + ' ' + v;
+      }).catch(function () {});
+    }
+    applyModalSize($('.sync-modal'), readModalSizes().settings, 560, 360);
     activateSyncGroup('storage');
     $('#sync-status').classList.remove('error');
     $('#sync-status').textContent = T('正在读取配置…');
@@ -9212,12 +8235,6 @@
       refreshBackupStatus();
       $('#sync-status').textContent = '';
       if (desktop.getSetting) {
-        desktop.getSetting('trashRetentionDays').then(function (days) {
-          $('#sync-trash-days').value = days == null ? 30 : Number(days);
-        }).catch(function () { $('#sync-trash-days').value = 30; });
-        desktop.getSetting('autoWriteBack').then(function (value) {
-          $('#sync-auto-writeback').checked = value === true;
-        }).catch(function () {});
         desktop.getSetting('translatorAutoTranslate').then(function (value) {
           $('#sync-translator-auto').checked = value === true;
         }).catch(function () {});
@@ -9228,23 +8245,28 @@
       }
       var syncThemeSelect = $('#sync-theme-select');
       if (syncThemeSelect) {
-        syncThemeSelect.value = localStorage.getItem(THEME_KEY) || 'auto';
+        syncThemeSelect.value = currentTheme();
       }
       var syncLangSelect = $('#sync-lang-select');
       if (syncLangSelect) {
         syncLangSelect.value = localStorage.getItem('litboard.lang') || 'auto';
       }
-      // 指定 sectionId 时切到其所在分组并短暂高亮（首次使用清单「扩展」步、划词翻译等）
+      // 指定 sectionId 时切到其所在分组并短暂高亮（首次使用清单「扩展」步、划词翻译、
+      // 对话面板的「管理模型…」）；分组里该段可能不在视野内，滚动过去高亮才看得见
       if (sectionId && typeof sectionId === 'string') {
         var section = $('#' + sectionId + '-section');
         if (section) {
           activateSyncGroup(section.dataset.syncGroup);
+          if (section.scrollIntoView) section.scrollIntoView({ block: 'start' });
           section.classList.add('sync-section-flash');
           setTimeout(function () { section.classList.remove('sync-section-flash'); }, 1600);
         }
       }
     }).catch(function (error) {
-      $('#sync-status').textContent = T('读取配置失败：') + (error && error.message || error);
+      // 配置没读上来：表单停在 HTML 默认值，装载守卫会拦住后续提交（不让默认值覆盖已存配置），
+      // 所以必须说清楚「这里改了不会存」，否则用户以为改完就生效了
+      $('#sync-status').textContent = T('读取配置失败：') + (error && error.message || error) +
+        T('（配置未装载，本页改动不会保存；请重开设置页）');
       $('#sync-status').classList.add('error');
     });
   }
@@ -9297,16 +8319,15 @@
     var auto = !!(opts && opts.auto);
     return desktop.saveIntegrationConfig(syncFormValue()).then(function (config) {
       integrationConfig = config;
-      refreshSyncFormAfterSync = true;
+      if (remotePlan) remotePlan.markRefreshFormAfterSync();
       // 自动保存不回填表单：异步返回时会覆盖用户正在编辑的其他字段
       if (!auto) fillSyncForm(config);
+      else afterAgentProvidersSaved();
       $('#sync-status').classList.remove('error');
       $('#sync-status').textContent = auto ? T('已自动保存 · ') + new Date().toLocaleTimeString() : T('配置已保存');
-      var trashDays = Math.max(0, Math.min(3650, Number($('#sync-trash-days').value) || 0));
-      if (desktop.setSetting) {
-        desktop.setSetting('trashRetentionDays', trashDays).catch(function () {});
-        autoWriteBack = $('#sync-auto-writeback').checked;
-        desktop.setSetting('autoWriteBack', autoWriteBack).catch(function () {});
+      // 这几个开关只活在设置表单的 DOM 里：表单没装载时读到的是 HTML 默认值，
+      // 写回去等于替用户改开关（关掉的自动同步被打开、网页检索被打开）。未装载就整块跳过。
+      if (desktop.setSetting && syncFormLoaded) {
         autoSyncEnabled = $('#sync-auto-sync').checked;
         desktop.setSetting('autoSyncEnabled', autoSyncEnabled).catch(function () {});
         // AI 助手（一期）：会话根目录走 settings 表；凭据走 integrations.json
@@ -9324,11 +8345,10 @@
           desktop.setSetting('webSearchEnabled', $('#sync-web-search-enabled').checked).catch(function () {});
           if (window.LitAgentUi) LitAgentUi.refreshConfig();
         }
-        if (desktop.bridgeSetEnabled) {
-          desktop.bridgeSetEnabled($('#sync-bridge-enabled').checked).then(refreshBridgeStatus).catch(function () {});
-        }
+        // 扩展桥开关不在这里落：它是顶栏「扩展」面板的控件（自己的 change 监听立即生效），
+        // 本函数读不到它的真实勾选态——面板没开过就是 HTML 默认的未勾选，写了会停掉扩展桥
       }
-      // 自动保存只落本机；上传云端仍由「保存并同步」/内容变化自动同步触发
+      // 自动保存只落本机；上传云端仍由「立即同步」/内容变化自动同步触发
       if (!auto) scheduleNutstoreSync();
       if (drawerId) refreshJournalRank(true);
       return config;
@@ -9347,9 +8367,10 @@
   }
   function flushSyncAutoSave() {
     if (syncAutoSaveTimer) { clearTimeout(syncAutoSaveTimer); syncAutoSaveTimer = null; }
-    if (!syncAutoSaveDirty) return;
+    if (!syncAutoSaveDirty) return Promise.resolve(null);
     syncAutoSaveDirty = false;
-    saveSyncSettings({ auto: true }).catch(function (error) {
+    // 返回 promise：调用方（服务商的「测试连接 / 拉取模型」）要等落盘完成才能按 id 取凭据
+    return saveSyncSettings({ auto: true }).catch(function (error) {
       $('#sync-status').classList.add('error');
       $('#sync-status').textContent = T('自动保存失败：') + (error && error.message || String(error));
       toast(T('设置自动保存失败：') + (error && error.message || error));
@@ -9378,7 +8399,7 @@
     }).catch(function () {});
   }
 
-  // ---------- 完整备份 ----------
+  // ---------- 完整备份（简化设置：目录、立即备份、恢复） ----------
   function setBackupStatusText(message, stateName) {
     var el = $('#sync-backup-status');
     if (!el) return;
@@ -9391,30 +8412,22 @@
     return desktop.getBackupStatus().then(function (info) {
       var input = $('#sync-backup-dir');
       if (input) input.value = info.backupDir || '';
+      var configured = !!info.configured;
       var restoreBtn = $('#sync-backup-restore');
       var openBtn = $('#sync-backup-open');
-      if (restoreBtn) restoreBtn.disabled = !info.configured;
-      if (openBtn) openBtn.disabled = !info.configured;
-      var keepInput = $('#sync-backup-keep');
-      var keepApply = $('#sync-backup-keep-apply');
-      if (keepInput && document.activeElement !== keepInput) {
-        keepInput.value = info.keepSnapshots ? String(info.keepSnapshots) : '';
-        keepInput.placeholder = (info.keepMin || 1) + '–' + (info.keepMax || 30) +
-          T('（默认 ') + (info.defaultKeepSnapshots || info.keepSnapshots || 7) + '）';
-      }
-      if (keepApply) keepApply.disabled = !info.configured;
-      var el = $('#sync-backup-status');
-      if (!el) return info;
-      if (!info.configured) {
+      var backupBtn = $('#sync-backup-now');
+      if (restoreBtn) restoreBtn.disabled = !configured;
+      if (openBtn) openBtn.disabled = !configured;
+      if (backupBtn) backupBtn.disabled = !configured;
+      if (!configured) {
         setBackupStatusText(T('未设置备份目录 — 选择目录后立即创建首份完整备份。'), '');
         return info;
       }
       var parts = [];
       if (info.lastBackupAt) parts.push(T('上次备份：') + new Date(info.lastBackupAt).toLocaleString());
       if (info.snapshots && info.snapshots.length) {
-        parts.push(T('快照 ') + info.snapshots.length + T(' 份（保留 ') + info.keepSnapshots + '）');
+        parts.push(T('备份副本 ') + info.snapshots.length + T(' 份（保留 ') + info.keepSnapshots + '）');
       }
-      if (info.lastSnapshotId) parts.push(T('最近：') + info.lastSnapshotId);
       setBackupStatusText(parts.join(' · ') || T('已配置'), 'success');
       return info;
     }).catch(function () { return null; });
@@ -9426,82 +8439,14 @@
     desktop.chooseBackupDir().then(function (result) {
       if (!result || result.canceled) { refreshBackupStatus(); return; }
       if (result.error) { setBackupStatusText(T('备份目录不可用：') + result.error, 'error'); return; }
-      refreshBackupStatus();
       if (result.backup && result.backup.ok) {
         setBackupStatusText(T('✓ 备份目录已设置，首份完整备份已创建（') + result.backup.snapshotId + '）', 'success');
-      } else if (result.backup && result.backup.skipped && result.backup.existing) {
-        setBackupStatusText(T('✓ 已挂载现有备份目录；未创建空库快照'), 'success');
-      } else {
-        var reason = result.backup && result.backup.error || T('未知错误');
-        setBackupStatusText(T('备份目录已设置；但首份备份未完成：') + reason, 'warning');
+      } else if (result.backup && result.backup.existing) {
+        setBackupStatusText(T('✓ 已挂载现有备份目录；未创建空库备份副本'), 'success');
       }
-    }).catch(function (e) {
-      setBackupStatusText(T('设置备份目录失败：') + (e && e.message || e), 'error');
-    });
-  }
-
-  function formatBytes(bytes) {
-    var value = Number(bytes) || 0;
-    if (value < 1024) return value + ' B';
-    if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KB';
-    if (value < 1024 * 1024 * 1024) return (value / 1024 / 1024).toFixed(1) + ' MB';
-    return (value / 1024 / 1024 / 1024).toFixed(2) + ' GB';
-  }
-
-  function cleanBackupLeftovers() {
-    if (!desktop || !desktop.scanBackupLeftovers || !desktop.cleanBackupLeftovers) return;
-    setBackupStatusText(T('正在扫描遗留文件…'), 'pending');
-    desktop.scanBackupLeftovers().then(function (scan) {
-      var items = (scan && scan.items) || [];
-      var skipNote = scan && scan.skipped && scan.skipped.length ? T('（已跳过：') + scan.skipped.join('；') + '）' : '';
-      if (!items.length) {
-        setBackupStatusText(T('没有可清理的遗留文件') + skipNote, 'success');
-        return;
-      }
-      var detail = Object.keys(scan.categories).map(function (key) {
-        var group = scan.categories[key];
-        return group.label + ' ' + group.count + T(' 项 / ') + formatBytes(group.bytes);
-      }).join('；');
-      var dangerCount = items.filter(function (item) { return item.danger; }).length;
-      var message = T('将删除 ') + items.length + T(' 项遗留文件，释放约 ') + formatBytes(scan.totalBytes) + '。' +
-        detail + '。' +
-        (dangerCount
-          ? T('其中 ') + dangerCount + T(' 项属于高危类别（已隔离的数据库副本、批注写回前的 .litbak 留底），') +
-            T('它们分别保留着损坏库或写回前原件的最后一份拷贝，都只有超过 30 天保留期才会出现在这里；删除后无法找回。')
-          : '') +
-        T('当前数据库、全部快照与仍在被引用的附件都不会被删除。') + skipNote;
-      dlgConfirm(T('清理遗留文件'), message, T('清理'), true).then(function (ok) {
-        if (!ok) { setBackupStatusText(T('已取消清理'), ''); return; }
-        setBackupStatusText(T('正在清理…'), 'pending');
-        desktop.cleanBackupLeftovers().then(function (result) {
-          if (!result || !result.ok) { setBackupStatusText(T('清理失败'), 'error'); return; }
-          var failedNote = result.failed && result.failed.length ? '，' + result.failed.length + T(' 项失败') : '';
-          setBackupStatusText(T('✓ 已清理 ') + result.removed + T(' 项，释放 ') + formatBytes(result.bytes) + failedNote, 'success');
-        }).catch(function (e) {
-          setBackupStatusText(T('清理失败：') + (e && e.message || e), 'error');
-        });
-      });
-    }).catch(function (e) {
-      setBackupStatusText(T('扫描遗留文件失败：') + (e && e.message || e), 'error');
-    });
-  }
-
-  function applyBackupKeep() {
-    if (!desktop || !desktop.setBackupKeep) return;
-    var input = $('#sync-backup-keep');
-    if (!input) return;
-    var value = String(input.value || '').trim();
-    if (!/^\d+$/.test(value)) { setBackupStatusText(T('保留份数请填 1–30 之间的整数'), 'warning'); return; }
-    setBackupStatusText(T('正在保存保留份数…'), 'pending');
-    desktop.setBackupKeep(Number(value)).then(function (result) {
-      if (!result || !result.ok) {
-        setBackupStatusText(T('设置保留份数失败：') + ((result && result.error) || T('未知错误')), 'error');
-        return;
-      }
-      setBackupStatusText(T('✓ 保留份数已设为 ') + result.keepSnapshots + T('（下一次成功备份时轮换生效）'), 'success');
       refreshBackupStatus();
-    }).catch(function (e) {
-      setBackupStatusText(T('设置保留份数失败：') + (e && e.message || e), 'error');
+    }).catch(function (error) {
+      setBackupStatusText(T('设置备份目录失败：') + (error && error.message || error), 'error');
     });
   }
 
@@ -9510,70 +8455,56 @@
     setBackupStatusText(T('正在创建完整备份…'), 'pending');
     desktop.backupNow().then(function (result) {
       if (result && result.ok && result.unchanged) {
-        setBackupStatusText(T('✓ 文献库与最近一份快照内容一致，未重复保存（仍为 ') + result.snapshotId + '）', 'success');
+        setBackupStatusText(T('✓ 文献库与最近一份备份副本内容一致，未重复保存（仍为 ') + result.snapshotId + '）', 'success');
       } else if (result && result.ok) {
-        setBackupStatusText(T('✓ 完整备份完成：') + result.snapshotId + '（' + result.assets + T(' 个附件') +
-          (result.prunedObjects ? T('，清理 ') + result.prunedObjects + T(' 个旧对象') : '') + '）', 'success');
+        setBackupStatusText(T('✓ 完整备份完成：') + result.snapshotId, 'success');
       } else {
-        var reason = (result && result.error) || T('未知错误');
-        if (result && result.missing && result.missing.length) {
-          reason += T('。缺失 ') + result.missing.length + T(' 个引用文件：') +
-            result.missing.slice(0, 3).map(function (m) { return m.path; }).join('、') +
-            (result.missing.length > 3 ? T(' 等') : '');
-        }
-        setBackupStatusText(T('备份未发布：') + reason, 'error');
+        setBackupStatusText(T('备份失败：') + ((result && result.error) || T('未知错误')), 'error');
       }
       refreshBackupStatus();
-    }).catch(function (e) {
-      setBackupStatusText(T('备份失败：') + (e && e.message || e), 'error');
-      refreshBackupStatus();
+    }).catch(function (error) {
+      setBackupStatusText(T('备份失败：') + (error && error.message || error), 'error');
     });
   }
 
   function restoreFromBackup() {
     if (!desktop || !desktop.restoreBackup) return;
     refreshBackupStatus().then(function (info) {
-      if (!info || !info.configured) { setBackupStatusText(T('请先设置备份目录'), 'warning'); return; }
-      var snapshots = (info.snapshots || []).filter(function (s) { return s.valid; });
-      if (!snapshots.length) { setBackupStatusText(T('备份目录中没有有效快照'), 'warning'); return; }
-      dlgPick(T('从完整备份恢复'), T('选择要还原的快照（恢复前会先创建当前库的紧急快照，并逐项校验所选快照的数据库与附件哈希，随后重启应用）：'),
-        snapshots.map(function (s) {
-          return { id: s.id, label: s.createdAt + ' · ' + (s.assets || 0) + T(' 个附件') };
-        })).then(function (id) {
-        if (!id) return;
-        dlgConfirm(T('恢复完整备份'), T('将把当前文献库替换为快照 ') + id + T(' 的内容。') +
-          T('当前库会先自动备份为紧急快照，恢复后应用将重启。是否继续？'), T('恢复并重启'), true).then(function (ok) {
-          if (!ok) return;
-          setBackupStatusText(T('正在创建紧急快照并恢复…'), 'pending');
-          desktop.restoreBackup(id).then(function (result) {
-            if (result && result.ok) {
-              setBackupStatusText(T('✓ 已从 ') + result.snapshotId + T(' 恢复，应用即将重启…'), 'success');
-            } else {
-              setBackupStatusText(T('恢复失败：') + ((result && result.error) || T('未知错误')), 'error');
-              refreshBackupStatus();
-            }
-          }).catch(function (e) {
-            setBackupStatusText(T('恢复失败：') + (e && e.message || e), 'error');
-            refreshBackupStatus();
-          });
+      var snapshots = info && info.snapshots ? info.snapshots.filter(function (item) { return item.valid; }) : [];
+      if (!snapshots.length) { setBackupStatusText(T('备份目录中没有有效备份副本'), 'warning'); return; }
+      dlgPick(T('从完整备份恢复'), T('选择要还原的备份副本（恢复前会先创建当前库的紧急备份副本，并逐项校验所选备份副本的数据库与附件哈希，随后重启应用）：'),
+        snapshots.map(function (item) { return { id: item.id, label: item.createdAt + ' · ' + (item.assets || 0) + T(' 个附件') }; }))
+        .then(function (snapshotId) {
+          if (!snapshotId) return;
+          return dlgConfirm(T('恢复完整备份'), T('将把当前文献库替换为备份副本 ') + snapshotId + T(' 的内容。') +
+            T('当前库会先自动备份为紧急备份副本，恢复后应用将重启。是否继续？'), T('恢复并重启'), true)
+            .then(function (ok) {
+              if (!ok) return;
+              setBackupStatusText(T('正在创建紧急备份副本并恢复…'), 'pending');
+              return desktop.restoreBackup(snapshotId).then(function (result) {
+                if (result && result.ok) setBackupStatusText(T('✓ 已从 ') + result.snapshotId + T(' 恢复，应用即将重启…'), 'success');
+                else setBackupStatusText(T('恢复失败：') + ((result && result.error) || T('未知错误')), 'error');
+              });
+            });
+        }).catch(function (error) {
+          setBackupStatusText(T('恢复失败：') + (error && error.message || error), 'error');
         });
-      });
     });
   }
 
   function openBackupDir() {
     if (!desktop || !desktop.openBackupDir) return;
-    desktop.openBackupDir().then(function (err) {
-      if (err) setBackupStatusText(T('打开备份目录失败：') + err, 'error');
+    desktop.openBackupDir().then(function (error) {
+      if (error) setBackupStatusText(T('打开备份目录失败：') + error, 'error');
     }).catch(function () {});
   }
 
-  /** 库内带本地 PDF 的附件总数（与 LitPdfSearch 的索引单元口径一致） */
+  /** 库内带本地全文文件（PDF/EPUB）的附件总数（与 LitPdfSearch 的索引单元口径一致） */
   function localPdfUnitCount() {
     var count = 0;
     state.papers.forEach(function (paper) {
       var list = (paper.attachments || []).filter(function (attachment) {
-        return attachment && attachment.kind === 'pdf' && attachment.path;
+        return attachment && (attachment.kind === 'pdf' || attachment.kind === 'epub') && attachment.path;
       });
       if (list.length) count += list.length;
       else if (paper.pdfPath) count++;
@@ -9591,27 +8522,17 @@
       var total = localPdfUnitCount();
       var missing = Math.max(0, total - indexed);
       var text = T('已索引 ') + indexed + ' / ' + total +
-        T(' 篇 PDF 正文（约 ') + (mb >= 0.1 ? mb.toFixed(1) + ' MB' : '0 MB') + '）。';
-      if (!total) text = T('库内没有带本地 PDF 的文献。');
+        T(' 篇全文正文（约 ') + (mb >= 0.1 ? mb.toFixed(1) + ' MB' : '0 MB') + '）。';
+      if (!total) text = T('库内没有带本地全文文件（PDF/EPUB）的文献。');
       else if (missing) text += T('其余 ') + missing + T(' 篇在首次全文检索时自动构建，也可点「构建索引」立即生成。');
       el.textContent = text;
     }).catch(function () {});
   }
 
   function applySyncedWorkspace(value, skipNutstoreSync) {
-    var workspace = window.LitModel.normalizeWorkspace(value, uid);
-    // baseSignatures 必须是「数据库最近一次确认的内容签名」。applyWorkspaceState 会把
-    // persistedWorkspaceSignatures 推进到新内容；若直接以它为 base，saveState 会把
-    // 每个条目都判成「本地未改」而跳过——同步落库 / Zotero 导入完成会被静默丢弃。
-    var persistedBeforeApply = persistedWorkspaceSignatures;
-    applyWorkspaceState(workspace);
-    persistedWorkspaceSignatures = persistedBeforeApply;
-    var saved = save(skipNutstoreSync); renderAll();
+    var saved = workspaceStore.applyIncoming(value, skipNutstoreSync); renderAll();
     if (drawerId && getById(drawerId)) openDrawer(drawerId);
-    return Promise.resolve(saved).then(function (ok) {
-      if (!ok) throw new Error(T('同步结果未能写入本地 SQLite，已停止显示完成状态'));
-      return workspace;
-    });
+    return saved;
   }
 
   /**
@@ -9768,578 +8689,6 @@
     }
   }
 
-  function showSyncConflicts(conflicts) {
-    toast(T('同步冲突：') + conflicts.length + T(' 条本地修改被云端版本覆盖'), 9000, {
-      label: T('查看'), fn: function () {
-        var list = $('#sync-conflict-list');
-        list.innerHTML = '';
-        conflicts.forEach(function (c) {
-          var row = document.createElement('div');
-          row.className = 'sync-conflict-row';
-          row.innerHTML = '<span class="sync-conflict-title">' + esc(c.title || c.id) + '</span>' +
-            T('<span class="sync-conflict-dir">以云端版本为准</span>');
-          list.appendChild(row);
-        });
-        $('#sync-conflict-mask').hidden = false;
-        pendingConflictExport = conflicts;
-      }
-    });
-  }
-  var pendingConflictExport = [];
-  var pendingRemotePlan = null;
-  var pendingRemoteResolutions = {};
-  var LOCAL_EMPTY_RESET_KEY = 'plan:local-empty-reset'; // 与主进程 integrations.js 保持一致
-  var remotePlanApplying = false;
-  var refreshSyncFormAfterSync = false;
-
-  function remotePlanId(plan) {
-    return plan && (plan.planId || plan.id || plan.token) || '';
-  }
-
-  function remotePlanConflicts(plan) {
-    return plan && (Array.isArray(plan.conflicts) ? plan.conflicts :
-      Array.isArray(plan.fieldConflicts) ? plan.fieldConflicts : []) || [];
-  }
-
-  function remotePlanLocalOnly(plan) {
-    return plan && (Array.isArray(plan.localOnly) ? plan.localOnly :
-      Array.isArray(plan.localOnlyEntities) ? plan.localOnlyEntities : []) || [];
-  }
-
-  function remoteConflictKey(conflict, index) {
-    return String(conflict && (conflict.conflictId || conflict.id) ||
-      (conflict && conflict.collection || 'papers') + ':' + (conflict && conflict.entityId || conflict && conflict.itemId || '') + ':' +
-      (conflict && conflict.field || '') + ':' + index);
-  }
-
-  function remoteConflictLabel(conflict) {
-    var collection = conflict && conflict.collection || 'papers';
-    var id = conflict && (conflict.entityId || conflict.id || conflict.itemId) || '';
-    var field = conflict && (conflict.field || conflict.label) || T('实体');
-    return collection + ' · ' + (conflict && (conflict.title || id) || id) + ' · ' + field;
-  }
-
-  var remotePlanModel = {
-    items: [],
-    requiredKeys: new Set(),
-    resolvedKeys: new Set(),
-    filteredItems: [],
-    renderedCount: 0,
-    filterText: '',
-    chunkSize: 60,
-    rowMap: new Map(),
-    scrollTicking: false
-  };
-
-  function remotePlanValue(value) {
-    if (value === undefined || value === null) return T('（不存在 / 删除）');
-    if (typeof value === 'string') return value.length > 1500 ? (value.slice(0, 1500) + T('…（长文本截断）')) : (value || T('（空）'));
-    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-    try {
-      var s = JSON.stringify(value, null, 2);
-      return s.length > 1500 ? (s.slice(0, 1500) + T('\n…（超长结构截断）')) : s;
-    } catch (error) {
-      return String(value);
-    }
-  }
-
-  function updateRemotePlanRowVisual(row, choice) {
-    var buttons = row.querySelectorAll('[data-remote-choice]');
-    for (var i = 0; i < buttons.length; i++) {
-      var btn = buttons[i];
-      var isSel = (btn.dataset.remoteChoice === choice);
-      btn.classList.toggle('selected', isSel);
-      if (btn.parentElement && btn.parentElement.classList.contains('remote-plan-value')) {
-        btn.parentElement.classList.toggle('selected', isSel);
-      }
-    }
-  }
-
-  function updateRemotePlanApplyButton() {
-    var isComplete = (remotePlanModel.resolvedKeys.size >= remotePlanModel.requiredKeys.size);
-    var applyBtn = $('#sync-remote-plan-apply');
-    if (applyBtn) applyBtn.disabled = !isComplete;
-  }
-
-  function updateRemotePlanSummary() {
-    if (!pendingRemotePlan) return;
-    var totalRequired = remotePlanModel.requiredKeys.size;
-    var resolvedCount = remotePlanModel.resolvedKeys.size;
-    var totalItems = remotePlanModel.items.length;
-    var remoteState = pendingRemotePlan.remoteExists === false
-      ? T('远端库文件不存在')
-      : T('远端 ') + (pendingRemotePlan.remoteCount == null ? T('未知') : pendingRemotePlan.remoteCount) + T(' 篇');
-    var summary = (pendingRemotePlan.mode === 'restore' ? T('远端恢复') : T('普通同步')) +
-      ' · ' + remoteState +
-      T(' · 待选择 ') + totalRequired + T(' 项（已选 ') + resolvedCount + '/' + totalRequired + '）' +
-      (totalItems > totalRequired ? T('，仅本机 ') + (totalItems - totalRequired) + T(' 项') : '') + '。' +
-      T('采用本机＝本机保留；远端无此条目时会重新上传，远端已有另一版本时保持云端副本不变。') +
-      T('采用远端＝本机改用云端内容。') +
-      (pendingRemotePlan.localEmptyReset ? T('检测到本机文献为 0 而同步基线仍有内容（常见于本机读取失败或切换过数据目录），已暂停自动同步，请先选择处理方式。') :
-        (pendingRemotePlan.remoteResetSuspected ? T('检测到远端库从非空突然变为 0 篇，已暂停自动同步，请确认保留本机。') : '')) +
-      (pendingRemotePlan.remoteEtag ? T('远端版本已锁定，应用前会再次校验。') : '');
-    $('#sync-remote-plan-summary').textContent = summary;
-  }
-
-  function setRemotePlanChoice(key, choice) {
-    pendingRemoteResolutions[key] = choice;
-    if (remotePlanModel.requiredKeys.has(key)) {
-      if (choice === 'local' || choice === 'remote') {
-        remotePlanModel.resolvedKeys.add(key);
-      } else {
-        remotePlanModel.resolvedKeys.delete(key);
-      }
-      updateRemotePlanApplyButton();
-    }
-    var row = remotePlanModel.rowMap.get(key) || (typeof window !== 'undefined' && window.CSS && window.CSS.escape ? document.querySelector('[data-remote-conflict-key="' + window.CSS.escape(key) + '"]') : null);
-    if (row) {
-      updateRemotePlanRowVisual(row, choice);
-    }
-    updateRemotePlanBulkButtons();
-  }
-
-  // 批量按钮的「已应用」态由未决项的实际选择反推：全部未决项都指向同一侧才算生效，
-  // 逐项改过就自动熄灭——既是点击反馈，也不会显示过期的状态。
-  function uniformRemotePlanChoice() {
-    var keys = remotePlanModel.requiredKeys;
-    if (!keys.size) return '';
-    var first = '';
-    keys.forEach(function (key) { if (!first) first = pendingRemoteResolutions[key]; });
-    if (first !== 'local' && first !== 'remote') return '';
-    var uniform = true;
-    keys.forEach(function (key) { if (pendingRemoteResolutions[key] !== first) uniform = false; });
-    return uniform ? first : '';
-  }
-
-  function updateRemotePlanBulkButtons() {
-    var applied = uniformRemotePlanChoice();
-    [['#sync-remote-choose-local', 'local'], ['#sync-remote-choose-remote', 'remote']].forEach(function (pair) {
-      var btn = $(pair[0]);
-      if (!btn) return;
-      var on = (applied === pair[1]);
-      btn.classList.toggle('selected', on);
-      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-      btn.title = on ? T('全部未决项当前都采用这一侧（逐项改动后会取消）') : '';
-    });
-  }
-
-  function batchSetRemotePlanChoices(choice) {
-    if (!pendingRemotePlan) return;
-    var label = choice === 'local' ? T('采用本机版本') : T('采用远端版本');
-    var changed = 0;
-    var undecided = 0;
-    for (var i = 0; i < remotePlanModel.items.length; i++) {
-      var item = remotePlanModel.items[i];
-      if (pendingRemoteResolutions[item.key] !== choice) changed++;
-      pendingRemoteResolutions[item.key] = choice;
-      if (item.isRequired) {
-        if (!remotePlanModel.resolvedKeys.has(item.key)) undecided++;
-        remotePlanModel.resolvedKeys.add(item.key);
-      }
-    }
-    updateRemotePlanApplyButton();
-    remotePlanModel.rowMap.forEach(function (row) {
-      updateRemotePlanRowVisual(row, choice);
-    });
-    updateRemotePlanSummary();
-    updateRemotePlanBulkButtons();
-    // 列表可能滚在别处、行也未必在视口里，点完必须当场有回音
-    toast(changed
-      ? T('✓ 已将 ') + changed + T(' 项设为「') + label + '」' + (undecided ? T('，未决项已全部有选择') : '')
-      : T('所有条目本来就是「') + label + '」');
-  }
-
-  function createRemotePlanRow(item) {
-    var key = item.key;
-    var row = document.createElement('div');
-    row.className = 'remote-plan-row';
-    row.dataset.remoteConflictKey = key;
-    var head = document.createElement('div');
-    head.className = 'remote-plan-row-head';
-    head.textContent = item.label;
-    var hint = document.createElement('small');
-    hint.textContent = item.hint;
-    head.appendChild(hint);
-    row.appendChild(head);
-
-    var curChoice = pendingRemoteResolutions[key];
-
-    if (item.kind === 'conflict') {
-      var values = document.createElement('div');
-      values.className = 'remote-plan-values';
-      var localBox = document.createElement('div');
-      localBox.className = 'remote-plan-value' + (curChoice === 'local' ? ' selected' : '');
-      var localText = document.createElement('div');
-      localText.textContent = remotePlanValue(item.localVal);
-      localBox.appendChild(localText);
-      var localBtn = document.createElement('button');
-      localBtn.type = 'button';
-      localBtn.className = 'btn' + (curChoice === 'local' ? ' selected' : '');
-      localBtn.dataset.remoteChoice = 'local';
-      localBtn.textContent = T('采用本机版本');
-      localBox.appendChild(localBtn);
-      values.appendChild(localBox);
-
-      var remoteBox = document.createElement('div');
-      remoteBox.className = 'remote-plan-value' + (curChoice === 'remote' ? ' selected' : '');
-      var remoteText = document.createElement('div');
-      remoteText.textContent = remotePlanValue(item.remoteVal);
-      remoteBox.appendChild(remoteText);
-      var remoteBtn = document.createElement('button');
-      remoteBtn.type = 'button';
-      remoteBtn.className = 'btn' + (curChoice === 'remote' ? ' selected' : '');
-      remoteBtn.dataset.remoteChoice = 'remote';
-      remoteBtn.textContent = T('采用远端版本');
-      remoteBox.appendChild(remoteBtn);
-      values.appendChild(remoteBox);
-
-      row.appendChild(values);
-    } else {
-      var buttons = document.createElement('div');
-      buttons.className = 'remote-plan-toolbar';
-      var keepBtn = document.createElement('button');
-      keepBtn.type = 'button';
-      keepBtn.className = 'btn' + (curChoice === 'local' ? ' selected' : '');
-      keepBtn.dataset.remoteChoice = 'local';
-      keepBtn.textContent = item.localLabel || T('保留本机');
-      buttons.appendChild(keepBtn);
-
-      var removeBtn = document.createElement('button');
-      removeBtn.type = 'button';
-      removeBtn.className = 'btn' + (curChoice === 'remote' ? ' selected' : '');
-      removeBtn.dataset.remoteChoice = 'remote';
-      removeBtn.textContent = item.remoteLabel || T('从本机移除');
-      buttons.appendChild(removeBtn);
-
-      row.appendChild(buttons);
-    }
-    return row;
-  }
-
-  function appendRemotePlanChunk() {
-    var list = $('#sync-remote-plan-list');
-    if (!list) return;
-    var filtered = remotePlanModel.filteredItems;
-    var start = remotePlanModel.renderedCount;
-    if (start >= filtered.length) return;
-    var end = Math.min(filtered.length, start + remotePlanModel.chunkSize);
-    var frag = document.createDocumentFragment();
-    for (var i = start; i < end; i++) {
-      var item = filtered[i];
-      var row = createRemotePlanRow(item);
-      remotePlanModel.rowMap.set(item.key, row);
-      frag.appendChild(row);
-    }
-    list.appendChild(frag);
-    remotePlanModel.renderedCount = end;
-
-    var oldMore = list.querySelector('.remote-plan-more-hint');
-    if (oldMore) oldMore.remove();
-    if (end < filtered.length) {
-      var moreHint = document.createElement('div');
-      moreHint.className = 'remote-plan-more-hint';
-      moreHint.style.cssText = 'text-align:center;padding:8px;font-size:12px;color:var(--text-muted);cursor:pointer;';
-      moreHint.textContent = T('已显示 ') + end + T(' / 共 ') + filtered.length + T(' 项（向下滚动继续加载，或点击此处全部加载）');
-      moreHint.addEventListener('click', function () {
-        remotePlanModel.chunkSize = filtered.length;
-        appendRemotePlanChunk();
-      });
-      list.appendChild(moreHint);
-    }
-  }
-
-  function applyRemotePlanFilter(query) {
-    remotePlanModel.filterText = String(query || '').trim().toLowerCase();
-    if (!remotePlanModel.filterText) {
-      remotePlanModel.filteredItems = remotePlanModel.items;
-    } else {
-      var q = remotePlanModel.filterText;
-      remotePlanModel.filteredItems = remotePlanModel.items.filter(function (item) {
-        return (item.label && item.label.toLowerCase().indexOf(q) !== -1) ||
-          (item.localText && item.localText.toLowerCase().indexOf(q) !== -1) ||
-          (item.remoteText && item.remoteText.toLowerCase().indexOf(q) !== -1);
-      });
-    }
-    var list = $('#sync-remote-plan-list');
-    if (list) {
-      list.innerHTML = '';
-      remotePlanModel.renderedCount = 0;
-      remotePlanModel.rowMap.clear();
-      appendRemotePlanChunk();
-    }
-  }
-
-  function renderRemotePlan(plan) {
-    pendingRemotePlan = plan;
-    pendingRemoteResolutions = {};
-    remotePlanModel.items = [];
-    remotePlanModel.requiredKeys.clear();
-    remotePlanModel.resolvedKeys.clear();
-    remotePlanModel.renderedCount = 0;
-    remotePlanModel.rowMap.clear();
-    remotePlanModel.filterText = '';
-    remotePlanModel.chunkSize = 60;
-
-    var allConflicts = remotePlanConflicts(plan);
-    var conflicts = allConflicts.filter(function (conflict) { return conflict.direction !== 'local-only'; });
-    var localOnly = remotePlanLocalOnly(plan);
-
-    // 「本机为空疑似重置」：作为必选决议置顶——不选就不能应用，避免把
-    // 「读不到」静默当成「已删除」清空远端。
-    if (plan.localEmptyReset) {
-      remotePlanModel.requiredKeys.add(LOCAL_EMPTY_RESET_KEY);
-      remotePlanModel.items.push({
-        key: LOCAL_EMPTY_RESET_KEY,
-        kind: 'conflict',
-        label: T('⚠ 本机工作区为空（0 篇），同步基线仍有内容'),
-        hint: T('本机为空常见于数据库读取失败或切换过数据目录；正常删除会留下墓碑，不会整库消失'),
-        localVal: T('本机：空库（0 篇）——选择将按空库覆盖远端'),
-        remoteVal: plan.baseRecoveryAvailable
-          ? T('上次同步基线：') + plan.baseRecoveryCount + T(' 篇——选择将从本机同步基线恢复双方元数据')
-          : T('远端：') + (plan.remoteCount == null ? T('未知') : plan.remoteCount) + T(' 篇——选择将把远端内容拉回本机'),
-        localText: T('本机为空库'),
-        remoteText: plan.baseRecoveryAvailable ? T('同步基线恢复') : T('远端完整库'),
-        isRequired: true
-      });
-    }
-
-    conflicts.forEach(function (conflict, index) {
-      var key = remoteConflictKey(conflict, index);
-      remotePlanModel.requiredKeys.add(key);
-      remotePlanModel.items.push({
-        key: key,
-        kind: 'conflict',
-        label: remoteConflictLabel(conflict),
-        hint: T('请选择一个版本'),
-        localVal: conflict.local,
-        remoteVal: conflict.remote,
-        localText: typeof conflict.local === 'string' ? conflict.local : (conflict.local && (conflict.local.title || conflict.local.name) || ''),
-        remoteText: typeof conflict.remote === 'string' ? conflict.remote : (conflict.remote && (conflict.remote.title || conflict.remote.name) || ''),
-        isRequired: true
-      });
-    });
-
-    localOnly.forEach(function (entity, index) {
-      var collection = entity && entity.collection || 'papers';
-      var value = entity && (entity.entity || entity.value || entity) || {};
-      var id = entity && (entity.id || entity.entityId) || value.id || index;
-      var key = entity && entity.conflictId || 'local-only:' + collection + ':' + id;
-      remotePlanModel.items.push({
-        key: key,
-        kind: 'local-only',
-        label: T('仅本机 · ') + (value.title || value.name || id),
-        hint: T('默认保留'),
-        localLabel: T('保留本机'),
-        remoteLabel: T('从本机移除'),
-        localVal: value,
-        remoteVal: null,
-        localText: value.title || value.name || '',
-        remoteText: '',
-        isRequired: false
-      });
-    });
-
-    remotePlanModel.filteredItems = remotePlanModel.items;
-
-    var filterInput = $('#sync-remote-plan-filter');
-    if (filterInput) filterInput.value = '';
-
-    resetRemotePlanProgressUi();
-    var list = $('#sync-remote-plan-list');
-    list.innerHTML = '';
-    appendRemotePlanChunk();
-
-    updateRemotePlanSummary();
-    updateRemotePlanApplyButton();
-    updateRemotePlanBulkButtons();
-    $('#sync-remote-plan-mask').hidden = false;
-  }
-
-  function inspectRemote() {
-    if (!desktop || !desktop.inspectNutstoreRemote) { setSyncInlineStatus('sync-remote-status', T('当前版本不支持远端检查'), 'error'); return; }
-    setSyncInlineStatus('sync-remote-status', T('正在只读检查远端…'), 'pending');
-    desktop.inspectNutstoreRemote(syncFormValue()).then(function (info) {
-      if (info && info.exists === false) {
-        var missing = T('未找到远端库文件 · ') + (info.fileUrl || 'litboard-library.json') +
-          (info.status ? ' · HTTP ' + info.status : '');
-        setSyncInlineStatus('sync-remote-status', missing, 'warning');
-        return;
-      }
-      var paperCount = info && info.counts && info.counts.papers;
-      var text = T('远端库文件存在 · ') + (paperCount == null ? T('文献数未知') : (paperCount + T(' 篇'))) +
-        (info && info.fileUrl ? ' · ' + info.fileUrl : '');
-      if (info && info.config && info.config.exists) text += (info.config.locked ? T(' · 配置已加密（需配置密码）') : T(' · 含可恢复配置'));
-      setSyncInlineStatus('sync-remote-status', text, 'success');
-    }).catch(function (error) {
-      setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
-    });
-  }
-
-  function createRemotePlan(mode) {
-    if (!desktop || !desktop.createNutstoreSyncPlan) { setSyncInlineStatus('sync-remote-status', T('当前版本不支持远端恢复计划'), 'error'); return; }
-    setSyncInlineStatus('sync-remote-status', T('正在读取远端并生成对照…'), 'pending');
-    desktop.createNutstoreSyncPlan({ config: syncFormValue(), workspace: workspacePayload(), mode: mode }).then(function (plan) {
-      renderRemotePlan(plan || {});
-      setSyncInlineStatus('sync-remote-status', T('已生成对照，请完成选择后应用'), 'warning');
-    }).catch(function (error) {
-      setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
-    });
-  }
-
-  function pullRemoteConfig() {
-    if (!desktop || !desktop.pullNutstoreConfig) { setSyncInlineStatus('sync-remote-status', T('当前版本不支持独立配置恢复'), 'error'); return; }
-    setSyncInlineStatus('sync-remote-status', T('正在恢复远端配置…'), 'pending');
-    desktop.pullNutstoreConfig(syncFormValue()).then(function (result) {
-      if (!result || !result.found) throw new Error(T('远端没有可用的加密配置'));
-      integrationConfig = result.config || integrationConfig;
-      if (result.config) {
-        applyPortableConfigRuntime(result.config);
-        fillSyncForm(result.config);
-      }
-      setSyncInlineStatus('sync-remote-status', T('配置恢复完成（文献库未改变）'), 'success');
-      toast(T('远端配置恢复完成'));
-    }).catch(function (error) {
-      setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
-    });
-  }
-
-  function closeRemotePlanDialog() {
-    if (remotePlanApplying) return; // 应用进行中不允许关闭，避免同步落库到一半丢 UI
-    $('#sync-remote-plan-mask').hidden = true;
-    pendingRemotePlan = null;
-    pendingRemoteResolutions = {};
-    remotePlanModel.items = [];
-    remotePlanModel.filteredItems = [];
-    remotePlanModel.rowMap.clear();
-    remotePlanModel.requiredKeys.clear();
-    remotePlanModel.resolvedKeys.clear();
-    var planList = $('#sync-remote-plan-list');
-    if (planList) planList.innerHTML = '';
-    var filterInput = $('#sync-remote-plan-filter');
-    if (filterInput) filterInput.value = '';
-  }
-
-  function setRemotePlanApplying(applying) {
-    remotePlanApplying = applying;
-    var progress = $('#sync-remote-plan-progress');
-    var list = $('#sync-remote-plan-list');
-    var filterInput = $('#sync-remote-plan-filter');
-    var toolbar = filterInput && filterInput.parentElement;
-    if (progress) progress.hidden = !applying;
-    if (list) list.hidden = applying;
-    if (toolbar) toolbar.hidden = applying;
-  }
-
-  function setRemotePlanProgress(payload) {
-    if (!payload) return;
-    var text = $('#sync-remote-plan-progress-text');
-    var percent = $('#sync-remote-plan-progress-percent');
-    var bar = $('#sync-remote-plan-progress-bar');
-    if (text && payload.message) text.textContent = payload.message;
-    if (!bar) return;
-    if (payload.phase === 'assets' && payload.total > 0) {
-      bar.max = payload.total;
-      bar.value = Math.max(0, Math.min(payload.done, payload.total));
-      if (percent) percent.textContent = Math.round((bar.value / bar.max) * 100) + '%';
-    } else if (payload.phase === 'done') {
-      bar.max = 100;
-      bar.value = 100;
-      if (percent) percent.textContent = '100%';
-    } else {
-      // 校验/写入/配置阶段总量未知：进度条走不确定态动画
-      bar.removeAttribute('value');
-      if (percent) percent.textContent = '';
-    }
-  }
-
-  function resetRemotePlanProgressUi() {
-    setRemotePlanApplying(false);
-    var cancelButton = $('#sync-remote-plan-cancel');
-    if (cancelButton) {
-      cancelButton.disabled = false;
-      cancelButton.textContent = T('取消');
-    }
-    var applyButton = $('#sync-remote-plan-apply');
-    if (applyButton) {
-      applyButton.hidden = false;
-      applyButton.textContent = T('应用选择并同步');
-    }
-  }
-
-  function setRemotePlanCompleted(message) {
-    remotePlanApplying = false;
-    var progress = $('#sync-remote-plan-progress');
-    var list = $('#sync-remote-plan-list');
-    var filterInput = $('#sync-remote-plan-filter');
-    var toolbar = filterInput && filterInput.parentElement;
-    if (progress) progress.hidden = false;
-    if (list) list.hidden = true;
-    if (toolbar) toolbar.hidden = true;
-    setRemotePlanProgress({ phase: 'done', message: message || T('同步完成') });
-    var cancelButton = $('#sync-remote-plan-cancel');
-    if (cancelButton) {
-      cancelButton.disabled = false;
-      cancelButton.textContent = T('关闭');
-    }
-    var applyButton = $('#sync-remote-plan-apply');
-    if (applyButton) applyButton.hidden = true;
-  }
-
-  function handleSyncProgress(payload) {
-    if (!payload) return;
-    if (remotePlanApplying) {
-      if (payload.scope === 'apply-plan' && payload.planId === remotePlanId(pendingRemotePlan)) {
-        setRemotePlanProgress(payload);
-      }
-      return;
-    }
-    // 后台自动同步：设置弹窗开着时把阶段信息透出到状态行
-    if (payload.message && syncBusy) {
-      var status = $('#sync-status');
-      var mask = $('#sync-mask');
-      if (status && mask && !mask.hidden) status.textContent = payload.message;
-    }
-  }
-
-  function applyRemotePlan() {
-    if (!pendingRemotePlan || !desktop || !desktop.applyNutstoreSyncPlan) return;
-    if (remotePlanApplying) return;
-    var planMode = pendingRemotePlan.mode;
-    var button = $('#sync-remote-plan-apply'); button.disabled = true;
-    var cancelButton = $('#sync-remote-plan-cancel'); if (cancelButton) cancelButton.disabled = true;
-    setRemotePlanApplying(true);
-    setRemotePlanProgress({ phase: 'verify', message: T('正在校验远端版本…') });
-    setSyncInlineStatus('sync-remote-status', T('正在校验远端版本并应用…'), 'pending');
-    var applyAssetFailures = 0;
-    desktop.applyNutstoreSyncPlan({ planId: remotePlanId(pendingRemotePlan), resolutions: pendingRemoteResolutions }).then(function (result) {
-      var workspace = result && result.workspace ? result.workspace : result;
-      applyAssetFailures = result && result.assets && result.assets.failures ? result.assets.failures.length : 0;
-      if (workspace && workspace.papers) {
-        return applySyncedWorkspace(workspace, true).then(function () {
-          setSyncIndicator('ok');
-          if (desktop.getIntegrationConfig) return desktop.getIntegrationConfig().catch(function () { return null; });
-          return null;
-        });
-      }
-      if (desktop.getIntegrationConfig) return desktop.getIntegrationConfig().catch(function () { return null; });
-      return null;
-    }).then(function (config) {
-      if (config) {
-        applyPortableConfigRuntime(config);
-        fillSyncForm(config);
-      }
-      var label = planMode === 'merge' ? T('同步对照已应用') : T('远端恢复完成');
-      if (applyAssetFailures) label += '（' + applyAssetFailures + T(' 个附件失败，下次同步自动续传）');
-      setSyncInlineStatus('sync-remote-status', label, applyAssetFailures ? 'warning' : 'success');
-      setRemotePlanCompleted(label);
-      toast(label);
-    }).catch(function (error) {
-      resetRemotePlanProgressUi();
-      button.disabled = false;
-      setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
-    });
-  }
-
   function applyPortableConfigRuntime(config) {
     if (!config || typeof config !== 'object') return;
     if (config.autoWriteBack != null) autoWriteBack = config.autoWriteBack === true;
@@ -10359,35 +8708,43 @@
     }
     var useNutstore = config.nutstoreUser && config.hasNutstorePassword;
     if (!useNutstore) {
-      if (!silent) throw new Error(T('请先配置坚果云账号和应用密码'));
+      // 不抛异常：调用点是点击处理里 fire-and-forget 的 .then，抛出去只会变成未捕获的
+      // rejection（控制台报错，而界面上停在上一句「配置已保存」，看着像点了没反应）
+      var notConfigured = T('请先配置坚果云账号和应用密码');
+      setSyncIndicator('error', notConfigured);
+      if (!silent) {
+        $('#sync-status').classList.add('error');
+        $('#sync-status').textContent = notConfigured;
+        toast(T('同步失败：') + notConfigured);
+      }
       return Promise.resolve(false);
     }
     syncBusy = true;
     setSyncIndicator('syncing');
     if (!silent) { $('#sync-status').classList.remove('error'); $('#sync-status').textContent = T('正在同步…'); }
     var current = workspacePayload();
-    var syncRevision = workspaceRevision;
+    var syncRevision = workspaceStore.getRevision();
     var chain = Promise.resolve(current);
     if (useNutstore) chain = chain.then(function (workspace) { return desktop.syncNutstore(workspace); });
     return chain.then(function (result) {
       if (result && (result.pendingPlan || result.plan)) {
-        renderRemotePlan(result.pendingPlan || result.plan);
-        setSyncInlineStatus('sync-remote-status', T('后台同步发现冲突，远端写入已暂停'), 'warning');
-        if (!silent) $('#sync-status').textContent = T('同步发现冲突，请完成远端对照');
+        showRemotePlan(result.pendingPlan || result.plan);
+        setSyncInlineStatus('sync-remote-status', T('后台同步发现冲突，云端写入已暂停'), 'warning');
+        if (!silent) $('#sync-status').textContent = T('同步发现冲突，请完成云端对照');
         return false;
       }
       var workspace = result && result.workspace ? result.workspace : result;
-      if (workspaceRevision !== syncRevision) {
+      if (workspaceStore.getRevision() !== syncRevision) {
         scheduleNutstoreSync(true); // 本次同步已在进行中，收尾重排队不受自动同步开关影响
         if (!silent) $('#sync-status').textContent = T('检测到新的本地修改，已重新排队同步');
         return true;
       }
       return applySyncedWorkspace(workspace, true).then(function () {
-        if (result && result.config && refreshSyncFormAfterSync) {
+        if (result && result.config && remotePlan && remotePlan.shouldRefreshForm()) {
           integrationConfig = result.config;
           applyPortableConfigRuntime(result.config);
           fillSyncForm(result.config);
-          refreshSyncFormAfterSync = false;
+          remotePlan.clearRefreshFormFlag();
         }
         if (desktop.getIntegrationConfig) {
           desktop.getIntegrationConfig().then(function (freshConfig) {
@@ -10434,195 +8791,23 @@
     $('#folder-name-input').focus();
   }
 
-  // ---------- 主题（GitHub 流行 Top 5 亮暗主题体系） ----------
-  var THEMES = [
-    'auto',
-    'light-github', 'light-catppuccin', 'light-solarized', 'light-onelight', 'light-gruvbox',
-    'dark-catppuccin', 'dark-dracula', 'dark-tokyonight', 'dark-nord', 'dark-onedark'
-  ];
-  var THEME_INFO = {
-    'auto':             { label: T('跟随系统'), group: 'auto', icon: 'lb-i-theme-auto' },
-    'light':            { label: 'GitHub Light', group: 'light', dot: 'theme-github', icon: 'lb-i-sun' },
-    'light-github':     { label: 'GitHub Light', group: 'light', dot: 'theme-github', icon: 'lb-i-sun' },
-    'light-catppuccin': { label: 'Catppuccin Latte', group: 'light', dot: 'theme-catppuccin-latte', icon: 'lb-i-sun' },
-    'light-solarized':  { label: 'Solarized Light', group: 'light', dot: 'theme-solarized-light', icon: 'lb-i-sun' },
-    'light-onelight':   { label: 'One Light', group: 'light', dot: 'theme-onelight', icon: 'lb-i-sun' },
-    'light-gruvbox':    { label: 'Gruvbox Light', group: 'light', dot: 'theme-gruvbox-light', icon: 'lb-i-sun' },
-    'dark':             { label: 'Catppuccin Mocha', group: 'dark', dot: 'theme-catppuccin-mocha', icon: 'lb-i-moon' },
-    'dark-catppuccin':  { label: 'Catppuccin Mocha', group: 'dark', dot: 'theme-catppuccin-mocha', icon: 'lb-i-moon' },
-    'dark-dracula':     { label: 'Dracula', group: 'dark', dot: 'theme-dracula', icon: 'lb-i-moon' },
-    'dark-tokyonight':  { label: 'Tokyo Night', group: 'dark', dot: 'theme-tokyonight', icon: 'lb-i-moon' },
-    'dark-nord':        { label: 'Nord', group: 'dark', dot: 'theme-nord', icon: 'lb-i-moon' },
-    'dark-onedark':     { label: 'One Dark', group: 'dark', dot: 'theme-onedark', icon: 'lb-i-moon' }
-  };
-  var THEME_LABEL = {
-    auto: T('跟随系统'),
-    light: 'GitHub Light',
-    'light-github': 'GitHub Light',
-    'light-catppuccin': 'Catppuccin Latte',
-    'light-solarized': 'Solarized Light',
-    'light-onelight': 'One Light',
-    'light-gruvbox': 'Gruvbox Light',
-    dark: 'Catppuccin Mocha',
-    'dark-catppuccin': 'Catppuccin Mocha',
-    'dark-dracula': 'Dracula',
-    'dark-tokyonight': 'Tokyo Night',
-    'dark-nord': 'Nord',
-    'dark-onedark': 'One Dark'
-  };
-  var THEME_ICON = {
-    auto: 'lb-i-theme-auto',
-    light: 'lb-i-sun',
-    'light-github': 'lb-i-sun',
-    'light-catppuccin': 'lb-i-sun',
-    'light-solarized': 'lb-i-sun',
-    'light-onelight': 'lb-i-sun',
-    'light-gruvbox': 'lb-i-sun',
-    dark: 'lb-i-moon',
-    'dark-catppuccin': 'lb-i-moon',
-    'dark-dracula': 'lb-i-moon',
-    'dark-tokyonight': 'lb-i-moon',
-    'dark-nord': 'lb-i-moon',
-    'dark-onedark': 'lb-i-moon'
-  };
-
-  function applyTheme(t) {
-    var root = document.documentElement;
-    // 切换瞬间禁用过渡：Chromium 下仅 color-scheme 变化时，带 background-color
-    // 过渡的元素不会重解析 light-dark()，会整片卡在旧色（css 里有 .theme-switching 说明）
-    root.classList.add('theme-switching');
-    if (t === 'auto') {
-      root.removeAttribute('data-theme');
-    } else {
-      root.setAttribute('data-theme', t);
-    }
-    var info = THEME_INFO[t] || THEME_INFO.auto;
-    var themeBtn = $('#btn-theme');
-    if (themeBtn) {
-      themeBtn.innerHTML = svgUse(info.icon || THEME_ICON[t] || THEME_ICON.auto);
-      themeBtn.title = T('主题：') + (info.label || THEME_LABEL[t] || THEME_LABEL.auto) + T('（点击切换）');
-    }
-    var syncThemeSelect = $('#sync-theme-select');
-    if (syncThemeSelect && syncThemeSelect.value !== t) {
-      syncThemeSelect.value = t;
-    }
-    requestAnimationFrame(function () {
-      requestAnimationFrame(function () { root.classList.remove('theme-switching'); });
+  /* ---- 主题与界面语言（js/app/theme.js）：适配层 ---- */
+  var theme = null;
+  function initTheme() {
+    if (!window.LitTheme) return;
+    theme = window.LitTheme.create({
+      T: T, $: $, svgUse: svgUse, toast: toast, showCtxMenu: showCtxMenu,
+      renderAll: renderAll, renderPdfTabs: renderPdfTabs,
+      desktop: function () { return desktop; },
+      i18n: window.LitI18n
     });
   }
-
-  function setTheme(t) {
-    localStorage.setItem(THEME_KEY, t);
-    applyTheme(t);
-    var info = THEME_INFO[t] || THEME_INFO.auto;
-    toast(T('已应用主题：') + (info.label || THEME_LABEL[t] || t));
-  }
-
-  /* 语言切换：词典 + 静态骨架即时重译，动态区域走全量重渲染；无需重启。
-   * 同时把解析后的语言镜像进 settings 表，主进程原生对话框据此取文案。 */
-  function applyLanguage(value) {
-    if (!window.LitI18n) return;
-    window.LitI18n.setLang(value);
-    document.documentElement.lang = window.LitI18n.getLang();
-    window.LitI18n.applyStatic(document);
-    renderAll();
-    renderPdfTabs();
-    if (desktop && desktop.setSetting) {
-      desktop.setSetting('uiLang', window.LitI18n.getLang()).catch(function () {});
-    }
-    toast(window.LitI18n.getLang() === 'en' ? 'Interface language: English' : '界面语言：简体中文');
-  }
-
-  function cycleTheme() {
-    var cur = localStorage.getItem(THEME_KEY) || 'auto';
-    var idx = THEMES.indexOf(cur);
-    if (idx === -1) {
-      if (cur === 'light') idx = THEMES.indexOf('light-github');
-      else if (cur === 'dark') idx = THEMES.indexOf('dark-catppuccin');
-      else idx = 0;
-    }
-    var next = THEMES[(idx + 1) % THEMES.length];
-    setTheme(next);
-  }
-
-  function showThemeMenu() {
-    var cur = localStorage.getItem(THEME_KEY) || 'auto';
-    var btn = $('#btn-theme');
-    if (!btn) return;
-    var rect = btn.getBoundingClientRect();
-
-    var isCur = function (key) {
-      if (cur === key) return true;
-      if (key === 'light-github' && cur === 'light') return true;
-      if (key === 'dark-catppuccin' && cur === 'dark') return true;
-      return false;
-    };
-
-    var items = [
-      { header: T('界面与主题') },
-      {
-        label: T('跟随系统 (Auto)') + (cur === 'auto' ? '  ✓' : ''),
-        icon: 'lb-i-theme-auto',
-        fn: function () { setTheme('auto'); }
-      },
-      'sep',
-      { header: T('浅色主题 (GitHub Top 5)') },
-      {
-        label: T('GitHub Light（经典白）') + (isCur('light-github') ? '  ✓' : ''),
-        dot: 'theme-github',
-        fn: function () { setTheme('light-github'); }
-      },
-      {
-        label: T('Catppuccin Latte（柔和浅色）') + (isCur('light-catppuccin') ? '  ✓' : ''),
-        dot: 'theme-catppuccin-latte',
-        fn: function () { setTheme('light-catppuccin'); }
-      },
-      {
-        label: T('Solarized Light（日耀米黄）') + (isCur('light-solarized') ? '  ✓' : ''),
-        dot: 'theme-solarized-light',
-        fn: function () { setTheme('light-solarized'); }
-      },
-      {
-        label: T('One Light（原子浅灰）') + (isCur('light-onelight') ? '  ✓' : ''),
-        dot: 'theme-onelight',
-        fn: function () { setTheme('light-onelight'); }
-      },
-      {
-        label: T('Gruvbox Light（复古羊皮）') + (isCur('light-gruvbox') ? '  ✓' : ''),
-        dot: 'theme-gruvbox-light',
-        fn: function () { setTheme('light-gruvbox'); }
-      },
-      'sep',
-      { header: T('深色主题 (GitHub Top 5)') },
-      {
-        label: T('Catppuccin Mocha（经典摩卡）') + (isCur('dark-catppuccin') ? '  ✓' : ''),
-        dot: 'theme-catppuccin-mocha',
-        fn: function () { setTheme('dark-catppuccin'); }
-      },
-      {
-        label: T('Dracula（德古拉紫）') + (isCur('dark-dracula') ? '  ✓' : ''),
-        dot: 'theme-dracula',
-        fn: function () { setTheme('dark-dracula'); }
-      },
-      {
-        label: T('Tokyo Night（东京夜色）') + (isCur('dark-tokyonight') ? '  ✓' : ''),
-        dot: 'theme-tokyonight',
-        fn: function () { setTheme('dark-tokyonight'); }
-      },
-      {
-        label: T('Nord（极光冷灰）') + (isCur('dark-nord') ? '  ✓' : ''),
-        dot: 'theme-nord',
-        fn: function () { setTheme('dark-nord'); }
-      },
-      {
-        label: T('One Dark（原子深灰）') + (isCur('dark-onedark') ? '  ✓' : ''),
-        dot: 'theme-onedark',
-        fn: function () { setTheme('dark-onedark'); }
-      }
-    ];
-
-    showCtxMenu(rect.left - 120, rect.bottom + 6, items);
-  }
+  function currentTheme() { return theme ? theme.current() : (localStorage.getItem('litboard.theme') || 'auto'); }
+  function applyTheme(t) { if (theme) theme.apply(t); }
+  function setTheme(t) { if (theme) theme.set(t); }
+  function cycleTheme() { if (theme) theme.cycle(); }
+  function showThemeMenu() { if (theme) theme.showMenu(); }
+  function applyLanguage(value) { if (theme) theme.applyLanguage(value); }
 
   // ---------- 无边框窗口控制 ----------
   function setMaximizedUi(maximized) {
@@ -10659,6 +8844,7 @@
   function bindEvents() {
     bindPaneResizer('resizer-left', 'left');
     bindPaneResizer('resizer-right', 'right');
+    bindModalResizer($('.sync-modal'), $('#sync-resize-grip'), 'settings', 560, 360);
     window.addEventListener('resize', debounce(function () {
       applyPaneSizes({
         left: Number($('.workspace').dataset.leftWidth) || 220,
@@ -10670,19 +8856,17 @@
     $('#btn-sync').addEventListener('click', function () { openSyncSettings(); });
     $('#btn-word').addEventListener('click', openWordPanel);
     $('#btn-bridge').addEventListener('click', openBridgePanel);
-    // 右栏图标轨（详情 / AI 助手 / 手动检索）在 agentui 内部绑定，此处不重复
+    // 右栏图标轨（详情 / AI 助手 / 阅读批注）在 agentui 内部绑定，此处不重复
     // 更多菜单（顶栏瘦身：低频操作收进这里）
+    registerTopbarMenu($('#btn-more'), $('#more-menu'));
     $('#btn-more').addEventListener('click', function (e) {
       e.stopPropagation();
-      var menu = $('#more-menu');
-      menu.hidden = !menu.hidden;
+      toggleTopbarMenu($('#more-menu'));
     });
     document.addEventListener('click', function () { $('#more-menu').hidden = true; });
     $('#more-menu').addEventListener('click', function () { $('#more-menu').hidden = true; });
     bindAgentSettings();
-    $('#word-panel-close').addEventListener('click', closeWordPanel);
     $('#bridge-panel-close').addEventListener('click', closeBridgePanel);
-    $('#word-panel-mask').addEventListener('click', function (e) { if (e.target === this) closeWordPanel(); });
     $('#bridge-panel-mask').addEventListener('click', function (e) { if (e.target === this) closeBridgePanel(); });
     $('#sync-nav').addEventListener('click', function (e) {
       var btn = e.target.closest('.sync-nav-btn');
@@ -10693,12 +8877,17 @@
     ['sync-nutstore-url', 'sync-nutstore-user', 'sync-nutstore-password', 'sync-nutstore-folder',
       'sync-zotero-webdav-folder', 'sync-translator-provider', 'sync-translator-target',
       'sync-translator-model', 'sync-translator-api-key', 'sync-rank-provider',
-      'sync-scigreat-api-key', 'sync-easyscholar-api-key',
-      'sync-rename-template', 'sync-proxy-prefix', 'sync-trash-days',
-      'sync-auto-writeback', 'sync-auto-sync'
+      'sync-scigreat-api-key', 'sync-easyscholar-api-key', 'sync-auto-sync',
+      // 检索/元数据服务、向量模型与 AI 预算：以前只搭别的字段的顺风车，
+      // 单改这些字段（页脚承诺「改动即时保存」）关窗就丢，这里补齐
+      'sync-openalex-email', 'sync-openalex-key', 'sync-elsevier-key', 'sync-tinyfish-key',
+      'sync-embed-provider', 'sync-embed-base-url', 'sync-embed-model', 'sync-embed-api-key',
+      'sync-agent-context-tokens', 'sync-agent-max-output-tokens', 'sync-agent-session-root',
+      'sync-agent-autocompact'
     ].forEach(function (id) {
       $('#' + id).addEventListener('change', queueSyncAutoSave);
     });
+    $('#sync-rank-provider').addEventListener('change', updateRankProviderFields);
     // 扩展开关已搬到顶栏「扩展」面板：不能走设置自动保存（设置从未打开时表单是空的，
     // 保存会把空配置写回去抹掉凭据），改为立即生效
     $('#sync-bridge-enabled').addEventListener('change', function () {
@@ -10717,66 +8906,20 @@
         applyLanguage(this.value);
       });
     }
+    $('#sync-font-size-down').addEventListener('click', function () { applyFontScale(fontScale - 0.1); });
+    $('#sync-font-size-reset').addEventListener('click', function () { applyFontScale(1); });
+    $('#sync-font-size-up').addEventListener('click', function () { applyFontScale(fontScale + 0.1); });
     $('#sync-choose-config-dir').addEventListener('click', function () { chooseDataPath('config'); });
     $('#sync-choose-library-dir').addEventListener('click', function () { chooseDataPath('library'); });
     $('#sync-data-paths-apply').addEventListener('click', applyDataPathChanges);
     $('#sync-backup-choose').addEventListener('click', chooseBackupDir);
-    $('#sync-backup-keep-apply').addEventListener('click', applyBackupKeep);
-    $('#sync-backup-cleanup').addEventListener('click', cleanBackupLeftovers);
     $('#sync-backup-now').addEventListener('click', runBackupNow);
     $('#sync-backup-restore').addEventListener('click', restoreFromBackup);
     $('#sync-backup-open').addEventListener('click', openBackupDir);
-    $('#sync-remote-inspect').addEventListener('click', inspectRemote);
-    $('#sync-remote-config').addEventListener('click', pullRemoteConfig);
-    $('#sync-remote-restore').addEventListener('click', function () { createRemotePlan('restore'); });
-    $('#sync-remote-merge').addEventListener('click', function () { createRemotePlan('merge'); });
-    $('#sync-remote-plan-cancel').addEventListener('click', closeRemotePlanDialog);
-    $('#sync-remote-plan-apply').addEventListener('click', applyRemotePlan);
-    $('#sync-remote-choose-local').addEventListener('click', function () {
-      batchSetRemotePlanChoices('local');
-    });
-    $('#sync-remote-choose-remote').addEventListener('click', function () {
-      batchSetRemotePlanChoices('remote');
-    });
-
-    var planList = $('#sync-remote-plan-list');
-    if (planList) {
-      planList.addEventListener('click', function (event) {
-        var btn = event.target.closest('[data-remote-choice]');
-        if (!btn) return;
-        var row = btn.closest('[data-remote-conflict-key]');
-        if (!row) return;
-        var key = row.dataset.remoteConflictKey;
-        var choice = btn.dataset.remoteChoice;
-        setRemotePlanChoice(key, choice);
-      });
-      planList.addEventListener('scroll', function () {
-        if (remotePlanModel.scrollTicking) return;
-        remotePlanModel.scrollTicking = true;
-        requestAnimationFrame(function () {
-          remotePlanModel.scrollTicking = false;
-          if (planList.scrollTop + planList.clientHeight >= planList.scrollHeight - 200) {
-            appendRemotePlanChunk();
-          }
-        });
-      });
-    }
-
-    var planFilter = $('#sync-remote-plan-filter');
-    if (planFilter) {
-      planFilter.addEventListener('input', debounce(function () {
-        applyRemotePlanFilter(planFilter.value);
-      }, 150));
-    }
+    /* 远端对照/冲突弹窗整体在 js/app/remote-plan.js */
+    initRemotePlan();
     $('#sync-translator-provider').addEventListener('change', updateTranslatorFields);
     $('#sync-translator-auto').addEventListener('change', function () { setTranslatorAutoTranslate(this.checked, true); });
-    $('#sync-save').addEventListener('click', function () {
-      cancelSyncAutoSave();
-      saveSyncSettings().catch(function (error) {
-        $('#sync-status').classList.add('error');
-        $('#sync-status').textContent = error && error.message || String(error);
-      });
-    });
     $('#sync-test-nutstore').addEventListener('click', function () {
       var button = this;
       button.disabled = true;
@@ -10808,8 +8951,8 @@
       var provider = $('#sync-rank-provider').value;
       desktop.testScigreatConnection({
         rankProvider: provider,
-        scigreatApiKey: $('#sync-scigreat-api-key').value,
-        easyscholarApiKey: $('#sync-easyscholar-api-key').value,
+        scigreatApiKey: secretInputValue('sync-scigreat-api-key'),
+        easyscholarApiKey: secretInputValue('sync-easyscholar-api-key'),
         journal: 'Nature'
       }).then(function (result) {
         var data = rankResultData(result);
@@ -10896,9 +9039,20 @@
         setSyncInlineStatus('sync-sources-test-status', error && error.message || String(error), 'error');
       }).finally(function () { button.disabled = false; });
     });
+    // 「立即同步」（设置 → 云同步）：先取消待执行的自动保存、把当前表单一次性落盘，
+    // 再发起一次非静默同步（状态与失败原因要看得见）。页脚不放同步按钮——改动本就即时保存，
+    // 页脚再挂一个「保存并同步」会让人以为不点就丢设置。
     $('#sync-run').addEventListener('click', function () {
       cancelSyncAutoSave();
-      saveSyncSettings().then(function (config) { return performSync(config, false); });
+      saveSyncSettings().then(function (config) { return performSync(config, false); })
+        .catch(function (error) {
+          // 兜底：保存或同步链路上任何未预期的失败都要落到看得见的地方——点击处理没人接这个
+          // promise，漏出去就是控制台里一条未捕获的 rejection（界面停在「配置已保存」）
+          var message = error && error.message || String(error);
+          $('#sync-status').classList.add('error');
+          $('#sync-status').textContent = message;
+          toast(T('同步失败：') + message);
+        });
     });
     $('#sync-detect-zotero').addEventListener('click', function () {
       $('#sync-status').textContent = T('正在检测 Zotero 数据目录…');
@@ -10942,35 +9096,12 @@
         button.disabled = false;
       });
     });
-    $('#sync-bib-export-choose').addEventListener('click', function () {
-      if (!desktop || !desktop.chooseSavePath) return;
-      desktop.chooseSavePath({
-        title: T('选择自动导出的 .bib 文件'), name: 'library.bib',
-        filters: [{ name: T('BibTeX 文件'), extensions: ['bib'] }]
-      }).then(function (filePath) {
-        if (filePath) { $('#sync-bib-export-path').value = filePath; queueSyncAutoSave(); }
-      }).catch(function () {});
-    });
-    $('#sync-bib-export-clear').addEventListener('click', function () {
-      $('#sync-bib-export-path').value = '';
-      queueSyncAutoSave();
-    });
-    $('#sync-pdf-download-dir-choose').addEventListener('click', function () {
-      if (!desktop || !desktop.chooseDirectory) return;
-      desktop.chooseDirectory({ title: T('选择 PDF 自动下载目录') }).then(function (dirPath) {
-        if (dirPath) { $('#sync-pdf-download-dir').value = dirPath; queueSyncAutoSave(); }
-      }).catch(function () {});
-    });
-    $('#sync-pdf-download-dir-clear').addEventListener('click', function () {
-      $('#sync-pdf-download-dir').value = '';
-      queueSyncAutoSave();
-    });
     $('#sync-bridge-copy-token').addEventListener('click', function () {
       if (!bridgeTokenCache) { toast(T('令牌未生成')); return; }
       copyToClipboard(bridgeTokenCache).then(function () { toast(T('✓ 令牌已复制')); });
     });
     $('#sync-clear-pdf-cache').addEventListener('click', function () {
-      dlgConfirm(T('删除全文索引'), T('删除 PDF 全文索引？下次全文检索时会重新提取正文（耗时取决于文献数量）。'), T('删除索引'), true).then(function (ok) {
+      dlgConfirm(T('删除全文索引'), T('删除 PDF 全文索引？下次全文检索时会重新提取正文（耗时取决于文献数量）。'), T('清除索引'), true).then(function (ok) {
         if (!ok) return;
         desktop.pdfSearchClear().then(function () {
           if (window.LitPdfSearch) window.LitPdfSearch.resetCache();
@@ -10982,198 +9113,12 @@
         });
       });
     });
-    // ---------- Zotero 导入向导（选择来源 → 扫描预览 → 导入 → 核对报告） ----------
-    var zoteroWiz = { step: 'source', dir: '', scan: null, report: null, busy: false, offProgress: null };
-    var ZOTERO_WIZ_LABELS = { source: T('选择来源'), preview: T('扫描预览'), progress: T('导入'), report: T('核对报告') };
-    var ZOTERO_WIZ_ORDER = ['source', 'preview', 'progress', 'report'];
-
-    function zoteroWizRender() {
-      var index = ZOTERO_WIZ_ORDER.indexOf(zoteroWiz.step);
-      $('#zotero-wiz-step-label').textContent = T('第 ') + (index + 1) + T(' 步 / 共 4 步：') + ZOTERO_WIZ_LABELS[zoteroWiz.step];
-      $all('#zotero-import-mask .zotero-wiz-step').forEach(function (el) {
-        el.hidden = el.dataset.zoteroStep !== zoteroWiz.step;
-      });
-      $('#zotero-wiz-back').hidden = zoteroWiz.step !== 'preview' || zoteroWiz.busy;
-      $('#zotero-wiz-cancel').textContent = zoteroWiz.step === 'report' ? T('关闭') : T('取消');
-      $('#zotero-wiz-cancel').disabled = zoteroWiz.busy;
-      $('#zotero-wiz-export').hidden = zoteroWiz.step !== 'report';
-      var next = $('#zotero-wiz-next');
-      next.disabled = zoteroWiz.busy || (zoteroWiz.step === 'source' && !zoteroWiz.dir);
-      next.hidden = zoteroWiz.step === 'progress';
-      next.textContent = zoteroWiz.step === 'report' ? T('完成')
-        : zoteroWiz.step === 'preview' ? T('开始导入') : T('下一步');
-      if (zoteroWiz.step === 'preview' && zoteroWiz.scan) {
-        var s = zoteroWiz.scan.stats;
-        $('#zotero-wiz-stats').innerHTML = '<table class="zotero-report-table">' +
-          T('<tr><td>条目</td><td>') + s.source.items + '</td></tr>' +
-          T('<tr><td>笔记</td><td>') + s.source.notes + '</td></tr>' +
-          T('<tr><td>附件</td><td>') + s.source.attachments + '</td></tr>' +
-          T('<tr><td>批注</td><td>') + s.source.annotations + '</td></tr>' +
-          T('<tr><td>文件夹</td><td>') + s.source.collections + '</td></tr>' +
-          T('<tr><td>标签</td><td>') + s.source.tags + '</td></tr>' +
-          (s.missing ? T('<tr><td>缺失/未下载附件</td><td>') + s.missing + '</td></tr>' : '') +
-          (s.unconverted ? T('<tr><td>保留原始表示的内容</td><td>') + s.unconverted + '</td></tr>' : '') +
-          (s.failures ? T('<tr><td>无法读取的条目</td><td>') + s.failures + '</td></tr>' : '') +
-          '</table>';
-      }
-    }
-
-    function zoteroWizGo(step) { zoteroWiz.step = step; zoteroWizRender(); }
-
-    function openZoteroWizard() {
-      if (zoteroWiz.offProgress) { zoteroWiz.offProgress(); zoteroWiz.offProgress = null; }
-      zoteroWiz = { step: 'source', dir: $('#sync-zotero-dir').value.trim(), scan: null, report: null, busy: false, offProgress: null };
-      $('#zotero-wiz-dir').value = zoteroWiz.dir;
-      $('#zotero-wiz-source-status').textContent = '';
-      $('#zotero-import-mask').hidden = false;
-      zoteroWizRender();
-    }
-
-    function closeZoteroWizard() {
-      if (zoteroWiz.busy) return;
-      if (zoteroWiz.offProgress) { zoteroWiz.offProgress(); zoteroWiz.offProgress = null; }
-      $('#zotero-import-mask').hidden = true;
-    }
-
-    function zoteroWizFail(message) {
-      zoteroWiz.busy = false;
-      $('#zotero-wiz-source-status').textContent = message;
-      zoteroWizRender();
-      toast('⚠ ' + message);
-    }
-
-    function zoteroWizScan() {
-      zoteroWiz.busy = true;
-      $('#zotero-wiz-source-status').textContent = T('正在只读扫描 Zotero 库…');
-      zoteroWizRender();
-      desktop.scanZoteroLibrary({ dir: zoteroWiz.dir }).then(function (result) {
-        zoteroWiz.busy = false;
-        zoteroWiz.scan = result;
-        zoteroWizGo('preview');
-      }).catch(function (error) {
-        zoteroWizFail(error && error.message || String(error));
-      });
-    }
-
-    function zoteroWizReportGroup(title, items, format) {
-      if (!items || !items.length) return '';
-      return '<details class="zotero-report-group"><summary>' + esc(title) + '（' + items.length + '）</summary>' +
-        '<ul class="zotero-report-list">' + items.slice(0, 500).map(function (item) {
-          return '<li>' + esc(format(item)) + '</li>';
-        }).join('') + (items.length > 500 ? T('<li>…（其余 ') + (items.length - 500) + T(' 条见导出报告）</li>') : '') +
-        '</ul></details>';
-    }
-
-    function zoteroWizShowReport(importResult, mergeResult) {
-      var report = importResult.report;
-      var imp = report.imported;
-      var stats = mergeResult.stats;
-      var html = '<table class="zotero-report-table">' +
-        T('<tr><td>新增条目</td><td>') + stats.papersAdded + '</td></tr>' +
-        T('<tr><td>补缺更新条目</td><td>') + stats.papersUpdated + '</td></tr>' +
-        T('<tr><td>新增附件</td><td>') + stats.attachmentsAdded + T('（复制文件 ') + imp.assetsCopied +
-          (imp.assetsSkipped ? T('，跳过已存在 ') + imp.assetsSkipped : '') + '）</td></tr>' +
-        T('<tr><td>新增笔记</td><td>') + stats.notesAdded + (stats.notesSkipped ? T('（已有 ') + stats.notesSkipped + T(' 条未覆盖）') : '') + '</td></tr>' +
-        T('<tr><td>导入批注</td><td>') + (imp.annotations + stats.annotationsAdded) + '</td></tr>' +
-        T('<tr><td>文件夹 / 标签颜色</td><td>') + imp.folders + ' / ' + imp.tagColors + '</td></tr>' +
-        '</table>';
-      html += zoteroWizReportGroup(T('缺失 / 未下载的附件（可稍后用「迁移云附件」补齐）'), report.missing, function (m) {
-        return (m.fileName || m.zoteroKey) + ' — ' + ({ 'not-found': T('源文件不存在'), 'relative-no-base': T('相对路径缺少基准目录'), 'annotation-orphan': T('批注找不到所属附件') })[m.reason] || m.reason;
-      });
-      html += zoteroWizReportGroup(T('失败项（不影响其余内容导入）'), report.failures, function (f) {
-        return '[' + f.kind + '] ' + f.key + ' — ' + f.message;
-      });
-      html += zoteroWizReportGroup(T('保留原始表示的内容'), report.unconverted, function (u) {
-        return '[' + u.kind + '] ' + u.key + (u.detail ? ' — ' + u.detail : '');
-      });
-      html += zoteroWizReportGroup(T('字段差异（已保留本地值，未覆盖）'), mergeResult.conflicts, function (c) {
-        return c.field + T('：本地「') + (c.localValue || T('（空）')) + '」 ≠ Zotero「' + (c.zoteroValue || T('（空）')) + '」';
-      });
-      $('#zotero-wiz-report').innerHTML = html || T('<p class="field-hint">没有可导入的内容。</p>');
-      zoteroWiz.report = { import: report, merge: { stats: mergeResult.stats, conflicts: mergeResult.conflicts } };
-      zoteroWizGo('report');
-    }
-
-    function zoteroWizImport() {
-      zoteroWiz.busy = true;
-      zoteroWizGo('progress');
-      var existing = { attachmentKeys: [], noteKeys: [], paperKeys: [] };
-      state.papers.forEach(function (p) {
-        if (p.zoteroKey) existing.paperKeys.push(p.zoteroKey);
-        (p.attachments || []).forEach(function (a) {
-          if (a.zoteroKey && a.path && String(a.path).trim()) existing.attachmentKeys.push(a.zoteroKey);
-        });
-      });
-      (state.notes || []).forEach(function (n) { if (n.zoteroKey) existing.noteKeys.push(n.zoteroKey); });
-      if (desktop.onZoteroProgress) {
-        zoteroWiz.offProgress = desktop.onZoteroProgress(function (payload) {
-          if (!payload || zoteroWiz.step !== 'progress') return;
-          var total = payload.total || 0, done = payload.done || 0;
-          $('#zotero-wiz-progress').max = Math.max(total, 1);
-          $('#zotero-wiz-progress').value = done;
-          $('#zotero-wiz-progress-text').textContent = T('正在复制附件文件… ') + done + ' / ' + total;
-        });
-      }
-      desktop.importZoteroLibrary({
-        dir: zoteroWiz.dir,
-        copyFiles: $('#zotero-wiz-copy').checked,
-        existing: existing
-      }).then(function (result) {
-        var mergeResult = mergeZoteroImport({
-          papers: state.papers, notes: state.notes, folders: state.folders.concat(state.folderTombstones),
-          tagColorRecords: state.tagColorRecords
-        }, result.workspace);
-        return applySyncedWorkspace(mergeResult.workspace).then(function () {
-          zoteroWiz.busy = false;
-          if (zoteroWiz.offProgress) { zoteroWiz.offProgress(); zoteroWiz.offProgress = null; }
-          zoteroWizShowReport(result, mergeResult);
-          toast(T('✓ Zotero 导入完成：新增 ') + mergeResult.stats.papersAdded + T(' 篇'));
-        });
-      }).catch(function (error) {
-        if (zoteroWiz.offProgress) { zoteroWiz.offProgress(); zoteroWiz.offProgress = null; }
-        zoteroWizGo('source');
-        zoteroWizFail(error && error.message || String(error));
-      });
-    }
-
-    $('#zotero-wiz-detect').addEventListener('click', function () {
-      $('#zotero-wiz-source-status').textContent = T('正在检测…');
-      desktop.detectZoteroDataDir().then(function (dir) {
-        zoteroWiz.dir = dir || '';
-        $('#zotero-wiz-dir').value = zoteroWiz.dir;
-        $('#zotero-wiz-source-status').textContent = dir ? T('已找到：') + dir : T('未找到 Zotero 数据目录');
-        zoteroWizRender();
-      });
-    });
-    $('#zotero-wiz-choose').addEventListener('click', function () {
-      desktop.chooseZoteroDataDir().then(function (dir) {
-        if (dir) {
-          zoteroWiz.dir = dir;
-          $('#zotero-wiz-dir').value = dir;
-          $('#zotero-wiz-source-status').textContent = T('已选择：') + dir;
-          zoteroWizRender();
-        } else {
-          $('#zotero-wiz-source-status').textContent = T('所选目录不是有效的 Zotero 数据目录');
-        }
-      });
-    });
-    $('#zotero-wiz-next').addEventListener('click', function () {
-      if (zoteroWiz.step === 'source') zoteroWizScan();
-      else if (zoteroWiz.step === 'preview') zoteroWizImport();
-      else if (zoteroWiz.step === 'report') closeZoteroWizard();
-    });
-    $('#zotero-wiz-back').addEventListener('click', function () {
-      if (zoteroWiz.step === 'preview') zoteroWizGo('source');
-    });
-    $('#zotero-wiz-cancel').addEventListener('click', closeZoteroWizard);
-    $('#zotero-wiz-export').addEventListener('click', function () {
-      if (!zoteroWiz.report) return;
-      download('zotero-import-report-' + stamp() + '.json', JSON.stringify(zoteroWiz.report, null, 2), 'application/json');
-    });
-
-    $('#sync-import-zotero').addEventListener('click', function () {
-      openZoteroWizard();
-    });
+    /* Zotero 导入向导整体在 js/app/zotero-wizard.js（状态 + 绑定 + 四步流程） */
+    initZoteroWizard();
+    initJournalRank();
+    initQueryBuilder();
+    initWordPanel();
+    initNoteExport();
     $('#sync-migrate-zotero-cloud').addEventListener('click', function () {
       if (syncBusy) return;
       syncBusy = true;
@@ -11443,7 +9388,6 @@
     // M3 首次使用清单：四步引导（可跳过；跳过后空库只显示一行简版提示）
     $('#onboard-import').addEventListener('click', function () { $('#btn-import').click(); });
     $('#onboard-bridge').addEventListener('click', openBridgePanel);
-    $('#onboard-backup').addEventListener('click', function () { openSyncSettings('backup'); });
     $('#onboard-skip').addEventListener('click', function () {
       try { localStorage.setItem(ONBOARD_DISMISS_KEY, '1'); } catch (e) {}
       renderTable();
@@ -11478,6 +9422,13 @@
       $('#paste-mask').hidden = false;
       $('#paste-area').focus();
     });
+    // 导入文件夹（左侧栏拖放的兜底入口；浏览器版拿不到文件路径，toast 引导）
+    $('#more-import-folder').addEventListener('click', function () {
+      if (!desktop || !desktop.chooseDirectory || !desktop.scanFolder) { toast(T('导入文件夹需要桌面版')); return; }
+      desktop.chooseDirectory({}).then(function (dirPath) {
+        if (dirPath) importDroppedFolder(dirPath, '');
+      }).catch(function () {});
+    });
     $('#paste-cancel').addEventListener('click', function () { $('#paste-mask').hidden = true; });
     $('#paste-ok').addEventListener('click', function () {
       var text = $('#paste-area').value.trim();
@@ -11487,11 +9438,13 @@
       pendingPasteFolderId = '';
     });
 
-    // 拖放。只有两个落点：统计仪表盘 = 导入（虚线框 + 提示胶囊）；
-    // 条目行 = 附加到该条（Zotero 式行级高亮）。拖到其他区域不接文件，只提示落点。
+    // 拖放。三个落点：统计仪表盘或列表区空白处 = 导入（统计区虚线框 + 提示胶囊，
+    // 列表区整卡虚线框）；条目行 = 附加到该条（Zotero 式行级高亮）。
+    // 拖到其他区域不接文件，只提示落点。
     var dragDepth = 0;
     var fileDropTr = null;
     var statsDropActive = false;
+    var listDropActive = false;
     function dragHasFiles(e) {
       var types = e.dataTransfer && e.dataTransfer.types;
       return !!(types && Array.prototype.indexOf.call(types, 'Files') !== -1);
@@ -11510,9 +9463,16 @@
       var hint = $('#stats-drop-hint');
       if (hint) hint.hidden = !on;
     }
+    function setListDropActive(on) {
+      if (listDropActive === on) return;
+      listDropActive = on;
+      var card = document.querySelector('.table-card');
+      if (card) card.classList.toggle('list-drop-zone', on);
+    }
     function clearFileDropZones() {
       setFileDropTr(null);
       setStatsDropActive(false);
+      setListDropActive(false);
     }
     document.addEventListener('dragenter', function (e) {
       e.preventDefault();
@@ -11542,10 +9502,14 @@
       // 仪表盘落区在收起态也激活（细条上只显示虚线框，胶囊由 CSS 隐藏），保证导入入口常在
       var statsHit = e.target.closest ? e.target.closest('#stats-row') : null;
       setStatsDropActive(!tr && !!statsHit);
+      // 列表区空白处（非行、非统计区）同样接收导入：用户直觉是“拖进来就该进库”，
+      // 不必瞄准顶部统计区；浏览器版行级落区不存在，列表整卡（含行）都算空白落区
+      var listHit = !tr && !statsDropActive && !!(e.target.closest && e.target.closest('.table-card'));
+      setListDropActive(listHit);
       // 悬停仪表盘落区时由框头胶囊接管，其余位置保持全局胶囊
       var pill = $('#drag-hint-pill');
       if (pill) pill.hidden = statsDropActive;
-      if (fileDropTr && e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      if ((fileDropTr || listDropActive) && e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
     });
     document.addEventListener('drop', function (e) {
       e.preventDefault();
@@ -11556,6 +9520,7 @@
         ? Array.prototype.slice.call(e.dataTransfer.files) : null;
       var tr = fileDropTr;
       var inStats = statsDropActive;
+      var inList = listDropActive;
       clearFileDropZones();
       if (tr) {
         var paper = getById(tr.dataset.id);
@@ -11563,11 +9528,104 @@
         return;
       }
       if (!files) return;
-      if (inStats) {
+      if (inStats || inList) {
         promptImportFolder(function (folderId) { handleFiles(files, folderId); }, currentImportFolderId());
       } else {
-        toast(T('拖到顶部统计区导入文献；拖到条目行附加为附件'));
+        toast(T('拖到列表空白处或顶部统计区导入文献；拖到条目行附加为附件'));
       }
+    });
+
+    // OS 文件夹拖入左侧栏：悬停文件夹行 = 导入到该文件夹内部；列表空白/空态 = 根级导入
+    //（拖入的文件夹本身建为对应位置的 LitBoard 文件夹，目录树走 folders 实体，见 importDroppedFolder）。
+    // 与内部拖动（文件夹排序 folderDragId / 条目归类 dragPayloadIds）互不干扰；stopPropagation
+    // 截停本区域的 OS 文件拖放，防止 document 级落区把同一 drop 再处理一遍。
+    var sidebarFileRow = null;
+    function clearSidebarFileDrop() {
+      if (sidebarFileRow) { sidebarFileRow.classList.remove('folder-file-drop'); sidebarFileRow = null; }
+      $('#folder-list').classList.remove('folder-file-drop');
+      $('#folder-empty').classList.remove('folder-file-drop');
+    }
+    function sidebarFileDragOver(e) {
+      if (folderDragId || dragPayloadIds) return;
+      if (!dragHasFiles(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      var row = e.target.closest ? e.target.closest('.folder-item[data-folder]') : null;
+      if (sidebarFileRow !== row) {
+        if (sidebarFileRow) sidebarFileRow.classList.remove('folder-file-drop');
+        sidebarFileRow = row || null;
+        if (sidebarFileRow) sidebarFileRow.classList.add('folder-file-drop');
+      }
+      var inList = !row && !!(e.target.closest && e.target.closest('#folder-list'));
+      var inEmpty = !row && !!(e.target.closest && e.target.closest('#folder-empty'));
+      $('#folder-list').classList.toggle('folder-file-drop', inList);
+      $('#folder-empty').classList.toggle('folder-file-drop', inEmpty);
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    }
+    function sidebarFileDragLeave(e) {
+      if (!dragHasFiles(e)) return;
+      // 拖拽期间 relatedTarget 不可靠（常 null），改用坐标判定是否真的离开该元素
+      var bounds = e.currentTarget.getBoundingClientRect();
+      if (e.clientX >= bounds.left && e.clientX <= bounds.right &&
+          e.clientY >= bounds.top && e.clientY <= bounds.bottom) return;
+      clearSidebarFileDrop();
+    }
+    function sidebarFileDrop(e) {
+      if (folderDragId || dragPayloadIds) return;
+      if (!dragHasFiles(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      var row = e.target.closest ? e.target.closest('.folder-item[data-folder]') : null;
+      var targetFolderId = row ? row.dataset.folder : '';
+      clearSidebarFileDrop();
+      // document 级 drop 被截停，这里手动收掉全局拖放提示与落区状态
+      dragDepth = 0;
+      var pill = $('#drag-hint-pill');
+      if (pill) pill.hidden = true;
+      clearFileDropZones();
+      if (!desktop || !desktop.getPathForFile || !desktop.scanFolder) {
+        toast(T('导入文件夹需要桌面版'));
+        return;
+      }
+      // dataTransfer.items 离开事件处理器即失效，必须同步取全：目录项 + 散 PDF 一起处理
+      var dirPaths = [];
+      var loosePdfs = [];
+      var unresolvable = 0;
+      Array.prototype.forEach.call(e.dataTransfer.items || [], function (item) {
+        if (!item || item.kind !== 'file') return;
+        var entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+        var file = item.getAsFile();
+        if (!file) return;
+        var p = '';
+        try { p = desktop.getPathForFile(file) || ''; } catch (err) { p = ''; }
+        if (!p) { unresolvable++; return; }
+        if (entry && entry.isDirectory) dirPaths.push(p);
+        else if (/\.pdf$/i.test(file.name)) loosePdfs.push({ name: file.name, path: p });
+      });
+      if (!dirPaths.length && !loosePdfs.length) {
+        toast(unresolvable ? T('无法读取拖入项的路径，请改用「更多 → 导入文件夹…」')
+          : T('拖到列表空白处或顶部统计区导入文献；拖到条目行附加为附件'));
+        return;
+      }
+      // 多目录按序导入（同路径去重，重复拖入由规划层幂等复用）；散 PDF 归入同一落点
+      var seen = {};
+      var chain = Promise.resolve();
+      dirPaths.forEach(function (p) {
+        var key = p.toLowerCase();
+        if (seen[key]) return;
+        seen[key] = true;
+        chain = chain.then(function () { return importDroppedFolder(p, targetFolderId); });
+      });
+      if (loosePdfs.length) {
+        chain = chain.then(function () { importPdfFiles(loosePdfs, targetFolderId); });
+      }
+    }
+    ['#folder-list', '#folder-empty'].forEach(function (sel) {
+      var el = $(sel);
+      if (!el) return;
+      el.addEventListener('dragover', sidebarFileDragOver);
+      el.addEventListener('dragleave', sidebarFileDragLeave);
+      el.addEventListener('drop', sidebarFileDrop);
     });
 
     // 拖动表格行到左侧文件夹归类
@@ -11633,9 +9691,10 @@
     // 补全 / 导出菜单
     $('#btn-enrich').addEventListener('click', enrichAll);
     $('#btn-enrich-stop').addEventListener('click', abortEnrich);
+    registerTopbarMenu($('#btn-export'), $('#export-menu'));
     $('#btn-export').addEventListener('click', function (e) {
       e.stopPropagation();
-      $('#export-menu').hidden = !$('#export-menu').hidden;
+      toggleTopbarMenu($('#export-menu'));
     });
     document.addEventListener('click', function () { $('#export-menu').hidden = true; });
     $('#btn-export-json').addEventListener('click', exportJson);
@@ -11648,7 +9707,7 @@
     // 快速添加
     $('#btn-add').addEventListener('click', function () {
       $('#add-mask').hidden = false;
-      $('#add-status').textContent = T('支持 DOI、arXiv 编号或论文标题；抓取后可再编辑。');
+      $('#add-status').textContent = T('支持 DOI、arXiv 编号或文献标题；联网获取后可再编辑。');
       $('#add-id').focus();
     });
     $('#add-cancel').addEventListener('click', function () { $('#add-mask').hidden = true; });
@@ -11804,13 +9863,6 @@
 
     // 同步状态 / 冲突报告
     $('#sync-indicator').addEventListener('click', function () { openSyncSettings(); });
-    $('#sync-conflict-close').addEventListener('click', function () { $('#sync-conflict-mask').hidden = true; });
-    $('#sync-conflict-export').addEventListener('click', function () {
-      if (!pendingConflictExport.length) return;
-      download('litboard-sync-conflicts-' + stamp() + '.json', JSON.stringify(pendingConflictExport.map(function (c) {
-        return { id: c.id, title: c.title, direction: c.direction, overwrittenLocalVersion: c.overwritten };
-      }), null, 2), 'application/json');
-    });
     $('#dedupe-close').addEventListener('click', function () { $('#dedupe-mask').hidden = true; });
     $('#dedupe-merge-all').addEventListener('click', function () {
       var groups = window.LitDedupe.findGroups(state.papers.filter(function (p) { return !p.deletedAt; }));
@@ -11832,12 +9884,7 @@
     $('#pdf-fit-width').addEventListener('click', fitPdfWidth);
     $('#pdf-rotate').addEventListener('click', rotatePdf);
     $('#pdf-layout-toggle').addEventListener('click', togglePdfLayout);
-    $('#pdf-renderer-toggle').addEventListener('click', togglePdfRenderer);
-  $('#pdf-reflow-toggle').addEventListener('click', togglePdfReflow);
-  $('#pdf-scroll').addEventListener('scroll', function () {
-    if (pdfState.reflowMode) ensureReflowPages();
-  });
-    $('#pdf-translation-settings').addEventListener('click', function () { openSyncSettings('translation'); });
+    $('#rail-translation').addEventListener('click', function () { openSyncSettings('translation'); });
     $('#pdf-page-prev').addEventListener('click', function () { goToPdfPage(pdfState.currentPage - 1); });
     $('#pdf-page-next').addEventListener('click', function () { goToPdfPage(pdfState.currentPage + 1); });
     $('#pdf-page-number').addEventListener('change', function (e) { goToPdfPage(e.target.value); });
@@ -11845,22 +9892,11 @@
     $('#pdf-search').addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); runPdfSearch.flush(); goToPdfSearchResult(e.shiftKey ? -1 : 1); }
     });
+    bindPdfSearchOption('#pdf-search-case', 'litboard.pdfSearchCase');
+    bindPdfSearchOption('#pdf-search-word', 'litboard.pdfSearchWord');
     $('#pdf-search-prev').addEventListener('click', function () { goToPdfSearchResult(-1); });
     $('#pdf-search-next').addEventListener('click', function () { goToPdfSearchResult(1); });
     $('#pdf-search-toggle').addEventListener('click', function () { pdfSearchPanelOpen(); });
-    $('#pdf-annotations-toggle').addEventListener('click', function () {
-      var panel = $('#pdf-annotations');
-      // 阅读模式：批注面板已收编为右栏页签——隐藏状态归 switchPane 统一管理
-      if (panel.parentElement && panel.parentElement.classList.contains('detail-sidebar') &&
-          window.LitAgentUi && LitAgentUi.switchPane) {
-        var annoActive = panel.hidden === false;
-        LitAgentUi.switchPane(annoActive ? 'detail' : 'anno');
-        this.setAttribute('aria-pressed', annoActive ? 'false' : 'true');
-        return;
-      }
-      panel.hidden = !panel.hidden;
-      this.setAttribute('aria-pressed', panel.hidden ? 'false' : 'true');
-    });
     $('#pdf-annotation-colors').addEventListener('click', function (e) {
       var color = e.target.closest('[data-annotation-color]');
       if (!color) return;
@@ -11878,6 +9914,7 @@
     $('#pdf-translate-selection').addEventListener('click', translatePdfSelection);
     $('#pdf-auto-translate').addEventListener('change', function () { setTranslatorAutoTranslate(this.checked, true); });
     $('#pdf-translation-close').addEventListener('click', hidePdfTranslation);
+    new ResizeObserver(positionPdfTranslation).observe($('#pdf-translation-popover'));
     $('#pdf-scroll').addEventListener('mouseup', function () { setTimeout(showPdfTranslationSelection, 0); });
     $('#pdf-scroll').addEventListener('keyup', function () { setTimeout(showPdfTranslationSelection, 0); });
     document.addEventListener('selectionchange', function () {
@@ -11899,8 +9936,7 @@
     $('#pdf-scroll').addEventListener('wheel', function (e) {
       if (e.ctrlKey) {
         e.preventDefault();
-        pdfWheelZoomSteps = Math.max(-3, Math.min(3, pdfWheelZoomSteps + (e.deltaY < 0 ? 1 : -1)));
-        applyPdfWheelZoom();
+        applyPdfWheelZoom(e.deltaY < 0 ? 1 : -1);
       } else if (e.shiftKey && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
         e.preventDefault();
         this.scrollLeft += e.deltaY;
@@ -11938,7 +9974,7 @@
         var note = currentPdfNote() || createNote(pdfState.paper.id, '');
         var added = addAnnotationsToNote(note, [source], pdfState.paper);
         if (added) {
-          pdfNoteCurrentId = note.id;
+          if (pdfNotePanel) pdfNotePanel.setCurrentId(note.id);
           renderPdfNoteEditor();
           toast(T('✓ 已加入「') + (note.title || T('笔记')) + T('」（可在预览中点 ↩ 定位）'));
         }
@@ -11980,37 +10016,6 @@
       commitUndo(T('批注加标签'), undoBefore, { papers: [pdfState.paper.id] });
       save(); renderPdfAnnotations(tagAnn.id);
     });
-    // 阶段三：侧栏笔记编辑器
-    $('#pdf-note-select').addEventListener('change', function (e) {
-      pdfNoteCurrentId = e.target.value;
-      renderPdfNoteEditor();
-    });
-    $('#pdf-note-new').addEventListener('click', function () {
-      if (!pdfState.paper) return;
-      dlgPrompt(T('新建笔记'), T('标题；留空则创建跨文献主题笔记'), '').then(function (title) {
-        if (title == null) return;
-        var note = createNote(title.trim() ? pdfState.paper.id : '', title.trim());
-        pdfNoteCurrentId = note.id;
-        save(); renderPdfNoteEditor();
-        toast(T('✓ 已创建笔记'));
-      });
-    });
-    $('#pdf-note-edit-tab').addEventListener('click', function () { setPdfNoteMode('edit'); });
-    $('#pdf-note-preview-tab').addEventListener('click', function () { setPdfNoteMode('preview'); });
-    // 阶段三下半：富文本编辑器 / 导出 Word
-    $('#pdf-note-richtext').addEventListener('click', function () { openNoteEditor(currentPdfNote()); });
-    $('#pdf-note-export-word').addEventListener('click', function () { exportNoteToWord(currentPdfNote()); });
-    $('#pdf-note-textarea').addEventListener('input', function (e) {
-      var note = currentPdfNote();
-      if (!note) return;
-      note.content = e.target.value;
-      window.LitModel.touch(note);
-      savePdfNoteSide();
-    });
-    $('#pdf-note-stale').addEventListener('click', function (e) {
-      var btn = e.target.closest('[data-stale-action]');
-      if (btn) handleStaleAction(btn.dataset.staleAction, btn.dataset.annotationId);
-    });
     // 阶段三：批注 → 笔记入口
     $('#pdf-annotations-to-note').addEventListener('click', function () {
       if (pdfState.paper) openExcerptDialog(pdfState.paper);
@@ -12021,7 +10026,7 @@
       if (!annotations.length) { toast(T('本篇还没有批注')); return; }
       var note = createNote(pdfState.paper.id, '《' + pdfState.paper.title + T('》批注笔记'));
       var n = addAnnotationsToNote(note, annotations.slice(), pdfState.paper);
-      pdfNoteCurrentId = note.id;
+      if (pdfNotePanel) pdfNotePanel.setCurrentId(note.id);
       renderPdfNoteEditor();
       toast(T('✓ 已生成批注笔记（') + n + T(' 条摘录）'));
     });
@@ -12059,17 +10064,11 @@
     $('#pdf-external').addEventListener('click', function () {
       if (pdfState.paper && desktop) desktop.openPath(pdfState.paper.pdfPath);
     });
-    $('#pdf-write-back').addEventListener('click', function () {
-      if (!pdfState.paper) return;
-      writeBackPdfAnnotations(pdfState.paper, pdfState.attachment, false);
-    });
     $('#pdf-side-toggle').addEventListener('click', function () {
       togglePdfSide($('#pdf-side').dataset.tab === 'thumbs' ? 'thumbs' : 'outline');
     });
     $('#pdf-side-tab-outline').addEventListener('click', function () { togglePdfSide('outline'); });
     $('#pdf-side-tab-thumbs').addEventListener('click', function () { togglePdfSide('thumbs'); });
-    $('#pdf-snapshot-toggle').addEventListener('click', function () { toggleSnapshotMode(); });
-    $('#pdf-ink-toggle').addEventListener('click', function () { toggleInkMode(); });
     $('#pdf-ocr-page').addEventListener('click', function () {
       if (!pdfState.handle || !pdfState.pageCount) return;
       ocrPdfPages([pdfState.currentPage - 1]);
@@ -12087,15 +10086,19 @@
       if (ocrBusy && window.LitOcr) window.LitOcr.cancel();
       hideOcrBanner();
     });
-    $('#pdf-scroll').addEventListener('mousedown', function (e) {
-      if (e.button !== 0) return;
-      if (pdfState.snapshotMode) { startSnapshotDrag(e); return; }
-      if (pdfState.inkMode) { startInkStroke(e);  }
-    });
-
     // 点遮罩空白处关闭（表单类弹窗除外，避免误触丢失输入）
-    ['add-mask', 'cite-mask', 'shortcuts-mask', 'bibkey-search-mask', 'dedupe-mask', 'zotero-import-mask', 'excerpt-mask', 'note-edit-mask', 'query-builder-mask', 'bulk-edit-mask', 'authors-mask', 'related-mask', 'tags-mask', 'sync-conflict-mask'].forEach(function (id) {
+    ['add-mask', 'bibkey-search-mask', 'zotero-import-mask', 'excerpt-mask', 'note-edit-mask', 'query-builder-mask', 'bulk-edit-mask'].forEach(function (id) {
       $('#' + id).addEventListener('click', function (e) { if (e.target === this) this.hidden = true; });
+    });
+    // 纯信息类弹窗：点遮罩空白处关闭，一律走对应关闭按钮，保证状态清理与点按钮一致
+    [['dedupe-mask', '#dedupe-close'], ['authors-mask', '#authors-close'], ['tags-mask', '#tags-close'],
+      ['shortcuts-mask', '#shortcuts-close'], ['sync-conflict-mask', '#sync-conflict-close'],
+      ['cite-mask', '#cite-close'], ['related-mask', '#related-cancel'], ['snapshot-mask', '#snapshot-close'],
+      ['graph-mask', '#graph-close']
+    ].forEach(function (pair) {
+      var infoMask = $('#' + pair[0]);
+      var infoBtn = $(pair[1]);
+      if (infoMask && infoBtn) infoMask.addEventListener('mousedown', function (e) { if (e.target === infoMask) infoBtn.click(); });
     });
     // 设置弹窗关闭前先落盘待保存的改动
     $('#sync-mask').addEventListener('click', function (e) { if (e.target === this) closeSyncSettings(); });
@@ -12107,11 +10110,7 @@
     // 通用对话框
     $('#dlg-cancel').addEventListener('click', dlgCancel);
     $('#dlg-mask').addEventListener('click', function (e) { if (e.target === this) dlgCancel(); });
-    $('#dlg-ok').addEventListener('click', function () {
-      if (!dlgState) return;
-      if (dlgState.mode === 'input') dlgSettle($('#dlg-input').value);
-      else dlgSettle(true);
-    });
+    $('#dlg-ok').addEventListener('click', function () { if (dialogs) dialogs.submit(); });
     $('#dlg-input').addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); $('#dlg-ok').click(); }
     });
@@ -12130,15 +10129,18 @@
       else showThemeMenu();
     });
 
+    initSearchHelp();
+
     // 搜索 / 筛选
     $('#search').addEventListener('input', debounce(function (e) {
       state.filters.q = e.target.value.trim();
+      searchSortOverride = false;
       state.tablePage = 0;
       if (state.ftEnabled) { state.ftHits = {}; runFtSearch(); }
       renderAll();
       var hint = $('#search-hint');
       if (querySyntaxError && state.filters.q) {
-        hint.textContent = T('检索语法有误，已按普通子串搜索（支持 field:value、AND/OR/NOT、year>=2020、/正则/）');
+        hint.textContent = T('检索语法有误，已按普通子串搜索（点搜索框旁的 ? 查看语法速查）');
         hint.hidden = false;
       } else {
         hint.hidden = true;
@@ -12158,6 +10160,14 @@
     }
     $('#btn-stats-collapse').addEventListener('click', function () { setStatsCollapsed(true, true); });
     $('#stats-strip').addEventListener('click', function () { setStatsCollapsed(false, true); });
+    $('#chart-range').addEventListener('click', function () {
+      chartShowAllYears = !chartShowAllYears;
+      if (!chartShowAllYears && state.filters.year != null && state.filters.year < chartRecentStart) {
+        state.filters.year = null;
+        state.tablePage = 0;
+        renderAll();
+      } else renderChart();
+    });
     try { setStatsCollapsed(localStorage.getItem(STATS_COLLAPSED_KEY) === '1', false); } catch (err) { setStatsCollapsed(false, false); }
 
     // 完整度 tile 的缺字段计数 → 一键填入对应 missing: 查询
@@ -12218,8 +10228,11 @@
 
     // 表头排序
     $all('.lit-table th.sortable').forEach(function (th) {
-      th.addEventListener('click', function () {
+      th.addEventListener('click', function (e) {
+        // 分区列内嵌的「补查缺失分区」按钮：不触发排序（bind 里另有 stopPropagation 兜底双保险）
+        if (e.target && e.target.closest && e.target.closest('#rank-refresh-all')) return;
         var key = th.dataset.sort;
+        searchSortOverride = !!state.filters.q;
         if (state.sort.key === key) state.sort.dir *= -1;
         else state.sort = { key: key, dir: key === 'title' || key === 'firstAuthor' || key === 'venue' ? 1 : -1 };
         state.tablePage = 0;
@@ -12376,7 +10389,9 @@
       showCtxMenu(e.clientX, e.clientY, buildPaperCtxItems(target, papers));
     });
     document.addEventListener('click', function (e) {
-      if (ctxMenuEl && !e.target.closest('.ctx-menu')) hideCtxMenu();
+      // 对话面板底部的模型徽标用 click 打开菜单（不是 contextmenu）：同一个 click 会冒泡到这里，
+      // 不排除它就会「开了立刻关」——看上去像点了没反应
+      if (ctxMenuEl && !e.target.closest('.ctx-menu') && !e.target.closest('#agent-model-btn')) hideCtxMenu();
     });
     document.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') hideCtxMenu();
@@ -12446,9 +10461,17 @@
       } else if (act === 'export-ris') {
         download('litboard-selected-' + stamp() + '.ris', window.LitCite.ris(papers), 'application/x-research-info-systems');
       } else if (act === 'delete') {
-        dlgConfirm(T('移入回收站'), T('删除选中的 ') + papers.length + T(' 篇？可在提示条点「撤销」恢复，也可稍后在回收站找回。'), T('移入回收站')).then(function (ok) {
-          if (ok) removePapers(ids);
-        });
+        var linkFolder = currentFolderLinkTarget();
+        if (linkFolder) {
+          dlgConfirm(T('从当前文件夹移出'), T('将选中的 ') + papers.length + T(' 篇从“') + linkFolder.name +
+            T('”移出？文献、附件及其它文件夹中的链接都会保留。'), T('移出')).then(function (ok) {
+            if (ok) removePapersFromFolder(papers, linkFolder);
+          });
+        } else {
+          dlgConfirm(T('移入回收站'), T('删除选中的 ') + papers.length + T(' 篇？可在提示条点「撤销」恢复，也可稍后在回收站找回。'), T('移入回收站')).then(function (ok) {
+            if (ok) removePapers(ids);
+          });
+        }
       } else if (act === 'restore') {
         var restored = restorePapers(ids);
         state.selected = {};
@@ -12486,6 +10509,8 @@
         e.preventDefault(); pdfSearchPanelOpen(true); return;
       }
       if (e.key === 'Escape') {
+        // 检索语法速查浮层：非模态，先于弹窗栈收起
+        if (searchHelp && searchHelp.isOpen()) { searchHelp.close(); return; }
         // 窄窗搜索浮层先收起，再走弹窗栈（M1：只关最顶层）
         if (!$('#pdf-overlay').hidden && document.querySelector('.pdf-tools.pdf-search-open')) {
           pdfSearchPanelOpen(false);
@@ -12511,7 +10536,7 @@
         return;
       }
       // 有弹窗/阅读器打开时，除 Esc 外不响应导航键
-      var blocking = ['pdf-overlay', 'epub-overlay', 'edit-mask', 'add-mask', 'cite-mask', 'paste-mask', 'shortcuts-mask', 'bibkey-search-mask', 'dedupe-mask', 'zotero-import-mask', 'excerpt-mask', 'note-edit-mask', 'query-builder-mask', 'bulk-edit-mask', 'snapshot-mask', 'sync-mask', 'sync-remote-plan-mask', 'import-folder-mask', 'authors-mask', 'related-mask', 'tags-mask', 'sync-conflict-mask', 'dlg-mask'];
+      var blocking = ['pdf-overlay', 'epub-overlay', 'edit-mask', 'add-mask', 'cite-mask', 'paste-mask', 'shortcuts-mask', 'bibkey-search-mask', 'dedupe-mask', 'zotero-import-mask', 'excerpt-mask', 'note-edit-mask', 'query-builder-mask', 'bulk-edit-mask', 'snapshot-mask', 'sync-mask', 'sync-remote-plan-mask', 'import-folder-mask', 'authors-mask', 'related-mask', 'tags-mask', 'sync-conflict-mask', 'dlg-mask', 'word-panel-mask', 'bridge-panel-mask', 'graph-mask', 'word-cite-mask'];
       for (var i = 0; i < blocking.length; i++) { if (!$('#' + blocking[i]).hidden) return; }
       if (matchesShortcut(e, state.shortcuts.pdfOnly)) { e.preventDefault(); togglePdfAttachmentSearch(); return; }
       if (matchesShortcut(e, state.shortcuts.bibkey)) { e.preventDefault(); openBibkeySearch(); return; }
@@ -12559,13 +10584,6 @@
         case '?': $('#shortcuts-mask').hidden = false; break;
       }
     });
-    $('#d-journal-rank-refresh').addEventListener('click', refreshJournalRank);
-    // 这颗按钮住在可排序的表头里：不拦住冒泡的话，点一下开始/暂停会顺带把表格按分区重排
-    $('#rank-refresh-all').addEventListener('click', function (event) {
-      event.stopPropagation();
-      refreshAllJournalRanks();
-    });
-    updateRankRefreshUi();   // 先落一次初始态：data-rank-state/图标不依赖第一次点击
     $('#d-status').addEventListener('change', function (e) {
       var p = getById(drawerId); if (!p) return;
       p.status = e.target.value;
@@ -12728,8 +10746,14 @@
       copyToClipboard(window.LitBib.paperToBibtex(p)).then(function () { toast(T('✓ BibTeX 已复制')); });
     });
     $('#d-edit').addEventListener('click', function () {
-      var p = getById(drawerId); if (!p) return;
-      openEditModal(p);
+      if (drawerInlineEditing) cancelDrawerInlineEdit();
+      else startDrawerInlineEdit();
+    });
+    $('#d-inline-save').addEventListener('click', saveDrawerInlineEdit);
+    $('#drawer').addEventListener('keydown', function (e) {
+      if (!drawerInlineEditing) return;
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancelDrawerInlineEdit(); }
+      else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); saveDrawerInlineEdit(); }
     });
     $('#d-cite').addEventListener('click', function () {
       var p = getById(drawerId); if (!p) return;
@@ -12737,10 +10761,18 @@
     });
     $('#d-delete').addEventListener('click', function () {
       var p = getById(drawerId); if (!p) return;
-      dlgConfirm(T('删除文献'), T('删除「') + p.title.slice(0, 40) + T('…」？可在提示条点「撤销」恢复。'), T('删除'), true).then(function (ok) {
-        if (!ok) return;
-        removePapers([p.id], T('已删除「') + p.title.slice(0, 24) + '」');
-      });
+      var linkFolder = currentFolderLinkTarget();
+      if (linkFolder) {
+        dlgConfirm(T('从当前文件夹移出'), T('将「') + p.title.slice(0, 40) + T('」从“') + linkFolder.name +
+          T('”移出？文献、附件及其它文件夹中的链接都会保留。'), T('移出')).then(function (ok) {
+          if (ok) removePapersFromFolder([p], linkFolder);
+        });
+      } else {
+        dlgConfirm(T('删除文献'), T('删除「') + p.title.slice(0, 40) + T('…」？可在提示条点「撤销」恢复。'), T('删除'), true).then(function (ok) {
+          if (!ok) return;
+          removePapers([p.id], T('已删除「') + p.title.slice(0, 24) + '」');
+        });
+      }
     });
   }
 
@@ -12753,19 +10785,15 @@
     if (p.year) base += '-' + p.year;
     return (base || 'paper') + '.pdf';
   }
-  /* 下载文件名：优先按「PDF 命名模板」生成（与「按模板重命名」同一口径），回退标题-年份。
+  /* 下载文件名固定使用默认模板（与「按模板重命名」同一口径），回退标题-年份。
    * 返回不含扩展名的主名（.pdf 由主进程 safePdfFileName 统一补）。 */
   function pdfDownloadBaseName(p) {
-    var template = (integrationConfig && integrationConfig.renameTemplate) ||
-      (window.LitRename && window.LitRename.DEFAULT_TEMPLATE) || '{author} - {year} - {title}';
+    var template = (window.LitRename && window.LitRename.DEFAULT_TEMPLATE) || '{author} - {year} - {title}';
     var base = (window.LitRename && window.LitRename.buildName(p, template)) || '';
     if (!base || base === 'paper') {
       base = pdfSafeFileName(p).replace(/\.pdf$/i, '');
     }
     return base;
-  }
-  function pdfAutoDownloadDir() {
-    return String((integrationConfig && integrationConfig.pdfDownloadDir) || '').trim();
   }
   function setPdfButton(label, disabled) {
     var btn = $('#d-fetch-pdf');
@@ -12786,8 +10814,7 @@
     setPdfButton(c.source + '…', true);
     return desktop.downloadPdf({
       url: c.url,
-      name: pdfDownloadBaseName(p),
-      dir: pdfAutoDownloadDir()
+      name: pdfDownloadBaseName(p)
     }).then(function (result) {
       if (!result || result.canceled) {
         if (!quiet) toast(T('已取消下载'));
@@ -12881,15 +10908,20 @@
 
   // ---------- 启动 ----------
   function start() {
-    applyTheme(localStorage.getItem(THEME_KEY) || 'auto');
+    initTheme();
+    applyTheme(currentTheme());
     initWindowControls();
     state.collapsedFolders = readCollapsedFolders();
     state.shortcuts = readShortcutSettings();
     applyPaneSizes(readPaneSizes());
+    initWorkspaceStore();
+    initHistory();
+    initDialogs();
+    initReaderNotePanels();
     bindEvents();
     initAgentUi();
-    /* 阅读模式右栏可达性：PDF/EPUB 全屏层打开时，右栏（详情/AI/手动检索）浮到层上，
-     * 阅读层右侧让出同等宽度（css body.reading-open；AI 对话与手动检索的回答由此可达）。
+    /* 阅读模式右栏可达性：PDF/EPUB 全屏层打开时，右栏（详情/AI/批注）浮到层上，
+     * 阅读层右侧让出同等宽度（css body.reading-open；AI 对话由此可达）。
      * hidden/class 都会被各处直接赋值，统一 MutationObserver 同步，不逐点插桩。 */
     watchReadingRail();
     // M9 三期：引文网络面板
@@ -12930,7 +10962,7 @@
         });
       }
       // 定时自动同步（15 分钟；编辑后另有 1.2s 防抖同步）。两者都受
-      // 「内容变化时自动同步」开关控制，关闭后仅手动「保存并同步」联网。
+      // 「内容变化时自动同步」开关控制，关闭后仅手动「立即同步」联网。
       setInterval(function () {
         if (autoSyncEnabled && !syncBusy && integrationConfig && integrationConfig.nutstoreUser && integrationConfig.hasNutstorePassword) {
           performSync(integrationConfig, true);
@@ -12977,19 +11009,14 @@
       });
       state.hiddenPurged = stillPurged;
       if (Object.keys(readHiddenPurged()).length !== Object.keys(stillPurged).length) saveHiddenPurged();
-      // 回收站惰性清理（默认保留 30 天，可在设置中调整，0 = 永不清理）
-      if (desktop && desktop.getSetting) {
-        desktop.getSetting('trashRetentionDays').then(function (days) {
-          var retention = days == null ? 30 : Number(days);
-          if (!Number.isFinite(retention) || retention <= 0) return;
-          var cutoff = Date.now() - retention * 86400000;
-          var stale = state.papers.filter(function (p) { return p.deletedAt && p.deletedAt < cutoff; })
-            .map(function (p) { return p.id; });
-          if (stale.length) {
-            purgePapers(stale);
-            toast(T('回收站已自动清理 ') + stale.length + T(' 篇（超过 ') + retention + T(' 天）'));
-          }
-        }).catch(function () {});
+      // 回收站固定保留 30 天；不再将这个低频维护策略暴露为设置项。
+      var retention = 30;
+      var cutoff = Date.now() - retention * 86400000;
+      var stale = state.papers.filter(function (p) { return p.deletedAt && p.deletedAt < cutoff; })
+        .map(function (p) { return p.id; });
+      if (stale.length) {
+        purgePapers(stale);
+        toast(T('回收站已自动清理 ') + stale.length + T(' 篇（超过 ') + retention + T(' 天）'));
       }
       renderAll();
       renderPdfTabs();

@@ -1,4 +1,4 @@
-/* 跨库 PDF 全文搜索：渲染层负责 PDF 文本提取（PDF.js），
+/* 跨库 PDF 全文搜索：渲染层负责 PDF 文本提取（MuPDF.js），
  * 桌面版索引与查询由主进程 SQLite（FTS5 trigram）承担；
  * 浏览器版退化为会话内存缓存 + 线性扫描。 */
 (function () {
@@ -11,8 +11,9 @@
 
   function attachmentKey(paper, attachment) { return paper.id + ':' + (attachment && attachment.id || ''); }
   function paperAttachments(paper) {
+    // EPUB 与 PDF 共用全文索引（spine 章节序 = 页序），检索/读取同一套
     var list = (paper && paper.attachments || []).filter(function (attachment) {
-      return attachment && attachment.kind === 'pdf' && attachment.path;
+      return attachment && (attachment.kind === 'pdf' || attachment.kind === 'epub') && attachment.path;
     });
     if (!list.length && paper && paper.pdfPath) list.push({ id: '', kind: 'pdf', path: paper.pdfPath,
       fileName: paper.pdfFileName || '', fingerprint: paper.pdfFingerprint || '' });
@@ -34,7 +35,7 @@
   }
 
   /** 从 PDF 提取全部页面文本（页数与单页长度设上限，防异常文件） */
-  function extractPages(paper, attachment) {
+  function extractPdfPages(attachment) {
     if (!window.LitPdf || !DESKTOP || !window.litboardDesktop.readFileBytes || !attachment || !attachment.path) {
       return Promise.resolve(null); // 无桌面桥接时无法读取本地 PDF
     }
@@ -49,6 +50,48 @@
     });
   }
 
+  /** 从 EPUB 提取章节正文（spine 序 = 页序）：JSZip 解压后走 LitEpub 纯函数解析。
+   *  解析失败的章节记空串保持页序对齐；不含正文层（封面页等）自然为空页。 */
+  function extractEpubPages(attachment) {
+    if (!window.JSZip || !window.LitEpub || !DESKTOP ||
+        !window.litboardDesktop.readFileBytes || !attachment || !attachment.path) {
+      return Promise.resolve(null);
+    }
+    var zip = null;
+    return window.litboardDesktop.readFileBytes(attachment.path).then(function (bytes) {
+      return window.JSZip.loadAsync(bytes);
+    }).then(function (loaded) {
+      zip = loaded;
+      var container = zip.file('META-INF/container.xml');
+      return container ? container.async('string') : '';
+    }).then(function (containerXml) {
+      var opfPath = window.LitEpub.opfPathFromContainer(containerXml);
+      if (!opfPath || !zip.file(opfPath)) return [];
+      return zip.file(opfPath).async('string').then(function (opfXml) {
+        var spinePaths = window.LitEpub.spineHrefsFromOpf(opfXml)
+          .map(function (href) { return window.LitEpub.resolveHref(opfPath, href); })
+          .slice(0, 400);
+        var reads = spinePaths.map(function (p) {
+          var file = zip.file(p);
+          return file ? file.async('string').catch(function () { return ''; }) : Promise.resolve('');
+        });
+        return Promise.all(reads).then(function (texts) {
+          var map = {};
+          spinePaths.forEach(function (p, i) { map[p] = texts[i]; });
+          return window.LitEpub.chapterTexts(spinePaths, map).map(function (t) {
+            return t.length > 200000 ? t.slice(0, 200000) : t;
+          });
+        });
+      });
+    }).catch(function () { return null; });
+  }
+
+  function extractPages(paper, attachment) {
+    return attachment && attachment.kind === 'epub'
+      ? extractEpubPages(attachment)
+      : extractPdfPages(attachment);
+  }
+
   function indexAttachment(paper, attachment) {
     var key = attachmentKey(paper, attachment);
     return extractPages(paper, attachment).then(function (pages) {
@@ -57,7 +100,7 @@
         return window.litboardDesktop.pdfSearchPut({
           paperId: paper.id, attachmentId: attachment.id || '',
           fingerprint: attachment.fingerprint || paper.pdfFingerprint || '',
-          method: 'pdfjs',
+          method: attachment.kind === 'epub' ? 'epub' : 'mupdf',
           pages: pages
         }).then(function () {
           metaCache[key] = { fingerprint: attachment.fingerprint || paper.pdfFingerprint || '', updatedAt: Date.now() };

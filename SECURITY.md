@@ -33,17 +33,19 @@
   都在攻击面内。任意代码执行、路径穿越写出、SSRF 都是有效漏洞。
 - **凭据存储**：WebDAV / 翻译 / 分区 / 嵌入服务的密钥经加密后存放，同步到远端的配置不含账号密码、
   本地路径与扩展令牌（备份快照还会剥离令牌）。**明文落盘**、**密钥随同步外泄**、**加密口令可被离线爆破** 均属有效漏洞。
-- **网络出口**：主进程受 `ALLOWED_API_HOSTS` 白名单约束，渲染层受 `index.html` 的 CSP 约束。
+- **网络出口**：主进程的固定元数据服务受 `ALLOWED_API_HOSTS` 白名单约束；不可信 OA 下载地址受
+  公共 HTTPS、DNS/IP 与逐跳重定向校验；渲染层受 `index.html` 的 CSP 约束。
   绕过白名单发起请求，或让渲染层获得越权能力（`nodeIntegration`、`contextIsolation` 被关掉等），属有效漏洞。
 - **不属于**安全问题的：需要用户已在自己机器上具备同等权限才能实现的影响；第三方元数据接口的限流或不可用；
-  已在上游（Electron / PDF.js / tesseract / citeproc）修复但未随本应用升级的问题——请直接开普通 issue。
+  已在上游（Electron / MuPDF.js / PaddleOCR / onnxruntime / citeproc）修复但未随本应用升级的问题——请直接开普通 issue。
 
 ## 加固现状
 
 为便于评估，以下是当前已有的防护措施：
 
 - 渲染层与主进程之间通过 `electron/preload.js` 的 `contextBridge` 暴露白名单 API；
-- 主进程网络请求固定走主机白名单；渲染层 CSP 为 `default-src 'self'`，`object-src`/`base-uri` 均为 `'none'`；
+- 主进程固定服务请求走主机白名单；渲染层 CSP 为 `default-src 'self'`，`object-src`/`base-uri` 均为 `'none'`；
+- 不可信 OA PDF 链接只允许公共 HTTPS；DNS 结果固定到实际 TLS 连接，私网/保留地址与每一跳危险重定向均拒绝；
 - 数据库损坏时不做静默重建，恢复前校验完整快照的 SHA-256；
 - 备份与恢复全程校验附件哈希，引用缺失则拒绝发布该次备份；
 - 全库范围无 `eval` / `new Function`。

@@ -25,9 +25,9 @@ function makeDeps(overrides) {
 
 test('tool schemas cover the base read-only tools with valid shape', function () {
   const t = LitAgent.createTools(makeDeps());
-  assert.equal(t.tools.length, 14); // R18 + R19：基础 9 + get_work 等四件 + read_work_fulltext
+  assert.equal(t.tools.length, 15); // 整篇梳理作为独立工具注册
   const names = t.tools.map((x) => x.function.name);
-  ['search_library', 'search_research', 'search_openalex', 'get_research_work', 'get_paper', 'fulltext_search', 'read_pdf_pages', 'list_pdf_annotations',
+  ['search_library', 'search_research', 'search_openalex', 'get_research_work', 'get_paper', 'fulltext_search', 'read_pdf_pages', 'summarize_paper', 'list_pdf_annotations',
     'find_literature',
     // R18（对照 literature-mcp 补齐）：精确解析 / 实体联想 / 摘要回填 / 库内引文邻接
     'get_work', 'autocomplete_entity', 'backfill_abstracts', 'graph_neighbors']
@@ -185,6 +185,69 @@ test('reading assistant: read_pdf_pages caps range at 8 pages and reports limits
   assert.ok(miss.indexOf('全文索引') !== -1);
 });
 
+test('summarize_paper reads in batches, preserves page cursor, and marks completion only at the end', async function () {
+  const calls = [];
+  const deps = makeDeps();
+  deps.getPaperById = () => ({ id: 'p1', attachments: [{ id: 'att-main', kind: 'pdf', fileName: 'paper.pdf' }] });
+  deps.desktop.pdfSearchGetPageRange = async (input) => {
+    calls.push(input);
+    const to = Math.min(input.to, 10);
+    return {
+      paperId: input.paperId, attachmentId: input.attachmentId, total: 10, from: input.from, to,
+      pages: Array.from({ length: to - input.from + 1 }, (_, i) => ({ page: input.from + i, text: 'Page ' + (input.from + i) }))
+    };
+  };
+  const t = LitAgent.createTools(deps);
+  const first = JSON.parse(await t.execute('summarize_paper', { paperId: 'p1' }));
+  assert.equal(calls[0].attachmentId, 'att-main');
+  assert.equal(first.complete, false);
+  assert.ok(first.taskPrompt.includes('研究背景与缺口'));
+  assert.deepEqual(first.nextCall, { paperId: 'p1', attachmentId: 'att-main', from: 9, fromChar: 0 });
+  const second = JSON.parse(await t.execute('summarize_paper', first.nextCall));
+  assert.equal(second.complete, true);
+  assert.equal(second.pages[0].page, 9);
+  assert.equal(second.nextCall, undefined);
+  assert.equal(second.taskPrompt, undefined);
+});
+
+test('summarize_paper resumes within a long page without losing text', async function () {
+  const deps = makeDeps();
+  deps.desktop.pdfSearchGetPageRange = async (input) => ({
+    paperId: input.paperId, attachmentId: 'att', total: 1, from: 1, to: 1,
+    pages: [{ page: 1, charOffset: input.fromChar, charTotal: 14000, text: 'x'.repeat(14000 - input.fromChar) }]
+  });
+  const t = LitAgent.createTools(deps);
+  const first = JSON.parse(await t.execute('summarize_paper', { paperId: 'p1' }));
+  assert.equal(first.complete, false);
+  assert.ok(first.nextCall.fromChar > 0);
+  assert.ok(JSON.stringify(first).length < 12000);
+  const second = JSON.parse(await t.execute('summarize_paper', first.nextCall));
+  assert.equal(second.complete, true);
+  assert.equal(first.pages[0].text.length + second.pages[0].text.length, 14000);
+});
+
+test('summarize_paper follows database-level page truncation, including a short remainder', async function () {
+  const deps = makeDeps();
+  deps.desktop.pdfSearchGetPageRange = async (input) => {
+    const raw = 'x'.repeat(10002);
+    const tail = raw.slice(input.fromChar);
+    const cap = input.capChars || 3500;
+    return {
+      paperId: input.paperId, attachmentId: 'att', total: 1, from: 1, to: 1,
+      pages: [{ page: 1, charOffset: input.fromChar || 0, charTotal: raw.length,
+        text: tail.length > cap ? tail.slice(0, cap) + '…[截断]' : tail }]
+    };
+  };
+  const t = LitAgent.createTools(deps);
+  const first = JSON.parse(await t.execute('summarize_paper', { paperId: 'p1' }));
+  assert.equal(first.complete, false);
+  assert.equal(first.nextCall.fromChar, 10000);
+  assert.equal(first.pages[0].text.length, 10000);
+  const second = JSON.parse(await t.execute('summarize_paper', first.nextCall));
+  assert.equal(second.complete, true);
+  assert.equal(second.pages[0].text, 'xx');
+});
+
 test('reading assistant: list_pdf_annotations maps page/type/text/comment', async function () {
   const deps = makeDeps();
   deps.getPapers = () => [{
@@ -210,8 +273,9 @@ test('search_scopus registers only with includeScopus and maps Scopus fields', a
   deps.desktop.researchSearchScopus = async () => ({
     count: 2, stored: 1,
     works: [
-      { id: 'W7', title: 'S paper', year: 2024, doi: '10.1016/j.t.2024.01', sourceName: 'J X', citedBy: 17, existed: true },
-      { id: 'local:abc', title: 'Local', year: null, doi: '', sourceName: '', citedBy: 0, existed: false }
+      // A-followup #3：existed=调研库已有；inLibrary=正式库已收藏（正式库反查）——两者独立
+      { id: 'W7', title: 'S paper', year: 2024, doi: '10.1016/j.t.2024.01', sourceName: 'J X', citedBy: 17, existed: true, inLibrary: false },
+      { id: 'W8', title: 'Collected', year: 2023, doi: '10.1016/j.t.2023.01', sourceName: 'J Y', citedBy: 5, existed: true, inLibrary: true }
     ]
   });
   const t = LitAgent.createTools(deps);
@@ -222,8 +286,27 @@ test('search_scopus registers only with includeScopus and maps Scopus fields', a
   const out = JSON.parse(await t2.execute('search_scopus', { query: 'battery' }));
   assert.equal(out.total, 2);
   assert.equal(out.works[0].citedByScopus, 17);
-  assert.equal(out.works[0].alreadyInLibrary, true);
+  assert.equal(out.works[0].alreadyInLibrary, false, '调研库命中不得冒充正式库收藏');
+  assert.equal(out.works[0].inResearch, true);
+  assert.equal(out.works[1].alreadyInLibrary, true, '正式库反查命中才是已收藏');
   assert.ok(out.note.indexOf('摘要') !== -1);
+});
+
+test('A-followup #3: web_search 分开回报「调研库已有」与「正式库已收藏」', async function () {
+  const deps = makeDeps({ includeWebSearch: true });
+  deps.desktop.researchWebSearch = async () => ({
+    total: 2, matched: 1, created: 1,
+    works: [
+      { workId: 'local:a', isNew: false, inResearch: true, inLibrary: false, title: 'In research only', url: 'https://x.edu/a' },
+      { workId: 'local:b', isNew: true, inResearch: false, inLibrary: true, title: 'Collected', url: 'https://x.edu/b' }
+    ]
+  });
+  const t = LitAgent.createTools(deps);
+  const out = JSON.parse(await t.execute('web_search', { query: 'q' }));
+  assert.equal(out.works[0].collected, false, '调研库已有 ≠ 已收藏到正式库');
+  assert.equal(out.works[0].inResearch, true);
+  assert.equal(out.works[1].collected, true, '正式库反查命中才是已收藏');
+  assert.equal(out.works[1].inResearch, false);
 });
 
 test('R10: read_pdf_pages 省略 attachmentId 时自动解析主 PDF', async function () {
@@ -351,6 +434,36 @@ test('R11: render_pdf_pages 仅视觉能力下注册；渲染→存会话附件�
   // 缺会话上下文
   const noCtx = await t.execute('render_pdf_pages', { paperId: 'p1', pages: [3] }, {});
   assert.ok(String(noCtx).indexOf('会话上下文') !== -1);
+});
+
+test('性能回归：render_pdf_pages 走批量口子（文档只开一次，不逐页重读整份 PDF）', async function () {
+  const deps = makeDeps();
+  deps.includeVisionRender = true;
+  let batchCalls = 0;
+  let singleCalls = 0;
+  deps.renderPagesImage = async (input) => {
+    batchCalls += 1;
+    assert.deepEqual(input.pages, [2, 4]);
+    return [
+      { page: 2, dataUrl: 'data:image/png;base64,QUJD' },
+      { page: 4, error: '页码超出范围：4 / 3' }
+    ];
+  };
+  deps.renderPageImage = async () => { singleCalls += 1; return { dataUrl: 'data:image/png;base64,QUJD' }; };
+  deps.getPapers = () => [{
+    id: 'p1', title: 'Vision paper',
+    attachments: [{ id: 'att-pdf', kind: 'pdf', fileName: 'main.pdf', path: 'C:/m/main.pdf' }]
+  }];
+  deps.getPaperById = (id) => deps.getPapers().find((p) => p.id === id) || null;
+  deps.desktop.sessionSaveAttachment = async () => ({ file: '附件/page-2.png' });
+  const t = LitAgent.createTools(deps);
+  const out = await t.execute('render_pdf_pages', { paperId: 'p1', pages: [2, 4] }, { sessionId: 's1' });
+  assert.equal(batchCalls, 1, '一次批量调用');
+  assert.equal(singleCalls, 0, '不得再逐页渲染');
+  assert.equal(out.images.length, 1);
+  // 逐页失败如实回报，不静默吞掉
+  assert.equal(JSON.parse(out.text).failures.length, 1);
+  assert.equal(JSON.parse(out.text).failures[0].page, 4);
 });
 
 test('R16: search_openalex 透传 mode（keyword/semantic），source 里如实标明', async function () {
@@ -664,4 +777,92 @@ test('R19: 抽取失败也要回收临时文件（store 收到空文本）', asy
   assert.ok(out.error.indexOf('抽取失败') !== -1);
   assert.equal(stored.tempPath, 'C:/tmp/fulltext/W3.pdf', '失败路径仍调用 store 让主进程删临时文件');
   assert.equal(stored.text, '');
+});
+
+/* ---------------- A-followup #2/#6：附件索引身份 + 取消边界 ---------------- */
+
+test('A-followup #2: read_pdf_pages 未命中时报出所问附件，且声明不会回退其它附件', async function () {
+  const deps = makeDeps();
+  deps.getPapers = () => [{ id: 'p1', title: 'T', attachments: [
+    { id: 'att-main', kind: 'pdf', fileName: 'main.pdf' },
+    { id: 'att-supp', kind: 'supp', fileName: 'supp.pdf' }
+  ] }];
+  deps.getPaperById = (id) => deps.getPapers().find((p) => p.id === id) || null;
+  const calls = [];
+  deps.desktop.pdfSearchGetPageRange = async (input) => {
+    calls.push(input);
+    // 主 PDF 有索引、补充材料没有（旧实现在这里会静默返回主 PDF 的正文）
+    return input.attachmentId === 'att-main'
+      ? { paperId: 'p1', attachmentId: 'att-main', total: 3, from: 1, to: 1, pages: [{ page: 1, text: 'MAIN' }] }
+      : null;
+  };
+  const t = LitAgent.createTools(deps);
+  const miss = await t.execute('read_pdf_pages', { paperId: 'p1', attachmentId: 'att-supp', from: 1, to: 1 });
+  assert.equal(calls[0].attachmentId, 'att-supp', '请求的附件身份原样下传，不得改写');
+  assert.ok(String(miss).indexOf('att-supp') !== -1, '错误里必须写明问的是哪份附件');
+  assert.ok(String(miss).indexOf('不会退回') !== -1, '必须声明不会回退该文献其它附件');
+  // 显式指定主 PDF 时照常读到内容
+  const hit = JSON.parse(await t.execute('read_pdf_pages', { paperId: 'p1', attachmentId: 'att-main', from: 1, to: 1 }));
+  assert.equal(hit.pages[0].text, 'MAIN');
+});
+
+test('A-followup #6: add_pdfs_to_folder 在暂存前后复核取消状态', async function () {
+  const deps = makeDeps();
+  let staged = 0;
+  let imported = 0;
+  deps.desktop.researchStagePdfs = async () => { staged++; return { results: [{ workId: 'W1', fileName: 'a.pdf', path: '/managed/a.pdf' }] }; };
+  deps.importStagedPdfs = async () => { imported++; return { added: 1, merged: 0 }; };
+  const t = LitAgent.createTools(deps);
+
+  // ① 进入工具前已取消：不发起暂存
+  let out = await t.execute('add_pdfs_to_folder', { files: [{ file: 'a.pdf', workId: 'W1' }] }, {
+    sessionId: 's1', cancelRequested: () => true
+  });
+  assert.ok(String(out).indexOf('已停止') !== -1);
+  assert.equal(staged, 0);
+
+  // ② 暂存期间被取消（下载/复制是长异步）：不得进入导入
+  let stopped = false;
+  deps.desktop.researchStagePdfs = async () => {
+    staged++;
+    stopped = true; // 暂存返回前用户点了停止
+    return { results: [{ workId: 'W1', fileName: 'a.pdf', path: '/managed/a.pdf' }] };
+  };
+  out = await t.execute('add_pdfs_to_folder', { files: [{ file: 'a.pdf', workId: 'W1' }] }, {
+    sessionId: 's1', cancelRequested: () => stopped
+  });
+  assert.ok(String(out).indexOf('已停止') !== -1);
+  assert.equal(imported, 0, '暂存后被取消不得调用导入');
+
+  // ③ 确认框挂着时被取消：取消信号透传给渲染层，由它在写库前复核
+  let confirmStopped = false;
+  let passedOpts = null;
+  deps.desktop.researchStagePdfs = async () => { staged++; return { results: [{ workId: 'W1', fileName: 'a.pdf', path: '/managed/a.pdf' }] }; };
+  deps.importStagedPdfs = async (_ok, _folder, opts) => {
+    imported++;
+    passedOpts = opts;
+    return { canceled: true, stopped: true, added: 0, merged: 0 };
+  };
+  out = await t.execute('add_pdfs_to_folder', { files: [{ file: 'a.pdf', workId: 'W1' }] }, {
+    sessionId: 's1', cancelRequested: () => confirmStopped
+  });
+  assert.equal(typeof passedOpts.isCancelled, 'function', 'isCancelled 必须交给渲染层');
+  assert.ok(String(out).indexOf('已停止') !== -1, 'stopped 与「用户取消」要分开如实回报');
+  assert.equal(imported, 1);
+});
+
+test('A-followup #6: collect_papers 同样在确认边界复核取消', async function () {
+  const deps = makeDeps({ includeWrite: true });
+  let passedOpts = null;
+  deps.collectWorks = async (_ids, _folder, opts) => { passedOpts = opts; return { canceled: true, stopped: true, added: 0, merged: 0 }; };
+  const t = LitAgent.createTools(deps);
+  const out = await t.execute('collect_papers', { workIds: ['W1'] }, { sessionId: 's1', cancelRequested: () => false });
+  assert.equal(typeof passedOpts.isCancelled, 'function');
+  assert.ok(String(out).indexOf('已停止') !== -1);
+  // 进入前已取消：不调用收藏桥
+  let called = 0;
+  deps.collectWorks = async () => { called++; return { added: 1, merged: 0 }; };
+  const out2 = await t.execute('collect_papers', { workIds: ['W1'] }, { sessionId: 's1', cancelRequested: () => true });
+  assert.ok(String(out2).indexOf('已停止') !== -1);
+  assert.equal(called, 0);
 });

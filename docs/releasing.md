@@ -30,15 +30,21 @@
 
    产物在 `dist/`：`LitBoard-Setup-<版本>-x64.exe`、`LitBoard-Portable-<版本>-x64.exe`；
    `<版本>` 是本次自动迭代后的版本号，构建日志首行会打印改动（如 `LitBoard 版本：1.2.0 → 1.2.1`）。
-3. 生成校验和（连同安装包一起发布）：
+3. 若本次同时发布浏览器扩展，先生成带当前版本号的扩展包：
+
+   ```powershell
+   npm run pack-extension
+   ```
+
+4. 生成校验和（连同安装包一起发布）：
 
    ```powershell
    npm run release-checksums
    ```
 
    产出 `dist/SHA256SUMS.txt`，含哈希、文件大小与构建环境（Electron / electron-builder 版本）。
-4. 记录本次构建的依赖指纹：`vendor/SHA256SUMS`（`npm run vendor-hashes` 可重生成）应与仓库一致。
-5. 打包会让 `package.json` / `package-lock.json` 变脏（版本 +1）：确认无误后把它们连同
+5. 记录本次构建的依赖指纹：`vendor/SHA256SUMS`（`npm run vendor-hashes` 可重生成）应与仓库一致。
+6. 打包会让 `package.json` / `package-lock.json` 变脏（版本 +1）：确认无误后把它们连同
    `CHANGELOG.md` 的本版本条目一起提交，别把版本改动留在未提交的工作区里。
 
 ## 发布前人工验收（每次必做）

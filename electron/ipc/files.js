@@ -100,6 +100,46 @@ function register() {
     return result.canceled || !result.filePaths[0] ? '' : result.filePaths[0];
   });
 
+  // 拖入文件夹导入用：递归枚举目录树（跳过隐藏项；符号链接/junction 不跟随，天然防环）。
+  // 超限（层级/文件数/字节数）如实报错，绝不静默截断
+  ctx.handle('files:scan-folder', async function (_event, options) {
+    const rootPath = String(options && options.path || '');
+    if (!path.isAbsolute(rootPath)) return { error: ctx.T('无效的目录路径') };
+    const MAX_DEPTH = 48, MAX_FILES = 5000, MAX_BYTES = 5 * 1024 * 1024 * 1024;
+    const files = [];
+    let hiddenSkipped = 0, totalBytes = 0;
+    async function walk(current, prefix, depth) {
+      if (depth > MAX_DEPTH) throw new Error('TOO_DEEP');
+      const entries = await fs.readdir(current, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name.startsWith('.')) { hiddenSkipped++; continue; }
+        const abs = path.join(current, entry.name);
+        const rel = prefix ? prefix + '/' + entry.name : entry.name;
+        if (entry.isDirectory()) { await walk(abs, rel, depth + 1); continue; }
+        if (!entry.isFile()) continue;
+        let size = 0;
+        try { size = (await fs.stat(abs)).size; } catch (error) { continue; } // 不可读条目跳过
+        totalBytes += size;
+        files.push({ rel: rel, name: entry.name, ext: path.extname(entry.name).toLowerCase(), abs: abs, size: size });
+        if (files.length > MAX_FILES) throw new Error('TOO_MANY_FILES');
+        if (totalBytes > MAX_BYTES) throw new Error('TOO_MANY_BYTES');
+      }
+    }
+    try {
+      const stat = await fs.stat(rootPath).catch(function () { return null; });
+      if (!stat || !stat.isDirectory()) return { error: ctx.T('不是有效目录：') + rootPath };
+      await walk(rootPath, '', 0);
+    } catch (error) {
+      const code = error && error.message;
+      if (code === 'TOO_MANY_FILES' || code === 'TOO_MANY_BYTES') {
+        return { error: ctx.T('文件夹过大（超过 {files} 个文件或 5 GB），请分批导入', { files: MAX_FILES }) };
+      }
+      if (code === 'TOO_DEEP') return { error: ctx.T('目录层级过深（超过 48 层），无法导入') };
+      return { error: String(error && error.message || error) };
+    }
+    return { ok: true, rootName: path.basename(rootPath), rootPath: rootPath, files: files, hiddenSkipped: hiddenSkipped };
+  });
+
   // 通用文件选择（添加附件用）
   ctx.handle('files:choose-files', async function (_event, options) {
     const result = await dialog.showOpenDialog(ctx.mainWindow, {

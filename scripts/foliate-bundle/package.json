@@ -1,0 +1,15 @@
+{
+  "name": "litboard-foliate-bundle",
+  "private": true,
+  "description": "foliate-js vendor 构建的外置源钉版（仓库零 node_modules；产物 vendor/foliate/）",
+  "foliatejs": {
+    "source": "https://github.com/johnfactotum/foliate-js",
+    "commit": "78914aef4466eb960965702401634c2cb348e9b1",
+    "commitDate": "2026-05-01",
+    "license": "MIT",
+    "vendoredDeps": {
+      "@zip.js/zip.js": "2.7.52（上游 vendor/zip.js，BSD-3）",
+      "fflate": "0.8.2（上游 vendor/fflate.js，MIT）"
+    }
+  }
+}

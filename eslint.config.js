@@ -23,6 +23,7 @@ const UMD_GLOBALS = {
   LitGraphView: 'readonly',
   LitAgentChat: 'readonly',
   LitAgentCore: 'readonly',
+  LitAgentCfg: 'readonly',
   LitAgentProto: 'readonly',
   LitEmbedCfg: 'readonly',
   LitAgentLoop: 'readonly',
@@ -36,13 +37,12 @@ const UMD_GLOBALS = {
   LitCslJson: 'readonly',
   LitDedupe: 'readonly',
   LitEnrich: 'readonly',
+  LitFolderImport: 'readonly',
   LitMarkdown: 'readonly',
   LitMerge: 'readonly',
   LitModel: 'readonly',
   LitOcr: 'readonly',
   LitPdf: 'readonly',
-  LitPdfAnnot: 'readonly',
-  LitPdfium: 'readonly',
   LitPdfSearch: 'readonly',
   LitQuery: 'readonly',
   LitRename: 'readonly',
@@ -51,9 +51,7 @@ const UMD_GLOBALS = {
   // electron/preload.js 经 contextBridge 暴露的桥接对象（渲染层唯一的主进程入口）
   litboardDesktop: 'readonly',
   // 挂在 window 上的第三方运行时 / 主进程注入的标记
-  pdfjsLib: 'readonly',
   CSL: 'readonly',
-  PDFLib: 'readonly',
   Tesseract: 'readonly',
   vis: 'readonly',
   litboardReadyAt: 'writable',
@@ -224,7 +222,7 @@ const BASE_RULES = {
   'no-empty-character-class': 'error',
   'no-misleading-character-class': 'error',
   // 有意使用控制字符，属设计而非笔误：文件名清洗（\x00-\x1f）、
-  // markdown 占位符（\u0000）、BOM 剥离等，见 electron/backup.js、js/markdown.js、js/rename.js
+  // BOM 剥离等，见 electron/backup.js、js/rename.js
   'no-control-regex': 'off',
   'no-template-curly-in-string': 'error',
   'no-unexpected-multiline': 'error',
@@ -270,6 +268,7 @@ module.exports = [
       'extension/icons/**',
       'extension/js/**', // 生成的共享 translator 拷贝（源在 js/translators.js，由 pack-extension.ps1 同步）
       '.tmp/**', // 本地临时产物（gitignore），不属审查范围
+      'scripts/one-off/**/probe-dist/**', // 探针构建产物（第三方 SDK bundle/模型副本），不属审查范围
     ],
   },
 

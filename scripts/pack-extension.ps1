@@ -13,7 +13,8 @@ if (!(Test-Path $translatorsDstDir)) { New-Item -ItemType Directory -Path $trans
 Copy-Item -Path $translatorsSrc -Destination (Join-Path $translatorsDstDir 'translators.js') -Force
 $distDir = Join-Path $projectDir 'dist'
 if (!(Test-Path $distDir)) { New-Item -ItemType Directory -Path $distDir | Out-Null }
-$target = Join-Path $distDir 'LitBoard-Extension.zip'
+$pkg = Get-Content -LiteralPath (Join-Path $projectDir 'package.json') -Raw | ConvertFrom-Json
+$target = Join-Path $distDir ("LitBoard-Extension-$($pkg.version).zip")
 if (Test-Path $target) { Remove-Item $target -Force }
 Compress-Archive -Path (Join-Path $extensionDir '*') -DestinationPath $target -Force
 Write-Host "Extension packed -> $target"

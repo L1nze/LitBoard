@@ -52,6 +52,12 @@ jobs:
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
 
+      - name: Audit locked build dependencies
+        run: npm audit --audit-level=high
+
+      - name: Verify vendored asset hashes
+        run: node scripts/vendor-hashes.js --check
+
       - name: Run ESLint
         run: npm run lint
 

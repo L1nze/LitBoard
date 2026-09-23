@@ -1,0 +1,8 @@
+{
+  "name": "litboard-ocr-bundle",
+  "private": true,
+  "description": "PaddleOCR vendor 构建的外置依赖钉版（仓库零 node_modules；产物 vendor/paddleocr/）",
+  "dependencies": {
+    "@paddleocr/paddleocr-js": "0.4.2"
+  }
+}

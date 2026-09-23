@@ -25,6 +25,26 @@
   function parseAuthors(value) {
     return text(value).split(/;\s*/).map(function (s) { return s.trim(); }).filter(Boolean);
   }
+  function parseCnkiPublicationInfo(value) {
+    var source = text(value).replace(/\s+/g, ' ').replace(/[。.]$/, '').trim();
+    if (!source) return {};
+    var yearMatch = /(?:^|\D)((?:19|20)\d{2})(?=\D|$)/.exec(source);
+    if (!yearMatch) return { venue: source };
+    var year = yearMatch[1];
+    var yearIndex = yearMatch.index + yearMatch[0].indexOf(year);
+    var venue = source.slice(0, yearIndex).replace(/[\s.,，。;；:：]+$/, '').replace(/^《|》$/g, '').trim();
+    var tail = source.slice(yearIndex + year.length).replace(/^\s*[,，.。;；:]\s*/, '').trim();
+    var volume = '', issue = '', pages = '';
+    var volumeMatch = /^(\d+)(?:\s*[(（](\d+)[)）])?/.exec(tail);
+    if (volumeMatch) {
+      volume = volumeMatch[1];
+      issue = volumeMatch[2] || '';
+      tail = tail.slice(volumeMatch[0].length);
+      var pageMatch = /[:：]\s*([\d\s,，-]+)/.exec(tail);
+      if (pageMatch) pages = pageMatch[1].replace(/\s+/g, '').replace(/[，,]+$/, '');
+    }
+    return { venue: venue, year: year, volume: volume, issue: issue, pages: pages };
+  }
   /** citation_* meta → item 基础（通用投影，专用 translator 在此基础上补特例）
    *  支持多值 meta（ctx.metas）：citation_author 逐作者、citation_keywords 逐关键词 */
   function itemFromMeta(ctx) {
@@ -126,7 +146,12 @@
         if (item.authors.length === 1 && /[;；]/.test(ctx.meta('citation_author'))) {
           item.authors = ctx.meta('citation_author').split(/[;；]/).map(function (s) { return s.trim(); }).filter(Boolean);
         }
-        if (!item.venue) item.venue = firstNonEmpty([ctx.meta('dc.source'), ctx.text('.top-tip')]);
+        var publicationInfo = parseCnkiPublicationInfo(ctx.text('.top-tip'));
+        if (!item.venue) item.venue = firstNonEmpty([ctx.meta('dc.source'), publicationInfo.venue, ctx.text('.top-tip')]);
+        if (!item.date && publicationInfo.year) item.date = publicationInfo.year;
+        if (!item.volume && publicationInfo.volume) item.volume = publicationInfo.volume;
+        if (!item.issue && publicationInfo.issue) item.issue = publicationInfo.issue;
+        if (!item.pages && publicationInfo.pages) item.pages = publicationInfo.pages;
         var dbcode = (ctx.url().match(/[?&]dbcode=(\w+)/) || [])[1];
         if (dbcode) item.bibtexExtra.dbcode = dbcode;
         return { item: item, attachments: item.attachments, snapshot: false, report: { translator: 'cnki' } };
@@ -201,5 +226,6 @@
     return null;
   }
 
-  return { translators: translators, runTranslators: runTranslators, itemFromMeta: itemFromMeta };
+  return { translators: translators, runTranslators: runTranslators, itemFromMeta: itemFromMeta,
+    parseCnkiPublicationInfo: parseCnkiPublicationInfo };
 });

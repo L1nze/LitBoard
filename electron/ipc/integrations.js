@@ -4,7 +4,7 @@
  * registerIpc 平移）。ctx.syncInFlight 是向量空闲调度 isIdle 的输入（跨域共享）。
  * 注意：本文件是 integrations:* 通道的注册层，服务本体在 ../integrations.js。 */
 
-const { dialog } = require('electron');
+const { clipboard, dialog } = require('electron');
 const ctx = require('./context.js');
 
 module.exports = { register: register };
@@ -31,8 +31,25 @@ async function applyPortableSyncSettings(config) {
 }
 
 function register() {
-  ctx.handle('integrations:get-config', function () { return ctx.integrations.getConfig(); });
+  // 设置弹窗打开的头一道 IPC。有一例「进设置整窗无响应」的报告在隔离环境无法复现
+  // （渲染层实测 30ms 内完成），最可能的主进程侧嫌疑是本通道或 data-paths:get 被卡；
+  // 超过 2s 落一条 startupLog——复发时 litboard-startup.log 直接指出卡在哪条通道、多久。
+  ctx.handle('integrations:get-config', function () {
+    const startedAt = Date.now();
+    return Promise.resolve(ctx.integrations.getConfig()).finally(function () {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed > 2000) ctx.startupLog('slow ipc: integrations:get-config ' + elapsed + 'ms（设置打开卡顿来源）');
+    });
+  });
   ctx.handle('integrations:save-config', function (_event, value) { return ctx.integrations.saveConfig(value || {}); });
+  ctx.handle('integrations:reveal-secret', function (_event, value) { return ctx.integrations.revealSecret(value || {}); });
+  ctx.handle('integrations:copy-secret', function (_event, value) {
+    return ctx.integrations.revealSecret(value || {}).then(function (secret) {
+      if (!secret) throw new Error(ctx.T('未找到已保存的 API Key'));
+      clipboard.writeText(secret);
+      return true;
+    });
+  });
   ctx.handle('integrations:sync-nutstore', async function (_event, value) {
     const input = value || {};
     const workspace = input && input.workspace && typeof input.workspace === 'object' ? input.workspace : input;
@@ -49,22 +66,22 @@ function register() {
     return result;
   });
   ctx.handle('integrations:inspect-nutstore', function (_event, value) {
-    if (!ctx.integrations.inspectNutstoreRemote) throw new Error(ctx.T('当前版本不支持远端检查'));
+    if (!ctx.integrations.inspectNutstoreRemote) throw new Error(ctx.T('当前版本不支持云端检查'));
     return ctx.integrations.inspectNutstoreRemote(value || {});
   });
   ctx.handle('integrations:create-sync-plan', async function (_event, value) {
-    if (!ctx.integrations.createNutstoreSyncPlan) throw new Error(ctx.T('当前版本不支持远端同步计划'));
+    if (!ctx.integrations.createNutstoreSyncPlan) throw new Error(ctx.T('当前版本不支持云端同步计划'));
     return ctx.integrations.createNutstoreSyncPlan(Object.assign({}, value || {}, { portableSettings: await getPortableSyncSettings() }));
   });
   ctx.handle('integrations:apply-sync-plan', function (_event, value) {
-    if (!ctx.integrations.applyNutstoreSyncPlan) throw new Error(ctx.T('当前版本不支持应用远端同步计划'));
+    if (!ctx.integrations.applyNutstoreSyncPlan) throw new Error(ctx.T('当前版本不支持应用云端同步计划'));
     return ctx.integrations.applyNutstoreSyncPlan(value || {}).then(async function (result) {
       await applyPortableSyncSettings(result && result.config);
       return result;
     });
   });
   ctx.handle('integrations:pull-config', function (_event, value) {
-    if (!ctx.integrations.pullNutstoreConfig) throw new Error(ctx.T('当前版本不支持远端配置恢复'));
+    if (!ctx.integrations.pullNutstoreConfig) throw new Error(ctx.T('当前版本不支持云端配置恢复'));
     return ctx.integrations.pullNutstoreConfig(value || {}).then(async function (result) {
       await applyPortableSyncSettings(result && result.config);
       return result;

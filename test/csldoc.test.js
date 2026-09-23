@@ -151,9 +151,9 @@ test('document exports to docx and restores with identical citation texts', asyn
   doc.getBibliography().forEach(function (entry) {
     paragraphs.push({ text: entry.replace(/<[^>]*>/g, '') });
   });
-  const bytes = LitDocx.buildDocx(paragraphs);
+  const bytes = await LitDocx.buildDocx(paragraphs);
 
-  const fields = LitDocx.readDocxFields(bytes);
+  const fields = await LitDocx.readDocxFields(bytes);
   assert.equal(fields.length, 2);
   assert.equal(fields[0].addin, 'LitBoard.Citation.1');
   assert.match(fields[0].instr, /ADDIN LitBoard\.Citation\.1/);

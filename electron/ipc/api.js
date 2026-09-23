@@ -66,15 +66,14 @@ function register() {
   });
 
   // 下载一篇开放获取 PDF：渲染层提供直链 + 建议文件名。
-  // 落盘目录 = 渲染层传来的 pdfDownloadDir 设置；未设置时落到配置目录下的 open-access-pdf
-  // 受管目录（不再弹保存框），都按命名模板重命名（同名覆盖，幂等重下）。
+  // 统一落到配置目录下的 open-access-pdf 受管目录，不再允许为自动下载另选目录。
   ctx.handle('pdf:download', async function (event, options) {
     let url;
     try { url = new URL(String(options && options.url || '')); } catch (error) { return { error: ctx.T('无效的下载地址') }; }
     if (url.protocol !== 'https:' && url.protocol !== 'http:') return { error: ctx.T('无效的下载地址') };
 
     const suggestedName = safePdfFileName(options && options.name || 'paper.pdf');
-    const autoDir = String(options && options.dir || '').trim() || openAccessPdfDir();
+    const autoDir = openAccessPdfDir();
     if (!path.isAbsolute(autoDir)) return { error: ctx.T('PDF 下载目录必须是绝对路径') };
     try {
       await fs.mkdir(autoDir, { recursive: true });

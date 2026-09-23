@@ -73,3 +73,90 @@ test('stepFontSize / stepTheme 三档循环', () => {
   assert.strictEqual(LitEpub.stepTheme('dark', 1), 'light');
   assert.strictEqual(LitEpub.stepTheme('dark', -1), 'sepia');
 });
+
+/* ---------- 正文抽取（全文索引：spine 章节序 = 页序） ---------- */
+
+test('opfPathFromContainer / spineHrefsFromOpf：容器与 OPF 解析', () => {
+  const container = '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">' +
+    '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>';
+  assert.equal(LitEpub.opfPathFromContainer(container), 'OEBPS/content.opf');
+  assert.equal(LitEpub.opfPathFromContainer(''), '');
+  assert.equal(LitEpub.opfPathFromContainer("<rootfiles><rootfile full-path='a/b.opf'/></rootfiles>"), 'a/b.opf');
+
+  const opf = '<?xml version="1.0"?>' +
+    '<package><manifest>' +
+    '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>' +
+    '<item id="c2" href="chap%202.xhtml" media-type="application/xhtml+xml"/>' +
+    '<item id="c1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>' +
+    '<item id="css" href="style.css" media-type="text/css"/>' +
+    '</manifest><spine toc="ncx">' +
+    '<itemref idref="c1"/>' +
+    '<itemref idref="c2"/>' +
+    '<itemref idref="missing"/>' +
+    '</spine></package>';
+  // spine 顺序保持（不按清单序）；缺清单项跳过；URL 解码
+  assert.deepStrictEqual(LitEpub.spineHrefsFromOpf(opf), ['chapter1.xhtml', 'chap%202.xhtml']);
+  assert.deepStrictEqual(LitEpub.spineHrefsFromOpf('<package></package>'), []);
+
+  // 相对 OPF 目录解析 + 去 fragment + 上跳目录
+  assert.equal(LitEpub.resolveHref('OEBPS/content.opf', 'chapter1.xhtml'), 'OEBPS/chapter1.xhtml');
+  assert.equal(LitEpub.resolveHref('OEBPS/text/content.opf', '../style/main.css#frag'), 'OEBPS/style/main.css');
+  assert.equal(LitEpub.resolveHref('content.opf', 'chap%202.xhtml'), 'chap 2.xhtml');
+});
+
+test('xhtmlToText：head/script 剔除、块级换行、实体解码、空白收敛', () => {
+  const xhtml = '<?xml version="1.0" encoding="utf-8"?>' +
+    '<html><head><title>忽略我</title><style>p { color: red }</style></head>' +
+    '<body><h1>第一章&nbsp;引言</h1>' +
+    '<script>var x = "&lt;script&gt;";</script>' +
+    '<p>第一段，含 <em>强调</em> 与 &amp; 符号。</p><p>第二段</p>' +
+    '<div>行<br/>断开</div>' +
+    '</body></html>';
+  const text = LitEpub.xhtmlToText(xhtml);
+  assert.ok(!text.includes('忽略我'), 'head 里的 title 不进正文');
+  assert.ok(!text.includes('color: red'), 'style 不进正文');
+  assert.ok(!text.includes('var x'), 'script 不进正文');
+  assert.ok(text.includes('第一章\u00a0引言') || text.includes('第一章 引言'), '实体解码');
+  assert.ok(text.includes('第一段，含 强调 与 & 符号。'));
+  // 块级边界换行、行内标签不换行
+  assert.ok(/第一章[^\n]*引言\n\n?第一段/.test(text.replace(/\u00a0/g, ' ')));
+  assert.ok(text.includes('行\n断开'));
+  const again = LitEpub.xhtmlToText(text);
+  assert.equal(again, text); // 纯文本再过一遍不变（幂等）
+});
+
+test('chapterTexts：按 spine 序映射、缺文件记空串保持页序', () => {
+  const texts = LitEpub.chapterTexts(
+    ['OEBPS/c1.xhtml', 'OEBPS/c2.xhtml', 'OEBPS/missing.xhtml'],
+    { 'OEBPS/c1.xhtml': '<p>Alpha</p>', 'OEBPS/c2.xhtml': '<p>Beta</p>' }
+  );
+  assert.deepStrictEqual(texts, ['Alpha', 'Beta', '']);
+  assert.deepStrictEqual(LitEpub.chapterTexts(null, {}), []);
+});
+
+// WS4：textAnchor 章内查找（旧 CFI 解析失败时的回退锚，纯函数）
+test('findAnchorRange：exact 单节点命中 / 跨节点命中 / prefix-suffix 消歧 / 未命中返回 null', () => {
+  const nodes = [
+    { data: '采样定理指出，' },
+    { data: '若信号最高频率为 B，' },
+    { data: '采样频率须大于 2B。' },
+  ];
+  // 单节点内
+  assert.deepStrictEqual(LitEpub.findAnchorRange(nodes, { exact: '采样定理' }),
+    { startNode: 0, startOffset: 0, endNode: 0, endOffset: 4 });
+  // 跨节点（「频率为 B，采样」横跨 node1 尾与 node2 头）
+  assert.deepStrictEqual(LitEpub.findAnchorRange(nodes, { exact: '频率为 B，采样' }),
+    { startNode: 1, startOffset: 5, endNode: 2, endOffset: 2 }); // 「频率」在「若信号最高」之后
+  const disambig = LitEpub.findAnchorRange(nodes, { exact: '采样频率', prefix: '，' });
+  assert.deepStrictEqual(disambig, { startNode: 2, startOffset: 0, endNode: 2, endOffset: 4 }, 'prefix 校验通过（「，」紧邻其前）');
+  // 「采样频率」全书仅一处（node2 开头），无 prefix 时同样命中它
+  assert.deepStrictEqual(LitEpub.findAnchorRange(nodes, { exact: '采样频率' }),
+    { startNode: 2, startOffset: 0, endNode: 2, endOffset: 4 });
+  // suffix 消歧
+  const bySuffix = LitEpub.findAnchorRange(nodes, { exact: '采样频率', suffix: '须' });
+  assert.deepStrictEqual(bySuffix, { startNode: 2, startOffset: 0, endNode: 2, endOffset: 4 });
+  // 未命中 / 空 exact / 空 anchor
+  assert.strictEqual(LitEpub.findAnchorRange(nodes, { exact: '不存在的串' }), null);
+  assert.strictEqual(LitEpub.findAnchorRange(nodes, {}), null);
+  assert.strictEqual(LitEpub.findAnchorRange(null, { exact: '采样' }), null);
+});

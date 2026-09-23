@@ -124,7 +124,8 @@ test('citation keys use the lowercase first-author family name and year', functi
   assert.equal(LitModel.citationKeyBase({ authors: ['Ada Lovelace'], year: 1843 }), 'lovelace1843');
   assert.equal(LitModel.citationKeyBase({ authors: ['Lovelace, Ada'], year: 1843 }), 'lovelace1843');
   assert.equal(LitModel.citationKeyBase({ authors: ['José García'], year: 2024 }), 'garcia2024');
-  assert.equal(LitModel.citationKeyBase({ authors: ['张三'], year: 2025 }), '张三2025');
+  assert.equal(LitModel.citationKeyBase({ authors: ['张三'], year: 2025 }), 'zhangsan2025');
+  assert.equal(LitModel.citationKeyBase({ authors: ['欧阳娜娜'], year: 2025 }), 'ouyangnana2025');
   assert.equal(LitModel.citationKeyBase({ authors: [], year: null }), 'anonnodate');
 });
 

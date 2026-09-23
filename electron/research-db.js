@@ -17,7 +17,7 @@ const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const LitResearch = require('../js/research.js');
 
-const RESEARCH_DB_VERSION = 3;
+const RESEARCH_DB_VERSION = 4;
 
 function createResearchDb(options) {
   const dir = options.dir;
@@ -59,6 +59,9 @@ function createResearchDb(options) {
    *   （正文文本与 works 行分离——元数据 upsert 不必反复重写几十万字符的大文本），
    *   works_fts 重建为五列（title/abstract/snippet/fulltext），全文文本进调研库可检索；
    *   全文不属于嵌入配方（title+abstract），不触碰 vec 行。
+   * - v4（A-followup #5）：works 增 title_norm 列 + 索引，规范化标题随写入维护、迁移时
+   *   一次性回填。旧实现按「被引数前 400 篇」扫标题去重，低被引的既有条目永远匹配不到，
+   *   反复检索会为同一篇论文造出重复身份（身份分裂）。
    */
   function migrateWorks(db) {
     const version = userVersionOf(db);
@@ -143,6 +146,17 @@ function createResearchDb(options) {
           FROM works w LEFT JOIN works_fulltext f ON f.work_id = w.id
         `);
       }
+      if (version < 4) {
+        addColumnIfMissing(db, 'works', 'title_norm', "TEXT DEFAULT ''");
+        db.exec('CREATE INDEX IF NOT EXISTS idx_works_title_norm ON works(title_norm)');
+        // 规范化在 JS 侧算（Unicode 属性类 SQL 表达不了）：迁移时一次性回填，之后随写入维护
+        const backfill = db.prepare("SELECT id, title FROM works WHERE title != ''").all();
+        const setNorm = db.prepare('UPDATE works SET title_norm = ? WHERE id = ?');
+        backfill.forEach(function (row) {
+          const norm = LitResearch.normalizeTitleKey(row.title);
+          if (norm) setNorm.run(norm, row.id);
+        });
+      }
       db.exec('PRAGMA user_version = ' + RESEARCH_DB_VERSION);
       db.exec('COMMIT');
     } catch (error) {
@@ -219,6 +233,8 @@ function createResearchDb(options) {
       id: String(row.id || ''),
       doi: String(row.doi || ''),
       title: String(row.title || '').slice(0, 4000),
+      // v4：规范化标题随行写入（findIdByNormalizedTitle 走这个索引列精确命中）
+      title_norm: LitResearch.normalizeTitleKey(row.title).slice(0, 4000),
       year: Number(row.year) || null,
       pubdate: String(row.pubdate || '').slice(0, 10),
       type: String(row.type || '').slice(0, 60),
@@ -246,15 +262,16 @@ function createResearchDb(options) {
     works.exec('BEGIN');
     try {
       const upsert = works.prepare(`
-        INSERT INTO works(id, doi, title, year, pubdate, type, source_id, source_name,
+        INSERT INTO works(id, doi, title, title_norm, year, pubdate, type, source_id, source_name,
           abstract, snippet, page_url, lang, cited_by, is_oa, oa_url, authors_json, refs_json,
           concepts_json, keywords_json, created_at, updated_at)
-        VALUES(@id, @doi, @title, @year, @pubdate, @type, @source_id, @source_name,
+        VALUES(@id, @doi, @title, @title_norm, @year, @pubdate, @type, @source_id, @source_name,
           @abstract, @snippet, @page_url, @lang, @cited_by, @is_oa, @oa_url, @authors_json, @refs_json,
           @concepts_json, @keywords_json, @now, @now)
         ON CONFLICT(id) DO UPDATE SET
           doi = CASE WHEN excluded.doi != '' THEN excluded.doi ELSE works.doi END,
           title = CASE WHEN excluded.title != '' THEN excluded.title ELSE works.title END,
+          title_norm = CASE WHEN excluded.title != '' THEN excluded.title_norm ELSE works.title_norm END,
           year = COALESCE(excluded.year, works.year),
           pubdate = CASE WHEN excluded.pubdate != '' THEN excluded.pubdate ELSE works.pubdate END,
           type = CASE WHEN excluded.type != '' THEN excluded.type ELSE works.type END,
@@ -278,16 +295,27 @@ function createResearchDb(options) {
       const ftsInsert = works.prepare(`INSERT INTO works_fts(work_id, title, abstract, snippet, fulltext)
         VALUES(?, ?, ?, ?, COALESCE((SELECT content FROM works_fulltext WHERE work_id = ?), ''))`);
       const readMerged = works.prepare('SELECT title, abstract, snippet, concepts_json, keywords_json FROM works WHERE id = ?');
+      // 变前镜像：FTS 只是 works 的镜像，内容没变就不重建——重建要删行 + 对 title/abstract/snippet
+      // 重新分词，且 fulltext 列还要回读侧表（最多 40 万字符）。检索类工具一次调用会 upsert
+      // 上百行（find_literature 的每条召回都过这里），这笔开销是「Agent 一调工具就卡」的主要来源之一
+      const readPrevious = works.prepare('SELECT title, abstract, snippet FROM works WHERE id = ?');
       const extInsert = works.prepare('INSERT OR IGNORE INTO ext_ids(work_id, kind, value) VALUES(?, ?, ?)');
       const staleVecIds = [];
       list.forEach(function (row) {
         const c = workToColumns(row);
+        const previous = readPrevious.get(c.id) || null;
         upsert.run(c);
         // R09：FTS 用「UPSERT 后数据库实际保留的合并行」重建——UPSERT 是非空补齐语义，
         // 直接拿输入值写 FTS 会把「空摘要不覆盖」变成「空摘要清掉检索命中」
         const merged = readMerged.get(c.id) || { title: '', abstract: '', snippet: '' };
-        ftsDelete.run(c.id);
-        ftsInsert.run(c.id, merged.title || '', merged.abstract || '', merged.snippet || '', c.id);
+        const ftsUnchanged = !!previous &&
+          String(previous.title || '') === String(merged.title || '') &&
+          String(previous.abstract || '') === String(merged.abstract || '') &&
+          String(previous.snippet || '') === String(merged.snippet || '');
+        if (!ftsUnchanged) {
+          ftsDelete.run(c.id);
+          ftsInsert.run(c.id, merged.title || '', merged.abstract || '', merged.snippet || '', c.id);
+        }
         // R13：嵌入相关文本（title/abstract/concepts/keywords）的 hash 变了 → 旧向量立即失效
         const hash = LitResearch.embeddingHash({
           title: merged.title || '', abstract: merged.abstract || '',
@@ -396,17 +424,25 @@ function createResearchDb(options) {
       'works.source_name AS source_name, works.cited_by AS cited_by, works.is_oa AS is_oa, ' +
       'works.abstract AS abstract, works.snippet AS snippet, works.page_url AS page_url, ' +
       'works.type AS type, works.oa_url AS oa_url';
-    const total = works.prepare('SELECT COUNT(*) AS n FROM ' + from + whereSql).get(params).n;
+    // 命中总数不再单独 COUNT：trigram 命中多时 COUNT 要把全部命中枚举一遍（实测万级库 ~74ms，
+    // 每次检索白付一次）。这里只需要「够不够翻页」——取满一页就回报「至少 N 条」并打上
+    // totalIsLowerBound，取不满时 offset + rows.length 就是精确值
     const rows = works.prepare(
       'SELECT ' + columns + ' FROM ' + from + whereSql +
       ' ORDER BY works.cited_by DESC, works.id ASC LIMIT @limit OFFSET @offset'
     ).all(Object.assign({}, params, { limit: limit, offset: offset }));
-    return { total: Number(total) || 0, works: rows.map(workSummary) };
+    return {
+      total: offset + rows.length,
+      totalIsLowerBound: rows.length >= limit,
+      works: rows.map(workSummary)
+    };
   }
 
   function getWorks(ids) {
     ensureOpen();
-    const list = (Array.isArray(ids) ? ids : []).map(String).filter(Boolean).slice(0, 50);
+    // 上限 500：引文网络按「请求的文献集合」建图（诱导子图）时要一次装整批种子；
+    // 卡在 50 会让「>120 篇按被引/PageRank 择优截取」这条可读性路径永远无法触发
+    const list = (Array.isArray(ids) ? ids : []).map(String).filter(Boolean).slice(0, 500);
     if (!list.length) return [];
     const placeholders = list.map(function () { return '?'; }).join(',');
     const stmt = works.prepare(`SELECT works.*, (SELECT chars FROM works_fulltext f WHERE f.work_id = works.id) AS fulltext_chars FROM works WHERE works.id IN (${placeholders})`);
@@ -500,20 +536,15 @@ function createResearchDb(options) {
     return { count: count };
   }
 
-  /** 标题精确匹配（规范化后）：网页检索结果按标题补 DOI 归属用 */
+  /** 标题精确匹配（规范化后）：网页检索结果按标题补身份归属用。
+   *  A-followup #5：走 v4 的 title_norm 索引——旧实现「按被引数取前 400 篇再逐行比对」，
+   *  低被引的既有条目永远匹配不到，同一篇论文会被反复建成新的 local: 身份。 */
   function findIdByNormalizedTitle(title) {
     ensureOpen();
-    const norm = String(title == null ? '' : title).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    const norm = LitResearch.normalizeTitleKey(title);
     if (norm.length < 8) return null;
-    const rows = works.prepare(`
-      SELECT id, title FROM works WHERE title != ''
-      ORDER BY cited_by DESC LIMIT 400
-    `).all();
-    for (const row of rows) {
-      const rowNorm = String(row.title || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
-      if (rowNorm && rowNorm === norm) return row.id;
-    }
-    return null;
+    const row = works.prepare('SELECT id FROM works WHERE title_norm = ? LIMIT 1').get(norm);
+    return row ? row.id : null;
   }
 
   function recordSearch(input) {
@@ -536,7 +567,13 @@ function createResearchDb(options) {
     if (!id) return { updated: 0 };
     const sets = [];
     const params = { id: id, now: Date.now() };
-    if (patch && patch.title) { sets.push('title = @title'); params.title = String(patch.title).slice(0, 4000); }
+    if (patch && patch.title) {
+      sets.push('title = @title');
+      // v4：title_norm 必须跟着 title 一起改，否则改过标题的行再也匹配不到（身份去重失效）
+      sets.push('title_norm = @title_norm');
+      params.title = String(patch.title).slice(0, 4000);
+      params.title_norm = LitResearch.normalizeTitleKey(patch.title).slice(0, 4000);
+    }
     if (patch && patch.abstract) { sets.push('abstract = @abstract'); params.abstract = String(patch.abstract).slice(0, 200000); }
     if (!sets.length) return { updated: 0 };
     sets.push('updated_at = @now');
@@ -545,11 +582,13 @@ function createResearchDb(options) {
       const result = works.prepare('UPDATE works SET ' + sets.join(', ') + ' WHERE id = @id').run(params);
       const changed = Number(result.changes) || 0;
       if (changed) {
-        const ftsDelete = works.prepare('DELETE FROM works_fts WHERE work_id = ?');
-        const ftsInsert = works.prepare('INSERT INTO works_fts(work_id, title, abstract, snippet) VALUES(?, ?, ?, ?)');
+        // FTS 行必须带 fulltext 列（v3 五列）：只写四列会把该文献的正文从检索索引里抹掉
+        // （works_fts.fulltext 来自 works_fulltext 侧表，元数据更新不该动它）
+        const ftsInsert = works.prepare(`INSERT INTO works_fts(work_id, title, abstract, snippet, fulltext)
+          VALUES(?, ?, ?, ?, COALESCE((SELECT content FROM works_fulltext WHERE work_id = ?), ''))`);
         const row = works.prepare('SELECT title, abstract, snippet FROM works WHERE id = ?').get(id);
-        ftsDelete.run(id);
-        ftsInsert.run(id, row.title, row.abstract, row.snippet || '');
+        works.prepare('DELETE FROM works_fts WHERE work_id = ?').run(id);
+        ftsInsert.run(id, row.title || '', row.abstract || '', row.snippet || '', id);
         const prov = works.prepare(`
           INSERT INTO field_provenance(work_id, field, source, fetched_at) VALUES(@id, @field, @source, @now)
           ON CONFLICT(work_id, field) DO UPDATE SET source = excluded.source, fetched_at = excluded.fetched_at
@@ -781,6 +820,25 @@ function createResearchDb(options) {
   }
 
   /**
+   * 向量覆盖度（A-followup #4）：按**当前模型 + 配方**统计可用向量数。
+   * 「全库向量总数 > 0」不能当可用性判据——换了嵌入模型后旧模型的向量还在，总数不为零，
+   * 但 cosineSearch 只认同模型同配方，检索会一篇都命不中；用户看到的像是「没有相关文献」，
+   * 实际是当前向量空间尚未构建。matched = 当前模型 + 配方下的向量数。
+   */
+  function vecCoverage(options) {
+    ensureOpen();
+    if (!vec) return { total: 0, matched: 0 };
+    const opts = options || {};
+    const model = String(opts.model || '');
+    const recipe = Number(opts.recipe) || 0;
+    const total = Number(vec.prepare('SELECT COUNT(*) AS n FROM vecs').get().n) || 0;
+    const matched = (model || recipe)
+      ? Number(vec.prepare('SELECT COUNT(*) AS n FROM vecs WHERE model = ? AND recipe = ?').get(model, recipe).n) || 0
+      : total;
+    return { total: total, matched: matched };
+  }
+
+  /**
    * 余弦相似度检索（暴力全扫，1 万篇毫秒级——与上游 harness 同路线，无 ANN）。
    * vec.db 与 research.db 是两个独立连接，无法 SQL 跨库 join——先取候选再在 works 库过滤年份。
    * R13：传入 model/recipe 时只检索同模型同配方的向量——相同维度不代表同一向量空间，
@@ -921,6 +979,7 @@ function createResearchDb(options) {
     vecClear: vecClear,
     pendingEmbeddings: pendingEmbeddings,
     cosineSearch: cosineSearch,
+    vecCoverage: vecCoverage,
     findWorksNeedingAbstract: findWorksNeedingAbstract,
     exportIdentityCore: exportIdentityCore,
     importIdentityCore: importIdentityCore

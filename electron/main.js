@@ -48,10 +48,11 @@ const LIFECYCLE_MODE = process.env.LITBOARD_SMOKE_LIFECYCLE || '';
 // M4 分段计时起点：主进程模块加载时刻
 const BOOT_T0 = Date.now();
 const SMOKE_PDF = process.env.LITBOARD_SMOKE_PDF || '';
+const SMOKE_EPUB = process.env.LITBOARD_SMOKE_EPUB || '';
 // 可选：把 smoke 渲染的 PDF 页截图到指定文件（肉眼检查渲染效果用）
 const SMOKE_SHOT = process.env.LITBOARD_SMOKE_SHOT || '';
 const SMOKE_SCALE = Number(process.env.LITBOARD_SMOKE_SCALE) || 0.2; // 截图目检时可调大
-const SMOKE_EXPECT_RENDERER = process.env.LITBOARD_SMOKE_EXPECT_RENDERER === 'pdfjs' ? 'pdfjs' : 'pdfium';
+const SMOKE_EXPECT_RENDERER = 'mupdf';
 
 // 启动诊断日志的实现随 IPC 域拆分移至 ipc/context.js（全进程唯一实例：
 // 整文件重写式日志，两份实例会互相覆盖）；main.js 经上方 ctx.startupLog 别名调用。
@@ -235,14 +236,10 @@ function createWindow() {
       try {
         const result = await mainWindow.webContents.executeJavaScript(`(async function () {
           const pdfResourceRequests = [];
-          const originalXhrOpen = XMLHttpRequest.prototype.open;
-          XMLHttpRequest.prototype.open = function (method, url) {
-            if (/\\/vendor\\/pdfjs\\/(?:standard_fonts|cmaps|wasm|iccs)\\//.test(String(url))) pdfResourceRequests.push(String(url));
-            return originalXhrOpen.apply(this, arguments);
-          };
           const pdfPath = ${JSON.stringify(SMOKE_PDF)};
+          const epubPath = ${JSON.stringify(SMOKE_EPUB)};
           const shotWanted = ${SMOKE_SHOT ? 'true' : 'false'};
-          const pdfjsLib = pdfPath ? await window.LitPdf.load() : await import('./vendor/pdfjs/pdf.min.mjs');
+            await window.LitPdf.load();
           const result = {
             desktopBridge: !!window.litboardDesktop,
             modelLoaded: !!window.LitModel,
@@ -269,22 +266,37 @@ function createWindow() {
               !!window.litboardDesktop.onSyncProgress,
             autoSyncTogglePresent: !!document.querySelector('#sync-auto-sync') && !!window.litboardDesktop.getSetting &&
               !!window.litboardDesktop.setSetting,
+            // 「立即同步」按钮归属云同步分组，不再挂在弹窗页脚（改动本就即时保存，
+            // 页脚再放一个「保存并同步」会让人以为不点就丢设置）
+            syncNowInCloudPresent: !!document.querySelector('#sync-run') &&
+              !!document.querySelector('#sync-run').closest('.sync-section[data-sync-group="cloud"]') &&
+              !document.querySelector('.sync-modal-actions #sync-run'),
             remoteRecoveryApiPresent: !!window.litboardDesktop.inspectNutstoreRemote && !!window.litboardDesktop.pullNutstoreConfig &&
               !!window.litboardDesktop.createNutstoreSyncPlan && !!window.litboardDesktop.applyNutstoreSyncPlan,
             inlineTestStatusPresent: !!document.querySelector('#sync-nutstore-test-status') && !!document.querySelector('#sync-scigreat-test-status'),
             nestedFolderUiPresent: !!document.querySelector('#folder-create-parent'),
-            pdfJsLoaded: !!pdfjsLib.getDocument,
-            pdfLayoutTogglePresent: !!document.querySelector('#pdf-layout-toggle') && !!document.querySelector('#pdf-renderer-toggle') &&
-              !!document.querySelector('#pdf-reflow-toggle'),
+            muPdfLoaded: !!window.LitMuPdf,
+            pdfLayoutTogglePresent: !!document.querySelector('#pdf-layout-toggle'),
             translationUiPresent: !!document.querySelector('#pdf-translate-selection') && !!document.querySelector('#sync-translator-provider'),
+            // 检索语法速查：占位符不再罗列语法，帮助必须有看得见的入口（? 按钮 + 浮层可开）
+            searchHelpUiPresent: !!document.querySelector('#btn-search-help') && !!document.querySelector('#search-help-pop'),
+            // 「插入引文」的检索框与主检索框同构：内嵌放大镜 + 语法速查入口 + 语法错误提示
+            wordCiteSearchUiPresent: !!document.querySelector('#word-cite-search').closest('.search-wrap') &&
+              !!document.querySelector('#word-cite-search').closest('.search-wrap').querySelector('.search-icon') &&
+              !!document.querySelector('#btn-word-cite-help') && !!document.querySelector('#word-cite-hint'),
             // AI 调研助手（一期）：抽屉 + 顶栏入口 + 设置区（AI 助手/检索服务/调研库/会话记录）+ IPC 面
             agentDrawerPresent: !!document.querySelector('#agent-drawer') && !!document.querySelector('#agent-chat-root') &&
               !!document.querySelector('#agent-history') && !!document.querySelector('#btn-agent') &&
               !!document.querySelector('#agent-model') && !!document.querySelector('#agent-thinking') &&
-              // 底部服务商徽标（由 Base URL 判定）：DOM 必须在，否则「当前经谁的端点」不可见
+              // 底部服务商徽标（自定义名称或由 Base URL 判定）：DOM 必须在，否则「当前经谁的端点」不可见
               !!document.querySelector('#agent-provider') &&
-              !!document.querySelector('#sync-agent-base-url') && !!document.querySelector('#sync-openalex-email') &&
-              !!document.querySelector('#sync-research-import') && !!document.querySelector('#sync-agent-session-root'),
+              // 模型徽标是可点开的切换按钮（分组菜单 + 「管理模型…」）
+              !!document.querySelector('#agent-model-btn') && !!window.LitAgentCfg &&
+              !!document.querySelector('#agent-provider-items') && !!document.querySelector('#agent-provider-detail') &&
+              !!document.querySelector('#agent-provider-add') &&
+              !!window.litboardDesktop.agentSetSelection &&
+              !!document.querySelector('#sync-openalex-email') &&
+              !!document.querySelector('#sync-agent-session-root'),
             agentApiPresent: !!window.litboardDesktop.agentChat && !!window.litboardDesktop.agentCancel &&
               !!window.litboardDesktop.researchQuery && !!window.litboardDesktop.researchSearchOpenalex &&
               !!window.litboardDesktop.sessionList && !!window.litboardDesktop.onAgentEvent,
@@ -299,10 +311,49 @@ function createWindow() {
               !!window.litboardDesktop.researchEmbedBuild && !!window.litboardDesktop.researchDownloadPdfs &&
               !!window.litboardDesktop.researchStagePdfs && !!window.litboardDesktop.researchRegister,
             // M9 三期：引文网络面板 + vis 库 + 组装模块 + IPC 面 + 双入口菜单项
+            // （版式对照 literature-mcp：三栏 = 本图论文 / 画布 / 详情 + 图例）
             agentGraphPresent: !!document.querySelector('#graph-mask') && !!document.querySelector('#graph-canvas') &&
               !!document.querySelector('#graph-export') &&
+              !!document.querySelector('#graph-list') && !!document.querySelector('#graph-detail') &&
+              !!document.querySelector('#graph-legend') && !!document.querySelector('#graph-meta') &&
               !!window.vis && !!window.vis.Network && !!window.LitGraphGen && !!window.LitGraphView &&
               !!window.litboardDesktop.researchGraph,
+            // 引文网络三栏端到端：纯函数建图 → 面板渲染 → 左列表/右详情/图例/画布都真的产出
+            // （不联网、不碰调研库：数据源注入内存库）
+            graphViewerWorks: await (async function () {
+              try {
+                const G = window.LitGraphGen;
+                if (!G || !window.LitGraphView || !G.viewerData || !G.buildGraphData) return false;
+                const lib = {};
+                for (let i = 0; i < 24; i++) {
+                  lib['W' + i] = {
+                    id: 'W' + i, title: 'Smoke paper ' + i, year: 2000 + (i % 12), citedBy: i * 5,
+                    authors: [{ name: 'Author' + i + ' Surname' }], sourceName: 'Journal',
+                    abstract: 'abstract ' + i, refs: []
+                  };
+                }
+                for (let i = 0; i < 24; i++) lib['W' + i].refs = ['W' + ((i + 1) % 24), 'W0'];
+                const graph = await G.buildGraphData(Object.keys(lib), { depth: 0, maxNodes: 120 }, {
+                  getWorks: async function (ids) { return ids.map(function (id) { return lib[id]; }).filter(Boolean); }
+                });
+                window.LitGraphView.showData(graph, '冒烟引文网络');
+                const view = G.viewerData(graph, { palette: 'light' });
+                const rows = document.querySelectorAll('#graph-list .paper-row').length;
+                const detail = document.querySelector('#graph-detail');
+                const legend = document.querySelector('#graph-legend');
+                const meta = document.querySelector('#graph-meta');
+                const labels = view.nodes.filter(function (n) { return n.label; }).length;
+                const ok = rows === 24 && graph.meta.nodeCount === 24 && graph.meta.edgeCount > 0 &&
+                  !!document.querySelector('#graph-canvas canvas') &&
+                  !!detail && detail.textContent.indexOf('Smoke paper') !== -1 &&
+                  !!legend && legend.innerHTML.indexOf('yearbar') !== -1 &&
+                  !!document.querySelector('#physicsToggle') &&
+                  !!meta && meta.textContent.indexOf('节点 24') !== -1 &&
+                  labels > 0 && labels < 24;   // 标签必须稀疏（每个节点都挂标签就是那团毛线球）
+                window.LitGraphView.close();
+                return ok;
+              } catch (error) { return String(error && error.message || error); }
+            })(),
             // M9-4：科研网页检索——设置 UI + IPC 面 + 纯函数模块 + 工具门控（默认关：未传 includeWebSearch 不注册）
             agentWebSearchPresent: !!document.querySelector('#sync-web-search-enabled') &&
               !!document.querySelector('#sync-tinyfish-key') &&
@@ -313,10 +364,10 @@ function createWindow() {
             // PDF 阅读助手（期一）：agent 的按页读取/批注工具 + 页区间 IPC
             //（阅读器「AI 解释」按钮已于 2026-09-20 整体移除，用户反馈无实际作用）
             agentReaderPresent: !!window.litboardDesktop.pdfSearchGetPageRange,
-            // R16：段落找文献——S2 Key 设置项 + IPC 面 + 纯函数层 + 工具常驻注册；
-            // 语义检索只作为 agent 工具（供应商开关与手动模式「语义检索」按钮已移除）
-            agentFindLiteraturePresent: !!document.querySelector('#sync-semanticscholar-key') &&
-              !!window.LitLitSearch &&
+            // R16：段落找文献——IPC 面 + 纯函数层 + 工具常驻注册；
+            // 语义检索只作为 agent 工具（供应商开关与手动模式「语义检索」按钮已移除）；
+            // Semantic Scholar Key 输入框已从设置页移除（共享池够用），故不再断言该元素
+            agentFindLiteraturePresent: !!window.LitLitSearch &&
               !!window.litboardDesktop.researchFindLiterature &&
               !!window.litboardDesktop.researchSearchSemanticscholar &&
               window.LitAgent.createTools({ desktop: {} }).tools.some(function (t) {
@@ -367,22 +418,15 @@ function createWindow() {
               try {
                 const railAi = document.querySelector('#btn-agent');
                 const railDetail = document.querySelector('#rail-detail');
-                const railSearch = document.querySelector('#rail-search');
                 const aiPane = document.querySelector('#agent-drawer');
                 const detailPane = document.querySelector('#panel-detail');
-                const manualPane = document.querySelector('#manual-panel');
-                if (!railAi || !railDetail || !railSearch || !aiPane || !detailPane || !manualPane) return false;
+                if (!railAi || !railDetail || !aiPane || !detailPane) return false;
                 const visible = (node) => !!node.offsetParent && node.getBoundingClientRect().height > 0;
                 railAi.click();
-                const toAi = visible(aiPane) && !visible(detailPane) && !visible(manualPane) && railAi.classList.contains('active');
+                const toAi = visible(aiPane) && !visible(detailPane) && railAi.classList.contains('active');
                 railDetail.click();
-                const toDetail = !visible(aiPane) && visible(detailPane) && !visible(manualPane) && railDetail.classList.contains('active');
-                // 手动检索：独立栏位，无需任何 AI 配置即可用（含检索输入框）
-                railSearch.click();
-                const toManual = visible(manualPane) && !visible(aiPane) && railSearch.classList.contains('active') &&
-                  !!manualPane.querySelector('input');
-                railDetail.click();
-                return toAi && toDetail && toManual;
+                const toDetail = !visible(aiPane) && visible(detailPane) && railDetail.classList.contains('active');
+                return toAi && toDetail;
               } catch (error) { return String(error && error.message || error); }
             })(),
             // AI 对话层渲染冒烟：隔离容器强制挂载 assistant-ui（无需 Key），用含
@@ -534,11 +578,29 @@ function createWindow() {
             // 拖放落点：全局拖入提示胶囊 + 统计仪表盘导入落区（条目行落点是运行时行为无静态标记）
             importDropZonesPresent: !!document.querySelector('#drag-hint-pill') &&
               !!document.querySelector('#stats-drop-hint'),
-            pdfAutoDownloadUiPresent: !!document.querySelector('#sync-pdf-download-dir') &&
-              !!document.querySelector('#sync-pdf-download-dir-choose') && !!document.querySelector('#sync-pdf-download-dir-clear'),
+            statsOverviewPresent: document.querySelectorAll('.stats-summary > .tile').length === 3 &&
+              !!document.querySelector('#chart-range') && !!document.querySelector('#chart-peak'),
+            // 拖入文件夹导入：规划模块 + 更多菜单兜底入口（落区高亮是运行时行为，行为探针在下方补）
+            folderImportPresent: !!window.LitFolderImport && !!document.querySelector('#more-import-folder') &&
+              !!document.querySelector('#folder-empty'),
+            removedSettingsAbsent: !document.querySelector('#sync-pdf-download-dir') &&
+              !document.querySelector('#sync-rename-template') && !document.querySelector('#sync-bib-export-path') &&
+              !document.querySelector('#sync-proxy-prefix') && !document.querySelector('#sync-trash-days'),
+            simplifiedBackupUiPresent: !!document.querySelector('#sync-backup-dir') &&
+              !!document.querySelector('#sync-backup-choose') && !!document.querySelector('#sync-backup-now') &&
+              !!document.querySelector('#sync-backup-restore') && !!document.querySelector('#sync-backup-open') &&
+              !!document.querySelector('#sync-backup-status') && !document.querySelector('#sync-backup-keep') &&
+              !document.querySelector('#sync-backup-cleanup'),
             pdfSearchUiPresent: !!document.querySelector('#pdf-search') && !!document.querySelector('#btn-ft') &&
               !!document.querySelector('#ft-status') && !!window.LitPdfSearch,
+            ocrEnginePresent: !!window.LitOcr && typeof window.LitOcr.ocrPages === 'function' &&
+              typeof window.LitOcr.dataStatus === 'function' && typeof window.LitOcr.ensureData === 'function' &&
+              typeof window.LitOcr.cancel === 'function',
             pdfSearchTogglePresent: !!document.querySelector('#pdf-search-toggle'),
+            pdfSearchOptionsPresent: !!document.querySelector('#pdf-search-case') &&
+              !!document.querySelector('#pdf-search-word') &&
+              document.querySelector('#pdf-search-case').getAttribute('aria-pressed') === 'false' &&
+              document.querySelector('#pdf-search-word').getAttribute('aria-pressed') === 'false',
             issuesCenterPresent: !!document.querySelector('#btn-issues') && !!document.querySelector('#issues-menu') &&
               !!document.querySelector('#issues-list'),
             onboardPresent: !!document.querySelector('#onboard-steps') && !!document.querySelector('#onboard-import') &&
@@ -554,11 +616,14 @@ function createWindow() {
             syncIndicatorPresent: !!document.querySelector('#sync-indicator'),
             bridgeUiPresent: !!document.querySelector('#sync-bridge-enabled'),
             pdfReaderExtrasPresent: !!document.querySelector('#pdf-tabs') && !!document.querySelector('#pdf-side') &&
-              !!document.querySelector('#pdf-snapshot-toggle') && !!document.querySelector('#pdf-ink-toggle') &&
-              !!document.querySelector('#pdf-write-back') && !!document.querySelector('#pdf-ocr-banner'),
+              !!document.querySelector('#pdf-ocr-banner') && !!document.querySelector('#rail-translation') &&
+              !!document.querySelector('#rail-anno') && !document.querySelector('#pdf-reflow-toggle') &&
+              !document.querySelector('#pdf-snapshot-toggle') && !document.querySelector('#pdf-ink-toggle') &&
+              !document.querySelector('#pdf-write-back') && !document.querySelector('#pdf-tts') &&
+              !document.querySelector('#pdf-translation-settings') && !document.querySelector('#pdf-annotations-toggle'),
             pdfTopTabsPresent: !!document.querySelector('#pdf-tabs .pdf-tab .pdf-tab-title') &&
               Array.prototype.some.call(document.querySelectorAll('#pdf-tabs .pdf-tab-title'), function (el) {
-                return el.textContent.indexOf('资料库') !== -1;
+                return el.textContent.indexOf('文献库') !== -1;
               }),
             title: document.title,
             titlebarControlsPresent: !!document.querySelector('#win-min') &&
@@ -597,27 +662,137 @@ function createWindow() {
               typeof window.LitQuery.parseAst === 'function' && typeof window.LitQuery.compile === 'function',
             bulkEditPresent: !!document.querySelector('#bulk-edit-mask') &&
               !!document.querySelector('#bulk-edit-field') && !!document.querySelector('#bulk-edit-confirm'),
-            undoPresent: !!document.querySelector('#btn-undo') && !!document.querySelector('#btn-redo'),
-            backupUiPresent: !!document.querySelector('#sync-backup-dir') &&
-              !!document.querySelector('#sync-backup-now') && !!document.querySelector('#sync-backup-restore') &&
-              !!document.querySelector('#sync-backup-open') && !!document.querySelector('#sync-backup-status') &&
-              !!document.querySelector('#sync-backup-keep') && !!document.querySelector('#sync-backup-keep-apply') &&
-              !!document.querySelector('#sync-backup-cleanup'),
-            backupApiPresent: !!window.litboardDesktop.getBackupStatus &&
- !!window.litboardDesktop.chooseBackupDir && !!window.litboardDesktop.backupNow &&
- !!window.litboardDesktop.setBackupKeep &&
- !!window.litboardDesktop.scanBackupLeftovers && !!window.litboardDesktop.cleanBackupLeftovers &&
- !!window.litboardDesktop.restoreBackup && !!window.litboardDesktop.replaceLibrary
+            undoPresent: !!document.querySelector('#btn-undo') && !!document.querySelector('#btn-redo')
           };
           document.querySelector('#btn-new-folder').click();
           result.folderCreateOpens = !document.querySelector('#folder-create-form').hidden;
           document.querySelector('#folder-create-cancel').click();
+          // 拖入文件夹导入落区行为：合成 dragover（DataTransfer 带 Files 类型）应点亮列表空白
+          // （根级导入）与文件夹行（导入到该文件夹内，行悬停时列表空白高亮退位），dragleave 收起
+          result.folderImportDropHighlight = await (async function () {
+            try {
+              const list = document.querySelector('#folder-list');
+              if (!list) return false;
+              const dt = new DataTransfer();
+              dt.items.add(new File(['x'], 'x.pdf'));
+              const evOver = function (target) {
+                target.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt, bubbles: true, cancelable: true }));
+              };
+              evOver(list);
+              const okList = list.classList.contains('folder-file-drop');
+              const row = document.createElement('div');
+              row.className = 'folder-item';
+              row.dataset.folder = 'smoke-probe';
+              list.appendChild(row);
+              evOver(row);
+              const okRow = row.classList.contains('folder-file-drop') && !list.classList.contains('folder-file-drop');
+              list.dispatchEvent(new DragEvent('dragleave', {
+                dataTransfer: dt, bubbles: true, clientX: -1000, clientY: -1000
+              }));
+              const okClear = !list.classList.contains('folder-file-drop') && !row.classList.contains('folder-file-drop');
+              row.remove();
+              return okList && okRow && okClear;
+            } catch (error) { return false; }
+          })();
           // 弹窗栈：嵌套打开时后开者必须盖住先开者（设置 → Zotero 导入向导），与 DOM 顺序无关
           const zIndexOf = function (el) { return Number(getComputedStyle(el).zIndex) || 0; };
           const settle = function () { return new Promise(function (resolve) { requestAnimationFrame(resolve); }); };
+          // 检索语法速查：? 按钮能开浮层（常用层 + 折叠的高级层），示例点选即填入搜索框
+          document.querySelector('#btn-search-help').click();
+          await settle();
+          const helpPop = document.querySelector('#search-help-pop');
+          result.searchHelpOpens = !!helpPop && !helpPop.hidden &&
+            helpPop.textContent.indexOf('常用') !== -1 &&
+            helpPop.textContent.indexOf('高级语法') !== -1 &&
+            helpPop.querySelectorAll('.search-help-try').length >= 15;
+          result.searchHelpDiag = {
+            hidden: helpPop ? helpPop.hidden : 'missing',
+            tries: helpPop ? helpPop.querySelectorAll('.search-help-try').length : -1,
+            hasCommon: helpPop ? helpPop.textContent.indexOf('常用') !== -1 : false,
+            hasAdv: helpPop ? helpPop.textContent.indexOf('高级语法') !== -1 : false
+          };
+          helpPop.querySelector('.search-help-try').click();
+          await settle();
+          result.searchHelpTryWorks = document.querySelector('#search-help-pop').hidden &&
+            document.querySelector('#search').value.length > 0;
+          document.querySelector('#search').value = '';
+          document.querySelector('#search').dispatchEvent(new Event('input', { bubbles: true }));
+          // 「插入引文」的检索框共用同一个速查浮层：示例要写回弹窗自己的输入框，不是主搜索框。
+          // 直接显示弹窗（不经顶栏按钮——那条路要求真机装着 Word 且开着文档）。
+          const wordCiteMask = document.querySelector('#word-cite-mask');
+          const wordCiteInput = document.querySelector('#word-cite-search');
+          wordCiteMask.hidden = false;
+          await settle();
+          document.querySelector('#btn-word-cite-help').click();
+          await settle();
+          result.wordCiteHelpOpens = !document.querySelector('#search-help-pop').hidden;
+          document.querySelector('#search-help-pop').querySelector('.search-help-try').click();
+          await settle();
+          result.wordCiteHelpTryWorks = document.querySelector('#search-help-pop').hidden &&
+            wordCiteInput.value.length > 0 &&
+            document.querySelector('#search').value === '';
+          // 语法走 js/query.js：写错的语法挂出提示（与主检索框同一条反馈），写对了收回
+          wordCiteInput.value = '(';
+          wordCiteInput.dispatchEvent(new Event('input', { bubbles: true }));
+          await settle();
+          result.wordCiteSyntaxHintWorks = !document.querySelector('#word-cite-hint').hidden;
+          wordCiteInput.value = 'tag:综述';
+          wordCiteInput.dispatchEvent(new Event('input', { bubbles: true }));
+          await settle();
+          result.wordCiteSyntaxHintClears = document.querySelector('#word-cite-hint').hidden;
+          wordCiteInput.value = '';
+          wordCiteInput.dispatchEvent(new Event('input', { bubbles: true }));
+          wordCiteMask.hidden = true;
+          await settle();
           document.querySelector('#btn-sync').click();
           await settle();
           const settingsMask = document.querySelector('#sync-mask');
+          // 设置框拖右下角手柄改尺寸：拖小 → 拖大（撞视口上限即钳制）→ 双击复位回默认
+          const settingsModal = settingsMask.querySelector('.sync-modal');
+          const grip = document.querySelector('#sync-resize-grip');
+          // 弹窗有 .18s 入场动画（transform: scale(.98)）；隐藏窗口里合成器出帧时机不定，
+          // 量基准尺寸前必须等动画真的结束，否则基准是缩放中间态（745×764 而不是 760×780）
+          for (let i = 0; i < 40 && getComputedStyle(settingsModal).transform !== 'none'; i++) {
+            await new Promise(function (resolve) { setTimeout(resolve, 50); });
+          }
+          const modalRect = settingsModal.getBoundingClientRect();
+          result.settingsResizeUiPresent = !!grip &&
+            getComputedStyle(settingsModal).position === 'relative' &&
+            getComputedStyle(grip).cursor === 'nwse-resize';
+          if (grip) {
+            // 弹窗由遮罩居中，尺寸 = 指针到中心的距离 ×2；合成 PointerEvent 走同一条链路
+            const cx = modalRect.left + modalRect.width / 2;
+            const cy = modalRect.top + modalRect.height / 2;
+            const pointer = function (type, x, y) {
+              grip.dispatchEvent(new PointerEvent(type, {
+                bubbles: true, cancelable: true, pointerId: 1, clientX: x, clientY: y
+              }));
+            };
+            pointer('pointerdown', cx + modalRect.width / 2, cy + modalRect.height / 2);
+            pointer('pointermove', cx + 300, cy + 180);
+            pointer('pointerup', cx + 300, cy + 180);
+            await settle();
+            const small = settingsModal.getBoundingClientRect();
+            pointer('pointerdown', cx + small.width / 2, cy + small.height / 2);
+            pointer('pointermove', cx + 900, cy + 450);
+            pointer('pointerup', cx + 900, cy + 450);
+            await settle();
+            const big = settingsModal.getBoundingClientRect();
+            result.settingsResizeDiag = {
+              before: [Math.round(modalRect.width), Math.round(modalRect.height)],
+              small: [Math.round(small.width), Math.round(small.height)],
+              big: [Math.round(big.width), Math.round(big.height)],
+              viewport: [window.innerWidth, window.innerHeight]
+            };
+            result.settingsResizes = small.width < modalRect.width - 100 && small.height < modalRect.height - 100 &&
+              big.width > small.width + 100 && big.height > small.height + 100;
+            grip.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+            await settle();
+            const reset = settingsModal.getBoundingClientRect();
+            result.settingsResizeDiag.reset = [Math.round(reset.width), Math.round(reset.height)];
+            result.settingsResizeResets = !settingsModal.style.width &&
+              Math.abs(reset.width - modalRect.width) < 1 && Math.abs(reset.height - modalRect.height) < 1;
+          }
           document.querySelector('#sync-import-zotero').click();
           await settle();
           const wizardMask = document.querySelector('#zotero-import-mask');
@@ -632,6 +807,90 @@ function createWindow() {
           // 全部关闭后内联 z-index 复位回 css 默认，不留长期覆盖
           result.nestedModalStacking = nestedVisibleStacked && parentRestored &&
             zIndexOf(wizardMask) === 210 && zIndexOf(settingsMask) === 210;
+          // AI 助手「服务商 + 模型」编辑器（设置 → 集成与服务）：加一个服务商 → 加一个模型 →
+          // 自动保存落盘 → 底部模型菜单能列出它（配置读写与切换入口的完整链路）
+          document.querySelector('#btn-sync').click();
+          await settle();
+          document.querySelector('#sync-nav .sync-nav-btn[data-sync-group="integrations"]').click();
+          await settle();
+          const providerRows = function () { return document.querySelectorAll('#agent-provider-items .agent-provider-row'); };
+          const providersBefore = providerRows().length;
+          document.querySelector('#agent-provider-add').click();
+          await settle();
+          const providerRowAdded = providerRows().length === providersBefore + 1;
+          const pName = document.querySelector('#agent-p-name');
+          pName.value = 'Smoke Provider';
+          pName.dispatchEvent(new Event('input', { bubbles: true }));
+          const pBase = document.querySelector('#agent-p-base-url');
+          pBase.value = 'https://api.deepseek.com/anthropic';
+          pBase.dispatchEvent(new Event('change', { bubbles: true }));
+          const pModel = document.querySelector('#agent-p-model-input');
+          pModel.value = 'deepseek-smoke';
+          document.querySelector('#agent-p-model-add').click();
+          await settle();
+           const modelRowAdded = document.querySelectorAll('#agent-p-models .agent-model-row').length === 1 &&
+             document.querySelector('#agent-p-models .agent-model-row').className.indexOf('active') !== -1 &&
+             document.querySelector('#agent-p-dialect-hint').textContent.indexOf('api.deepseek.com/anthropic/v1/messages') !== -1;
+          const providerDetailRect = document.querySelector('#agent-provider-detail').getBoundingClientRect();
+          const modelBlockRect = document.querySelector('.agent-model-block').getBoundingClientRect();
+          result.agentProviderWideLayout = Math.abs(modelBlockRect.left - providerDetailRect.left) <= 1 &&
+            Math.abs(modelBlockRect.width - providerDetailRect.width) <= 1;
+          result.embeddingZhipuPresetPresent = !!document.querySelector('#sync-embed-provider option[value="zhipu"]');
+          // 内联状态框在纵向 flex 容器（服务商详情的 .agent-model-block）里必须是内容高度：
+          // 曾因全局 flex:1 1 240px 变成「高 240px 且继续撑满」，一行提示占掉大半个面板
+          const inlineStatus = document.querySelector('#agent-p-status');
+          inlineStatus.textContent = '✓ 拉取到 33 个模型，其中 25 个已加入清单';
+          inlineStatus.className = 'sync-inline-status success';
+          await settle();
+          const inlineStatusRect = inlineStatus.getBoundingClientRect();
+          result.inlineStatusCompact = inlineStatusRect.height > 0 && inlineStatusRect.height <= 60 &&
+            inlineStatusRect.width > 200;
+          result.inlineStatusDiag = {
+            height: Math.round(inlineStatusRect.height),
+            width: Math.round(inlineStatusRect.width),
+            flex: getComputedStyle(inlineStatus).flex
+          };
+          inlineStatus.textContent = '';
+          inlineStatus.className = 'sync-inline-status';
+          document.querySelector('#sync-close').click();
+          await settle();
+          // 自动保存是 600ms 防抖：等它落盘再核对配置文件（凭据按 id 合并、扁平镜像随选中项）
+          await new Promise(function (resolve) { setTimeout(resolve, 900); });
+          const savedAgentCfg = await window.litboardDesktop.getIntegrationConfig();
+          const savedProviders = savedAgentCfg.agentProviders || [];
+          const smokeProvider = savedProviders.filter(function (p) { return p.name === 'Smoke Provider'; })[0];
+          result.agentProviderEditorWorks = providerRowAdded && modelRowAdded &&
+            !!smokeProvider && smokeProvider.models.length === 1 &&
+            smokeProvider.activeModel === 'deepseek-smoke' &&
+            smokeProvider.baseUrl === 'https://api.deepseek.com/anthropic' &&
+            savedAgentCfg.agentActiveProviderId === smokeProvider.id &&
+            savedAgentCfg.agentBaseUrl === 'https://api.deepseek.com/anthropic' &&
+            savedAgentCfg.agentModel === 'deepseek-smoke';
+          // 「立即同步」在未配置坚果云时必须是可见的失败提示，而不是未捕获的 promise rejection
+          // （曾如此：控制台报错，界面上却停在「配置已保存」，看着像点了没反应）
+          const syncRejections = [];
+          const syncRejectionHook = function (e) {
+            syncRejections.push(String(e && e.reason && (e.reason.message || e.reason) || 'unknown'));
+          };
+          window.addEventListener('unhandledrejection', syncRejectionHook);
+          document.querySelector('#btn-sync').click();
+          await settle();
+          document.querySelector('#sync-nav .sync-nav-btn[data-sync-group="cloud"]').click();
+          await settle();
+          document.querySelector('#sync-run').click();
+          await settle();
+          await new Promise(function (resolve) { setTimeout(resolve, 800); });
+          const syncRunStatus = document.querySelector('#sync-status');
+          result.syncRunUnconfiguredGuarded = syncRunStatus.textContent.indexOf('请先配置坚果云') !== -1 &&
+            syncRunStatus.classList.contains('error') && syncRejections.length === 0;
+          result.syncRunUnconfiguredDiag = {
+            status: syncRunStatus.textContent,
+            errorClass: syncRunStatus.classList.contains('error'),
+            rejections: syncRejections
+          };
+          window.removeEventListener('unhandledrejection', syncRejectionHook);
+          document.querySelector('#sync-close').click();
+          await settle();
           for (let i = 0; i < 600 && !window.litboardReadyAt; i++) {
             await new Promise(function (resolve) { requestAnimationFrame(resolve); });
           }
@@ -676,10 +935,11 @@ function createWindow() {
           }
           result.paginationWorks = !!nextPage && (nextPage.disabled || (pageInfo.textContent !== initialPage && document.querySelectorAll('#table-body tr').length > 0));
           if (pdfPath) {
-            result.workerSrc = pdfjsLib.GlobalWorkerOptions.workerSrc || '';
+            result.workerSrc = 'mupdf-worker';
             const container = document.createElement('div');
             if (shotWanted) {
-              container.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#777;overflow:auto;padding:24px;';
+              // pointer-events:none：这层只给截图用，不参与命中测试，免得挡住 elementFromPoint 探针
+              container.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#777;overflow:auto;padding:24px;pointer-events:none;';
               document.body.appendChild(container);
               window.__smokeShotContainer = container;
             }
@@ -696,12 +956,14 @@ function createWindow() {
                 pages: doc && doc.numPages,
                 canvases: container.querySelectorAll('canvas').length,
                 pixelRatio: canvas ? Number(canvas.dataset.pixelRatio) : 0,
-                renderer: canvas ? canvas.dataset.renderer || 'pdfjs' : '',
+                renderer: canvas ? canvas.dataset.renderer || 'mupdf' : '',
                 opaqueCanvas: canvas ? canvas.getContext('2d').getContextAttributes().alpha === false : false,
-                renderingProfile: window.LitPdf.renderingProfile,
+                renderingProfile: { engine: window.LitPdf.engine },
                 textLayer: !!container.querySelector('.pdf-text-layer'),
                 annotationLayer: !!container.querySelector('.pdf-annotation-mark')
               };
+              result.pdfRender.pageError = (container.querySelector('.pdf-page-sheet') || {}).dataset
+                ? (container.querySelector('.pdf-page-sheet').dataset.renderError || '') : '';
               // relayout（缩放原位重排）：复用文档、旧 canvas 原子替换，数量不增不减
               const firstPageCanvas = container.querySelector('canvas.pdf-page');
               const widthBefore = firstPageCanvas ? firstPageCanvas.width : 0;
@@ -716,11 +978,68 @@ function createWindow() {
               result.pdfRender.relayout = relaidOut;
               result.pdfRender.relayoutOk = relayoutOk;
               result.pdfResourceRequests = pdfResourceRequests;
+              const writeBytes = await window.litboardDesktop.readFileBytes(pdfPath);
+              const writeResult = await window.LitPdf.writeAnnotations(new Uint8Array(writeBytes), [{
+                id: 'smoke-mupdf-annotation', type: 'highlight', color: '#ffd400', text: 'test', comment: 'smoke',
+                position: { pageIndex: 0, rects: [[20, 20, 100, 40]] }, createdAt: 1, updatedAt: 1
+              }]);
+              const readBack = await window.LitPdf.readAnnotations(null, new Uint8Array(writeResult.bytes));
+              result.pdfWrite = { written: writeResult.written, found: readBack.some(function (item) { return item.id === 'smoke-mupdf-annotation'; }) };
             } catch (error) {
               result.pdfRender = { error: String(error && error.message || error) };
             }
           } else {
             await new Promise(function (resolve) { setTimeout(resolve, 300); });
+          }
+          // EPUB 阅读链（foliate-js）：打开 → 翻页 → 进度 → 批注高亮 → 恢复阅读位置
+          result.epubEnginePresent = !!window.LitFoliate && !!window.LitEpub;
+          if (epubPath && result.epubEnginePresent) {
+            const epubHost = document.createElement('div');
+            epubHost.style.cssText = 'position:fixed;left:-9999px;top:0;width:640px;height:800px;';
+            document.body.appendChild(epubHost);
+            try {
+              const epubBytes = await window.litboardDesktop.readFileBytes(epubPath);
+              let relocated = 0;
+              let lastCfi = '';
+              const epubApi = window.LitEpub.openEpub(epubBytes, {
+                container: epubHost,
+                onRelocated: function (cfi) { relocated++; lastCfi = cfi; }
+              });
+              await epubApi.display();
+              const tocList = await epubApi.toc();
+              await epubApi.next();
+              await new Promise(function (resolve) { setTimeout(resolve, 300); });
+              const progAfterNext = epubApi.progress();
+              const visibleAfterNext = epubApi.visibleText();
+              // 批注高亮：add 后 overlayer 应有 SVG 绘制内容
+              if (lastCfi) epubApi.rendition.annotations.add('highlight', lastCfi, { id: 'smoke-epub-ann' }, null, 'lb-epub-ann', { fill: '#ffd400' });
+              await new Promise(function (resolve) { setTimeout(resolve, 400); });
+              let overlayDrawings = 0;
+              try {
+                const fv = epubHost.querySelector('foliate-view');
+                const c = fv && fv.renderer && fv.renderer.getContents ? fv.renderer.getContents() : [];
+                const ol = c.find(function (x) { return x.overlayer; });
+                overlayDrawings = ol ? ol.overlayer.element.childElementCount : 0;
+              } catch (e) {}
+              // 恢复阅读位置（goTo 上一处 cfi）
+              const gone = lastCfi ? await epubApi.goTo(lastCfi) : null;
+
+              await new Promise(function (resolve) { setTimeout(resolve, 300); });
+              result.epubReader = {
+                relocations: relocated,
+                hasCfi: !!lastCfi,
+                tocItems: tocList.length,
+                progressPercent: progAfterNext ? Math.round(progAfterNext.percent) : null,
+                visibleTextPreview: (visibleAfterNext || '').slice(0, 24),
+                overlayDrawings: overlayDrawings,
+                goToResolved: !!gone
+              };
+              epubApi.destroy();
+            } catch (error) {
+              result.epubReader = { error: String(error && error.message || error) };
+            } finally {
+              if (epubHost.parentNode) epubHost.parentNode.removeChild(epubHost);
+            }
           }
           // 顶栏「设置」必须挂在明面上：语言切换在 设置 → 偏好，而设置本身此前只藏在「···」溢出菜单里，
           // 等于双语界面根本没有可见入口（同 Word/扩展面板当年被投诉「看不到」的坑）
@@ -729,6 +1048,98 @@ function createWindow() {
           result.settingsEntryInTopbar = !!settingsBtn && !settingsBtn.hidden &&
             settingsBtn.closest('.menu') === null && !!settingsBtn.closest('.topbar') &&
             !!settingsRect && settingsRect.width > 0 && settingsRect.height > 0;
+          // 阅读模式右栏可达且可拖宽：PDF 层打开时轨栏/侧栏浮到遮罩上，把手贴住侧栏左缘，
+          // PDF 让位宽度 = 轨栏 + 侧栏实际渲染宽（CSS 的 vw 视觉钳制后也必须贴合，不留缝隙）
+          const smokePdfOverlay = document.querySelector('#pdf-overlay');
+          smokePdfOverlay.hidden = false;
+          await new Promise(function (resolve) { setTimeout(resolve, 80); });
+          (function () {
+            const wsEl = document.querySelector('.workspace');
+            const rail = document.querySelector('.right-rail');
+            const sidebar = document.querySelector('.detail-sidebar');
+            const resizer = document.querySelector('#resizer-right');
+            const railRect = rail.getBoundingClientRect();
+            const sideRect = sidebar.getBoundingClientRect();
+            const resizerRect = resizer.getBoundingClientRect();
+            const giveW = parseFloat(document.body.style.getPropertyValue('--reading-rail-w')) || 0;
+            const checks = {
+              readingOn: document.body.classList.contains('reading-open') && !wsEl.classList.contains('rail-collapsed'),
+              // 固定定位的参照是「布局视口」（不含经典滚动条）——用 clientWidth 而不是 innerWidth，
+              // 否则文档一旦出现滚动条，innerWidth 多出滚动条宽度，这条断言会假红
+              railFloats: getComputedStyle(rail).position === 'fixed' &&
+                Math.abs(railRect.right - document.documentElement.clientWidth) < 1,
+              sidebarFloats: getComputedStyle(sidebar).position === 'fixed' && sideRect.width > 40,
+              handleFloats: getComputedStyle(resizer).position === 'fixed' && resizerRect.height > 0,
+              handleAtSidebarEdge: Math.abs(resizerRect.left + resizerRect.width / 2 - sideRect.left) < 4,
+              giveMatches: Math.abs(giveW - (railRect.width + sideRect.width)) < 3
+            };
+            checks.ok = checks.readingOn && checks.railFloats && checks.sidebarFloats &&
+              checks.handleFloats && checks.handleAtSidebarEdge && checks.giveMatches;
+            result.readingRail = checks;
+          })();
+          // 顶栏下拉：同时只允许一个展开，且阅读模式下展开的面板必须完整可见（不被浮层右栏裁掉）。
+          // 回归背景：菜单按钮的 click 都 stopPropagation（否则 document 级 dismiss 会把刚展开的
+          // 面板立刻关掉），于是「先开导出、再点通知」两个面板都留着——它们同在一个 .menu-wrap 内、
+          // 都是 right:0 / top:100%，直接叠在一起；阅读模式下浮层侧栏 z-index 又高于顶栏，面板被裁一半。
+          // 逐一点开每个下拉（前一个还开着，正是出问题的时序），检查：只开一个 + 菜单矩形内每点都命中自己。
+          await (async function () {
+            const toggles = Array.prototype.map.call(
+              document.querySelectorAll('.topbar .menu-wrap > button'),
+              function (button) { return { button: button, menu: button.nextElementSibling }; }
+            ).filter(function (entry) { return !!entry.menu && entry.menu.classList.contains('menu'); });
+            const rectOf = function (el) {
+              const r = el.getBoundingClientRect();
+              return { left: Math.round(r.left), top: Math.round(r.top), right: Math.round(r.right),
+                bottom: Math.round(r.bottom), width: Math.round(r.width), height: Math.round(r.height) };
+            };
+            const openCount = function () {
+              return Array.prototype.filter.call(document.querySelectorAll('.topbar .menu'),
+                function (m) { return !m.hidden; }).length;
+            };
+            document.querySelector('#btn-issues').hidden = false; // 无问题记录时通知中心按钮是 hidden
+            const diag = { toggles: toggles.length, openCounts: [], covered: [], probeHits: [] };
+            let exclusive = toggles.length >= 2;
+            let onTop = true;
+            for (const entry of toggles) {
+              entry.button.click();
+              await new Promise(function (resolve) { setTimeout(resolve, 40); });
+              const count = openCount();
+              diag.openCounts.push(count);
+              if (count !== 1 || entry.menu.hidden) exclusive = false;
+              const rect = rectOf(entry.menu);
+              let miss = 0;
+              for (let row = 1; row <= 3; row++) {
+                const y = Math.round(rect.top + rect.height * row / 4);
+                for (let col = 1; col <= 4; col++) {
+                  const x = Math.round(rect.left + rect.width * col / 5);
+                  const hit = document.elementFromPoint(x, y);
+                  if (!hit || !(hit === entry.menu || entry.menu.contains(hit))) {
+                    miss++;
+                    diag.probeHits.push((entry.menu.id || 'menu') + ' ' + x + ',' + y + '=>' +
+                      (hit ? (hit.id || String(hit.className).slice(0, 30) || hit.tagName) : 'null'));
+                  }
+                }
+              }
+              diag.covered.push(miss);
+              if (miss) onTop = false;
+            }
+            diag.sidebarRect = rectOf(document.querySelector('.detail-sidebar'));
+            diag.railRect = rectOf(document.querySelector('.right-rail'));
+            diag.z = {
+              topbar: getComputedStyle(document.querySelector('.topbar')).zIndex,
+              sidebar: getComputedStyle(document.querySelector('.detail-sidebar')).zIndex,
+              rail: getComputedStyle(document.querySelector('.right-rail')).zIndex
+            };
+            result.topbarMenuExclusive = exclusive;
+            result.topbarMenuOnTop = onTop;
+            result.topbarMenuDiag = diag;
+            Array.prototype.forEach.call(document.querySelectorAll('.topbar .menu'), function (m) { m.hidden = true; });
+            await new Promise(function (resolve) { setTimeout(resolve, 20); });
+          })();
+          smokePdfOverlay.hidden = true;
+          await new Promise(function (resolve) { setTimeout(resolve, 80); });
+          result.readingRail.restores = !document.body.classList.contains('reading-open');
+          result.readingRailOk = result.readingRail.ok && result.readingRail.restores;
           // 右栏停在 AI 面板时点中间列表的条目 → 必须切回详情页；否则详情写进了隐藏面板，看着像「点了没反应」
           document.querySelector('#btn-agent').click();
           await settle();
@@ -756,6 +1167,177 @@ function createWindow() {
           } else {
             result.railPaneSwitchesToDetail = false;
           }
+          // 阅读标签切换必须同步详情抽屉：先分别打开 A/B，再通过顶部标签回切。
+          // 这只在传入真实 PDF 的 smoke 中运行，避免标准启动冒烟额外加载 PDF。
+          result.pdfTabDetailFollowsActive = !pdfPath;
+          if (pdfPath) {
+            try {
+              const smokePdfPath = String(pdfPath).split(String.fromCharCode(92)).join('/');
+              const tabTitleA = 'Smoke PDF Tab A';
+              const tabTitleB = 'Smoke PDF Tab B';
+              document.querySelector('#btn-paste').click();
+              document.querySelector('#paste-area').value =
+                '@article{smokePdfTabA, title={' + tabTitleA + '}, author={Doe, Jane}, year={2026}, journal={Smoke}, file={' + smokePdfPath + '}}' + String.fromCharCode(10) +
+                '@article{smokePdfTabB, title={' + tabTitleB + '}, author={Doe, John}, year={2026}, journal={Smoke}, file={' + smokePdfPath + '}}';
+              document.querySelector('#paste-ok').click();
+              await settle();
+              document.querySelector('#import-folder-ok').click();
+              for (let i = 0; i < 60 && !Array.prototype.some.call(document.querySelectorAll('#table-body tr.lit-row'), function (row) {
+                return row.textContent.indexOf(tabTitleB) !== -1;
+              }); i++) await settle();
+              const waitFor = async function (predicate) {
+                for (let i = 0; i < 120; i++) {
+                  if (predicate()) return true;
+                  await new Promise(function (resolve) { setTimeout(resolve, 25); });
+                }
+                return false;
+              };
+              const selectAndOpen = async function (title) {
+                const row = Array.prototype.find.call(document.querySelectorAll('#table-body tr.lit-row'), function (item) {
+                  return item.textContent.indexOf(title) !== -1;
+                });
+                if (!row) return false;
+                (row.querySelector('td') || row).click();
+                await settle();
+                const readButton = document.querySelector('#d-links [data-act="read-pdf"]');
+                if (!readButton) return false;
+                readButton.click();
+                return waitFor(function () {
+                  return !document.querySelector('#pdf-overlay').hidden &&
+                    document.querySelector('#pdf-title').textContent.indexOf(title) !== -1;
+                });
+              };
+              const firstOpened = await selectAndOpen(tabTitleA);
+              // 划词翻译浮层必须收在阅读视图内：它 z-index 低于右栏浮层与顶栏，越界的部分会被压住
+              // （真机截图里顶栏菜单就是这样被右栏裁掉的）。造一个真实选区触发它，再量四个边。
+              result.selectionPopoverInsideReading = false;
+              result.selectionPopoverDiag = 'skipped';
+              if (firstOpened) {
+                const scroll = document.querySelector('#pdf-scroll');
+                // 先把页面放大几档：小页面上「最右的文本」离阅读区右缘还很远，浮层根本不会越界，
+                // 断言就没有咬合力；放大到文本贴住右缘，不钳制时浮层必然伸到侧栏底下。
+                for (let i = 0; i < 3; i++) {
+                  document.querySelector('#pdf-zoom-in').click();
+                  await new Promise(function (resolve) { setTimeout(resolve, 120); });
+                }
+                // 文本层是渲染完成后异步挂上的（缩放会重建）：span 要等 MuPDF 把整页
+                // 结构文本走完才写进 DOM，大文档首屏能差出几百毫秒。必须等到层里真的有
+                // span 再取样，否则量到的是刚建出来的空层，断言恒假。
+                let layer = scroll && scroll.querySelector('.pdf-text-layer');
+                for (let i = 0; i < 120 && !(layer && layer.querySelector('span')); i++) {
+                  await new Promise(function (resolve) { setTimeout(resolve, 50); });
+                  layer = scroll.querySelector('.pdf-text-layer');
+                }
+                const walker = layer ? document.createTreeWalker(layer, NodeFilter.SHOW_TEXT) : null;
+                // 挑「最靠右的一行文本」并选它的尾部：只有选区贴着阅读区右缘，浮层才有越界风险
+                // （不钳制时会伸到浮层侧栏底下 / 顶栏之上），断言才有咬合力
+                let textNode = null;
+                let bestRight = -Infinity;
+                let node = walker ? walker.nextNode() : null;
+                while (node) {
+                  if (String(node.textContent || '').trim()) {
+                    const probeRange = document.createRange();
+                    probeRange.selectNodeContents(node);
+                    const probeRect = probeRange.getBoundingClientRect();
+                    if (probeRect.width > 0 && probeRect.right > bestRight) {
+                      bestRight = probeRect.right;
+                      textNode = node;
+                    }
+                  }
+                  node = walker.nextNode();
+                }
+                if (!textNode) {
+                  result.selectionPopoverDiag = layer ? 'no-text-node' : 'no-text-layer';
+                } else {
+                  const range = document.createRange();
+                  range.setStart(textNode, Math.max(0, textNode.textContent.length - 8));
+                  range.setEnd(textNode, textNode.textContent.length);
+                  const selection = window.getSelection();
+                  selection.removeAllRanges();
+                  selection.addRange(range);
+                  const selectionRect = range.getBoundingClientRect();
+                  scroll.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                  const popover = document.querySelector('#pdf-translation-popover');
+                  for (let i = 0; i < 40 && popover.hidden; i++) {
+                    await new Promise(function (resolve) { setTimeout(resolve, 25); });
+                  }
+                  if (popover.hidden) {
+                    result.selectionPopoverDiag = 'not-shown';
+                  } else {
+                    const popRect = popover.getBoundingClientRect();
+                    const viewRect = document.querySelector('#pdf-overlay').getBoundingClientRect();
+                    const inside = popRect.left >= viewRect.left - 1 && popRect.right <= viewRect.right + 1 &&
+                      popRect.top >= viewRect.top - 1 && popRect.bottom <= viewRect.bottom + 1;
+                    const hit = document.elementFromPoint(Math.round(popRect.left + popRect.width / 2), Math.round(popRect.top + 16));
+                    const uncovered = !!hit && (hit === popover || popover.contains(hit));
+                    // 模拟选区靠近底部时的初始落点，再让异步译文撑高弹层。
+                    // 旧实现只在选区出现时定位一次，译文填入后会越过阅读区底边。
+                    popover.style.top = Math.max(viewRect.top + 12, viewRect.bottom - popRect.height - 12) + 'px';
+                    const translation = document.querySelector('#pdf-translation-result');
+                    translation.hidden = false;
+                    translation.textContent = 'Translated passage. '.repeat(200);
+                    await new Promise(function (resolve) { requestAnimationFrame(function () { requestAnimationFrame(resolve); }); });
+                    const expandedRect = popover.getBoundingClientRect();
+                    const expandedInside = expandedRect.top >= viewRect.top - 1 && expandedRect.bottom <= viewRect.bottom + 1;
+                    result.selectionPopoverInsideReading = inside && uncovered && expandedInside;
+                    result.selectionPopoverDiag = {
+                      inside: inside, uncovered: uncovered, expandedInside: expandedInside,
+                      pop: [Math.round(popRect.left), Math.round(popRect.top), Math.round(popRect.right), Math.round(popRect.bottom)],
+                      expanded: [Math.round(expandedRect.top), Math.round(expandedRect.bottom)],
+                      view: [Math.round(viewRect.left), Math.round(viewRect.top), Math.round(viewRect.right), Math.round(viewRect.bottom)],
+                      selection: [Math.round(selectionRect.left), Math.round(selectionRect.right)]
+                    };
+                    selection.removeAllRanges();
+                    popover.hidden = true;
+                  }
+                }
+              }
+              document.querySelector('#pdf-tabs .pdf-tab:first-child .pdf-tab-title').click();
+              await settle();
+              const secondOpened = await selectAndOpen(tabTitleB);
+              const tabButton = function (title) {
+                return Array.prototype.find.call(document.querySelectorAll('#pdf-tabs .pdf-tab-title'), function (button) {
+                  return button.title === title;
+                });
+              };
+              const tabA = tabButton(tabTitleA);
+              if (tabA) tabA.click();
+              const switchedToA = await waitFor(function () {
+                return document.querySelector('#pdf-title').textContent.indexOf(tabTitleA) !== -1 &&
+                  document.querySelector('#d-title').textContent === tabTitleA;
+              });
+              const tabB = tabButton(tabTitleB);
+              if (tabB) tabB.click();
+              const switchedToB = await waitFor(function () {
+                return document.querySelector('#pdf-title').textContent.indexOf(tabTitleB) !== -1 &&
+                  document.querySelector('#d-title').textContent === tabTitleB;
+              });
+              result.pdfTabDetailFollowsActive = firstOpened && secondOpened && switchedToA && switchedToB;
+            } catch (error) {
+              result.pdfTabDetailFollowsActive = false;
+              result.pdfTabDetailDiag = String(error && error.message || error);
+            }
+          }
+          // 底部模型徽标 = 切换入口：点开必须列出刚在设置里加的服务商与模型（分组菜单 + 管理模型…）
+          document.querySelector('#btn-agent').click();
+          await settle();
+          document.querySelector('#agent-model-btn').click();
+          await settle();
+          const modelMenu = document.querySelector('#ctx-menu');
+          const menuText = modelMenu ? modelMenu.textContent : '';
+          result.agentModelMenuWorks = !!modelMenu &&
+            menuText.indexOf('Smoke Provider') !== -1 && menuText.indexOf('deepseek-smoke') !== -1 &&
+            menuText.indexOf('管理模型…') !== -1;
+          // 诊断留痕：菜单没出来时能直接看出是「徽标文案不对」还是「菜单根本没开」
+          result.agentModelMenuDiag = {
+            button: document.querySelector('#agent-model-btn') ? 'ok' : 'missing',
+            label: String(document.querySelector('#agent-model').textContent),
+            provider: String(document.querySelector('#agent-provider').textContent),
+            menu: menuText.slice(0, 200)
+          };
+          // 点菜单外任意处即收起（app.js 的全局 click 监听）
+          document.querySelector('.workspace').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          await settle();
           return result;
         })()`);
         // M4 分段计时：主进程启动 → 窗口 did-finish-load（含渲染层脚本求值完成）
@@ -779,7 +1361,40 @@ function createWindow() {
             noWrap: actions.every(function (a) { return getComputedStyle(a).flexWrap === 'nowrap'; })
           };
         })()`);
+        // 最小窗宽下正文不得横向溢出（三栏网格 + 轨栏的宽度预算必须落在 1080 内）——仍处于上面的 1080 尺寸
+        result.bodyOverflowAtMinWidth = await mainWindow.webContents.executeJavaScript(`(function () {
+          var ws = document.querySelector('.workspace');
+          return {
+            innerWidth: window.innerWidth,
+            docOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+            workspaceOverflow: ws ? ws.scrollWidth - ws.clientWidth : 0
+          };
+        })()`);
         mainWindow.setContentSize(sizeBefore[0], sizeBefore[1]);
+        // 弹窗栈覆盖：DOM 里每个 .modal-mask 都必须在 LitModal 登记（漏登记 = Esc 关不掉 + 单键快捷键穿透）
+        result.modalStackCoverage = await mainWindow.webContents.executeJavaScript(`(function () {
+          var api = window.LitModal;
+          if (!api) return { skipped: true };
+          var stack = api._stack || api;
+          if (typeof stack.list !== 'function') return { skipped: true };
+          var registered = stack.list().map(function (entry) { return entry.id; });
+          var ids = Array.prototype.map.call(document.querySelectorAll('.modal-mask'), function (el) { return el.id; })
+            .filter(function (id) { return !!id; });
+          return {
+            maskCount: ids.length,
+            unregistered: ids.filter(function (id) { return registered.indexOf(id) === -1; })
+          };
+        })()`);
+        // Esc 必须关掉最顶层弹窗（含曾经漏登记的引文网络面板）
+        result.escClosesTopModal = await mainWindow.webContents.executeJavaScript(`new Promise(function (resolve) {
+          var mask = document.querySelector('#graph-mask');
+          if (!mask || !window.LitModal) return resolve(false);
+          mask.hidden = false;
+          setTimeout(function () {
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            setTimeout(function () { resolve(mask.hidden === true); }, 200);
+          }, 200);
+        })`);
         if (SMOKE_SHOT && result.pdfRender && !result.pdfRender.error) {
           // 隐藏窗口不触发重绘，capturePage 只能拿到旧帧；截图前临时显示窗口
           mainWindow.show();
@@ -823,26 +1438,47 @@ function createWindow() {
           result.pdfRender.pixelRatio >= 2 && result.pdfRender.renderer === SMOKE_EXPECT_RENDERER && result.pdfRender.opaqueCanvas &&
           result.pdfRender.textLayer && result.pdfRender.annotationLayer &&
           result.pdfRender.relayout && result.pdfRender.relayoutOk &&
-          result.pdfRender.renderingProfile && result.pdfRender.renderingProfile.disableFontFace === false &&
-          result.pdfRender.renderingProfile.useSystemFonts === false && result.pdfRender.renderingProfile.isEvalSupported === false);
+          result.pdfRender.renderingProfile && result.pdfRender.renderingProfile.engine === 'mupdf');
+        const pdfWritePassed = !SMOKE_PDF || (result.pdfWrite && result.pdfWrite.written === 1 && result.pdfWrite.found === true);
+        const pdfTabDetailPassed = !SMOKE_PDF || result.pdfTabDetailFollowsActive === true;
+        // EPUB（foliate-js）：引擎常驻 + 传入真实 EPUB 时全链路（打开/翻页/进度/批注/恢复）
+        const epubPassed = result.epubEnginePresent === true && (!SMOKE_EPUB || (
+          result.epubReader && !result.epubReader.error && result.epubReader.relocations > 0 &&
+          result.epubReader.hasCfi && result.epubReader.progressPercent != null &&
+          result.epubReader.overlayDrawings >= 1 && result.epubReader.goToResolved === true));
+        // 划词浮层只在传入真实 PDF 的分支里量得到（需要真实文本层造选区）
+        const selectionPopoverPassed = !SMOKE_PDF || result.selectionPopoverInsideReading === true;
         const passed = result.desktopBridge && result.modelLoaded && result.tablePresent && result.pdfColumnPresent &&
            result.markdownLoaded && result.syncUiPresent && result.syncNavGroups === 4 && result.nutstoreTestPresent && result.nutstoreFolderPresent &&
            result.remoteRecoveryUiPresent && result.remoteRecoveryApiPresent && result.remotePlanProgressPresent &&
-           result.autoSyncTogglePresent &&
+           result.autoSyncTogglePresent && result.syncNowInCloudPresent && result.syncRunUnconfiguredGuarded === true &&
           result.dataPathUiPresent && result.dataPathApiPresent && result.dataPathApiWorks && result.dataPathTypable &&
           result.inlineTestStatusPresent && result.nestedFolderUiPresent &&
-          result.pdfJsLoaded && result.pdfLayoutTogglePresent && result.translationUiPresent && result.journalRankUiPresent &&
+          result.muPdfLoaded && result.pdfLayoutTogglePresent && result.translationUiPresent && result.journalRankUiPresent &&
+          result.searchHelpUiPresent && result.searchHelpOpens === true && result.searchHelpTryWorks === true &&
+          result.wordCiteSearchUiPresent && result.wordCiteHelpOpens === true && result.wordCiteHelpTryWorks === true &&
+          result.wordCiteSyntaxHintWorks === true && result.wordCiteSyntaxHintClears === true &&
+          result.settingsResizeUiPresent && result.settingsResizes === true && result.settingsResizeResets === true &&
+          result.bodyOverflowAtMinWidth && result.bodyOverflowAtMinWidth.docOverflow <= 1 &&
+          result.modalStackCoverage && result.modalStackCoverage.unregistered && result.modalStackCoverage.unregistered.length === 0 &&
+          result.escClosesTopModal === true &&
           result.agentDrawerPresent && result.agentApiPresent && result.agentCoreLoaded &&
-          result.agentPhase2Present && result.agentGraphPresent && result.agentWebSearchPresent &&
+          result.agentProviderEditorWorks === true && result.agentProviderWideLayout === true &&
+          result.embeddingZhipuPresetPresent === true && result.inlineStatusCompact === true && result.agentModelMenuWorks === true &&
+          result.agentPhase2Present && result.agentGraphPresent && result.graphViewerWorks === true &&
+          result.agentWebSearchPresent &&
           result.agentReaderPresent && result.agentFindLiteraturePresent &&
           result.agentChatRendered === true && result.chatBodyIsFlexColumn === true &&
           result.chatMathRendered === true &&
           result.rightRailPresent && result.railSwitchWorks === true &&
+          result.readingRailOk === true &&
           result.journalRankColumnPresent && result.rankRefreshTogglePresent &&
           result.scigreatTestPresent && result.easyscholarTestPresent && result.sourcesTestPresent &&
           result.pdfAnnotationUiPresent &&
-          result.pdfDownloadButtonPresent && result.importDropZonesPresent &&
-          result.pdfSearchUiPresent && result.pdfSearchTogglePresent && result.issuesCenterPresent && result.onboardPresent &&
+          result.pdfDownloadButtonPresent && result.importDropZonesPresent && result.statsOverviewPresent &&
+          result.folderImportPresent && result.folderImportDropHighlight === true &&
+          result.pdfSearchUiPresent && result.pdfSearchTogglePresent && result.pdfSearchOptionsPresent &&
+          result.issuesCenterPresent && result.onboardPresent &&
           result.pdfNavigationUiPresent && result.paginationPresent &&
           result.paginationWorks && result.folderCreateOpens && result.renderedRows <= 100 && result.sqliteStorageReady &&
           result.trashNavPresent && result.savedSearchUiPresent && result.tagManagePresent && result.cslUiPresent &&
@@ -852,10 +1488,12 @@ function createWindow() {
           result.queryEnginePresent &&
           result.nestedModalStacking &&
           result.settingsEntryInTopbar && result.railSeedRow && result.railPaneSwitchesToDetail &&
+          result.topbarMenuExclusive === true && result.topbarMenuOnTop === true &&
           result.topbarNarrow && result.topbarNarrow.noWrap === true && result.topbarNarrow.topSpread <= 3 &&
           result.topbarNarrow.overflow <= 1 && result.topbarNarrow.innerWidth <= 1090 &&
-          result.backupUiPresent && result.backupApiPresent &&
-          result.saveLibraryWorks && result.cslVendorRender && result.quitAckWorks && result.closeRequestAckWorks && pdfPassed;
+          result.removedSettingsAbsent && result.simplifiedBackupUiPresent &&
+          result.saveLibraryWorks && result.cslVendorRender && result.quitAckWorks && result.closeRequestAckWorks && pdfPassed && pdfWritePassed && pdfTabDetailPassed && epubPassed &&
+          selectionPopoverPassed;
         await finishSmokeTest(result, passed ? 0 : 1);
       } catch (error) {
         console.error('LITBOARD_SMOKE_ERROR', error);
@@ -1120,6 +1758,9 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
     ctx.agentNet = createAgentNet({
       fetch: function (url, init) { return net.fetch(url, init); },
       getConfig: function () { return ctx.integrations.getResearchRuntimeConfig(); },
+      // 「服务商 + 模型」清单：设置页按 providerId 测试连接/拉取模型时，由主进程解该服务商
+      // 自己存的 Key（用户没重填也要能测；明文不出主进程）
+      getProvider: function (id) { return ctx.integrations.getAgentProviderRuntime(id); },
       // 出网身份：OpenCode 等网关要求客户端自带 User-Agent（通用 HTTP 库名会被区别对待）
       userAgent: 'LitBoard/' + app.getVersion(),
       notify: function (channel, payload) {
@@ -1230,15 +1871,8 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
   ctx.bridgeServer = createBridgeServer({
     libraryDb: ctx.libraryDb,
     fetch: function (url, init) { return net.fetch(url, init); },
-    // 扩展抓取条目的 PDF 落盘目录：跟随「PDF 自动下载目录」设置（每次保存时现读），
-    // 未设置时与桌面下载一致，落配置目录下的 open-access-pdf 受管目录。
-    resolveDownloadDir: async function () {
-      let configured = '';
-      try {
-        configured = String((await ctx.integrations.getConfig()).pdfDownloadDir || '').trim();
-      } catch (error) { /* 配置读取失败按未设置处理 */ }
-      return configured || openAccessPdfDir();
-    },
+    // 扩展抓取的 PDF 一律落受管目录，避免把文献库附件散落到不受 LitBoard 管理的位置。
+    resolveDownloadDir: async function () { return openAccessPdfDir(); },
     onSaved: function (info) {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('library:externally-updated', {

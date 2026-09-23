@@ -88,13 +88,22 @@ function register() {
     return shell.openPath(state.backupDir);
   });
   ctx.handle('data-paths:get', function () {
-    return ctx.dataPathManager.getState();
+    // getState 里是同步 fs（readFileSync 定位文件）：落在慢盘/云同步目录上会卡住主进程，
+    // 表现为「打开设置整窗无响应」。超 2s 记 startupLog（与 integrations:get-config 同一 watchdog）
+    const startedAt = Date.now();
+    try {
+      return ctx.dataPathManager.getState();
+    } finally {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed > 2000) ctx.startupLog('slow ipc: data-paths:get ' + elapsed + 'ms（设置打开卡顿来源）');
+    }
   });
   ctx.handle('data-paths:stage', function (_event, value) {
     const result = ctx.dataPathManager.stage(value || {});
     ctx.dataPathState = ctx.dataPathManager.getState();
     return result;
   });
+  ctx.handle('app:get-version', function () { return app.getVersion(); });
   ctx.handle('app:relaunch', function () {
     const current = ctx.dataPathManager.getState();
     if (!current.restartRequired) return false;

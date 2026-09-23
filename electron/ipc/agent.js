@@ -91,6 +91,12 @@ function register() {
     if (!ctx.agentNet) throw new Error(ctx.T('AI 助手未就绪'));
     return ctx.agentNet.listModels(input || {});
   });
+  /* 对话面板底部切换服务商 / 模型（不打开设置即生效）：只改配置文件里的选中项，
+   * 凭据按 id 沿用（渲染层从不接触 Key）。返回新的 getConfig()，渲染层据此刷新徽标。 */
+  ctx.handle('agent:set-selection', function (_event, input) {
+    if (!ctx.integrations) throw new Error(ctx.T('AI 助手未就绪'));
+    return ctx.integrations.setAgentSelection(input || {});
+  });
 
   ctx.handle('session:create', function (_event, input) {
     if (!ctx.agentSessions) throw new Error(ctx.T('会话存储未就绪'));

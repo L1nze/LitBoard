@@ -5,6 +5,377 @@
 
 ## [Unreleased]
 
+### 修复（设置 → 模型配置：一行提示占满整个面板）
+
+- `.sync-inline-status` 的「吃满剩余宽度」写在了通用规则里（`flex: 1 1 240px`），而它只在横向
+  动作行里成立。服务商详情的 `#agent-p-status` 落在纵向 flex 容器 `.agent-model-block` 内，
+  `flex-basis: 240px` 于是变成**高度**、`flex-grow: 1` 再把它撑满面板——「拉取模型 / 测试连接」
+  的一行结果曾占掉 235px 高，且面板越高占得越多。
+- 该 flex 收进 `.sync-inline-actions .sync-inline-status:not(:empty)`，其余动作行内联状态行为
+  不变（实测仍为宽 410 吃满剩余宽度、高 30）。修后同一条提示为高 30。
+- smoke 增加断言 `inlineStatusCompact`：`#agent-p-status` 填入一行文本后高度必须 ≤ 60px，
+  且宽度仍 > 200px（防这条共享规则再被写回通用选择器）。
+
+### 修复（点「立即同步」在未配置坚果云时抛未捕获 rejection）
+
+- `performSync` 遇到「没填账号 / 应用密码」是 `throw`，而唯一非静默调用点就是按钮的
+  `saveSyncSettings().then(performSync)`——没人接这个 promise，于是控制台报一条未捕获的
+  rejection，界面上却停在上一句「配置已保存」，看着像点了没反应。改为与该函数里
+  「本地库未加载成功」分支同构：写同步指示灯、页脚状态行（标红）并弹提示，返回 false。
+- 按钮点击链路补一层 `.catch` 兜底，保存失败等未预期异常同样落到可见处。
+- smoke 增加断言 `syncRunUnconfiguredGuarded`：未配置时点「立即同步」必须给出
+  「请先配置坚果云账号和应用密码」，且 `unhandledrejection` 计数为 0。
+
+### 界面（设置：同步按钮从页脚归位到「云同步」）
+
+- 设置弹窗页脚的「保存并立即同步」移除，改为「云同步 → 坚果云 WebDAV」区的「立即同步」。
+  设置项本就改动即存（文本失焦、勾选、下拉即时落盘，关窗也会保存），页脚再挂一个「保存并同步」
+  只会让人以为不点就丢设置；按钮挪到凭据与自动同步开关旁边，「同步」的对象（坚果云）才看得见。
+- 行为不变：先取消待执行的自动保存、把当前表单一次性落盘，再发起一次非静默同步（状态与失败
+  原因照旧在页脚状态行与提示里可见）。页脚只留「关闭」与「改动即时保存」一句说明。
+- 连带更新：自动同步开关说明、「远端恢复」缺库提示里的按钮名（保存并同步 → 立即同步）；
+  smoke 增加断言——`#sync-run` 必须落在 `data-sync-group="cloud"` 分组内且不在页脚。
+
+### 重构（ZIP/Markdown/引文渲染三域收敛到 vendored 库 —— 本轮前置工作流）
+
+- **docx 与网页快照 ZIP 统一走 vendored JSZip**：`js/docx.js` 的 zipStore/zipRead 异步化，
+  `electron/integrations.js` 的快照打包/解包（zipStoreEntries/extractZipAll）同源；
+  旧手写 ZIP 写入路径移除。**快照 ZIP 字节布局变化（内容等价）**：内容不变的快照凭
+  syncSignature 快捷路径免重打包，一旦真重打包会产生一次新哈希上传——如实、一次性，属预期。
+- **markdown.js 重写为 markdown-it 14.3.2 适配层**（vendor/markdown-it/）：lbex 摘录块、数学
+  边界保护、图片/链接白名单、表格包裹规则全保持；旧实现含 NUL 字节的问题随之消除。
+- **引文弹窗三样式（APA/MLA/GB-T）统一走 citeproc**（js/cite.js 只剩 RIS 导出 + splitName +
+  formats 元数据 + renderFormat 适配）。**用户可见变化（更合规）**：APA 页码连字符变 ～；
+  GB/T 会议条目补 [C]// 且带 [1]	 编号；MLA 走 zh-CN 术语（《》/卷/页）并补 DOI；中文 GB/T 补 issue。
+
+### 重构（OCR 引擎：tesseract → PaddleOCR PP-OCRv5 mobile）
+
+- 扫描件/无文本层 PDF 的识别引擎换为 PaddleOCR（@paddleocr/paddleocr-js 0.4.2，Apache-2.0）：
+  module worker 内跑 onnxruntime-web wasm（单线程——应用无 COI 头无 SharedArrayBuffer），
+  ort wasm 与 SDK bundle 全部本地化 vendor（vendor/paddleocr/，构建 = scripts/ocr-bundle），
+  模型 tar（det+rec 约 21MB）首次使用时下载到用户配置目录 ocr/paddle/。
+- 中文精度对比（探针 scripts/one-off/probe-paddleocr/）：合成扫描页（纸张底色+噪点+1.5° 歪斜）
+  Paddle 字符错误率 0，tesseract chi_sim 7.14（把噪声逐个识别成字符）；真实样本同样压倒性。
+  首次下载提示改为「约 21MB 识别模型」；wasm 后端 A4 页约 2-3 秒、大图可达 20 秒（WebGPU 留口未启用）。
+- js/ocr.js 对外契约不变（dataStatus/ensureData/ocrPages/cancel），主线程 bundle 懒加载（586KB），
+  OpenCV 从主线程剥离（其 Emscripten 壳加载期 new Function 会被 CSP 拦）。vendor/tesseract 移除。
+- 附带发现：tesseract.js 以 blob: worker 运行，在当前 CSP（worker-src 'self'）下本就会被拦——
+  本次替换顺带消除了该隐患。
+
+### 重构（EPUB 内核：epub.js 0.3.93 → foliate-js 钉 commit）
+
+- EPUB 渲染内核换 foliate-js（钉 commit 78914aef，MIT；vendor/foliate/ 149KB，构建 = scripts/foliate-bundle，
+  pdf/mobi 等非 EPUB 格式剥离）。js/epub.js 纯函数层不动，openEpub 重写为适配层，
+  app.js 仅批注跳转一处加 textAnchor 第二参。
+- 进度恒精确（SectionProgress 字节加权，旧 locations 机制废弃）；朗读取文粒度从整章升到当前可见页。
+- 存量 epub.js 批注/阅读位置兼容：foliate resolveCFI 自带旧库错误 ID 断言重试（上游注释明示）；
+  解析失败再走 textAnchor 章内查找（新纯函数 findAnchorRange，含测试）→ 书首保底。epub.js 特有
+  /1:0-8 连字符偏移解析为 offset:0 不崩溃。
+- CSP 变化：style-src / frame-src / child-src 增加 blob:（foliate 以 blob: iframe 与 stylesheet
+  加载章节内容，探针实测旧 CSP 会拦）。vendor/epub 移除。
+
+
+### 修复（PDF 划词：中文选区高亮与画布字形同源）
+
+- 文本层不再让浏览器用替代字体重排整行：`mupdf-worker.js` 的 `getPageText` 改用
+  `StructuredText.walk()` 输出**视觉行 + 逐字 quad**（纯空白行丢弃），`renderMuTextLayer`
+  按逐字 quad 定 span 的位置/高度、用 `--scale-x` 拉伸到 MuPDF 的实际推进宽度，并把
+  `_litCharRects`/`_litBox` 挂在 span 上；选区与搜索高亮直接切这份几何，只有缺 quads 时
+  才回退 Range + 字体度量裁剪。
+- 修复中文论文「选几个字，高亮拉长/压到相邻行」：中文内容流碎片多、系统字体代替嵌入
+  字体排版，旧路径的高亮框比真实字形窄 20% 以上、高度多出十几 px 侵入下一行。实测样本
+  （82 页中文学位论文）选 6 个汉字：高亮 161×29 与字形推进一致，旧路径 156×42。
+- 文本层 items 过滤条件与阅读器搜索统一为 `typeof item.str === 'string'`，`textDivs`
+  下标恒等于 `fragment.itemIndex`（空槽错位会让整页搜索高亮串行）。
+
+### 重构（app.js 减负阶段 1 推进：Word 面板 / 笔记导出两域外迁）
+
+- 再拆两个模块（app.js 11,305 → 10,712 行）：`js/app/word-panel.js`（449 行，Word COM
+  面板全链：检测/引文插入/刷新/参考文献表/解除关联/Zotero 转换，含 base64 协议与
+  CSL 样式按文档记忆）、`js/app/note-export.js`（260 行，笔记 → Word 段落计划与
+  引文域混排导出）。
+- 修正一处搬移引入的隐患：引文多选弹窗内局部变量 `query` 曾遮蔽注入的 LitQuery
+  （变量提升导致语法检测静默失效），已重命名并补测试锁行为。
+- 新增模块级测试：word-panel 5 项（base64 UTF-8 往返、LitBoard 域指令解析过滤、
+  样式存取、分词 AND 命中、语法查询走 matcher）、note-export 4 项（markdown 段落
+  计划、图片段、litboard 链接参数解码与 suppressAuthor）。
+
+### 重构（app.js 减负阶段 1 推进：期刊分区 / 查询构建器两域外迁）
+
+- 再拆两个模块（app.js 11,837 → 11,305 行）：`js/app/journal-rank.js`（389 行，
+  期刊等级归一 + 文件夹自动补查 + 「补查缺失分区」可暂停队列）、
+  `js/app/query-builder.js`（272 行，可视化查询构建器 + 批量字段编辑）。
+- 期刊分区的补查状态（pending 期刊、冻结行序）收归模块，表格渲染改走访问器；
+  `rankResultData`/`journalRankSummary` 经适配器供设置页「测试源」按钮复用。
+- 原计划两项经核实撤销：`stats-query` 与 `snapshot-viewer` 的行数系函数索引跨度
+  误估（把后续绑定块计入），实际分别只有 8 行与 17 行，不值得拆。
+- 新增模块级测试：journal-rank 6 项（SciGreat/EasyScholar 双形状归一、7 天窗口、
+  同刊去重共享请求、缓存零请求）、query-builder 5 项（批量编辑 status/rating/year/tags
+  字段语义与撤销栈、明确清空、入口过滤）。
+
+### 重构（app.js 减负阶段 1 启动：主题 / Zotero 向导 / 远端对照三域外迁）
+
+- 按既有 UMD + `create(options)` 依赖注入模式拆出三个自包含模块（app.js
+  12,776 → 11,837 行）：`js/app/theme.js`（229 行，主题与界面语言）、
+  `js/app/zotero-wizard.js`（230 行，四步导入向导状态机）、`js/app/remote-plan.js`
+  （675 行，远端同步对照与冲突决议弹窗）。
+- app.js 只留薄适配层（`initTheme/initZoteroWizard/initRemotePlan` + 转发函数）；
+  各模块自带事件绑定，接线清单见 `docs/refactor-app-slim-plan.md`。
+- 新增模块级测试：theme 7 项（含 legacy 主题别名环切、菜单结构）、zotero-wizard
+  4 项（四步状态机全链、busy 守卫）、remote-plan 5 项（迷你 DOM 桩走通对照渲染、
+  批量决议、空库重置必选项、应用中禁关）；`test/theme.test.js` 的源码断言同步
+  指向新模块。
+- 行为零变化：只做搬移与注入改写；EPUB 朗读、存量批注显示等共享路径未动。
+
+### 移除（PDF 阅读器裁撤四个低价值功能，清掉残留死代码）
+
+- 裁撤 **PDF 重排阅读**（`#pdf-reflow-toggle`）、**区域截图批注**（`#pdf-snapshot-toggle`）、
+  **手写批注**（`#pdf-ink-toggle`）、**PDF 朗读**（`#pdf-tts`）——按钮与绑定在此前的
+  工具条收口中已移除，本次把 app.js 里约 460 行不可达逻辑一并清掉（`js/app.js`
+  13,238 → 12,778 行），`js/reflow.js` 纯函数层与 `test/reflow.test.js` 随之删除，
+  对应 CSS / i18n 词典死键同步清理。
+- 保留的相邻能力不受影响：**EPUB 朗读**继续可用（与 PDF 朗读共用的朗读状态栏
+  移至 EPUB 侧）；存量库中的 `snapshot` / `ink` 类型批注仍正常显示（只删创建入口，
+  渲染与数据模型不动）；网页快照附件（浏览器扩展保存的 snapshot）与本轮无关。
+- AGENTS.md、docs/limitations.md 已同步删除「PDF 重排（阶段六）」条目。
+
+### 新增（拖入文件夹导入：目录树 → 文件夹结构 + PDF 识别）
+
+- 把 OS 文件夹拖到左侧栏：**空白处 = 根级导入、悬停文件夹行 = 导入到该文件夹内部**；
+  拖入的文件夹在目标位置建为 LitBoard 文件夹，目录树原样映射为嵌套 folders 实体
+  （不在磁盘镜像目录树，与同步/备份口径一致）。另有「更多 → 导入文件夹…」菜单兜底入口
+  （拖放路径取不到时引导走这里）。
+- 规划逻辑在纯函数模块 `js/folderimport.js`（对照 zotero-folder-drop-importer 的语义）：
+  空分支剪枝（只保留有 PDF 后代的目录链）、同父层同名文件夹复用（大小写不敏感、精确
+  大小写优先，重复拖入幂等）、非 PDF 文件跳过并在结果里如实报数。
+- PDF 走既有识别管线：3 worker 解析（指纹/元数据/联网补全）→ 复制进受管
+  `synced-attachments`（`fs.copyFile`，**源文件全程只读不动**）→ 去重合并
+  （指纹/DOI 命中挂附件）→ 全文索引（`pdf_fts`）。「目录 → 条目归属」通过给
+  `addPapers` 合并路径补 `base.folderIds` 并集实现，整棵树一次调用一次落库。
+- 主进程新增 `files:scan-folder` IPC：递归枚举目录树（跳过隐藏项；符号链接/junction
+  不跟随，天然防环），深度 48 / 5000 文件 / 5 GB 上限，超限如实报错不静默截断。
+  冒烟新增 `folderImportPresent` + `folderImportDropHighlight`（合成 DataTransfer
+  探测列表空白与文件夹行的拖放高亮）。
+
+### 新增（引文网络：版式与构建逻辑整体对照 literature-mcp）
+
+- **构建逻辑搬过来**：节点 = 请求的文献集合（诱导子图，两端都在集合内才成边，边向
+  A→B 表示 A 引用 B；不在库中的 ID 如实回报 `missing`）；超过节点上限时按重要性截取
+  （被引 50% + PageRank 25% + 集合内被引 15% + 奠基年份 10%，`graph_visualize` 同一公式），
+  并如实回报隐藏了多少篇；社区划分（小图贪心模块度 CNM / 大图 Louvain 局部移动，社区号按
+  规模降序）与 PageRank / 度统计随节点返回。种子上限从 50 放宽到 500（`getWorks` 同步放宽），
+  否则「>120 篇按重要性择优」这条路径永远触发不了。
+- **版式搬过来**：三栏 = 左「本图论文」列表（种子标记、点选高亮）/ 中画布 / 右详情卡
+  （作者 chips、年份期刊、被引/库内被引/库内引用、摘要、社区、ID）+ 图例（年份色条、线深、
+  社区数、力导向开关）。画布侧：确定性初始布局（Fruchterman-Reingold，种子固定 → 连通分量
+  摆位 → 边缘收缩 → 像素化）→ 浏览器短暂收敛后自动冻结物理；标签只给重要节点
+  （`min(n, max(18, √n·2.5))`，其余悬停显示）；节点大小 = 被引量稳健对数缩放（5/95 分位裁剪）；
+  线深 = 局部引用结构强度（共同邻居 + 端点连接度 + 同社区）；边在拖拽/缩放时隐藏。
+- **配色换成科研顺序色阶**：年份渐变从单色蓝改为 viridis 家族的「苔—青—靛」多停靠色阶
+  （低饱和、色盲友好、打印不糊），浅底「越旧越淡」、暗底「越旧越暗」；图例色条与节点颜色
+  由同一个函数算出并内联（两处版式不会漂移）。
+- 导出 HTML 快照与应用内面板共用同一套数据侧（`viewerData` / `paperListHtml` / `detailHtml` /
+  `legendHtml` / `graphOptions`），只有 DOM 装配各写一份，避免版式漂移；快照仍是离线自包含
+  （内嵌 vis-network + 图数据，vendor 缺失时回退 CDN）。冒烟新增 `graphViewerWorks`
+  （端到端建图 → 三栏渲染 → 断言列表行数、详情、图例、画布与「标签必须稀疏」）。
+
+### 性能（Agent 调工具时软件「未响应」）
+
+- **根因**：主进程即窗口的消息泵，工具 handler 里的长同步块会冻住整个窗口。实测最重的三处都在
+  检索链路里，且一次工具调用会反复踩到。
+- **全文检索不再整批取 snippet**：`pdf_fts` 查询原先为最多 2000 行构建片段，合成语料上
+  1200 行命中就要 13.3s（片段成本随行文本量走），而界面只显示页码、agent 工具每篇最多用 2 条。
+  现在只取页码行（同一查询 127ms），片段改由 `attachSnippets` 对排在前面的 ≤24 篇按需现算，
+  命中处仍用 ⟪⟫ 标出。
+- **短词回退全表扫描分批让出**：<3 字符（中文两字词如「量子」「算法」）只能全表解压，
+  旧实现同步 `gunzipSync` 整表期间事件循环完全停止（72MB 语料 114ms，真实库可达秒级）。
+  改为异步 gunzip + 每 16 行或每 8MB 让出一次：同一查询最长同步块 114ms → 10ms
+  （总耗时略升，换取窗口不假死）。
+- **内容未变的 upsert 不再重建 FTS**：`upsertWorks` 原先逐行删除 + 重写 `works_fts`
+  （还要回读 `works_fulltext` 侧表）。现在比较「UPSERT 前的行」与「UPSERT 后的合并行」，
+  三者（title/abstract/snippet）都没变就整段跳过——检索工具一次调用会 upsert 上百行，
+  实测 100 行批次 11ms → 4ms，开销随被索引文本量放大。
+- **检索不再为每页做全量 COUNT**：`queryWorks` 的 `COUNT(*)` 在命中多时要枚举全部命中
+  （万级库 ~74ms/次，而每次检索都要付）。现在只取页面，取不满一页时给出精确总数，
+  取满时报「至少 N 条」（`totalIsLowerBound`）。
+- **正式库已收藏索引加缓存**：`inLibraryIndex`（web_search / find_literature 每次召回都要问）
+  原先每次都 `loadState()`（整库 JSON 解析 + normalize，6k 篇 ~110-130ms）。现按
+  「正式库最后一次写入」缓存 30s，库一写即失效。
+- **页面截图一次开文档**：`render_pdf_pages` 原先逐页调 `renderPageToPng`，每页都把整份 PDF
+  重读一遍（80MB 的 PDF 就是 3 次全文件 IPC + 3 次解析，渲染又占满渲染主线程）。新增
+  `LitPdf.renderPagesToPng` 批量口子：文档只开一次、逐页失败如实回报。
+
+### 修复（`updateWorkText` 写回 FTS 时抹掉该文献全文）
+
+- 摘要回填 / `updateWorkText` 重建 `works_fts` 时只写了四列（缺 `fulltext`），
+  「正文里独有的词可检索」在一次摘要更新后即失效。改为与 `upsertWorks` 同一写法
+  （`fulltext` 列从 `works_fulltext` 侧表取）。
+
+### 修复（浮层重叠：顶栏下拉互相叠压 / 被阅读模式右栏裁掉）
+
+- **顶栏下拉互斥**：通知中心 / 导出 / 更多三个下拉同在一个 `.menu-wrap` 内、都是
+  `right:0 + top:100%`，同时展开会完全叠在一起；而每个开关的 click 都必须
+  `stopPropagation`（不挡冒泡的话，document 级「点击外部即关闭」会在按钮自己的 handler
+  之前把刚展开的面板关掉，表现为「点了没反应」），于是「先开 A 再点 B」时 A 收不到
+  dismiss，两块面板一起留着。现在统一登记（`registerTopbarMenu` / `toggleTopbarMenu`），
+  展开任何一个之前先收起其余。
+- **层级重排**：阅读模式的轨栏/侧栏浮层（171-173）此前高于顶栏（155），顶栏向下展开的
+  下拉菜单落进右栏区域就被裁掉半截。顶栏提到 180，全局顺序明确为：阅读层 150/151 <
+  右栏浮层 171-173 < 顶栏 180 < 通用对话框 210 < 右键菜单 260 < toast 300。
+- **划词翻译浮层收进阅读视图**：此前按整窗钳制，选区贴近阅读区右缘时会伸到浮层侧栏
+  底下（z-index 低于侧栏）。新增 `readingViewport()`，左右上下都按阅读层实际矩形钳制。
+- 冒烟新增 `topbarMenuExclusive` / `topbarMenuOnTop`（逐个点开每个顶栏下拉，断言同时只开
+  一个、且菜单矩形内每个探点都命中菜单自身）与 `selectionPopoverInsideReading`（造真实
+  选区并放大页面使选区贴住阅读区右缘，断言浮层四边都在阅读区内且未被压住）；
+  `readingRail` 的右缘比对改用 `documentElement.clientWidth`（固定定位参照布局视口，
+  有滚动条时用 `innerWidth` 会假红）。
+
+### 优化（Ctrl+滚轮缩放不再卡帧）
+
+- **根因**：旧链路每 80ms 去抖档位触发完整 relayout 并当场对视口内每页开画——
+  PDFium WASM 光栅是主线程同步的（大页百毫秒级，还在微任务里先于任何绘制执行），
+  拉伸预览帧根本没机会上屏；加上逐档重建高分辨率 canvas 与整页文本层 span，连续
+  缩放表现为整段冻屏，在飞的渲染也不会取消、画完即作废再画。
+- **两段式缩放**：滚轮每刻度立即走 `handle.zoomPreview`（纯 CSS：旧位图拉伸 +
+  文本/链接/批注/搜索层 `transform: scale` 等比跟随，零重绘零光栅）；手势停顿
+  160ms 后统一走一次完整 relayout 出清晰位图。relayout 改为「先上屏预览帧再开画」
+  （rAF + 宏任务调度 `renderNearViewport`），且参数未变时也会补排重绘，兼容收尾
+  语义与按钮/快捷键单档缩放。
+- **削减重复工作**：在飞 renderPage 发现已过期即跳过同步光栅与文本层 DOM（补绘
+  交给 pendingRefresh）；缩放手势窗口内 IntersectionObserver 不启动重绘；
+  `renderNearViewport` 先画视口内页再画预取环、按下边界早停。重排模式（字号步进）
+  行为不变。
+
+### 安全与开源发布准备
+
+- OA PDF 下载与临时全文读取改用公共 HTTPS 安全下载器：拒绝本机、私网、保留地址与
+  URL 凭据；DNS 解析结果固定到实际 TLS 连接；每次重定向重新解析校验并限制为 5 跳，
+  同时将响应正文限制为 80 MB，关闭调研库 `oaUrl` 引发的 SSRF 与 DNS rebinding 路径。
+- Electron 升级到 44.4.3、electron-builder 升级到 26.15.3；锁文件审计恢复为 0 漏洞，
+  CI 新增 `npm audit --audit-level=high` 与 vendor 哈希校验。
+- 根 `LICENSE` 换成完整 AGPL-3.0 正文；补齐 pdf-lib、tesseract.js、vis-network、
+  citeproc-js 与 CSL 样式/locale 的许可证及 NOTICE，vendor 哈希现在也覆盖许可证文件。
+- 行为准则移除占位邮箱，统一走 GitHub Private Vulnerability Reporting 私密渠道。
+- 发布校验和只接受当前版本的 Setup/Portable 与带版本号的扩展 ZIP，旧版本残留不会混入本次清单；
+  当前版本任一安装包缺失时直接失败。
+
+### 新增（拖 PDF 到列表空白处直接导入，导入后自动建全文索引）
+
+- **拖放落点扩展**：此前只有「顶部统计区 = 导入、条目行 = 附加」两个落点，拖到中间
+  条目区空白处只弹提示。现在列表区（`.table-card`，含空库引导页与实体视图）的空白处
+  也是导入落点：悬停时整卡虚线框提示、鼠标为复制态，松手走与统计区完全相同的链路
+  （选目标文件夹 → `handleFiles`）。条目行仍优先附加，左侧文件夹 / 右栏等区域仍不接文件。
+- **导入后增量建全文索引**：`importPdfFiles` 落库收尾补 `LitPdfSearch.reindex`
+  （新增/被挂 PDF 的条目，stale 语义不重复提取；指纹回填完成后触发，缺指纹不误判）。
+  此前普通 PDF 导入不建索引，要等设置页手动「构建全文索引」才能命中新导入的 PDF；
+  调研侧 `importStagedPdfs` 早有同款收尾，这次对齐。
+
+### 诊断（设置打开卡死的排查收口）
+
+- 有「进入设置整窗无响应」的报告（开发运行、已配 AI 端点）。隔离环境多轮复现（同形态
+  配置 + 3000 篇库 + 可见窗口 + CDP 采样）均无法复现：渲染层打开设置实测 2–31ms、CPU
+  profile 近乎全空闲；主进程侧设置打开路径上的 IPC（配置读取 / 数据目录 / 备份清单 /
+  调研库统计）逐条核查过同步阻塞面，均为异步或毫秒级。渲染层步骤计时日志已按期撤除
+  （`start.ps1` 恢复原样）。
+- **留下一个零噪音看门狗**：设置弹窗依赖的头两道 IPC（`integrations:get-config`、
+  `data-paths:get`——后者含同步 `readFileSync` 定位文件，落在慢盘/云同步目录上是最像的
+  主进程侧嫌疑）超过 2 秒即写一行 `litboard-startup.log`。再复发时，日志直接指出卡在
+  哪条通道、耗时多久；若日志无记录而界面仍卡，则可排除主进程侧，指向渲染/合成层。
+
+
+### 简化（检索：默认零语法，帮助分级可查）
+
+- **搜索框回归「直接用」**：占位符不再罗列 `tag:综述 year>=2020 AND has:pdf` 这类语法示例，
+  改为朴素的「搜索标题、作者、摘要…」——绝大多数检索只需要关键词，不该让占位符替用户
+  决定要不要学语法；语法引擎（js/query.js）与既有查询能力一行未动。
+- **兑现「? 查看帮助」的承诺**（占位符承诺过但从没实现过）：搜索框旁新增 ? 按钮，聚焦
+  搜索框后按 ?（或 Esc 关闭）同样可用，弹出**检索语法速查浮层**——「常用 8 条」直接可见
+  （关键词 / 短语 / tag: / year>= / has: / missing: / is: / AND·OR·NOT），完整字段表、
+  数量与日期比较、ann()/note()/att() 跨层级组、正则收进「高级语法」折叠；每条右侧的
+  示例**点一下即填入搜索框立即试用**。浮层文案随界面语言即时切换，Esc / 点击外部 / ✕
+  均可关闭。语法错误提示行同步改为指向该入口。
+- **不想记语法另有出路**：浮层底部明示「可视化构建器」入口（筛选行右侧放大镜按钮）与
+  「筛好的结果可存为智能文件夹」；快捷键帮助表补了一行「搜索框内 ? = 检索语法速查」。
+
+
+### 新增（AI 助手多服务商与模型切换）
+
+- **底部直接换模型**：对话面板底部的模型徽标从只读展示变成切换入口——点开是按服务商分组的
+  菜单（每个服务商一项，子菜单列出它勾选的模型、当前项打勾），末尾「管理模型…」直达设置。
+  切换立即写回配置：下一轮请求就用新的端点/凭据/模型；正在生成的那一轮按 R03 仍用轮开始时
+  的端点（换模型不打断在途请求，toast 会说明）。
+- **设置里按服务商组织模型**：AI 助手设置从「一个 Base URL + 一把 Key + 一个模型名」升级为
+  **服务商清单**——每个服务商各自保存自定义名称、Base URL、接口格式与 API Key，模型可逐个
+  添加，也可一键从端点拉取清单后勾入；点某个模型即设为当前使用（服务商行的状态点如实显示
+  可对话 / 缺项 / 未填端点）。旧配置读取时自动合成内置服务商，凭据与已选模型不丢；扁平字段
+  （`agentBaseUrl` / `agentApiDialect` / `agentModel` / `agentApiKey`）降级为当前生效服务商的
+  镜像，语义权威在新纯函数模块 `js/agentcfg.js`。每个服务商一把独立 Key（密文保存，渲染层
+  不接触），「测试连接 / 拉取模型」可按服务商分别执行（未重填 Key 也能测）。
+
+### 修复（正式出版中文期刊 PDF 导入后作者/年份/期刊全空）
+
+中文核心期刊（如《电源技术》）的 PDF：DOI 多注册在 ISTIC（万方）而非 Crossref，
+OpenAlex 作品库基本不收、Crossref 404——联网补全落空后，导入条目只剩标题/摘要/DOI，
+作者、年份、卷期页、期刊全空，期刊等级的按刊名查询也因此不触发（venue 为空直接跳过）。
+修复：本地解析兜底（此前只认「网络首发」封面页的「作者：」标签），测试
+`test/pdfimport-title.test.js`（新增 3 例，含真机《电源技术》页面布局复刻）。
+
+- **文章编号**（GB/T 7713 `ISSN(年)期-起页-页数`，如 `1002-087X(2026)08-1486-08`）→
+  年份 / 期次 / 页码范围（起页 + 页数 - 1）/ ISSN；**期刊页脚**（`2026.8 Vol.50 No.8`）→
+  年 / 卷 / 期；**收稿日期**作为年份最弱兜底。空格打散（`1002-087 X`）在紧凑串上匹配。
+- **裸作者行**：标题行与摘要行之间按基线聚行，剔除上标角标行（`1,21,2…`）、单位/机构行、
+  脚注行后取第一个姓名行；中文行校验纯 CJK 姓名，西文行 `SURNAME Given` 归一为
+  `Surname, Given`；「作者：」标签路径保持优先，行为不变。
+- **ISSN 反查刊名**：`LitEnrich.venueByIssn`（OpenAlex `sources?filter=issn:`，期刊
+  source 记录的覆盖远好于作品库，实测 `1002-087X` → Chinese Journal of Power Sources）；
+  DOI/标题检索全落空且本地解析出 ISSN 时自动触发填 venue——venue 有了，
+  既有的期刊等级按刊名查询链路（`getScigreatRank`）即恢复正常触发。
+
+### 修复（Agent 后续审计 ba87f6b：7 项，均补回归测试）
+
+审计报告见 `docs/audits/agent-followup-ba87f6b.md`。逐条修复，每项都落成可复跑的测试。
+
+- **P1 压缩摘要抢占「重试/重新生成」的目标**：`applyCompaction` 把摘要插进历史时沿用当前
+  轮次的 `turnId`，而 `rerunTurn` 找的是「同 turnId 的第一条 user」——于是重跑截断点落在摘要上，
+  **重跑的问题变成摘要本身**（整条保留尾被丢弃）。修复：摘要消息 `turnId` 恒为空（独立身份，
+  不承担业务轮次入口），`rerunTurn`/`retryLast`/`turnIdAfterParent` 只认**真实** user 消息
+  （跳过 synthetic 的摘要与工具注入截图），UI 的按前驱定位与重试定位用同一规则。
+- **P1 指定附件查不到索引时，返回主 PDF 的旧索引**：`db.pdfTextGet` 在「显式附件查询未命中」时
+  无条件回退到 `attachment_id=''` 的旧行，于是请求补充材料会**静默拿到主文献正文**（调用成功、
+  无任何提示）。修复：严格按 `(paperId, attachmentId)` 匹配，兼容回退改为调用方显式
+  `{legacyFallback:true}`（只有阅读器 OCR 合并、且仅当打开的是该文献主 PDF 时传）；
+  `read_pdf_pages` 未命中时如实报出问的是哪份附件并声明不会跨附件回退。
+- **P2 把「调研库已有」误报为「已收藏到正式库」**：`web_search` 的 `collected` 来自 `!isNew`，
+  Scopus 的 `alreadyInLibrary` 来自 `existed`（两者都只是调研库命中）——模型据此可能谎报
+  「已在你库里」或跳过用户想要的收藏。修复：`collected`/`alreadyInLibrary` 一律来自**正式库反查**
+  （`inLibraryIndex`，researchId + DOI 两路），调研库状态单独用 `inResearch` 如实回报
+  （Scopus handler 现在也做正式库反查）。
+- **P2 换向量模型后语义检索返回空结果**：可用性判定用「全库向量总数 > 0」，而 `cosineSearch`
+  只认**同模型 + 同配方**的向量——旧模型有向量、新模型没建时会进向量分支却一篇都命不中，
+  用户看到的像是「没有相关文献」。修复：新增 `research-db.vecCoverage`（按模型+配方计数）与
+  `LitResearch.vectorReadiness`（单一判定，区分 `unconfigured` / `stale-model`），
+  `research:semantic-search` 与 `find_literature` 共用；降级说明如实写明是「当前模型还没有向量」
+  而不是「没有相关文献」（显式 `mode=keyword` 时不再挂无意义的降级提示）。
+- **P2 标题去重只覆盖被引数前 400 篇**：`findIdByNormalizedTitle` 的 SQL 固定
+  `ORDER BY cited_by DESC LIMIT 400`，低被引的既有条目永远匹配不到，反复检索会为同一篇论文
+  造出重复 `local:` 身份。修复：调研库 schema **v4** 增 `title_norm` 列 + 索引（写入时维护、
+  v3→v4 迁移回填），查重走索引精确命中；身份解析顺序固定为 既有 id → DOI → S2 paperId →
+  **已登记 URL** → 规范化标题 → 新建 `local:`（网页检索、段落找文献、补登记三处一致）。
+- **P2 PDF 暂存后不再检查停止状态**：`add_pdfs_to_folder` 在 `researchStagePdfs`（长异步）前后
+  不复核取消，停止后仍会走到导入、甚至继续弹收入确认框。修复：进入前、暂存返回后各核一次，
+  并把 `isCancelled` 交给渲染层在「确认通过后、写库前」再核一次（`collect_papers` 同纪律）；
+  「用户取消」与「该轮已停止」分开如实回报。
+- **P3 阅读位置 chip 显示 `{n}`**：`js/agentui.js`/`js/graphview.js` 自建的 T 包装只收一个参数，
+  `T('第 {n} 页', {n: 7})` 的插值数据丢失，chip 显示成字面「第 {n} 页」。修复：包装透传
+  `params`，并加护栏测试（自建包装必须把第二个参数传给 `LitI18n.t`）。
+- 测试：`test/agentloop.test.js`（压缩后重跑目标 / retryLast 跳过合成消息）、
+  `test/agentcontext.test.js`（摘要不占业务 turnId）、`test/db.test.js`（附件索引严格身份 +
+  显式兼容回退）、`test/agenttools.test.js`（collected/inResearch 分离、取消边界、
+  未命中附件如实报错）、`test/research-db.test.js`（vecCoverage、title_norm 索引与迁移回填）、
+  `test/research.test.js`（vectorReadiness、normalizeTitleKey）、`test/i18n.test.js`（T 包装
+  透传插值参数）。另：`test/i18n.test.js` 的 T() 键覆盖门禁此前已按目录枚举 `electron/ipc/*.js`，
+  本轮新增的两条文案已补英文词典。
+
 ### 新增（AI 对话 LaTeX 公式渲染：MathJax tex-svg）
 
 - **`vendor/mathjax/`（3.2.2 tex-svg 单文件，Apache-2.0，SVG 输出无字体依赖）**：
@@ -1104,6 +1475,46 @@
 - 兼容性兜底备份 `litboard.sqlite.bak` 的节流时间戳改为写在旁边的 `litboard.sqlite.bak.stamp`，不再写进数据库的
   `settings.lastBackupAt` —— 那次记账写入会让内容相同的快照字节不同，使上面的「无变化跳过」永久失效。旧时间戳仍会被读一次以兼容升级。
 - 删除根目录 0 字节误创建文件与空的 `.agents/` 目录。
+
+### 变更（「插入引文」弹窗的检索与主检索框同源）
+
+- **现象**：Word 面板「插入引文」的文献多选弹窗只能按空格分词做标题/作者/年份的子串
+  AND 匹配，主检索框那一整套语法（`tag:`、`year>=`、`has:`、引号短语、`OR`、`NOT`、
+  正则、括号分组）在这里一概不可用——同一个应用里两个搜索框的能力不是一个量级。
+- **查询走同一套引擎**（`js/app.js` 的 `renderWordCiteList`）：带语法的查询交给
+  `js/query.js` 的 AST 求值（含 `is:` / `has:` / `missing:` / 批注·笔记·附件组），
+  语法写错退回分词子串搜索并在搜索框旁挂出与主检索框同一条提示。**纯关键词仍走弹窗
+  原有的 haystack**——它比引擎多认年份与姓名倒序写法（「Wang, Xiao」能按 `Xiao Wang`
+  搜到），挑引文时按年份找人是最常见的用法，不该因为换了引擎就搜不到。
+- **控件与主检索框同构**：内嵌放大镜、同样的占位符与 `.search` 外观，右侧 `?` 按钮打开
+  **同一个**语法速查浮层（`#search-help-pop` 仍是单例，谁打开谁决定示例写回哪个输入框）；
+  Esc / 点击外部收起，示例点选即填进弹窗自己的搜索框。
+- 弹窗说明文案同步改写（不再声称「多个词用空格分隔」），英文词典两条对应更新，
+  旧的无用条目清除；`test/i18n.test.js` 的 index.html 静态文案覆盖门禁照常通过。
+- **冒烟**：新增 `wordCiteSearchUiPresent`（内嵌图标 + `?` + 提示位）、`wordCiteHelpOpens`、
+  `wordCiteHelpTryWorks`（示例写回弹窗输入框、主搜索框不受影响）、
+  `wordCiteSyntaxHintWorks` / `wordCiteSyntaxHintClears`（语法写错挂提示、写对收回）。
+  弹窗经直接置 `hidden=false` 打开——顶栏那条路要求真机装着 Word 且开着文档，
+  冒烟环境（空库、无 Word）走不通。
+
+### 新增（设置弹窗可拖右下角手柄改尺寸）
+
+- 设置弹窗右下角加了一个拖拽手柄（`#sync-resize-grip` + `js/app.js` 的
+  `bindModalResizer`，与栏宽拖拽同一套 pointer 捕获 + `dblclick` 复位 + 方向键微调的
+  做法）：宽高都能拖，钳制在「视口减 40px」以内（遮罩的内边距），窗口被拖小后自动
+  重新钳制，不会溢出屏幕。尺寸按弹窗键名存 `localStorage`（`litboard.modalSizes`，
+  与 `litboard.paneSizes` 同一条思路：纯界面布局偏好，不进库、不参与同步），下次打开
+  沿用，双击手柄回到默认尺寸。
+- 尺寸按「指针到弹窗中心的距离 ×2」换算：弹窗由遮罩居中，直接累加指针位移只会让手柄
+  走一半（居中布局把增量对半分给了两侧）。
+- **踩坑记录**：隐藏窗口里合成器不一定出帧，入场动画 `modal-in` 的 `scale(.98)` 会停在
+  初始态——冒烟量基准尺寸前必须轮询 `getComputedStyle(modal).transform === 'none'`
+  再取值，否则拿到的是缩放中间态（760×780 量成 745×764），复位断言会假失败。
+  另外 `setPointerCapture` 对合成事件会抛 `NotFoundError`，拖拽判定因此看自建的
+  `dragId` 而不是 `hasPointerCapture`（真实指针路径不受影响）。
+- 冒烟新增 `settingsResizeUiPresent`（手柄存在 + 弹窗 `position: relative` + 光标为
+  `nwse-resize`）、`settingsResizes`（拖小 → 拖大，含撞上限的钳制）、
+  `settingsResizeResets`（双击复位且内联尺寸确实清空）。
 
 ## [1.2.0] - 2026-09-01
 

@@ -347,6 +347,101 @@
   }
   function clearHaystackCache() { if (hayCache.clear) hayCache.clear(); else hayCache = {}; }
 
+  /* 普通关键词检索的相关度层：布尔命中语义仍是「所有词可分布在任意元数据字段」，
+   * 这里只根据命中字段给结果排序，并返回一段可解释的上下文。高级语法不走此层。 */
+  var PLAIN_SEARCH_FIELDS = [
+    { key: 'title', weight: 50 },
+    { key: 'tags', weight: 30 },
+    { key: 'key', weight: 24 },
+    { key: 'authors', weight: 20 },
+    { key: 'venue', weight: 18 },
+    { key: 'abstract', weight: 8 },
+    { key: 'notes', weight: 6 }
+  ];
+
+  function plainSearchTerms(input) {
+    var normalized = normalizeForSearch(input).trim();
+    if (!normalized) return [];
+    var seen = {};
+    return normalized.split(/\s+/).filter(function (term) {
+      if (!term || seen[term]) return false;
+      seen[term] = true;
+      return true;
+    });
+  }
+
+  function plainFieldText(paper, key) {
+    var value = paper && paper[key];
+    return Array.isArray(value) ? value.join(' ') : text(value);
+  }
+
+  function plainMatchSnippet(value, terms, maxLength) {
+    var raw = text(value).replace(/\s+/g, ' ').trim();
+    if (!raw) return '';
+    var normalized = normalizeForSearch(raw);
+    var at = -1;
+    var phrase = terms.join(' ');
+    if (phrase) at = normalized.indexOf(phrase);
+    if (at < 0) {
+      terms.forEach(function (term) {
+        var pos = normalized.indexOf(term);
+        if (pos >= 0 && (at < 0 || pos < at)) at = pos;
+      });
+    }
+    if (at < 0) at = 0;
+    var cap = Math.max(60, Number(maxLength) || 180);
+    var start = Math.max(0, at - 48);
+    var end = Math.min(raw.length, start + cap);
+    if (end - start < cap && start > 0) start = Math.max(0, end - cap);
+    return (start > 0 ? '…' : '') + raw.slice(start, end) + (end < raw.length ? '…' : '');
+  }
+
+  /**
+   * 普通关键词查询 → {matched, score, field, snippet, fields}。
+   * 标题 > 标签/标识 > 作者/期刊 > 摘要 > 笔记；同字段完整短语另加权。
+   */
+  function rankPlainText(paper, input) {
+    var terms = plainSearchTerms(input);
+    if (!terms.length) return { matched: true, score: 0, field: '', snippet: '', fields: [] };
+    var values = {};
+    var all = '';
+    PLAIN_SEARCH_FIELDS.forEach(function (spec) {
+      var raw = plainFieldText(paper, spec.key);
+      values[spec.key] = { raw: raw, normalized: normalizeForSearch(raw), score: 0 };
+      all += ' ' + values[spec.key].normalized;
+    });
+    var matched = terms.every(function (term) { return all.indexOf(term) !== -1; });
+    if (!matched) return { matched: false, score: 0, field: '', snippet: '', fields: [] };
+    var phrase = terms.join(' ');
+    var total = 0;
+    var best = null;
+    var bestComplete = null;
+    var bestNonTitle = null;
+    var matchedFields = [];
+    PLAIN_SEARCH_FIELDS.forEach(function (spec) {
+      var value = values[spec.key];
+      var count = 0;
+      terms.forEach(function (term) { if (value.normalized.indexOf(term) !== -1) count++; });
+      if (!count) return;
+      value.score = count * spec.weight;
+      if (terms.length > 1 && value.normalized.indexOf(phrase) !== -1) value.score += spec.weight * 2;
+      total += value.score;
+      matchedFields.push(spec.key);
+      var candidate = { key: spec.key, raw: value.raw, score: value.score };
+      if (!best || value.score > best.score) best = candidate;
+      if (count === terms.length && (!bestComplete || value.score > bestComplete.score)) bestComplete = candidate;
+      if (spec.key !== 'title' && (!bestNonTitle || value.score > bestNonTitle.score)) bestNonTitle = candidate;
+    });
+    var explanation = bestComplete || (matchedFields.length > 1 && best && best.key === 'title' ? bestNonTitle : best);
+    return {
+      matched: true,
+      score: total,
+      field: explanation ? explanation.key : '',
+      snippet: explanation ? plainMatchSnippet(explanation.raw, terms, 180) : '',
+      fields: matchedFields
+    };
+  }
+
   function activeNotesFor(paper, ctx) {
     if (!paper || !ctx || !ctx.notesByPaper) return [];
     return ctx.notesByPaper[paper.id] || [];
@@ -800,6 +895,7 @@
     astToText: astToText,
     reviveAst: reviveAst,
     normalizeForSearch: normalizeForSearch,
+    rankPlainText: rankPlainText,
     clearHaystackCache: clearHaystackCache,
     rowsToText: rowsToText,
     entityHits: entityHits,

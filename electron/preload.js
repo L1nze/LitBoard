@@ -1,8 +1,9 @@
 'use strict';
 
-const { contextBridge, ipcRenderer, webUtils } = require('electron');
+const { contextBridge, ipcRenderer, webUtils, webFrame } = require('electron');
 
 contextBridge.exposeInMainWorld('litboardDesktop', {
+  setZoomFactor: function (factor) { webFrame.setZoomFactor(factor); },
   loadLibrary: function () { return ipcRenderer.invoke('library:load'); },
   recordRead: function (value) { return ipcRenderer.invoke('library:record-read', value); },
   wordInvoke: function (value) { return ipcRenderer.invoke('word:invoke', value); },
@@ -24,6 +25,7 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   setSetting: function (key, value) { return ipcRenderer.invoke('settings:set', { key: key, value: value }); },
   getDataPaths: function () { return ipcRenderer.invoke('data-paths:get'); },
   stageDataPaths: function (value) { return ipcRenderer.invoke('data-paths:stage', value); },
+  getAppVersion: function () { return ipcRenderer.invoke('app:get-version'); },
   relaunchApp: function () { return ipcRenderer.invoke('app:relaunch'); },
   chooseImportFiles: function () { return ipcRenderer.invoke('files:choose-import'); },
   saveFile: function (options) { return ipcRenderer.invoke('files:save', options); },
@@ -32,10 +34,13 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   revealInFolder: function (filePath) { return ipcRenderer.invoke('files:reveal', filePath); },
   exportPdfs: function (options) { return ipcRenderer.invoke('files:export-pdfs', options); },
   storePdf: function (options) { return ipcRenderer.invoke('files:store-pdf', options); },
+  scanFolder: function (options) { return ipcRenderer.invoke('files:scan-folder', options); },
   copyText: function (value) { return ipcRenderer.invoke('clipboard:write', value); },
   fetchJson: function (url) { return ipcRenderer.invoke('api:fetch-json', url); },
   getIntegrationConfig: function () { return ipcRenderer.invoke('integrations:get-config'); },
   saveIntegrationConfig: function (value) { return ipcRenderer.invoke('integrations:save-config', value); },
+  revealIntegrationSecret: function (value) { return ipcRenderer.invoke('integrations:reveal-secret', value || {}); },
+  copyIntegrationSecret: function (value) { return ipcRenderer.invoke('integrations:copy-secret', value || {}); },
   syncNutstore: function (workspace) { return ipcRenderer.invoke('integrations:sync-nutstore', workspace); },
   inspectNutstoreRemote: function (value) { return ipcRenderer.invoke('integrations:inspect-nutstore', value); },
   createNutstoreSyncPlan: function (value) { return ipcRenderer.invoke('integrations:create-sync-plan', value); },
@@ -97,6 +102,8 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   agentCancel: function (sessionId) { return ipcRenderer.invoke('agent:cancel', sessionId); },
   agentTest: function (input) { return ipcRenderer.invoke('agent:test', input); },
   agentListModels: function (input) { return ipcRenderer.invoke('agent:list-models', input); },
+  /* 对话面板底部切换服务商 / 模型（只改选中项，不打开设置） */
+  agentSetSelection: function (input) { return ipcRenderer.invoke('agent:set-selection', input); },
   onAgentEvent: function (handler) {
     var listener = function (_event, payload) { handler(payload); };
     ipcRenderer.on('agent:event', listener);
@@ -153,7 +160,11 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   researchSearchSemanticscholar: function (input) { return ipcRenderer.invoke('research:search-semanticscholar', input); },
   ocrStatus: function () { return ipcRenderer.invoke('ocr:status'); },
   ocrEnsureData: function () { return ipcRenderer.invoke('ocr:ensure-data'); },
-  pdfSearchGetPages: function (paperId, attachmentId) { return ipcRenderer.invoke('pdfsearch:get-pages', { paperId: paperId, attachmentId: attachmentId || '' }); },
+  // legacyFallback：只有「读该文献主 PDF 的旧版单 PDF 索引」这一种场景传 true；
+  // 省略即严格按附件身份匹配（A-followup #2）
+  pdfSearchGetPages: function (paperId, attachmentId, legacyFallback) {
+    return ipcRenderer.invoke('pdfsearch:get-pages', { paperId: paperId, attachmentId: attachmentId || '', legacyFallback: legacyFallback === true });
+  },
   pdfSearchGetPageRange: function (input) { return ipcRenderer.invoke('pdfsearch:get-page-range', input); },
   chooseSavePath: function (options) { return ipcRenderer.invoke('files:choose-save-path', options); },
   fetchCslStyle: function (styleId) { return ipcRenderer.invoke('csl:fetch-style', styleId); },
