@@ -22,10 +22,17 @@ if (!fs.existsSync(electronPath)) {
 }
 
 const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'litboard-smoke-'));
+const folderFixture = path.join(workDir, 'folder-import-fixture');
+fs.mkdirSync(path.join(folderFixture, 'Nested'), { recursive: true });
+fs.writeFileSync(path.join(folderFixture, 'Nested', 'smoke-folder-alpha.epub'), 'smoke epub fixture');
+fs.writeFileSync(path.join(folderFixture, 'Nested', 'smoke-folder-beta.docx'), 'smoke docx fixture');
+fs.writeFileSync(path.join(folderFixture, 'ignore.csv'), 'unsupported');
+fs.writeFileSync(path.join(folderFixture, '.hidden.pdf'), 'hidden');
 const resultFile = path.join(workDir, 'result.json');
 const env = Object.assign({}, process.env, {
   LITBOARD_SMOKE_TEST: '1',
-  LITBOARD_SMOKE_RESULT: resultFile
+  LITBOARD_SMOKE_RESULT: resultFile,
+  LITBOARD_SMOKE_FOLDER: folderFixture
 });
 const run = spawnSync(electronPath, ['.', '--user-data-dir=' + path.join(workDir, 'userdata')], {
   cwd: projectRoot,
@@ -37,12 +44,15 @@ const run = spawnSync(electronPath, ['.', '--user-data-dir=' + path.join(workDir
 let payload = null;
 try {
   payload = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
+  payload.folderImportSourcesIntact =
+    fs.readFileSync(path.join(folderFixture, 'Nested', 'smoke-folder-alpha.epub'), 'utf8') === 'smoke epub fixture' &&
+    fs.readFileSync(path.join(folderFixture, 'Nested', 'smoke-folder-beta.docx'), 'utf8') === 'smoke docx fixture';
   console.log(JSON.stringify(payload, null, 2));
 } catch (e) {
   console.error('smoke: 未取得结果文件');
 }
 fs.rmSync(workDir, { recursive: true, force: true });
-if (run.status !== 0 || !payload) {
+if (run.status !== 0 || !payload || !payload.folderImportSourcesIntact) {
   console.error('smoke: 失败（exit=%s）', run.status);
   console.error((run.stdout || '').slice(-2000), (run.stderr || '').slice(-2000));
   process.exit(1);

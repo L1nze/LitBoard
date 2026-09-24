@@ -37,7 +37,7 @@ function makeHarness(getRank) {
     $: function (sel) { return els[sel] || null; },
     toast: function () {},
     save: function () { calls.saved++; },
-    renderTable: function () {},
+    renderTable: function () { calls.rendered++; },
     getById: function (id) { return state.papers.find(function (p) { return p.id === id; }) || null; },
     drawerId: function () { return null; },
     filteredPapers: function () { return state.papers.filter(function (p) { return !p.deletedAt; }); },
@@ -113,6 +113,32 @@ test('refreshFolder：缓存未过期的一律跳过（零请求）', async () =
   await flush(4);
   assert.strictEqual(h.calls.rankCalls.length, 0);
   assert.strictEqual(h.state.papers[0].journalRank, cached, '缓存对象不被替换');
+});
+
+test('refreshFolder：已缓存的多个期刊不重复重绘表格', async () => {
+  const h = makeHarness();
+  h.state.papers = Array.from({ length: 60 }, function (_, i) {
+    return { id: 'p' + i, venue: 'Journal ' + i, journalRank: { jcr: 'Q1' },
+      journalRankCheckedAt: Date.now() };
+  });
+  await h.api.refreshFolder('all');
+  assert.equal(h.calls.rankCalls.length, 0);
+  assert.equal(h.calls.rendered, 0);
+  assert.equal(h.calls.saved, 0);
+});
+
+test('refreshFolder：同刊仅将有效缓存同步给过期条目', async () => {
+  const h = makeHarness();
+  const cached = { jcr: 'Q1' };
+  h.state.papers = [
+    { id: 'fresh', venue: 'Nature', journalRank: cached, journalRankCheckedAt: Date.now() },
+    { id: 'stale', venue: 'nature', journalRank: null, journalRankCheckedAt: 0 }
+  ];
+  await h.api.refreshFolder('all');
+  assert.equal(h.calls.rankCalls.length, 0);
+  assert.strictEqual(h.state.papers[1].journalRank, cached);
+  assert.equal(h.calls.rendered, 1);
+  assert.equal(h.calls.saved, 1);
 });
 
 test('pending 标记与冻结序访问器：默认空，清空后回到 null', () => {

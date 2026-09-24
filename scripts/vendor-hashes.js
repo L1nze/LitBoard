@@ -17,7 +17,7 @@ const vendorDir = path.join(root, 'vendor');
 const outFile = path.join(vendorDir, 'SHA256SUMS');
 const checkOnly = process.argv.includes('--check');
 
-const EXTS = new Set(['.js', '.mjs', '.wasm', '.json', '.css', '.xml', '.csl', '.txt']);
+const EXTS = new Set(['.js', '.mjs', '.wasm', '.json', '.css', '.xml', '.csl', '.txt', '.node']);
 
 function walk(dir) {
   const out = [];

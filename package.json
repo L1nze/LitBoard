@@ -1,10 +1,10 @@
 {
   "name": "litboard",
-  "version": "1.2.19",
+  "version": "1.0.0",
   "description": "本地优先的个人文献阅读仪表盘",
   "main": "electron/main.js",
   "author": "LitBoard",
-  "license": "AGPL-3.0-only",
+  "license": "MIT",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -51,9 +51,10 @@
       "build/icon-*.png",
       "package.json",
       "README.md",
+      "docs/THIRD-PARTY.md",
       "LICENSE"
     ],
-    "asarUnpack": ["word/**/*"],
+    "asarUnpack": ["word/**/*", "vendor/litgraph/**/*.node"],
     "extraResources": [
       {
         "from": "extension",

@@ -16,8 +16,12 @@
   var STORE_KEY = 'litboard.papers.v1';
   var ONBOARD_DISMISS_KEY = 'litboard.onboardDismissed';
   var PANE_SIZES_KEY = 'litboard.paneSizes';
+  var LEFT_SIDEBAR_COLLAPSED_KEY = 'litboard.leftSidebarCollapsed.v1';
+  var RIGHT_SIDEBAR_COLLAPSED_KEY = 'litboard.rightSidebarCollapsed.v1';
   var FOLDER_TREE_KEY = 'litboard.folderTree.v1';
   var STATS_COLLAPSED_KEY = 'litboard.statsCollapsed.v1';
+  var TAG_LIST_COLLAPSED_KEY = 'litboard.sidebarTagListCollapsed.v1';
+  var TAG_LIST_HEIGHT_KEY = 'litboard.sidebarTagListHeight.v1';
   var HIDDEN_PURGED_KEY = 'litboard.hiddenPurged.v1';
   var SHORTCUTS_KEY = 'litboard.shortcuts.v1';
   var TABLE_PAGE_SIZE = 100;
@@ -54,7 +58,6 @@
     tagColors: {},
     tagColorRecords: [],
     activeFolderId: 'all',
-    activeSavedSearchId: '',
     collapsedFolders: {},
     expandedRows: {},    // paperId -> true，行展开状态（附件子行）
     selected: {},        // id -> true，批量选择
@@ -65,13 +68,75 @@
     filters: { q: '', status: '', tag: '', year: null, pdfOnly: false, bibkeys: [] },
     resultView: 'papers',          // 阶段四：文献 | 批注 | 笔记 | 附件
     activeFolderIds: [],           // 阶段四：Ctrl+点击多选文件夹（含子文件夹）
-    activeSavedSearchIds: [],      // 阶段四：多智能文件夹联合（AND）
+    folderSelAnchor: null,         // 文件夹 Shift 区间选择的锚点（最近一次非 range 点击）
+    folderFocusId: null,           // 文件夹树键盘导航的聚焦行
     shortcuts: { pdfOnly: 'p', bibkey: 'b' },
     tablePage: 0,
     sort: { key: 'addedAt', dir: -1 },
     ftEnabled: false,      // PDF 全文检索模式
     ftHits: {}             // paperId -> { pages, count }
   };
+
+  var TABLE_COLUMNS_KEY = 'litboard.tableColumns';
+  var TABLE_COLUMNS = [
+    { key: 'attachment', label: 'PDF', width: 38, fixed: true },
+    { key: 'title', label: '标题', width: 260, fixed: true },
+    { key: 'status', label: '状态', width: 76 },
+    { key: 'authors', label: '作者', width: 150 },
+    { key: 'year', label: '年份', width: 64 },
+    { key: 'venue', label: '期刊 / 会议', width: 180 },
+    { key: 'rank', label: '分区', width: 150 },
+    { key: 'rating', label: '评分', width: 80 },
+    { key: 'tags', label: '标签', width: 160, optional: true },
+    { key: 'addedAt', label: '添加时间', width: 108, optional: true },
+    { key: 'updatedAt', label: '修改时间', width: 108, optional: true },
+    { key: 'doi', label: 'DOI', width: 210, optional: true }
+  ];
+  var tableColumns = (function () {
+    var saved = {};
+    try { saved = JSON.parse(localStorage.getItem(TABLE_COLUMNS_KEY)) || {}; } catch (error) {}
+    var result = {};
+    TABLE_COLUMNS.forEach(function (column) {
+      var value = saved[column.key] || {};
+      result[column.key] = {
+        visible: column.fixed || (typeof value.visible === 'boolean' ? value.visible : !column.optional),
+        width: column.key === 'attachment' ? column.width :
+          Math.max(column.key === 'title' ? 180 : 48, Math.min(800, Number(value.width) || column.width))
+      };
+    });
+    return result;
+  })();
+  function visibleTableColumns() {
+    return TABLE_COLUMNS.filter(function (column) { return tableColumns[column.key].visible; });
+  }
+  function saveTableColumns() {
+    try { localStorage.setItem(TABLE_COLUMNS_KEY, JSON.stringify(tableColumns)); } catch (error) {}
+  }
+  function applyTableColumns(widthOnly) {
+    var total = 0;
+    var headers = {};
+    TABLE_COLUMNS.forEach(function (column) {
+      var th = $('#lit-table th[data-column="' + column.key + '"]');
+      if (!th) return;
+      headers[column.key] = th;
+      var preference = tableColumns[column.key];
+      if (!widthOnly) th.hidden = !preference.visible;
+      if (preference.visible) total += preference.width;
+    });
+    var spare = Math.max(0, $('#table-wrap').clientWidth - total);
+    var titleExtra = Math.round(spare * (tableColumns.venue.visible ? 0.6 : 1));
+    TABLE_COLUMNS.forEach(function (column) {
+      var extra = column.key === 'title' ? titleExtra : column.key === 'venue' ? spare - titleExtra : 0;
+      headers[column.key].style.width = (tableColumns[column.key].width + extra) + 'px';
+    });
+    $('#lit-table').style.width = (total + spare) + 'px';
+    if (widthOnly) return;
+    $all('#table-body tr[data-id], #table-body tr.attachment-subrow').forEach(function (row) {
+      Array.prototype.forEach.call(row.cells, function (cell) {
+        cell.hidden = !tableColumns[cell.dataset.column].visible;
+      });
+    });
+  }
 
   // ---------- 工具 ----------
   function $(sel) { return document.querySelector(sel); }
@@ -206,9 +271,17 @@
     var available = Math.max(0, workspace.clientWidth - 520);
     var left = clamp(sizes.left, PANE_LIMITS.left.min, PANE_LIMITS.left.max);
     var right = clamp(sizes.right, PANE_LIMITS.right.min, PANE_LIMITS.right.max);
-    if (left + right > available && available >= 460) {
-      if (right > PANE_LIMITS.right.min) right = Math.max(PANE_LIMITS.right.min, available - left);
-      if (left + right > available) left = Math.max(PANE_LIMITS.left.min, available - right);
+    var leftCollapsed = workspace.classList.contains('left-collapsed');
+    var rightCollapsed = workspace.classList.contains('rail-collapsed');
+    var leftReserved = leftCollapsed ? 28 : left;
+    var rightReserved = rightCollapsed ? 0 : right;
+    if (leftReserved + rightReserved > available && available >= 460) {
+      if (!rightCollapsed && right > PANE_LIMITS.right.min) {
+        right = Math.max(PANE_LIMITS.right.min, available - leftReserved);
+      }
+      if (!leftCollapsed && left + (rightCollapsed ? 0 : right) > available) {
+        left = Math.max(PANE_LIMITS.left.min, available - (rightCollapsed ? 0 : right));
+      }
     }
     workspace.style.setProperty('--library-width', left + 'px');
     workspace.style.setProperty('--detail-width', right + 'px');
@@ -230,6 +303,45 @@
       left: Number(workspace.dataset.leftWidth),
       right: Number(workspace.dataset.rightWidth)
     }));
+  }
+
+  function readCollapsedPreference(key) {
+    try { return localStorage.getItem(key) === '1'; } catch (error) { return false; }
+  }
+
+  function setLeftSidebarCollapsed(collapsed, persist) {
+    var workspace = $('.workspace');
+    var collapseButton = $('#btn-left-sidebar-collapse');
+    var openButton = $('#btn-left-sidebar-open');
+    var sidebar = $('#library-sidebar');
+    workspace.classList.toggle('left-collapsed', collapsed);
+    sidebar.setAttribute('aria-hidden', String(collapsed));
+    sidebar.inert = collapsed;
+    openButton.hidden = !collapsed;
+    collapseButton.setAttribute('aria-expanded', String(!collapsed));
+    openButton.setAttribute('aria-expanded', String(collapsed));
+    applyPaneSizes({
+      left: Number(workspace.dataset.leftWidth) || 220,
+      right: Number(workspace.dataset.rightWidth) || 370
+    });
+    if (persist) {
+      try { localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0'); } catch (error) {}
+    }
+  }
+
+  function setRightSidebarCollapsed(collapsed, persist) {
+    var workspace = $('.workspace');
+    var sidebar = $('#detail-sidebar');
+    workspace.classList.toggle('rail-collapsed', collapsed);
+    sidebar.setAttribute('aria-hidden', String(collapsed));
+    sidebar.inert = collapsed;
+    applyPaneSizes({
+      left: Number(workspace.dataset.leftWidth) || 220,
+      right: Number(workspace.dataset.rightWidth) || 370
+    });
+    if (persist) {
+      try { localStorage.setItem(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0'); } catch (error) {}
+    }
   }
 
   function bindPaneResizer(id, side) {
@@ -380,8 +492,8 @@
     var span = document.createElement('span');
     span.textContent = msg;
     el.appendChild(span);
-    var timer = setTimeout(remove, ms || 2600);
-    function remove() { clearTimeout(timer); el.remove(); }
+    var timer = ms === 0 ? null : setTimeout(remove, ms || 2600);
+    function remove() { if (timer) clearTimeout(timer); el.remove(); }
     if (action && action.label && action.fn) {
       var btn = document.createElement('button');
       btn.className = 'toast-action';
@@ -392,6 +504,7 @@
     $('#toast-wrap').appendChild(el);
     // M3 通知中心：⚠ 开头的失败提示进入可找回列表，不再转瞬即逝
     if (/^⚠/.test(String(msg))) recordIssue(msg);
+    return remove;
   }
 
   /* ---- M3 通知中心：最近的问题与失败提示（本机 localStorage，保留 20 条，不上传） ---- */
@@ -534,7 +647,15 @@
     });
   }
 
-  /** 单一普通文件夹视图中的“删除”只解除当前位置软链；多文件夹联合视图保持全局删除语义。 */
+  function confirmPapersToTrash(ids) {
+    var papers = ids.map(getById).filter(function (p) { return p && !p.deletedAt; });
+    if (!papers.length) return;
+    dlgConfirm(T('移入回收站'), T('删除选中的 ') + papers.length + T(' 篇？可在提示条点「撤销」恢复，也可稍后在回收站找回。'), T('移入回收站'), true).then(function (ok) {
+      if (ok) removePapers(papers.map(function (p) { return p.id; }));
+    });
+  }
+
+  /** 仅供明确标为“从当前文件夹移出”的操作使用；删除文献始终进入回收站。 */
   function currentFolderLinkTarget() {
     if (state.activeFolderIds.length) return null;
     var folderId = currentImportFolderId();
@@ -603,6 +724,8 @@
       }
     });
     state.papers.forEach(function (p) {
+      // 附属笔记已全部墓碑化，兼容投影同步清空（与 normalizeWorkspace 的重投影口径一致）
+      if (idSet[p.id]) p.notes = '';
       p.relatedIds = (p.relatedIds || []).filter(function (rid) { return !idSet[rid]; });
     });
     if (purged) { saveHiddenPurged(); save(); closeDrawer(); renderAll(); }
@@ -847,7 +970,7 @@
   }
 
   function newPaper(base) {
-    return window.LitModel.normalizePaper(Object.assign({
+    var paper = window.LitModel.normalizePaper(Object.assign({
       id: uid(),
       key: '', entryType: 'article',
       title: '', authors: [], year: null, venue: '',
@@ -856,6 +979,24 @@
       tags: [], folderIds: [], status: 'unread', rating: 0, notes: '', pdfAnnotations: [],
       addedAt: Date.now()
     }, base || {}), uid);
+    var merged = window.LitDedupe.mergeAttachmentsDetailed({ attachments: paper.attachments }, null);
+    if (merged.attachments.length === paper.attachments.length) return paper;
+    paper.attachments = merged.attachments;
+    paper.pdfAnnotations = remapAnnotationAttachments(paper.pdfAnnotations, merged.aliases).annotations;
+    var normalized = window.LitModel.normalizePaper(paper, uid);
+    normalized.id = paper.id;
+    return normalized;
+  }
+
+  function remapAnnotationAttachments(annotations, aliases) {
+    var changed = false;
+    var result = (annotations || []).map(function (annotation) {
+      var canonicalId = annotation && aliases[annotation.attachmentId];
+      if (!canonicalId || canonicalId === annotation.attachmentId) return annotation;
+      changed = true;
+      return Object.assign({}, annotation, { attachmentId: canonicalId });
+    });
+    return { annotations: result, changed: changed };
   }
 
   /** 去重导入；命中已有条目时 PDF 走 attachments 挂到原条目（Zotero 式）；返回 {added, merged, attached, matches} */
@@ -867,6 +1008,7 @@
     // 整库一次建索引 O(n)，之后每条导入 O(1) 匹配
     var index = window.LitDedupe.createMatchIndex(state.papers);
     var added = 0, merged = 0, attached = 0, matches = [];
+    var removedAttachmentIndexes = [];
     var addedIds = [];   // M9 二期：新建条目的 id（收藏桥回写 researchIds 用）
     var indexMap = [];   // 与输入 list 逐一对齐：{ kind: 'added'|'merged', id }（收藏桥回写 researchIds 用）
     list.forEach(function (base) {
@@ -874,21 +1016,33 @@
       var existing = hit ? hit.paper : null;
       if (existing) {
         // 挂附件：incoming 的 PDF 并入原条目（指纹>路径>id 判重；原无主 PDF 时置首成为主 PDF）
-        var beforeCount = (existing.attachments || []).length;
-        var mergedAttachments = window.LitDedupe.mergeAttachments(existing, base);
-        var attachedNow = mergedAttachments.length > beforeCount;
+        var beforeAttachments = existing.attachments || [];
+        var attachmentMerge = window.LitDedupe.mergeAttachmentsDetailed(existing, base);
+        var mergedAttachments = attachmentMerge.attachments;
+        var attachmentsChanged = mergedAttachments.length !== beforeAttachments.length ||
+          mergedAttachments.some(function (attachment, index) { return attachment !== beforeAttachments[index]; });
+        var attachedNow = attachmentMerge.added.length > 0;
         var changed = false;
         matches.push({ id: existing.id, title: existing.title, folderIds: (existing.folderIds || []).slice(), reason: hit.reason, attachedPdf: attachedNow });
         // 只补空字段，不覆盖用户已有内容；pdf* 旧字段不直写，交给 normalizePaper 从主附件重投影
-        ['abstract', 'doi', 'url', 'venue', 'oaUrl', 'openalexId', 'key'].forEach(function (f) {
+        ['abstract', 'doi', 'url', 'venue', 'volume', 'issue', 'pages', 'issn',
+          'oaUrl', 'openalexId', 'key'].forEach(function (f) {
           if (!existing[f] && base[f]) { existing[f] = base[f]; changed = true; }
         });
         if (existing.year == null && base.year != null) { existing.year = base.year; changed = true; }
         if (existing.citations == null && base.citations != null) { existing.citations = base.citations; changed = true; }
         if ((!existing.authors || !existing.authors.length) && base.authors && base.authors.length) { existing.authors = base.authors; changed = true; }
         if (base.pdfAnnotations && base.pdfAnnotations.length) {
-          existing.pdfAnnotations = window.LitDedupe.merge([existing, base]).pdfAnnotations;
+          existing.pdfAnnotations = remapAnnotationAttachments(
+            window.LitDedupe.merge([existing, base]).pdfAnnotations, attachmentMerge.aliases
+          ).annotations;
           changed = true;
+        } else {
+          var remappedAnnotations = remapAnnotationAttachments(existing.pdfAnnotations, attachmentMerge.aliases);
+          if (remappedAnnotations.changed) {
+            existing.pdfAnnotations = remappedAnnotations.annotations;
+            changed = true;
+          }
         }
         // 归属并集：options.folderId（传统单文件夹导入）+ base 自带 folderIds
         //（拖入文件夹导入按目录逐条预盖，让整棵树一次 addPapers/一次 save 落库）
@@ -899,10 +1053,16 @@
         incomingFolders.forEach(function (fid) {
           if ((existing.folderIds || []).indexOf(fid) === -1) { existing.folderIds.push(fid); changed = true; }
         });
-        if (attachedNow) {
+        if (attachmentsChanged) {
           existing.attachments = mergedAttachments;
           changed = true;
         }
+        Object.keys(attachmentMerge.aliases).forEach(function (removedId) {
+          var canonicalId = attachmentMerge.aliases[removedId];
+          if (removedId && canonicalId && removedId !== canonicalId) {
+            removedAttachmentIndexes.push({ paperId: existing.id, attachmentId: removedId });
+          }
+        });
         if (changed) {
           window.LitModel.touch(existing);
           var norm = window.LitModel.normalizePaper(existing, uid);
@@ -927,6 +1087,11 @@
     added = Math.max(0, state.papers.length - initialCount);
     merged = Math.max(0, list.length - added);
     save();
+    if (window.LitPdfSearch && LitPdfSearch.invalidate) {
+      removedAttachmentIndexes.forEach(function (item) {
+        LitPdfSearch.invalidate(item.paperId, item.attachmentId);
+      });
+    }
     return { added: added, merged: merged, attached: attached, matches: matches, addedIds: addedIds, indexMap: indexMap };
   }
 
@@ -953,6 +1118,7 @@
   }
   function commitUndo(label, before, ids) {
     history.commit(label, before, ids);
+    updateUndoUi();
   }
   function undoOnce() {
     var result = history && history.undo();
@@ -996,17 +1162,26 @@
     var isRecent = state.activeFolderId === 'recent';
     var q = window.LitQuery ? window.LitQuery.normalizeForSearch(f.q) : f.q.toLowerCase();
     var plainSearch = !!(f.q && !state.ftEnabled && window.LitQuery && window.LitQuery.isPlainText(f.q) && window.LitQuery.rankPlainText);
+    var queryContext = null;
+    if (q && !state.ftEnabled && window.LitQuery) {
+      var notesByPaper = {};
+      (state.notes || []).forEach(function (note) {
+        if (!note || note.deletedAt || !note.paperId) return;
+        (notesByPaper[note.paperId] = notesByPaper[note.paperId] || []).push(note);
+      });
+      queryContext = { notes: state.notes, folders: state.folders, notesByPaper: notesByPaper };
+    }
     plainSearchMatches = {};
     var parsed = null;
     querySyntaxError = false;
     if (f.q && !state.ftEnabled && window.LitQuery && !plainSearch) {
-      parsed = window.LitQuery.parse(f.q);
+      parsed = window.LitQuery.parse(f.q, queryContext);
       if (parsed.error) { parsed = null; querySyntaxError = true; }
     }
     // 阶段四：多选文件夹的后代集合（一次计算）
     var multiFolderSets = {};
     state.activeFolderIds.forEach(function (fid) { multiFolderSets[fid] = folderDescendantSet(fid); });
-    var out = state.papers.filter(function (p) {
+    var out = state.papers.concat(folderImportPreviewPapers).filter(function (p) {
       if (state.hiddenPurged[p.id]) return false; // 彻底删除的永久墓碑：任何视图（含回收站）都不显示
       if (inTrash ? !p.deletedAt : p.deletedAt) return false; // 回收站视图只看墓碑，其余视图排除
       if (isRecent && !p.lastReadAt) return false;
@@ -1030,7 +1205,7 @@
         if (state.ftEnabled) {
           if (!state.ftHits[p.id]) return false;
         } else if (plainSearch) {
-          var ranked = window.LitQuery.rankPlainText(p, f.q);
+          var ranked = window.LitQuery.rankPlainText(p, f.q, queryContext);
           if (!ranked.matched) return false;
           plainSearchMatches[p.id] = ranked;
         } else if (parsed) {
@@ -1044,25 +1219,14 @@
       }
       return true;
     });
-    // 智能文件夹（与当前筛选叠加；支持多选联合 AND）
-    var activeSearchIds = state.activeSavedSearchId
-      ? [state.activeSavedSearchId].concat(state.activeSavedSearchIds.filter(function (id) { return id !== state.activeSavedSearchId; }))
-      : state.activeSavedSearchIds.slice();
-    if (activeSearchIds.length && window.LitQuery) {
-      activeSearchIds.forEach(function (searchId) {
-        var saved = state.savedSearches.find(function (s) { return s.id === searchId; });
-        if (!saved) return;
-        var compiled = compileSavedSearch(saved);
-        if (compiled.matcher) out = out.filter(compiled.matcher);
-      });
-    }
     var key = state.sort.key, dir = state.sort.dir;
-    var STATUS_ORDER = { unread: 0, reading: 1, read: 2 };
+    var STATUS_ORDER = { unread: 0, reading: 1 };
     var sortCollator = SORT_COLLATOR || (SORT_COLLATOR = new Intl.Collator());
     var compareCurrentSort = function (a, b) {
       var va, vb;
       if (key === 'firstAuthor') { va = (a.authors || [])[0] || ''; vb = (b.authors || [])[0] || ''; }
       else if (key === 'status') { va = STATUS_ORDER[a.status] || 0; vb = STATUS_ORDER[b.status] || 0; }
+      else if (key === 'tags') { va = (a.tags || []).join(', '); vb = (b.tags || []).join(', '); }
       else if (key === 'journalRank') { va = journalRankQuality(a); vb = journalRankQuality(b); }
       else { va = a[key]; vb = b[key]; }
       if (va == null && vb == null) return 0;
@@ -1109,27 +1273,6 @@
     };
     walk(folderId);
     return set;
-  }
-
-  /* 阶段四：智能文件夹编译缓存（内容或工作区引用变化即重编） */
-  var savedSearchCompileCache = {};
-  function compileSavedSearch(search) {
-    var hit = savedSearchCompileCache[search.id];
-    if (hit && hit.query === search.query && hit.ast === search.ast &&
-        hit.notes === state.notes && hit.folders === state.folders) return hit.compiled;
-    var compiled = null;
-    try {
-      compiled = window.LitQuery.compile(
-        search.ast ? JSON.parse(search.ast) : search.query,
-        { notes: state.notes, folders: state.folders });
-    } catch (e) {
-      compiled = { matcher: null, error: String(e && e.message || e) };
-    }
-    savedSearchCompileCache[search.id] = {
-      query: search.query, ast: search.ast,
-      notes: state.notes, folders: state.folders, compiled: compiled
-    };
-    return compiled;
   }
 
   function hasActiveFilters() {
@@ -1188,9 +1331,9 @@
     }
     if (!window.LitPdfSearch) return;
     var candidates = state.papers.filter(function (p) {
-      return (p.attachments || []).some(function (attachment) {
+      return !p.deletedAt && ((p.attachments || []).some(function (attachment) {
         return (attachment.kind === 'pdf' || attachment.kind === 'epub') && attachment.path;
-      }) || !!p.pdfPath;
+      }) || !!p.pdfPath);
     });
     var statusEl = $('#ft-status');
     statusEl.hidden = false;
@@ -1214,8 +1357,10 @@
       });
       state.ftHits = hitsById;
       state.tablePage = 0;
-      statusEl.textContent = hits.length
-        ? T('命中 ') + hits.length + T(' 篇 · ') + totalMatches + T(' 处')
+      var matchedPapers = Object.keys(hitsById).length;
+      statusEl.textContent = matchedPapers
+        ? T('命中 ') + matchedPapers + T(' 篇 · ') + totalMatches + T(' 个命中页') +
+          (hits.some(function (hit) { return hit.truncated; }) ? T('（只显示前 2000 个命中页，请缩小关键词）') : '')
         : T('全文中未找到「') + query + '」';
       renderAll();
     }).catch(function () {
@@ -1291,16 +1436,17 @@
     refreshAgentChips(); // R19：焦点/文件夹变了，AI 面板上下文 chips 跟着刷
   }
 
-  /* 侧栏计数单遍缓存：头部四项 + 每文件夹计数 + 智能文件夹命中数。
+  /* 侧栏计数单遍缓存：头部四项 + 每文件夹计数。
    * 签名 = 各集合长度 + 最大 updatedAt/lastReadAt + purge 键数：内容性修改一律经
    * touch/touchWorkspaceChanges 抬 updatedAt，阅读进度只动 lastReadAt，彻底删除改
    * hiddenPurged 键数——签名不变则计数必然不变，renderAll 因此从 O(文件夹×文献)
    * 的逐文件夹全量扫描降为一次 O(文献) 遍历且跨渲染复用。 */
   var sidebarCountsCache = { sig: '', data: null };
   function sidebarCounts() {
+    var visiblePapers = state.papers.concat(folderImportPreviewPapers);
     var maxUp = 0, maxRead = 0;
-    for (var i = 0; i < state.papers.length; i++) {
-      var p = state.papers[i];
+    for (var i = 0; i < visiblePapers.length; i++) {
+      var p = visiblePapers[i];
       if (p.updatedAt > maxUp) maxUp = p.updatedAt;
       if (p.lastReadAt > maxRead) maxRead = p.lastReadAt;
     }
@@ -1308,26 +1454,19 @@
     for (var j = 0; j < state.notes.length; j++) { if (state.notes[j].updatedAt > maxNote) maxNote = state.notes[j].updatedAt; }
     var maxFolder = 0;
     for (var k = 0; k < state.folders.length; k++) { if (state.folders[k].updatedAt > maxFolder) maxFolder = state.folders[k].updatedAt; }
-    var sig = [state.papers.length, maxUp, maxRead, state.notes.length, maxNote,
+    var sig = [visiblePapers.length, maxUp, maxRead, state.notes.length, maxNote,
       state.folders.length, maxFolder, Object.keys(state.hiddenPurged).length].join('|');
     if (sidebarCountsCache.sig === sig && sidebarCountsCache.data) return sidebarCountsCache.data;
     var byFolder = {}, all = 0, unfiled = 0, recent = 0, trash = 0;
-    var matchers = [], searchCounts = {};
-    state.savedSearches.forEach(function (s) {
-      var compiled = window.LitQuery ? compileSavedSearch(s) : null;
-      matchers.push(compiled && compiled.matcher ? compiled.matcher : null);
-      searchCounts[s.id] = 0;
-    });
-    state.papers.forEach(function (paper) {
+    visiblePapers.forEach(function (paper) {
       if (paper.deletedAt) { if (!state.hiddenPurged[paper.id]) trash++; return; }
       all++;
       var fids = paper.folderIds || [];
       if (!fids.length) unfiled++;
       if (paper.lastReadAt) recent++;
       for (var m = 0; m < fids.length; m++) byFolder[fids[m]] = (byFolder[fids[m]] || 0) + 1;
-      for (var s = 0; s < matchers.length; s++) if (matchers[s] && matchers[s](paper)) searchCounts[state.savedSearches[s].id]++;
     });
-    sidebarCountsCache = { sig: sig, data: { byFolder: byFolder, all: all, unfiled: unfiled, recent: recent, trash: trash, searchCounts: searchCounts } };
+    sidebarCountsCache = { sig: sig, data: { byFolder: byFolder, all: all, unfiled: unfiled, recent: recent, trash: trash } };
     return sidebarCountsCache.data;
   }
 
@@ -1336,27 +1475,12 @@
   }
 
   function compareFolders(a, b) {
-    return (a.sortIndex || 0) - (b.sortIndex || 0) || a.name.localeCompare(b.name);
+    return window.LitFolderTree.compareFolders(a, b);
   }
 
   function folderTree(includeCollapsed) {
-    var children = {}, byId = {}, result = [];
-    state.folders.forEach(function (folder) { byId[folder.id] = folder; });
-    state.folders.forEach(function (folder) {
-      var parentId = folder.parentId && byId[folder.parentId] ? folder.parentId : '';
-      (children[parentId] = children[parentId] || []).push(folder);
-    });
-    Object.keys(children).forEach(function (parentId) {
-      children[parentId].sort(compareFolders);
-    });
-    function visit(parentId, depth) {
-      (children[parentId] || []).forEach(function (folder) {
-        result.push({ folder: folder, depth: depth });
-        if (includeCollapsed || !state.collapsedFolders[folder.id]) visit(folder.id, depth + 1);
-      });
-    }
-    visit('', 0);
-    return result;
+    // 纯逻辑（排序/折叠/防环修复）在 js/foldertree.js，单一权威避免两处漂移
+    return window.LitFolderTree.buildVisibleRows(state.folders, includeCollapsed ? null : state.collapsedFolders);
   }
 
   function folderChildren(folderId) {
@@ -1376,34 +1500,7 @@
     return false;
   }
 
-  function renumberFolderOrder(parentId) {
-    folderChildren(parentId).forEach(function (folder, index) { folder.sortIndex = index; });
-  }
-
-  /** 拖动排序：mode 为 'before' | 'after' | 'inside' */
-  function reorderFolder(dragId, targetId, mode) {
-    var dragged = state.folders.find(function (folder) { return folder.id === dragId; });
-    var target = state.folders.find(function (folder) { return folder.id === targetId; });
-    if (!dragged || !target || dragId === targetId || isFolderDescendant(dragId, targetId)) return false;
-    var oldParent = dragged.parentId || '';
-    if (mode === 'inside') {
-      dragged.parentId = targetId;
-      var childrenOfTarget = folderChildren(targetId).filter(function (folder) { return folder.id !== dragId; });
-      childrenOfTarget.push(dragged);
-      childrenOfTarget.forEach(function (folder, index) { folder.sortIndex = index; });
-    } else {
-      dragged.parentId = target.parentId || '';
-      var siblings = folderChildren(target.parentId || '');
-      var pos = siblings.indexOf(target);
-      if (pos === -1) pos = siblings.length;
-      if (mode === 'after') pos++;
-      var without = siblings.filter(function (folder) { return folder.id !== dragId; });
-      without.splice(Math.max(0, Math.min(pos, without.length)), 0, dragged);
-      without.forEach(function (folder, index) { folder.sortIndex = index; });
-    }
-    if (oldParent !== (dragged.parentId || '')) renumberFolderOrder(oldParent);
-    return true;
-  }
+  /** 拖动排序统一走 window.LitFolderTree.applyMove（js/foldertree.js），此处不再留第二份实现 */
 
   function clearFolderDropMarks(keep) {
     $all('#folder-list .folder-item').forEach(function (row) {
@@ -1466,18 +1563,37 @@
 
   function selectFolder(folderId, options) {
     var multi = options && options.multi;
-    if (multi) {
+    var range = options && options.range;
+    if (range) {
+      // Shift 区间：锚点 = 最近一次普通/Ctrl 点击（不随区间点击移动），
+      // 区间取自当前可见行顺序（折叠节点不展开）；保持多选联合筛选语义
+      var anchor = state.folderSelAnchor || state.activeFolderId;
+      var visibleIds = folderTree().map(function (entry) { return entry.folder.id; });
+      var span = window.LitFolderTree.rangeIds(visibleIds, anchor, folderId);
+      if (!span.length) span = [folderId];
+      if (span.length) {
+        var previous = state.activeFolderIds.length ? state.activeFolderIds : [state.activeFolderId];
+        state.activeFolderIds = multi ? previous.concat(span).filter(function (id, index, ids) {
+          return visibleIds.indexOf(id) !== -1 && ids.indexOf(id) === index;
+        }) : span;
+        state.activeFolderId = state.activeFolderIds[0];
+      }
+    } else if (multi) {
       // 阶段四：Ctrl+点击加入/移出多选集合（联合筛选，含子文件夹）
+      if (!state.activeFolderIds.length && state.folders.some(function (f) { return f.id === state.activeFolderId; })) {
+        state.activeFolderIds = [state.activeFolderId];
+      }
       var idx = state.activeFolderIds.indexOf(folderId);
       if (idx === -1) state.activeFolderIds.push(folderId);
       else state.activeFolderIds.splice(idx, 1);
-      state.activeFolderId = state.activeFolderIds.length ? state.activeFolderIds[0] : folderId;
+      state.activeFolderId = state.activeFolderIds.length ? state.activeFolderIds[0] : 'all';
+      state.folderSelAnchor = folderId;
     } else {
       state.activeFolderId = folderId;
       state.activeFolderIds = [];
+      state.folderSelAnchor = folderId;
     }
-    state.activeSavedSearchId = '';   // 点击侧栏文件夹即退出智能文件夹视图
-    state.activeSavedSearchIds = [];
+    if (state.folders.some(function (f) { return f.id === folderId; })) state.folderFocusId = folderId;
     state.focusId = null;
     // 阶段四：切换文件夹保留筛选条件（不再清搜索框）
     state.selected = {};
@@ -1516,6 +1632,8 @@
       childCountByParent[pid] = (childCountByParent[pid] || 0) + 1;
     });
     var list = $('#folder-list');
+    // 键盘导航：重建会丢掉 DOM 焦点，重建前记下、重建后还给聚焦行
+    var hadFocus = document.activeElement === list || list.contains(document.activeElement);
     list.innerHTML = '';
     folderTree().forEach(function (entry) {
       var folder = entry.folder;
@@ -1524,9 +1642,15 @@
       if (state.activeFolderIds.indexOf(folder.id) !== -1) row.classList.add('multi-active');
       row.dataset.folder = folder.id;
       row.draggable = true;
+      row.tabIndex = -1;
+      row.setAttribute('role', 'treeitem');
+      row.setAttribute('aria-level', String(entry.depth + 1));
+      row.setAttribute('aria-selected', String(state.activeFolderId === folder.id || state.activeFolderIds.indexOf(folder.id) !== -1));
+      row.setAttribute('aria-expanded', entry.hasChildren ? String(!state.collapsedFolders[folder.id]) : 'false');
       row.style.setProperty('--folder-depth', entry.depth);
       row.classList.toggle('nested', entry.depth > 0);
       row.classList.toggle('collapsed', !!state.collapsedFolders[folder.id]);
+      if (state.folderFocusId === folder.id) row.classList.add('focused');
       var select = document.createElement('button');
       select.className = 'folder-select';
       select.dataset.folder = folder.id;
@@ -1544,6 +1668,7 @@
       var glyph = document.createElement('span');
       glyph.className = 'folder-glyph';
       glyph.setAttribute('aria-hidden', 'true');
+      glyph.innerHTML = svgUse('lb-i-folder');
       var label = document.createElement('span');
       label.className = 'folder-item-label';
       label.textContent = folder.name;
@@ -1576,27 +1701,54 @@
       list.appendChild(row);
     });
     $('#folder-empty').hidden = state.folders.length > 0;
-    renderSavedSearches();
+    if (hadFocus) {
+      var focusedRow = list.querySelector('.folder-item.focused') ||
+        (state.folderFocusId ? list.querySelector('.folder-item[data-folder="' + state.folderFocusId + '"]') : null);
+      if (focusedRow) focusedRow.focus({ preventScroll: true });
+      else list.focus({ preventScroll: true });
+    }
   }
 
-  /** 删除文件夹：子文件夹上移一级，文献本身保留（Zotero 行为） */
+  /** 与 Zotero 一致：删除整个集合子树，文献、附件及笔记保留。 */
   function deleteFolder(folderId) {
-    var folder = state.folders.find(function (item) { return item.id === folderId; });
-    if (!folder) return;
-    var childCount = state.folders.filter(function (item) { return item.parentId === folderId; }).length;
-    dlgConfirm(T('删除文件夹'), T('删除文件夹“') + folder.name + T('”？文献本身不会被删除。') +
-      (childCount ? T('其 ') + childCount + T(' 个子文件夹将上移一级。') : ''), T('删除'), true).then(function (ok) {
+    return deleteFolders([folderId]);
+  }
+
+  function deleteFolders(folderIds) {
+    var selected = state.folders.filter(function (folder) { return folderIds.indexOf(folder.id) !== -1; });
+    if (!selected.length) return;
+    var targetSet = window.LitFolderTree.collectSubtreeIds(state.folders, selected.map(function (f) { return f.id; }));
+    var targets = state.folders.filter(function (folder) { return targetSet[folder.id]; });
+    var names = selected.map(function (f) { return '「' + f.name + '」'; }).join('、');
+    var childTotal = targets.length - selected.length;
+    return dlgConfirm(T('删除 ') + targets.length + T(' 个文件夹'),
+      T('删除文件夹 ') + names + T('？文献本身不会被删除。') +
+        (childTotal ? T('共 ') + childTotal + T(' 个子文件夹将一并删除。') : ''),
+      T('删除'), true).then(function (ok) {
       if (!ok) return;
-      state.folders.forEach(function (item) { if (item.parentId === folderId) item.parentId = folder.parentId || ''; });
-      state.folders = state.folders.filter(function (item) { return item.id !== folderId; });
-      state.folderTombstones = state.folderTombstones.filter(function (item) { return item.id !== folderId; });
-      state.folderTombstones.push(Object.assign({}, folder, { deletedAt: Date.now() }));
-      state.papers.forEach(function (paper) {
-        paper.folderIds = (paper.folderIds || []).filter(function (fid) { return fid !== folderId; });
+      var affectedPaperIds = state.papers
+        .filter(function (p) { return (p.folderIds || []).some(function (fid) { return targetSet[fid]; }); })
+        .map(function (p) { return p.id; });
+      var undoIds = targets.map(function (folder) { return folder.id; });
+      var undoBefore = makeSnapshot({ folders: undoIds, papers: affectedPaperIds });
+      var deletedAt = Date.now();
+      state.folders = state.folders.filter(function (folder) { return !targetSet[folder.id]; });
+      state.folderTombstones = state.folderTombstones.filter(function (folder) { return !targetSet[folder.id]; });
+      targets.forEach(function (folder) {
+        state.folderTombstones.push(Object.assign({}, folder, { deletedAt: deletedAt }));
       });
-      if (state.activeFolderId === folderId) resetActiveFolder();
-      save(); renderAll();
-      toast(T('已删除文件夹“') + folder.name + '”');
+      state.papers.forEach(function (paper) {
+        paper.folderIds = (paper.folderIds || []).filter(function (fid) { return !targetSet[fid]; });
+      });
+      commitUndo(T('删除文件夹'), undoBefore, { folders: undoIds, papers: affectedPaperIds });
+      if (targetSet[state.activeFolderId]) resetActiveFolder();
+      state.activeFolderIds = state.activeFolderIds.filter(function (fid) { return !targetSet[fid]; });
+      if (state.folderSelAnchor && targetSet[state.folderSelAnchor]) state.folderSelAnchor = null;
+      if (state.folderFocusId && targetSet[state.folderFocusId]) state.folderFocusId = null;
+      renderAll();
+      return save().then(function (saved) {
+        if (saved) toast(T('已删除 ') + targets.length + T(' 个文件夹'));
+      });
     });
   }
 
@@ -1636,12 +1788,37 @@
     });
   }
 
-  function exportFolderBib(folder) {
-    var papers = folderPapers(folder.id);
-    if (!papers.length) { toast(T('该文件夹（含子文件夹）下没有文献')); return; }
-    var base = (window.LitRename && window.LitRename.sanitize(folder.name, 80)) || 'folder';
+  /** 内置视图（全部文献/未分类/最近阅读/回收站）的文献集合，口径与 filteredPapers 的
+   *  视图分支一致：彻底删除的永久墓碑在任何视图（含回收站）都不出现。 */
+  function libraryViewPapers(folderId) {
+    return state.papers.filter(function (p) {
+      if (state.hiddenPurged[p.id]) return false;
+      if (folderId === 'trash') return !!p.deletedAt;
+      if (p.deletedAt) return false;
+      if (folderId === 'all') return true;
+      if (folderId === 'unfiled') return !(p.folderIds || []).length;
+      if (folderId === 'recent') return !!p.lastReadAt;
+      return false;
+    });
+  }
+
+  function libraryViewLabel(folderId) {
+    if (folderId === 'all') return T('全部文献');
+    if (folderId === 'unfiled') return T('未分类');
+    if (folderId === 'recent') return T('最近阅读');
+    return T('回收站');
+  }
+
+  /** 导出任意文献集合为 BibTeX；emptyMsg 由调用方给出更贴合语境的「没有文献」提示 */
+  function exportPapersBib(papers, baseName, emptyMsg) {
+    if (!papers.length) { toast(emptyMsg || T('没有可导出的文献')); return; }
+    var base = (window.LitRename && window.LitRename.sanitize(baseName, 80)) || 'library';
     var out = papers.map(window.LitBib.paperToBibtex).join('\n\n');
     download(base + '.bib', out);
+  }
+
+  function exportFolderBib(folder) {
+    exportPapersBib(folderPapers(folder.id), folder.name, T('该文件夹（含子文件夹）下没有文献'));
   }
 
   function buildFolderCtxItems(folder) {
@@ -1650,6 +1827,7 @@
       'sep',
       { label: T('新建文件夹'), icon: 'lb-i-folder-new', fn: function () { openFolderCreator(''); } },
       { label: T('新建子文件夹'), icon: 'lb-i-folder-new', fn: function () { openFolderCreator(folder.id); } },
+      { label: T('在此导入文件夹…'), icon: 'lb-i-folder-import', fn: function () { chooseFolderImport(folder.id); } },
       'sep',
       { label: T('导出 PDF…'), icon: 'lb-i-tray-up', fn: function () { exportPdfs(folderPapers(folder.id)); } },
       { label: T('导出 BibTeX'), icon: 'lb-i-doc', fn: function () { exportFolderBib(folder); } },
@@ -1658,6 +1836,63 @@
       { label: T('重命名…'), icon: 'lb-i-pencil', fn: function () { renameFolder(folder.id); } },
       { label: T('删除文件夹'), icon: 'lb-i-trash', danger: true, fn: function () { deleteFolder(folder.id); } }
     ];
+  }
+
+  /** 右键多选集合时的批量菜单：删除对整组生效（Zotero 式） */
+  function buildFolderCtxItemsMulti(folderIds) {
+    var count = folderIds.length;
+    return [
+      { header: count + T(' 个文件夹') },
+      'sep',
+      { label: T('新建文件夹'), icon: 'lb-i-folder-new', fn: function () { openFolderCreator(''); } },
+      { label: T('新建子文件夹'), icon: 'lb-i-folder-new', fn: function () { openFolderCreator(folderIds[0]); } },
+      'sep',
+      { label: T('删除 ') + count + T(' 个文件夹'), icon: 'lb-i-trash', danger: true,
+        fn: function () { deleteFolders(folderIds); } }
+    ];
+  }
+
+  /** 回收站「恢复全部」：清空墓碑标记，条目回到原文件夹 */
+  function restoreAllTrash() {
+    var ids = libraryViewPapers('trash').map(function (p) { return p.id; });
+    if (!ids.length) { toast(T('回收站已经是空的')); return; }
+    var n = restorePapers(ids);
+    state.selected = {};
+    renderAll();
+    toast(T('✓ 已恢复 ') + n + T(' 篇'));
+  }
+
+  /** 清空回收站：站内全部条目彻底删除（永久墓碑，不可恢复） */
+  function emptyTrash() {
+    var ids = libraryViewPapers('trash').map(function (p) { return p.id; });
+    if (!ids.length) { toast(T('回收站已经是空的')); return; }
+    dlgConfirm(T('清空回收站'),
+      T('彻底删除回收站中的 ') + ids.length + T(' 篇文献？此操作不可恢复！'),
+      T('清空回收站'), true).then(function (ok) {
+      if (!ok) return;
+      var n = purgePapers(ids);
+      toast(T('✓ 已清空回收站，彻底删除 ') + n + T(' 篇'));
+    });
+  }
+
+  /** 内置视图右键菜单：集合级操作与文件夹菜单对齐；回收站换成恢复/清空 */
+  function buildLibraryCtxItems(folderId) {
+    var label = libraryViewLabel(folderId);
+    var items = [{ header: label }, 'sep'];
+    if (folderId === 'trash') {
+      items.push({ label: T('恢复全部'), icon: 'lb-i-undo', fn: restoreAllTrash });
+      items.push('sep');
+      items.push({ label: T('清空回收站'), icon: 'lb-i-trash', danger: true, fn: emptyTrash });
+      return items;
+    }
+    var papers = libraryViewPapers(folderId);
+    items.push({ label: T('导出 PDF…'), icon: 'lb-i-tray-up', fn: function () { exportPdfs(papers); } });
+    items.push({ label: T('导出 BibTeX'), icon: 'lb-i-doc', fn: function () { exportPapersBib(papers, label); } });
+    items.push({ label: T('构建引文网络'), icon: 'lb-i-layers', fn: function () { openGraphForPapers(papers.slice(0, 200)); } });
+    items.push('sep');
+    items.push({ label: T('新建文件夹'), icon: 'lb-i-folder-new', fn: function () { openFolderCreator(''); } });
+    items.push({ label: T('导入文件夹…'), icon: 'lb-i-folder-import', fn: function () { chooseFolderImport(''); } });
+    return items;
   }
 
   var drawerFolderFilter = '';
@@ -1769,118 +2004,6 @@
     renderFolderList(list, paper, drawerFolderFilter);
     // 底部操作
     wrap.insertAdjacentHTML('beforeend', actionsHtml);
-  }
-
-  // ---------- 智能文件夹 ----------
-  function savedSearchCount(search) {
-    return sidebarCounts().searchCounts[search.id] || 0;
-  }
-
-  function renderSavedSearches() {
-    var list = $('#saved-search-list');
-    if (!list) return;
-    list.innerHTML = '';
-    state.savedSearches.slice().sort(function (a, b) { return a.sortIndex - b.sortIndex; }).forEach(function (search) {
-      var row = document.createElement('div');
-      var isActive = state.activeSavedSearchId === search.id || state.activeSavedSearchIds.indexOf(search.id) !== -1;
-      row.className = 'saved-search-item' + (isActive ? ' active' : '');
-      var select = document.createElement('button');
-      select.type = 'button';
-      select.className = 'saved-search-select';
-      select.dataset.savedSearch = search.id;
-      select.title = search.query + T('（Ctrl+点击可多选联合）');
-      select.innerHTML = '<span class="saved-search-label">' + svgUse('lb-i-search') + esc(search.name) + '</span>' +
-        '<span class="library-count">' + savedSearchCount(search) + '</span>';
-      var editBtn = document.createElement('button');
-      editBtn.type = 'button';
-      editBtn.className = 'saved-search-edit';
-      editBtn.dataset.editSavedSearch = search.id;
-      editBtn.title = T('编辑智能文件夹');
-      editBtn.textContent = '✎';
-      var del = document.createElement('button');
-      del.type = 'button';
-      del.className = 'saved-search-delete';
-      del.dataset.deleteSavedSearch = search.id;
-      del.title = T('删除智能文件夹');
-      del.textContent = '×';
-      row.appendChild(select);
-      row.appendChild(editBtn);
-      row.appendChild(del);
-      list.appendChild(row);
-    });
-  }
-
-  function saveCurrentSearch() {
-    var query = state.filters.q.trim();
-    if (!query) { toast(T('先在搜索框输入条件（如 tag:综述 year>=2020）')); return; }
-    dlgPrompt(T('智能文件夹名称'), T('保存当前搜索条件：') + query, '', query.length > 24 ? query.slice(0, 24) + '…' : query).then(function (name) {
-      if (name == null) return;
-      name = name.trim().slice(0, 80);
-      if (!name) return;
-      if (window.LitQuery) {
-        var parsed = window.LitQuery.parse(query);
-        if (parsed.error) { toast(T('搜索语法有误，无法保存：') + parsed.error); return; }
-      }
-      state.savedSearches.push({
-        id: 'ss' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36),
-        name: name, query: query,
-        ast: window.LitQuery ? window.LitQuery.serializeAst(window.LitQuery.parseAst(query)) : '',
-        sortIndex: state.savedSearches.length
-      });
-      save();
-      renderSavedSearches();
-      toast(T('✓ 已保存智能文件夹「') + name + '」');
-    });
-  }
-
-  /** 阶段四：编辑智能文件夹（改名 + 改条件；AST 随保存更新，旧记录运行时自动迁移） */
-  function editSavedSearch(id) {
-    var search = state.savedSearches.find(function (s) { return s.id === id; });
-    if (!search) return;
-    dlgPrompt(T('重命名智能文件夹'), T('名称'), search.name).then(function (name) {
-      if (name == null) return;
-      name = name.trim().slice(0, 80);
-      if (!name) return;
-      dlgPrompt(T('搜索条件'), T('语法同搜索框；支持 ann(...)/note(...)/folder:"名称"/lastread>=2024-01-01/missing:venue'), search.query).then(function (query) {
-        if (query == null) return;
-        query = query.trim();
-        if (!query) return;
-        var parsed = window.LitQuery ? window.LitQuery.parse(query) : null;
-        if (parsed && (parsed.error || !parsed.matcher)) {
-          toast(T('搜索语法有误：') + (parsed.error || T('空条件')));
-          return;
-        }
-        search.name = name;
-        search.query = query;
-        search.ast = window.LitQuery ? window.LitQuery.serializeAst(window.LitQuery.parseAst(query)) : '';
-        window.LitModel.touch(search);
-        save();
-        renderSavedSearches();
-        renderAll();
-        toast(T('✓ 已更新智能文件夹「') + name + '」');
-      });
-    });
-  }
-
-  /** 应用智能文件夹；multi（Ctrl+点击）= 加入/移出多选联合集 */
-  function applySavedSearch(id, multi) {
-    if (multi) {
-      var idx = state.activeSavedSearchIds.indexOf(id);
-      if (idx === -1) state.activeSavedSearchIds.push(id);
-      else state.activeSavedSearchIds.splice(idx, 1);
-      state.activeSavedSearchId = state.activeSavedSearchIds.length ? state.activeSavedSearchIds[0] : '';
-    } else if (state.activeSavedSearchId === id) {
-      state.activeSavedSearchId = '';   // 再点一次取消
-      state.activeSavedSearchIds = [];
-    } else {
-      state.activeSavedSearchId = id;
-      state.activeSavedSearchIds = [];
-    }
-    resetActiveFolder();
-    state.activeFolderIds = [];
-    // 阶段四：切换智能文件夹保留筛选条件（不再清搜索框）
-    state.tablePage = 0;
-    renderAll();
   }
 
   // ---------- 标签管理 ----------
@@ -2017,8 +2140,9 @@
       var row = document.createElement('div');
       row.className = 'attachment-row';
       var icon = att.kind === 'pdf' ? svgUse('lb-i-doc') : (att.kind === 'supp' ? svgUse('lb-i-paperclip') : svgUse('lb-i-package'));
-      var badge = att.path ? T('<span class="attachment-badge local">本地</span>')
-        : (att.cloudName ? T('<span class="attachment-badge cloud">云端</span>') : T('<span class="attachment-badge missing">缺文件</span>'));
+      var badge = !att.path
+        ? (att.cloudName ? T('<span class="attachment-badge cloud">云端</span>') : T('<span class="attachment-badge missing">缺文件</span>'))
+        : '';
       row.innerHTML = '<span class="attachment-icon" aria-hidden="true">' + icon + '</span>' +
         '<span class="attachment-name" title="' + esc(att.path || att.fileName || '') + '">' +
           esc(att.fileName || att.path || T('(未命名)')) + '</span>' +
@@ -2206,6 +2330,8 @@
   }
 
   function activateEpubTab(tab, cfiOverride) {
+    ++pdfOpenRequest;
+    pausePdfReadingTimer();
     // 收起 PDF overlay（若可见）
     if (!$('#pdf-overlay').hidden) {
       saveReadPos.flush();
@@ -2310,6 +2436,7 @@
   }
 
   function openEpubViewer(paper, attachmentId, cfi) {
+    organizePaperAttachments(paper && paper.id);
     if (!window.LitEpub) { toast(T('EPUB 组件未加载')); return; }
     var attachment = epubAttachment(paper, attachmentId);
     if (!desktop || !attachment || !attachment.path) { toast(T('没有可阅读的本地 EPUB 附件')); return; }
@@ -2563,83 +2690,161 @@
     if (epubNotePanel) epubNotePanel.renderStale();
   }
 
-  function addAttachmentsTo(paper) {
-    if (!desktop || !desktop.chooseFiles) { toast(T('添加附件需要桌面版')); return; }
-    desktop.chooseFiles({ title: T('添加附件到「') + String(paper.title).slice(0, 24) + '」' }).then(function (files) {
-      if (!files || !files.length) return;
-      paper.attachments = paper.attachments || [];
-      files.forEach(function (file) {
-        paper.attachments.push(window.LitModel.normalizeAttachment({
-          id: attachmentUid(),
-          kind: window.LitModel.attachmentKindForFile(file.name) || 'supp',
-          fileName: file.name,
-          path: file.path
-        }));
-      });
-      var norm = window.LitModel.normalizePaper(paper, uid);
-      norm.id = paper.id;
-      state.papers[state.papers.indexOf(paper)] = norm;
-      save(); renderAll(); openDrawer(paper.id);
-      toast(T('✓ 已添加 ') + files.length + T(' 个附件'));
-    }).catch(function (e) { toast(T('⚠ 添加附件失败：') + (e && e.message || e)); });
+  var itemOrganizeInFlight = Object.create(null);
+  var itemOrganizeSeen = Object.create(null);
+  function attachmentPathsKey(paper) {
+    return (paper && paper.attachments || []).map(function (att) {
+      return att && att.path ? att.id + ':' + att.path : '';
+    }).join('\n');
   }
 
-  /* 文件拖到条目行上：附加到该条目（Zotero 式行级落点，对照 collectionViewItemTree.onDrop
-   * 的 application/x-moz-file 分支）。PDF 拷入受管 synced-attachments（files:store-pdf）后挂为
-   * PDF 附件（原无主 PDF 则置首，与导入合并同口径）；其他类型比照「添加附件」走外部路径；
-   * .lnk 快捷方式拒绝（Zotero 同）。附加后为该篇补建全文索引。 */
-  function attachDroppedFiles(paper, files) {
-    if (!desktop) { toast(T('附加文件需要桌面版')); return; }
+  /** 旧附件在首次打开该条目时复制进专属目录；先校验副本，再保存路径，原件保留。 */
+  function organizePaperAttachments(paperId) {
+    if (!paperId || !desktop || !desktop.organizeItemAttachments) return Promise.resolve();
+    var paper = getById(paperId);
+    if (!paper || paper.deletedAt || !(paper.attachments || []).some(function (att) { return att && att.path; })) return Promise.resolve();
+    var key = attachmentPathsKey(paper);
+    if (itemOrganizeSeen[paperId] === key) return Promise.resolve();
+    if (itemOrganizeInFlight[paperId]) return itemOrganizeInFlight[paperId];
+    var list = paper.attachments.filter(function (att) { return att && att.id && att.path; }).map(function (att) {
+      return { id: att.id, kind: att.kind, fileName: att.fileName, path: att.path };
+    });
+    itemOrganizeInFlight[paperId] = desktop.organizeItemAttachments({ paperId: paperId, attachments: list })
+      .then(function (result) {
+        if (!result || result.error) throw new Error(result && result.error || T('附件整理失败'));
+        if (result.failed && result.failed.length) {
+          toast('⚠ ' + T('部分附件整理失败：') + result.failed[0].error);
+        }
+        return waitForLocalSave().then(function (ready) {
+          if (!ready) return;
+          var current = getById(paperId);
+          if (!current || current.deletedAt) return;
+          var changes = {};
+          (result.updated || []).forEach(function (entry) { changes[entry.id] = entry; });
+          var changed = false;
+          var attachments = (current.attachments || []).map(function (att) {
+            var entry = att && changes[att.id];
+            if (!entry || att.path !== entry.from) return att;
+            changed = true;
+            return Object.assign({}, att, { path: entry.path });
+          });
+          if (!changed) {
+            itemOrganizeSeen[paperId] = attachmentPathsKey(current);
+            return backfillPdfFingerprints([paperId]);
+          }
+          var next = window.LitModel.normalizePaper(Object.assign({}, current, { attachments: attachments }), uid);
+          next.id = current.id;
+          var index = state.papers.indexOf(current);
+          if (index === -1) return;
+          state.papers[index] = next;
+          return save(true).then(function (saved) {
+            if (!saved) return;
+            itemOrganizeSeen[paperId] = attachmentPathsKey(next);
+            renderAll();
+            if (drawerId === paperId) openDrawer(paperId);
+            return backfillPdfFingerprints([paperId]);
+          });
+        });
+      }).catch(function (error) { toast('⚠ ' + T('附件整理失败：') + (error && error.message || error)); })
+      .finally(function () { delete itemOrganizeInFlight[paperId]; });
+    return itemOrganizeInFlight[paperId];
+  }
+
+  function attachmentSourcePath(file) {
+    if (desktop && desktop.getPathForFile) {
+      try {
+        var resolved = desktop.getPathForFile(file);
+        if (resolved) return resolved;
+      } catch (error) { /* 文件选择对话框返回的是普通路径对象，不是 File */ }
+    }
+    return file && file.path ? String(file.path) : '';
+  }
+
+  /** Zotero 式子附件：先复制到条目受管目录，成功后一次性提交附件记录。 */
+  function attachFilesToPaper(paper, files, fromDrop) {
+    if (!desktop || !desktop.storeAttachment) { toast(T('附加文件需要桌面版')); return Promise.resolve(); }
     var list = Array.prototype.slice.call(files || []);
-    if (list.some(function (f) { return /\.lnk$/i.test(f.name); })) toast(T('⚠ 快捷方式（.lnk）无法作为附件，已跳过'));
-    list = list.filter(function (f) { return !/\.lnk$/i.test(f.name); });
-    if (!list.length) return;
-    var pdfs = list.filter(function (f) { return /\.pdf$/i.test(f.name); });
-    var epubs = list.filter(function (f) { return /\.epub$/i.test(f.name); });
-    var supps = list.filter(function (f) { return !/\.pdf$/i.test(f.name) && !/\.epub$/i.test(f.name); });
-    paper.attachments = paper.attachments || [];
+    if (list.some(function (file) { return /\.lnk$/i.test(file.name); })) toast(T('⚠ 快捷方式（.lnk）无法作为附件，已跳过'));
+    list = list.filter(function (file) { return !/\.lnk$/i.test(file.name); });
+    // DataTransfer 的 File 离开 drop 事件后可能失效；必须在这里同步解析真实路径。
+    var sources = list.map(function (file) {
+      return { name: file.name, path: attachmentSourcePath(file) };
+    });
+    var added = [];
     var chain = Promise.resolve();
-    pdfs.forEach(function (f) {
+    sources.forEach(function (file) {
       chain = chain.then(function () {
-        return desktop.storePdf({ path: f.path }).then(function (result) {
-          if (!result || result.error || result.unchanged) {
-            toast('⚠ ' + f.name + T(' 存储失败：') + (result && result.error || T('文件已在库中')));
+        var sourcePath = file.path;
+        if (!sourcePath) {
+          toast('⚠ ' + file.name + T(' 存储失败：') + T('无效的源文件路径'));
+          return;
+        }
+        var current = getById(paper.id);
+        var existing = (current && current.attachments || []).concat(added).filter(function (att) {
+          return att && att.kind === 'pdf' && att.path;
+        }).map(function (att) { return { kind: att.kind, path: att.path }; });
+        return desktop.storeAttachment({ paperId: paper.id, path: sourcePath, existing: existing }).then(function (result) {
+          if (!result || result.error) {
+            toast('⚠ ' + file.name + T(' 存储失败：') + (result && result.error || T('无效的源文件路径')));
             return;
           }
-          var att = window.LitModel.normalizeAttachment({
+          if (result.duplicate) {
+            toast('⚠ ' + file.name + ' · ' + T('文件已在库中'));
+            return;
+          }
+          added.push(window.LitModel.normalizeAttachment({
             id: attachmentUid(),
-            kind: 'pdf',
-            fileName: result.name || f.name,
+            kind: window.LitModel.attachmentKindForFile(file.name) || 'supp',
+            fileName: file.name,
             path: result.path
-          });
-          var hasPrimary = (paper.attachments || []).some(function (a) { return a && a.kind === 'pdf' && a.path; });
-          if (!hasPrimary) paper.attachments.unshift(att); else paper.attachments.push(att);
+          }));
         });
       });
     });
-    supps.forEach(function (f) {
-      chain = chain.then(function () {
-        paper.attachments.push(window.LitModel.normalizeAttachment({
-          id: attachmentUid(),
-          kind: window.LitModel.attachmentKindForFile(f.name) || 'supp',
-          fileName: f.name,
-          path: f.path
-        }));
+    return chain.then(function () {
+      if (!added.length) return;
+      var current = getById(paper.id);
+      if (!current || current.deletedAt) return;
+      var attachments = (current.attachments || []).slice();
+      added.forEach(function (attachment) {
+        if (attachment.kind === 'pdf' && !attachments.some(function (a) { return a && a.kind === 'pdf'; })) {
+          attachments.unshift(attachment);
+        } else attachments.push(attachment);
       });
-    });
-    chain.then(function () {
-      window.LitModel.touch(paper);
-      var norm = window.LitModel.normalizePaper(paper, uid);
-      norm.id = paper.id;
-      var idx = state.papers.indexOf(paper);
-      if (idx !== -1) state.papers[idx] = norm;
-      save(); renderAll();
-      toast(T('✓ 已附加 ') + list.length + T(' 个文件到「') + String(paper.title || '').slice(0, 24) + '」');
-      if (pdfs.length || epubs.length) {
-        indexPaperFulltext(norm);
-        backfillPdfFingerprints().then(renderAll).catch(function () {});
-      }
-    }).catch(function (e) { toast(T('⚠ 附加失败：') + (e && e.message || e)); });
+      var next = Object.assign({}, current, { attachments: attachments });
+      window.LitModel.touch(next);
+      var norm = window.LitModel.normalizePaper(next, uid);
+      norm.id = current.id;
+      state.papers[state.papers.indexOf(current)] = norm;
+      return save().then(function (saved) {
+        if (!saved) return;
+        renderAll();
+        if (!fromDrop) openDrawer(paper.id);
+        toast(fromDrop
+          ? T('✓ 已附加 ') + added.length + T(' 个文件到「') + String(paper.title || '').slice(0, 24) + '」'
+          : T('✓ 已添加 ') + added.length + T(' 个附件'));
+        if (added.some(function (a) { return a.kind === 'pdf' || a.kind === 'epub'; })) {
+          backfillPdfFingerprints([paper.id]).then(function () {
+            var updated = getById(paper.id);
+            if (updated) indexPaperFulltext(updated);
+            renderAll();
+            return organizePaperAttachments(paper.id);
+          }).catch(function () {});
+        } else organizePaperAttachments(paper.id);
+      });
+    }).catch(function (error) { toast(T('⚠ 附加失败：') + (error && error.message || error)); });
+  }
+
+  function addAttachmentsTo(paper) {
+    if (!desktop || !desktop.chooseFiles) { toast(T('添加附件需要桌面版')); return; }
+    desktop.chooseFiles({ title: T('添加附件到「') + String(paper.title).slice(0, 24) + '」' }).then(function (files) {
+      if (files && files.length) return attachFilesToPaper(paper, files, false);
+    }).catch(function (error) { toast(T('⚠ 添加附件失败：') + (error && error.message || error)); });
+  }
+
+  /* 文件拖到条目行上：File 路径必须经 preload 的 webUtils.getPathForFile 解析。 */
+  function attachDroppedFiles(paper, files) {
+    return attachFilesToPaper(paper, files, true);
   }
 
   function renameAttachmentByTemplate(paper, attId) {
@@ -2863,14 +3068,14 @@
     updateSelectionUi();
   }
   /** Shift 区间选择：从锚点行到目标行（按当前筛选/排序顺序）全部选中，替换原选择 */
-  function selectRangeTo(targetId) {
+  function selectRangeTo(targetId, additive) {
     var list = filteredPapers();
     var targetIdx = -1, anchorIdx = -1;
     for (var i = 0; i < list.length; i++) {
       if (list[i].id === targetId) targetIdx = i;
       if (list[i].id === state.selAnchor) anchorIdx = i;
     }
-    state.selected = {};
+    if (!additive) state.selected = {};
     if (targetIdx === -1) return;
     if (anchorIdx === -1) { state.selected[targetId] = true; return; }
     var from = Math.min(anchorIdx, targetIdx), to = Math.max(anchorIdx, targetIdx);
@@ -2944,7 +3149,7 @@
     var old = $('.ybar-x'); if (old) old.remove();
 
     var counts = {};
-    state.papers.forEach(function (p) { if (!p.deletedAt && p.year != null) counts[p.year] = (counts[p.year] || 0) + 1; });
+    state.papers.forEach(function (p) { if (!p.deletedAt && !state.hiddenPurged[p.id] && p.year != null) counts[p.year] = (counts[p.year] || 0) + 1; });
     var years = Object.keys(counts).map(Number).sort(function (a, b) { return a - b; });
     if (!years.length) {
       body.innerHTML = T('<div class="chart-empty">导入文献后显示年份分布</div>');
@@ -3003,7 +3208,22 @@
       });
       bar.addEventListener('mouseleave', function () { tooltip.hidden = true; });
       bar.addEventListener('click', function () {
-        state.filters.year = (state.filters.year === y) ? null : y;
+        if (state.filters.year === y) {
+          state.filters.year = null;
+        } else {
+          // 柱图统计整个正式库；点击后列表也切到同一范围，避免旧筛选遮住这几篇。
+          clearFilters();
+          resetActiveFolder();
+          state.activeFolderIds = [];
+          state.activeSavedSearchId = '';
+          state.activeSavedSearchIds = [];
+          state.ftEnabled = false;
+          ftSearchToken++;
+          state.ftHits = {};
+          $('#btn-ft').classList.remove('active');
+          $('#ft-status').hidden = true;
+          state.filters.year = y;
+        }
         state.tablePage = 0;
         renderAll();
       });
@@ -3021,7 +3241,8 @@
     var mid = seq[Math.floor(seq.length / 2)];
     seq.forEach(function (y) {
       var s = document.createElement('span');
-      if (y === seq[0] || y === maxY || (seq.length > 4 && y === mid)) s.textContent = y;
+      if ((y === seq[0] && (showAll || minY >= recentStart)) ||
+          y === maxY || (seq.length > 4 && y === mid)) s.textContent = y;
       axis.appendChild(s);
     });
     body.parentNode.appendChild(axis);
@@ -3036,11 +3257,14 @@
     var freq = tagFrequency();
     var tags = Object.keys(freq).sort(function (a, b) { return freq[b] - freq[a]; }).slice(0, 12);
     wrap.innerHTML = '';
+    $('#tag-list-resize').hidden = tags.length === 0;
+    $('#sidebar-tag-panel').classList.toggle('no-tags', tags.length === 0);
     tags.forEach(function (t) {
       var b = document.createElement('button');
       b.className = 'chip' + (state.filters.tag === t ? ' active' : '');
       if (state.tagColors[t]) b.style.setProperty('--tag-color', state.tagColors[t]);
       b.textContent = t + ' ' + freq[t];
+      b.title = t + ' ' + freq[t];
       b.addEventListener('click', function () {
         state.filters.tag = (state.filters.tag === t) ? '' : t;
         state.tablePage = 0;
@@ -3050,8 +3274,8 @@
     });
   }
 
-  var STATUS_LABEL = { unread: T('未读'), reading: T('在读'), read: T('已读') };
-  var STATUS_NEXT = { unread: 'reading', reading: 'read', read: 'unread' };
+  var STATUS_LABEL = { unread: T('未读'), reading: T('在读') };
+  var STATUS_NEXT = { unread: 'reading', reading: 'unread' };
 
   function starsHtml(n) {
     var s = '';
@@ -3171,6 +3395,10 @@
     var result = window.LitQuery && window.LitQuery.searchEntities
       ? window.LitQuery.searchEntities(qRaw, { papers: papers, notes: state.notes, folders: state.folders }, { scope: scope })
       : { total: 0, items: [] };
+    if (result.error) {
+      box.innerHTML = '<p class="field-hint">' + esc(T('搜索语法有误：') + result.error) + '</p>';
+      return;
+    }
     // M3：ID 索引替代逐项全库 find；切换查询/视图时回到第一页
     var paperById = {};
     papers.forEach(function (item) { paperById[item.id] = item; });
@@ -3222,6 +3450,54 @@
     }).join('');
   }
 
+  function decorateTableRows(pageItems) {
+    var papersById = {};
+    pageItems.forEach(function (paper) { papersById[paper.id] = paper; });
+    $all('#table-body tr[data-id], #table-body tr.attachment-subrow').forEach(function (row) {
+      var paper = papersById[row.dataset.id || row.dataset.parentId];
+      if (!paper) return;
+      ['attachment', 'title', 'authors', 'year', 'venue', 'rank', 'rating'].forEach(function (key, index) {
+        row.cells[index].dataset.column = key;
+      });
+      var statusCell = row.insertCell(2);
+      statusCell.dataset.column = 'status';
+      if (row.dataset.id) {
+        statusCell.className = 'cell-status';
+        statusCell.innerHTML = '<span class="status-dot status-' + esc(paper.status || 'unread') + '"></span>' +
+          esc(STATUS_LABEL[paper.status] || paper.status || '—');
+        var title = row.querySelector('.t-title');
+        var reason = row.querySelector('.search-match-reason');
+        if (title) title.title = paper.title + (reason ? '\n' + reason.textContent : '');
+        var sub = row.querySelector('.t-sub');
+        if (sub) {
+          var badge = sub.querySelector('.ft-badge');
+          if (badge) row.querySelector('.t-title-row').appendChild(badge);
+          if (paper.notes) row.querySelector('.t-title-row').insertAdjacentHTML('beforeend',
+            '<span class="row-note-mark" title="' + T('有笔记') + '">' + svgUse('lb-i-note') + '</span>');
+          sub.remove();
+        }
+        if (reason) reason.remove();
+      } else {
+        statusCell.textContent = '—';
+      }
+      function addCell(key, value, tooltip) {
+        var cell = row.insertCell(-1);
+        cell.dataset.column = key;
+        cell.className = 'cell-truncate';
+        cell.textContent = value || '—';
+        if (tooltip) cell.title = tooltip;
+      }
+      if (row.dataset.id) {
+        addCell('tags', (paper.tags || []).join(', '), (paper.tags || []).join(', '));
+        addCell('addedAt', paper.addedAt ? new Date(paper.addedAt).toLocaleDateString() : '');
+        addCell('updatedAt', paper.updatedAt ? new Date(paper.updatedAt).toLocaleDateString() : '');
+        addCell('doi', paper.doi, paper.doi);
+      } else {
+        ['tags', 'addedAt', 'updatedAt', 'doi'].forEach(function (key) { addCell(key, ''); });
+      }
+    });
+  }
+
   function renderTable(list) {
     // 阶段四：非文献视图渲染命中列表
     var entityBox = $('#entity-hits');
@@ -3253,7 +3529,7 @@
     state.tablePage = Math.max(0, Math.min(state.tablePage, pageCount - 1));
     var start = state.tablePage * TABLE_PAGE_SIZE;
     var pageItems = list.slice(start, start + TABLE_PAGE_SIZE);
-    var visibleCount = state.papers.filter(function (p) { return !state.hiddenPurged[p.id]; }).length;
+    var visibleCount = state.papers.concat(folderImportPreviewPapers).filter(function (p) { return !state.hiddenPurged[p.id]; }).length;
     $('#empty-state').style.display = visibleCount ? 'none' : '';
     // M3：跳过引导后，空库只显示一行简版提示（信息仍在，不再展开四步清单）
     var onboardDismissed = false;
@@ -3261,8 +3537,10 @@
     $('#onboard-steps').hidden = onboardDismissed;
     $('#onboard-actions').hidden = onboardDismissed;
     $('#onboard-short').hidden = !onboardDismissed;
+    var folderViewActive = state.activeFolderIds.length > 0 ||
+      (!!state.activeFolderId && state.activeFolderId !== 'all');
     $('#table-foot').textContent = visibleCount
-      ? T('共 ') + visibleCount + T(' 篇') + (hasActiveFilters() ? T('，当前显示 ') + list.length + T(' 篇') : '')
+      ? T('共 ') + visibleCount + T(' 篇') + (hasActiveFilters() || folderViewActive ? T('，当前显示 ') + list.length + T(' 篇') : '')
       : '';
 
     $('#table-pagination').hidden = list.length <= TABLE_PAGE_SIZE;
@@ -3280,6 +3558,12 @@
 
     var rows = [];
     pageItems.forEach(function (p) {
+      if (p.folderImportPreview) {
+        rows.push('<tr class="lit-row" aria-busy="true"><td class="col-attachment">…</td>' +
+          '<td class="col-title"><div class="t-title">' + esc(p.title) + '</div></td>' +
+          '<td colspan="5">' + T('正在导入…') + '</td></tr>');
+        return;
+      }
       var atts = (p.attachments || []);
       var hasAtts = atts.length > 0;
       var isExpanded = !!state.expandedRows[p.id];
@@ -3329,9 +3613,8 @@
           var attName = att.fileName || (att.path ? att.path.split(/[/\\]/).pop() : '') || kindLabel;
           var badges = [];
           if (primary === att) badges.push(T('<span class="attachment-badge primary">主 PDF</span>'));
-          if (att.path) badges.push(T('<span class="attachment-badge local">本地</span>'));
-          else if (att.cloudName) badges.push(T('<span class="attachment-badge cloud">云端</span>'));
-          else badges.push(T('<span class="attachment-badge missing">缺文件</span>'));
+          if (!att.path && att.cloudName) badges.push(T('<span class="attachment-badge cloud">云端</span>'));
+          else if (!att.path) badges.push(T('<span class="attachment-badge missing">缺文件</span>'));
 
           var acts = [];
           if (att.path && desktop) {
@@ -3361,10 +3644,12 @@
     // 筛选后零结果：空库（无任何文献）仍走 onboard 空态，这里只提示「筛选无命中」
     var filterActive = hasActiveFilters() || (state.activeFolderId && state.activeFolderId !== 'all');
     if (!rows.length && filterActive) {
-      rows.push('<tr class="lit-row"><td colspan="7">' +
+      rows.push('<tr class="lit-row"><td colspan="' + visibleTableColumns().length + '">' +
         T('<p class="field-hint">当前筛选下没有匹配的条目。</p>') + '</td></tr>');
     }
     tbody.innerHTML = rows.join('');
+    decorateTableRows(pageItems);
+    applyTableColumns();
     syncCheckAll(list);
   }
 
@@ -3406,7 +3691,6 @@
       applyPortableConfigRuntime: applyPortableConfigRuntime,
       fillSyncForm: fillSyncForm,
       setSyncIndicator: setSyncIndicator,
-      setIntegrationConfig: function (config) { integrationConfig = config; },
       isSyncBusy: function () { return syncBusy; },
       download: download,
       stamp: stamp
@@ -3856,7 +4140,6 @@
     items.push('sep');
     items.push({ label: T('标为未读'), dot: 'unread', fn: function () { ctxSetStatus('unread', papers); } });
     items.push({ label: T('标为在读'), dot: 'reading', fn: function () { ctxSetStatus('reading', papers); } });
-    items.push({ label: T('标为已读'), dot: 'read', fn: function () { ctxSetStatus('read', papers); } });
     items.push('sep');
     items.push({ label: T('添加标签…'), icon: 'lb-i-tag', fn: function () { ctxAddTags(papers); } });
     if (state.folders.length) {
@@ -3872,7 +4155,7 @@
     items.push('sep');
     var linkFolder = currentFolderLinkTarget();
     if (linkFolder) {
-      items.push({ label: T('从当前文件夹移出'), icon: 'lb-i-trash', fn: function () {
+      items.push({ label: T('从当前文件夹移出'), icon: 'lb-i-folder', fn: function () {
         dlgConfirm(T('从当前文件夹移出'), T('将选中的 ') + papers.length + T(' 篇从“') + linkFolder.name +
           T('”移出？文献、附件及其它文件夹中的链接都会保留。'), T('移出')).then(function (ok) {
           if (ok) removePapersFromFolder(papers, linkFolder);
@@ -4024,6 +4307,7 @@
   var drawerId = null;
   var saveNotes = null;
   var drawerInlineEditing = false;
+  var drawerEnriching = false;
 
   function setDrawerInlineEditControls(editing) {
     var editButton = $('#d-edit');
@@ -4116,6 +4400,7 @@
   function openDrawerAndReveal(id) {
     if (window.LitAgentUi && window.LitAgentUi.switchPane) window.LitAgentUi.switchPane('detail');
     openDrawer(id);
+    organizePaperAttachments(id);
   }
 
   function openDrawer(id) {
@@ -4236,8 +4521,8 @@
       glyphEl.className = 'detail-folder-glyph';
       glyphEl.innerHTML = svgUse('lb-i-inbox');
     } else {
-      glyphEl.className = 'import-folder-glyph' + (depth > 0 ? ' child' : '');
-      glyphEl.setAttribute('aria-hidden', 'true');
+      glyphEl.className = 'detail-folder-glyph';
+      glyphEl.innerHTML = svgUse('lb-i-folder');
     }
     var nameEl = document.createElement('span');
     nameEl.className = 'folder-name';
@@ -4387,40 +4672,73 @@
     return T('；已合并到原条目：') + shown.join('；') + (unique.length > shown.length ? T('；另有 ') + (unique.length - shown.length) + T(' 条') : '');
   }
 
-  var backfillPdfFingerprintsRunning = false;
-  function backfillPdfFingerprints() {
+  var backfillPdfFingerprintsQueue = Promise.resolve();
+  function backfillPdfFingerprints(paperIds) {
     if (!desktop || !window.LitPdf.fingerprint) return Promise.resolve();
-    if (backfillPdfFingerprintsRunning) return Promise.resolve();
-    backfillPdfFingerprintsRunning = true;
-    var targets = [];
-    state.papers.forEach(function (paper) {
-      if (paper.deletedAt) return;
-      (paper.attachments || []).forEach(function (att) {
-        if (att && (att.kind === 'pdf' || att.kind === 'epub') && att.path && !att.fingerprint) targets.push({ paper: paper, attachment: att });
+    var allowed = null;
+    if (Array.isArray(paperIds)) {
+      allowed = Object.create(null);
+      paperIds.forEach(function (id) { if (id) allowed[id] = true; });
+    }
+    var run = backfillPdfFingerprintsQueue.then(function () {
+      var targets = [];
+      state.papers.forEach(function (paper) {
+        if (paper.deletedAt || allowed && !allowed[paper.id]) return;
+        (paper.attachments || []).forEach(function (att) {
+          if (att && (att.kind === 'pdf' || att.kind === 'epub') && att.path && !att.fingerprint) {
+            targets.push({ paperId: paper.id, attachmentId: att.id, path: att.path });
+          }
+        });
+      });
+      var cursor = 0;
+      var resolved = [];
+      function worker() {
+        var target = targets[cursor++];
+        if (!target) return Promise.resolve();
+        return Promise.race([
+          window.LitPdf.fingerprint(target.path),
+          new Promise(function (resolve) { setTimeout(function () { resolve(''); }, 10000); })
+        ]).then(function (fingerprint) {
+          if (/^[a-f0-9]{64}$/i.test(String(fingerprint || ''))) {
+            resolved.push(Object.assign({}, target, { fingerprint: String(fingerprint).toLowerCase() }));
+          }
+        }).catch(function () { /* 文件已移动或缺失时仍可继续导入 */ }).then(worker);
+      }
+      return Promise.all([worker(), worker(), worker()]).then(function () {
+        if (!resolved.length) return;
+        var byPaper = Object.create(null), removedIndexes = [], touched = false;
+        resolved.forEach(function (result) {
+          (byPaper[result.paperId] = byPaper[result.paperId] || []).push(result);
+        });
+        Object.keys(byPaper).forEach(function (paperId) {
+          var paper = getById(paperId);
+          if (!paper || paper.deletedAt) return;
+          var merged = window.LitPdfImportFlow.applyFingerprints(paper, byPaper[paperId], window.LitDedupe);
+          if (!merged.changed) return;
+          touched = true;
+          var next = Object.assign({}, paper, {
+            attachments: merged.attachments,
+            pdfAnnotations: remapAnnotationAttachments(paper.pdfAnnotations, merged.aliases).annotations
+          });
+          window.LitModel.touch(next);
+          var normalized = window.LitModel.normalizePaper(next, uid);
+          normalized.id = paper.id;
+          state.papers[state.papers.indexOf(paper)] = normalized;
+          Object.keys(merged.aliases).forEach(function (removedId) {
+            if (removedId && removedId !== merged.aliases[removedId]) {
+              removedIndexes.push({ paperId: paperId, attachmentId: removedId });
+            }
+          });
+        });
+        if (!touched) return;
+        return save(true).then(function (saved) {
+          if (!saved || !window.LitPdfSearch || !LitPdfSearch.invalidate) return;
+          removedIndexes.forEach(function (item) { LitPdfSearch.invalidate(item.paperId, item.attachmentId); });
+        });
       });
     });
-    var cursor = 0;
-    function worker() {
-      var target = targets[cursor++];
-      if (!target) return Promise.resolve();
-      return Promise.race([
-        window.LitPdf.fingerprint(target.attachment.path),
-        new Promise(function (resolve) { setTimeout(function () { resolve(''); }, 10000); })
-      ]).then(function (fingerprint) {
-        if (!fingerprint) return;
-        target.attachment.fingerprint = fingerprint;
-        window.LitModel.touch(target.paper);
-        var norm = window.LitModel.normalizePaper(target.paper, uid);
-        norm.id = target.paper.id;
-        var idx = state.papers.indexOf(target.paper);
-        if (idx !== -1) state.papers[idx] = norm;
-      }).catch(function () { /* 文件已移动或缺失时仍可继续导入 */ }).then(worker);
-    }
-    return Promise.all([worker(), worker(), worker()]).then(function () {
-      if (targets.length) save(true);
-    }).finally(function () {
-      backfillPdfFingerprintsRunning = false;
-    });
+    backfillPdfFingerprintsQueue = run.catch(function () {});
+    return run;
   }
   function restoreJsonWorkspace(workspace) {
     var replacing = workspaceStore.replace(workspace);
@@ -4483,10 +4801,16 @@
   /** 把解析出的新 PDF 拷进配置目录/synced-attachments，再交给 addPapers。
    *  已在库中或同批次出现的相同指纹只合并文件夹归属，不再制造第二份受管文件。
    *  4 worker 并发拷贝：各条目只改自己附件对象的 path/fileName，互不依赖；与解析段（3 worker）同量级，不给主进程压队列 */
-  function storeImportedPdfFiles(papers) {
+  function storeImportedPdfFiles(papers, options) {
     if (!desktop || !desktop.storePdf) return Promise.resolve();
-    return window.LitPdfImportFlow.storePdfAttachments(papers, state.papers, function (path) {
-      return desktop.storePdf({ path: path });
+    // 复制前先确定最终条目 ID：同 DOI/指纹的不同 PDF 进入同一个物理目录。
+    var paperIdByAttachment = window.LitPdfImportFlow.assignItemIds(
+      papers, state.papers, window.LitDedupe, uid);
+    return window.LitPdfImportFlow.storePdfAttachments(papers, state.papers, function (sourcePath, attachment) {
+      if (options && typeof options.isCancelled === 'function' && options.isCancelled()) {
+        return { error: T('已停止') };
+      }
+      return desktop.storePdf({ path: sourcePath, paperId: paperIdByAttachment.get(attachment) });
     }).catch(function (error) {
       throw new Error(T('PDF 复制失败：') + (error && error.message || error));
     });
@@ -4503,7 +4827,7 @@
     if (affected.length) LitPdfSearch.reindex(affected, function () {}).catch(function () {});
   }
 
-  function parsePdfEntries(entries, inputOf, assignPaper) {
+  function parsePdfEntries(entries, inputOf, assignPaper, options) {
     return window.LitPdfImportFlow.parseMany(entries, function (entry) {
       return window.LitPdf.pdfToPaper(inputOf(entry)).then(function (paper) {
         if (assignPaper) assignPaper(paper, entry);
@@ -4512,6 +4836,8 @@
     }, {
       concurrency: 3,
       timeoutMs: 75000,
+      isCancelled: options && options.isCancelled,
+      onStart: options && options.onStart,
       onError: function (entry, error) {
         toast('⚠ ' + entry.name + T(' 解析失败：') +
           (error && error.message === 'timeout' ? T('解析超时（可能是网络请求挂起）') : (error && error.message || error)));
@@ -4527,7 +4853,7 @@
       return waitForLocalSave().then(function (saved) {
         if (!saved) throw new Error(T('导入结果未能保存到本地'));
         // 指纹回填和全文索引可在导入成功后后台进行，不阻塞下一批目录。
-        backfillPdfFingerprints().then(function () {
+        backfillPdfFingerprints((result.addedIds || []).concat((result.matches || []).map(function (m) { return m.id; }))).then(function () {
           renderAll();
           queueImportedPdfIndex(result);
         }).catch(function () {});
@@ -4553,68 +4879,215 @@
       });
   }
 
-  /* 拖入文件夹导入：目录树 → LitBoard 文件夹（同名复用，重复拖入幂等）+ PDF 识别建条目并建全文索引。
-   * 源文件全程只读：storePdf 走 fs.copyFile 拷入受管 synced-attachments，原目录不动；
-   * 目录树不落磁盘，以 folders 实体表达（与同步/备份口径一致）。规划逻辑在 js/folderimport.js。 */
-  function importDroppedFolder(dirPath, targetFolderId) {
-    if (!desktop || !desktop.scanFolder) {
+  /* 目录树导入：PDF 走现有解析/去重，其他文档作为附件条目；原件始终保留。 */
+  var folderImportBusy = false;
+  var folderImportCancelled = false;
+  var folderImportPreviewPapers = [];
+  function chooseFolderImport(targetFolderId) {
+    if (!desktop || !desktop.chooseDirectory || !desktop.scanFolder) {
       toast(T('导入文件夹需要桌面版'));
-      return Promise.resolve();
+      return;
     }
-    toast(T('正在扫描文件夹…'));
-    return desktop.scanFolder({ path: dirPath }).then(function (scan) {
-      if (!scan || scan.error) {
-        toast('⚠ ' + ((scan && scan.error) || T('扫描失败')));
-        return;
-      }
+    desktop.chooseDirectory({}).then(function (dirPath) {
+      if (dirPath) return importDroppedFolder(dirPath, targetFolderId);
+    }).catch(function (error) { toast('⚠ ' + (error && error.message || error)); });
+  }
+  async function importDroppedFolder(dirPath, targetFolderId) {
+    if (!desktop || !desktop.scanFolder || !desktop.storeAttachment) {
+      toast(T('导入文件夹需要桌面版'));
+      return;
+    }
+    if (folderImportBusy) { toast(T('已有文件夹正在导入，请稍后再试')); return; }
+    folderImportBusy = true;
+    folderImportCancelled = false;
+    $('#more-stop-folder-import').hidden = false;
+    var createdFolderIds = [], persistStarted = false;
+    try {
+      if (!state.folders.some(function (folder) { return folder.id === targetFolderId; })) targetFolderId = '';
+      var scan = await desktop.scanFolder({ path: dirPath });
+      if (!scan || scan.error) throw new Error((scan && scan.error) || T('扫描失败'));
+      if (folderImportCancelled) { toast(T('已停止导入')); return; }
       var plan = window.LitFolderImport.planFolderImport({
         scan: scan, folders: state.folders, targetFolderId: targetFolderId
       });
-      if (!plan.pdfs.length) {
-        toast(plan.skippedNonPdf
-          ? T('文件夹中没有可导入的 PDF（跳过 {n} 个非 PDF 文件）', { n: plan.skippedNonPdf })
-          : T('文件夹中没有可导入的 PDF'));
-        return;
+      if (!plan.files.length) { toast(T('文件夹中没有可导入的文档')); return; }
+
+      var folderIdByKey = Object.create(null);
+      var rootId = plan.root.id || folderUid();
+      function nextSortIndex(parentId) {
+        return state.folders.filter(function (f) { return (f.parentId || '') === parentId; }).length;
       }
-      // 建文件夹：root + createList（BFS 序，父先于子），与建文件夹表单同款字段
-      var folderIdByKey = {};
-      var rootId = plan.root.id;
-      if (!rootId) {
-        rootId = folderUid();
-        state.folders.push({ id: rootId, name: plan.root.name, parentId: targetFolderId, sortIndex: folderChildren(targetFolderId).length });
+      if (!plan.root.id) {
+        state.folders.push({ id: rootId, name: plan.root.name,
+          parentId: targetFolderId, sortIndex: nextSortIndex(targetFolderId) });
+        createdFolderIds.push(rootId);
       }
-      plan.createList.forEach(function (spec) {
+      selectFolder(rootId);
+      await new Promise(function (resolve) { setTimeout(resolve, 0); });
+      for (var folderIndex = 0; folderIndex < plan.createList.length; folderIndex++) {
+        var spec = plan.createList[folderIndex];
         var parentId = spec.parentKey ? (plan.reuseMap[spec.parentKey] || folderIdByKey[spec.parentKey]) : rootId;
         var id = folderUid();
-        state.folders.push({ id: id, name: spec.name, parentId: parentId, sortIndex: folderChildren(parentId).length });
+        state.folders.push({ id: id, name: spec.name, parentId: parentId, sortIndex: nextSortIndex(parentId) });
+        createdFolderIds.push(id);
         folderIdByKey[spec.key] = id;
+        if (folderIndex % 8 === 7 || folderIndex === plan.createList.length - 1) {
+          renderFolders();
+          await new Promise(function (resolve) { setTimeout(resolve, 0); });
+        }
+      }
+      if (folderImportCancelled) {
+        state.folders = state.folders.filter(function (folder) { return createdFolderIds.indexOf(folder.id) === -1; });
+        renderAll();
+        toast(T('已停止导入'));
+        return;
+      }
+      function folderFor(entry) {
+        return entry.dirRel ? (plan.reuseMap[entry.dirRel] || folderIdByKey[entry.dirRel] || rootId) : rootId;
+      }
+
+      var failures = [], duplicates = [], drafts = [], seenKeys = Object.create(null);
+      var attemptedPdfs = 0, attemptedOther = 0;
+      var previewTimer = null;
+      function showImportPreview(paper) {
+        var preview = window.LitModel.normalizePaper(paper, uid);
+        preview.folderImportPreview = true;
+        folderImportPreviewPapers.push(preview);
+        if (!previewTimer) previewTimer = setTimeout(function () {
+          previewTimer = null;
+          renderAll();
+        }, 50);
+      }
+      var pdfPapers = await parsePdfEntries(plan.pdfs, function (entry) {
+        return { name: entry.name, path: entry.abs };
+      }, function (paper, entry) { paper.folderIds = [folderFor(entry)]; showImportPreview(paper); }, {
+        isCancelled: function () { return folderImportCancelled; },
+        onStart: function () { attemptedPdfs++; }
       });
-      save(); renderFolders();
+      for (var missing = pdfPapers.length; missing < attemptedPdfs; missing++) failures.push('PDF');
+      await storeImportedPdfFiles(pdfPapers);
+      for (var i = 0; i < plan.otherFiles.length; i++) {
+        if (folderImportCancelled) break;
+        attemptedOther++;
+        var entry = plan.otherFiles[i];
+        var key = entry.sourceKey;
+        var existing = key && state.papers.find(function (paper) {
+          return !paper.deletedAt && paper.sourceMeta && paper.sourceMeta.folderImportKey === key;
+        });
+        if (existing || key && seenKeys[key]) {
+          duplicates.push({ paper: existing || seenKeys[key], folderId: folderFor(entry) });
+          continue;
+        }
+        var paperId = uid();
+        try {
+          var stored = await desktop.storeAttachment({ paperId: paperId, path: entry.abs, existing: [] });
+          if (!stored || stored.error || !stored.path) {
+            stored = await desktop.storeAttachment({ paperId: paperId, path: entry.abs, existing: [] });
+          }
+          if (!stored || stored.error || !stored.path) throw new Error(stored && stored.error || T('附件复制失败'));
+          var paper = { id: paperId, entryType: 'misc',
+            title: entry.name.replace(/\.[^.]+$/, '').trim() || entry.name,
+            folderIds: [folderFor(entry)],
+            sourceMeta: { folderImportKey: key, folderImportSize: entry.size },
+            attachments: [{ id: attachmentUid(), kind: window.LitModel.attachmentKindForFile(entry.name) || 'other',
+              fileName: entry.name, path: stored.path }] };
+          drafts.push(paper);
+          showImportPreview(paper);
+          if (key) seenKeys[key] = paper;
+        } catch (error) { failures.push(entry.rel + ': ' + (error && error.message || error)); }
+      }
+      duplicates.forEach(function (item) {
+        if ((item.paper.folderIds || []).indexOf(item.folderId) === -1) item.paper.folderIds.push(item.folderId);
+      });
+      folderImportPreviewPapers = [];
+      if (previewTimer) { clearTimeout(previewTimer); previewTimer = null; }
+      persistStarted = true;
+      var result = pdfPapers.length || drafts.length ? addPapers(pdfPapers.concat(drafts), {}) : null;
+      if (!result) save();
+      renderAll();
+      if (!await waitForLocalSave()) throw new Error(T('导入结果未能保存到本地'));
       selectFolder(rootId);
-      return waitForLocalSave().then(function (saved) {
-        if (!saved) throw new Error(T('导入文件夹未能保存到本地'));
-        toast(T('正在解析 ') + plan.pdfs.length + T(' 个 PDF…'));
-        return parsePdfEntries(plan.pdfs, function (entry) {
-          return { name: entry.name, path: entry.abs };
-        }, function (paper, entry) {
-          var folderId = entry.dirRel ? (plan.reuseMap[entry.dirRel] || folderIdByKey[entry.dirRel] || rootId) : rootId;
-          paper.folderIds = [folderId];
-        });
-      }).then(function (papers) { return finishPdfImport(papers, ''); })
-        .then(function (result) {
-          if (!result) return;
-          toast(T('✓ 已导入文件夹「') + plan.root.name + '」' + T('新增 ') + result.added + T(' 篇') +
-            (result.merged ? T('，匹配已有 ') + result.merged + T(' 篇') : '') +
-            (result.attached ? T('，其中 ') + result.attached + T(' 个 PDF 已挂到原条目') : '') +
-            T('，新建文件夹 {a} 个、复用 {b} 个', { a: plan.createdCount, b: plan.reusedCount }) +
-            (plan.skippedNonPdf ? T('，跳过 {n} 个非 PDF 文件', { n: plan.skippedNonPdf }) : ''),
-            result.matches.length ? 7000 : undefined);
-          if (desktop && desktop.getScigreatRank) refreshFolderJournalRanks(rootId);
-          return result;
-        });
-    }).catch(function (err) {
-      toast('⚠ ' + (err && err.message || err));
+      var duplicateCount = duplicates.length + (result ? result.merged : 0);
+      var importedCount = result ? result.added : 0;
+      toast(T('✓ 文件夹导入完成：发现 {found} 个文件；新增 {added} 个、重复 {duplicates} 个、失败 {failed} 个；新建文件夹 {created} 个、复用 {reused} 个', {
+        found: plan.files.length, added: importedCount, duplicates: duplicateCount,
+        failed: failures.length, created: plan.createdCount, reused: plan.reusedCount
+      }) + (folderImportCancelled ? T('；已停止，未处理 {n} 个', { n: plan.files.length - attemptedPdfs - attemptedOther }) : '') +
+        (plan.skippedUnsupported ? T('；跳过不支持的文件 {n} 个', { n: plan.skippedUnsupported }) : '') +
+        (scan.hiddenSkipped ? T('；跳过隐藏项 {n} 个', { n: scan.hiddenSkipped }) : '') +
+        (scan.unreadable && scan.unreadable.length ? T('；无法读取 {n} 项', { n: scan.unreadable.length }) : ''), 9000);
+      if (result && pdfPapers.length) {
+        backfillPdfFingerprints((result.addedIds || []).concat((result.matches || []).map(function (m) { return m.id; })))
+          .then(function () { queueImportedPdfIndex(result); }).catch(function () {});
+      }
+      if (desktop && desktop.getScigreatRank) refreshFolderJournalRanks(rootId);
+      return result;
+    } catch (error) {
+      if (!persistStarted) {
+        state.folders = state.folders.filter(function (folder) { return createdFolderIds.indexOf(folder.id) === -1; });
+      }
+      toast('⚠ ' + (error && error.message || error));
+    } finally {
+      if (previewTimer) clearTimeout(previewTimer);
+      folderImportPreviewPapers = [];
+      renderAll();
+      folderImportBusy = false;
+      $('#more-stop-folder-import').hidden = true;
+    }
+  }
+
+  async function importLooseDocuments(files, folderId) {
+    if (!desktop || !desktop.storeAttachment) { toast(T('导入文件需要桌面版')); return; }
+    var supported = window.LitFolderImport.supportedExtensions;
+    var entries = (files || []).filter(function (file) {
+      return supported.some(function (ext) { return file.name.toLowerCase().endsWith(ext); });
     });
+    if (!entries.length) { toast(T('没有可导入的文档')); return; }
+    try {
+      var pdfEntries = entries.filter(function (file) { return /\.pdf$/i.test(file.name); });
+      var pdfPapers = await parsePdfEntries(pdfEntries, function (entry) { return entry; }, function (paper) {
+        paper.folderIds = folderId ? [folderId] : [];
+      });
+      await storeImportedPdfFiles(pdfPapers);
+      var drafts = [], duplicates = [], failures = pdfEntries.length - pdfPapers.length;
+      var seen = Object.create(null);
+      for (var i = 0; i < entries.length; i++) {
+        var entry = entries[i];
+        if (/\.pdf$/i.test(entry.name)) continue;
+        var key = 'loose:' + entry.name.toLowerCase() + ':' + Number(entry.size || 0);
+        var existing = state.papers.find(function (paper) {
+          return !paper.deletedAt && paper.sourceMeta && paper.sourceMeta.folderImportKey === key;
+        });
+        if (existing || seen[key]) { duplicates.push(existing || seen[key]); continue; }
+        var paperId = uid();
+        try {
+          var stored = await desktop.storeAttachment({ paperId: paperId, path: entry.path, existing: [] });
+          if (!stored || stored.error || !stored.path) throw new Error(stored && stored.error || T('附件复制失败'));
+          var paper = { id: paperId, entryType: 'misc',
+            title: entry.name.replace(/\.[^.]+$/, '').trim() || entry.name,
+            folderIds: folderId ? [folderId] : [], sourceMeta: { folderImportKey: key },
+            attachments: [{ id: attachmentUid(), kind: window.LitModel.attachmentKindForFile(entry.name) || 'other',
+              fileName: entry.name, path: stored.path }] };
+          drafts.push(paper);
+          seen[key] = paper;
+        } catch (error) { failures++; }
+      }
+      duplicates.forEach(function (paper) {
+        if (folderId && (paper.folderIds || []).indexOf(folderId) === -1) paper.folderIds.push(folderId);
+      });
+      var result = pdfPapers.length || drafts.length ? addPapers(pdfPapers.concat(drafts), {}) : null;
+      if (!result && duplicates.length) save();
+      renderAll();
+      if (!await waitForLocalSave()) throw new Error(T('导入结果未能保存到本地'));
+      toast(T('✓ 文档导入完成：新增 {added} 个、重复 {duplicates} 个、失败 {failed} 个', {
+        added: result ? result.added : 0,
+        duplicates: duplicates.length + (result ? result.merged : 0), failed: failures
+      }));
+      if (result && pdfPapers.length) {
+        backfillPdfFingerprints((result.addedIds || []).concat((result.matches || []).map(function (m) { return m.id; })))
+          .then(function () { queueImportedPdfIndex(result); }).catch(function () {});
+      }
+    } catch (error) { toast('⚠ ' + (error && error.message || error)); }
   }
 
   function handleFiles(fileList, folderId) {
@@ -5146,6 +5619,7 @@
     if (idx !== -1) state.papers[idx] = norm;
     commitUndo(T('编辑字段'), undoBefore, { papers: [p.id] });
     save(); renderAll();
+    organizePaperAttachments(p.id);
     return { venueChanged: venueChanged };
   }
 
@@ -5249,7 +5723,45 @@
     renderToken: 0, searchResults: [], searchMatches: [], searchIndex: -1
   };
   var pdfTabs = [];              // [{ paper, attachment, page, scale, layout, rotation, scrollTop }]
+  var pdfOpenRequest = 0;
   var pdfThumbsObserver = null;
+  var pdfOutlineRows = [];
+  var PDF_SIDE_WIDTH_KEY = 'litboard.pdfSideWidth';
+  var PDF_SIDE_COLLAPSED_KEY = 'litboard.pdfSideCollapsed';
+  var PDF_READING_THRESHOLD_MS = 10 * 60 * 1000;
+  var pdfReadingElapsed = Object.create(null);
+  var pdfReadingActive = null;
+
+  function pausePdfReadingTimer() {
+    if (!pdfReadingActive) return;
+    clearTimeout(pdfReadingActive.timer);
+    pdfReadingElapsed[pdfReadingActive.key] = (pdfReadingElapsed[pdfReadingActive.key] || 0) +
+      Math.max(0, Date.now() - pdfReadingActive.started);
+    pdfReadingActive = null;
+  }
+
+  function startPdfReadingTimer(paper, attachmentId) {
+    pausePdfReadingTimer();
+    if (!paper || !attachmentId || paper.status !== 'unread' || document.hidden || $('#pdf-overlay').hidden) return;
+    var key = paper.id + ':' + attachmentId;
+    var active = { paper: paper, key: key, started: Date.now(), timer: null };
+    pdfReadingActive = active;
+    active.timer = setTimeout(function () {
+      if (pdfReadingActive !== active) return;
+      pausePdfReadingTimer();
+      if (paper.status !== 'unread' || $('#pdf-overlay').hidden || !pdfState.paper ||
+          pdfState.paper.id !== paper.id || pdfState.attachmentId !== attachmentId) return;
+      paper.status = 'reading';
+      save();
+      renderAll();
+      if (drawerId === paper.id) $('#d-status').value = 'reading';
+    }, Math.max(0, PDF_READING_THRESHOLD_MS - (pdfReadingElapsed[key] || 0)));
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) pausePdfReadingTimer();
+    else if (!$('#pdf-overlay').hidden && pdfState.pageCount > 0) startPdfReadingTimer(pdfState.paper, pdfState.attachmentId);
+  });
 
   function persistReadPos(paperId) {
     if (!desktop || !desktop.setSetting || !pdfState.paper || pdfState.paper.id !== paperId) return;
@@ -5291,7 +5803,8 @@
 
   function stashPdfTab() {
     if (!pdfState.paper) return;
-    var tab = pdfTabs.find(function (t) { return t.paper.id === pdfState.paper.id; });
+    // 同一条目可有多个 PDF 标签，必须按附件身份保存，不能覆盖同条目的第一个标签。
+    var tab = window.LitPdfTabs.find(pdfTabs, pdfState.paper.id, pdfState.attachmentId);
     if (tab) {
       tab.page = pdfState.currentPage;
       tab.attachment = pdfState.attachment;
@@ -5303,6 +5816,8 @@
   }
 
   function goToLibraryTab() {
+    ++pdfOpenRequest;
+    pausePdfReadingTimer();
     saveReadPos.flush();
     stashPdfTab();
     if (!$('#epub-overlay').hidden) { stashEpubTab(); persistEpubReadPos.flush(); }
@@ -5381,6 +5896,8 @@
   }
 
   function activatePdfTab(tab) {
+    ++pdfOpenRequest;
+    pausePdfReadingTimer();
     setPdfPageLocked(true);
     if (!$('#epub-overlay').hidden) { stashEpubTab(); persistEpubReadPos.flush(); epubTtsStop(); hideEpubSelPopover(); $('#epub-overlay').hidden = true; }
     $('#pdf-overlay').hidden = false;
@@ -5389,6 +5906,7 @@
     pdfState.attachment = tab.attachment || pdfAttachment(tab.paper, '');
     pdfState.attachmentId = pdfState.attachment ? pdfState.attachment.id : '';
     pdfState.currentPage = tab.page || 1;
+    pdfState.pageCount = 0;
     pdfState.scale = tab.scale || 1.35;
     pdfState.layout = tab.layout || 'single';
     pdfState.rotation = tab.rotation || 0;
@@ -5405,13 +5923,15 @@
     renderPdfViewer();
     renderPdfTabs();
     if (tab.scrollTop) {
-      pdfState.handle.promise.then(function () {
-        if (tab.scrollTop) $('#pdf-scroll').scrollTop = tab.scrollTop;
+      var restoringHandle = pdfState.handle;
+      restoringHandle.promise.then(function () {
+        if (pdfState.handle === restoringHandle && tab.scrollTop) $('#pdf-scroll').scrollTop = tab.scrollTop;
       }).catch(function () {});
     }
   }
 
   function switchPdfTab(key) {
+    ++pdfOpenRequest;
     if (!$('#pdf-overlay').hidden && pdfState.paper && pdfState.attachmentId &&
         pdfState.paper.id + ':' + pdfState.attachmentId === key) return;
     stashPdfTab();
@@ -5420,12 +5940,15 @@
   }
 
   function hidePdfOverlay() {
+    ++pdfOpenRequest;
+    pausePdfReadingTimer();
     savePdfAnnotationComment.flush();
     if (pdfState.handle) { pdfState.handle.cancel(); pdfState.handle = null; }
     if (pdfThumbsObserver) { pdfThumbsObserver.disconnect(); pdfThumbsObserver = null; }
     $('#pdf-scroll').innerHTML = '';
     $('#pdf-outline').innerHTML = '';
     $('#pdf-thumbs').innerHTML = '';
+    pdfOutlineRows = [];
     hidePdfTranslation();
     setPdfPageLocked(false);
     $('#pdf-overlay').hidden = true;
@@ -5447,6 +5970,7 @@
     pdfTabs.splice(idx, 1);
     if (!pdfTabs.length) {
       if (epubTabs.length) {
+        pausePdfReadingTimer();
         // PDF 标签清空但还有 EPUB 标签：收起 PDF overlay，切到 EPUB
         if (pdfState.handle) { pdfState.handle.cancel(); pdfState.handle = null; }
         hidePdfTranslation();
@@ -5475,23 +5999,28 @@
   }
 
   function openPdfViewer(paper, attachmentId) {
+    organizePaperAttachments(paper && paper.id);
     var attachment = pdfAttachment(paper, attachmentId);
     if (!desktop || !attachment || !attachment.path) { toast(T('没有可阅读的本地 PDF 附件')); return; }
+    var request = ++pdfOpenRequest;
     var tabKey = paper.id + ':' + attachment.id;
     if (!$('#pdf-overlay').hidden && pdfState.paper && pdfState.paper.id + ':' + pdfState.attachmentId === tabKey) return;
     if (!$('#pdf-overlay').hidden) stashPdfTab();
-    $('#pdf-overlay').hidden = false;
     recordPaperRead(paper);
     var tab = pdfTabs.find(function (t) { return t.key === tabKey; });
     if (tab) { activatePdfTab(tab); return; }
     if (pdfTabs.length >= 8) { toast(T('最多同时打开 8 个 PDF')); return; }
     tab = { key: tabKey, paper: paper, attachment: attachment };
     pdfTabs.push(tab);
+    renderPdfTabs();
+    function activateIfCurrent() {
+      if (request === pdfOpenRequest && pdfTabs.indexOf(tab) !== -1) activatePdfTab(tab);
+    }
     if (desktop.getSetting) {
       desktop.getSetting('readpos:' + paper.id + ':' + attachment.id).then(function (pos) {
         if (!pos) return desktop.getSetting('readpos:' + paper.id);
         return pos;
-      }).then(function (pos) {
+      }).catch(function () { return null; }).then(function (pos) {
         if (pos && pdfTabs.indexOf(tab) !== -1) {
           tab.page = pos.page || 1;
           tab.scale = pos.scale || 1.35;
@@ -5499,10 +6028,10 @@
           tab.rotation = pos.rotation || 0;
           tab.scrollTop = pos.scrollTop || 0;
         }
-        activatePdfTab(tab);
-      }).catch(function () { activatePdfTab(tab); });
+        activateIfCurrent();
+      });
     } else {
-      activatePdfTab(tab);
+      activateIfCurrent();
     }
   }
 
@@ -5539,6 +6068,7 @@
     $('#pdf-page-prev').disabled = pdfState.currentPage <= 1;
     $('#pdf-page-next').disabled = pdfState.currentPage >= pdfState.pageCount;
     markPdfThumb(pdfState.currentPage);
+    markPdfOutline(pdfState.currentPage);
     saveReadPos();
     refreshAgentChips(); // R19：chip 上的「第 N 页」跟随翻页
   }
@@ -5633,33 +6163,77 @@
   }
 
   // ---------- 大纲 / 缩略图 ----------
+  function markPdfOutline(page) {
+    var active = null;
+    var previous = $('#pdf-outline .pdf-outline-row.active');
+    pdfOutlineRows.forEach(function (entry) {
+      entry.row.classList.remove('active');
+      if (entry.page <= page && !entry.row.closest('.pdf-outline-children[hidden]') &&
+          (!active || entry.page >= active.page)) active = entry;
+    });
+    if (active) {
+      active.row.classList.add('active');
+      if (active.row !== previous && !$('#pdf-side').hidden && $('#pdf-side').dataset.tab === 'outline') {
+        active.row.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      }
+    }
+  }
+
   function renderPdfOutline(doc) {
     var wrap = $('#pdf-outline');
     wrap.innerHTML = '';
+    pdfOutlineRows = [];
     if (!doc) return;
     doc.getOutline().then(function (outline) {
+      if (!pdfState.handle || pdfState.handle.doc !== doc) return;
       if (!outline || !outline.length) {
         wrap.innerHTML = T('<div class="pdf-side-empty">本文档没有大纲</div>');
         return;
       }
-      function addItems(items, depth) {
+      function addItems(items, parent) {
         items.forEach(function (item) {
+          var node = document.createElement('div');
+          node.className = 'pdf-outline-node';
+          var rowWrap = document.createElement('div');
+          rowWrap.className = 'pdf-outline-row';
+          var toggle = document.createElement('button');
+          toggle.type = 'button';
+          toggle.className = 'pdf-outline-toggle';
+          toggle.textContent = item.down && item.down.length ? '›' : '';
+          toggle.disabled = !item.down || !item.down.length;
           var row = document.createElement('button');
           row.type = 'button';
           row.className = 'pdf-outline-item';
-          row.style.paddingLeft = (10 + depth * 14) + 'px';
           row.title = item.title || '';
           row.textContent = item.title || T('(未命名)');
           row.addEventListener('click', function () {
             if (Number.isFinite(Number(item.page)) && Number(item.page) >= 0) goToPdfPage(Number(item.page) + 1);
           });
-          wrap.appendChild(row);
-          if (item.down && item.down.length) addItems(item.down, depth + 1);
+          rowWrap.appendChild(toggle);
+          rowWrap.appendChild(row);
+          node.appendChild(rowWrap);
+          parent.appendChild(node);
+          if (Number.isInteger(item.page) && item.page >= 0) pdfOutlineRows.push({ row: rowWrap, page: item.page + 1 });
+          if (item.down && item.down.length) {
+            var children = document.createElement('div');
+            children.className = 'pdf-outline-children';
+            children.hidden = item.open === false;
+            toggle.setAttribute('aria-expanded', String(!children.hidden));
+            toggle.setAttribute('aria-label', T('展开或收起大纲章节'));
+            toggle.addEventListener('click', function () {
+              children.hidden = !children.hidden;
+              toggle.setAttribute('aria-expanded', String(!children.hidden));
+              markPdfOutline(pdfState.currentPage);
+            });
+            node.appendChild(children);
+            addItems(item.down, children);
+          }
         });
       }
-      addItems(outline, 0);
+      addItems(outline, wrap);
+      markPdfOutline(pdfState.currentPage);
     }).catch(function () {
-      wrap.innerHTML = T('<div class="pdf-side-empty">大纲读取失败</div>');
+      if (pdfState.handle && pdfState.handle.doc === doc) wrap.innerHTML = T('<div class="pdf-side-empty">大纲读取失败</div>');
     });
   }
 
@@ -5667,6 +6241,10 @@
     $all('#pdf-thumbs .pdf-thumb').forEach(function (el) {
       el.classList.toggle('active', Number(el.dataset.page) === page);
     });
+    if (!$('#pdf-side').hidden && $('#pdf-side').dataset.tab === 'thumbs') {
+      var active = $('#pdf-thumbs .pdf-thumb.active');
+      if (active) active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
   }
 
   function renderPdfThumbs(doc) {
@@ -5677,9 +6255,11 @@
     var pages = doc.numPages;
     for (var p = 1; p <= pages; p++) {
       (function (pageNum) {
-        var item = document.createElement('div');
+        var item = document.createElement('button');
+        item.type = 'button';
         item.className = 'pdf-thumb';
         item.dataset.page = pageNum;
+        item.setAttribute('aria-label', T('页码') + ' ' + pageNum);
         item.innerHTML = '<div class="pdf-thumb-canvas-wrap"><span class="pdf-thumb-placeholder">' + pageNum + '</span></div>' +
           '<span class="pdf-thumb-num">' + pageNum + '</span>';
         item.addEventListener('click', function () { goToPdfPage(pageNum); });
@@ -5694,10 +6274,13 @@
         item.dataset.done = '1';
         var pageNum = Number(item.dataset.page);
         doc.getPage(pageNum).then(function (page) {
+          if (!pdfState.handle || pdfState.handle.doc !== doc || !item.isConnected) return;
           var viewport = page.getViewport({ scale: 1 });
-          var scale = 96 / viewport.width;
+          var scale = 120 * (window.devicePixelRatio || 1) / viewport.width;
           var thumbViewport = page.getViewport({ scale: scale });
           var canvas = document.createElement('canvas');
+          canvas.style.width = '120px';
+          canvas.style.height = Math.round(120 * viewport.height / viewport.width) + 'px';
           var holder = item.querySelector('.pdf-thumb-canvas-wrap');
           holder.innerHTML = '';
           holder.appendChild(canvas);
@@ -5709,20 +6292,37 @@
     markPdfThumb(pdfState.currentPage || 1);
   }
 
-  function togglePdfSide(tab) {
+  function setPdfSideVisible(show) {
     var side = $('#pdf-side');
-    var show = !side.hidden && side.dataset.tab === tab ? false : true;
     side.hidden = !show;
-    side.dataset.tab = tab;
+    side.inert = !show;
+    $('#pdf-reader-main').classList.toggle('pdf-side-collapsed', !show);
+    $('#pdf-side-resizer').hidden = !show;
+    $('#pdf-side-open').hidden = show;
+    $('#pdf-side-open').setAttribute('aria-expanded', String(show));
     $('#pdf-side-toggle').setAttribute('aria-pressed', show ? 'true' : 'false');
+    try { localStorage.setItem(PDF_SIDE_COLLAPSED_KEY, show ? '0' : '1'); } catch (e) {}
+    if (show) selectPdfSideTab(side.dataset.tab || 'thumbs');
+  }
+
+  function selectPdfSideTab(tab) {
+    var side = $('#pdf-side');
+    if (side.hidden) setPdfSideVisible(true);
+    side.dataset.tab = tab;
     $('#pdf-side-tab-outline').classList.toggle('active', tab === 'outline');
     $('#pdf-side-tab-thumbs').classList.toggle('active', tab === 'thumbs');
+    $('#pdf-side-tab-outline').setAttribute('aria-selected', String(tab === 'outline'));
+    $('#pdf-side-tab-thumbs').setAttribute('aria-selected', String(tab === 'thumbs'));
+    $('#pdf-side-tab-outline').tabIndex = tab === 'outline' ? 0 : -1;
+    $('#pdf-side-tab-thumbs').tabIndex = tab === 'thumbs' ? 0 : -1;
     $('#pdf-outline').hidden = tab !== 'outline';
     $('#pdf-thumbs').hidden = tab !== 'thumbs';
-    if (show && pdfState.handle && pdfState.handle.doc) {
+    if (pdfState.handle && pdfState.handle.doc) {
       if (tab === 'outline' && !$('#pdf-outline').childNodes.length) renderPdfOutline(pdfState.handle.doc);
       if (tab === 'thumbs' && !$('#pdf-thumbs').childNodes.length) renderPdfThumbs(pdfState.handle.doc);
     }
+    if (tab === 'thumbs') markPdfThumb(pdfState.currentPage);
+    else markPdfOutline(pdfState.currentPage);
   }
 
   function updatePdfViewUi() {
@@ -5748,6 +6348,10 @@
   function renderPdfViewer() {
     var scroll = $('#pdf-scroll');
     var attachment = pdfState.attachment;
+    if (pdfThumbsObserver) { pdfThumbsObserver.disconnect(); pdfThumbsObserver = null; }
+    $('#pdf-outline').innerHTML = '';
+    $('#pdf-thumbs').innerHTML = '';
+    pdfOutlineRows = [];
     if (!pdfState.paper || !attachment || !attachment.path) {
       scroll.innerHTML = T('<div class="pdf-loading">⚠ 当前附件没有本地 PDF 文件</div>');
       return;
@@ -5765,11 +6369,12 @@
       annotations: annotationsForAttachment(pdfState.paper, attachment),
       onPageChange: updatePdfPageUi,
       onSheetRendered: onPdfSheetRendered,
-      onAnnotationClick: focusPdfAnnotation
+      onAnnotationClick: revealPdfAnnotation
     });
     pdfState.handle.promise.then(function (doc) {
       if (token !== pdfState.renderToken || !doc) return;
       updatePdfPageUi(Math.min(targetPage, doc.numPages), doc.numPages);
+      startPdfReadingTimer(pdfState.paper, pdfState.attachmentId);
       updatePdfViewUi();
       if (targetPage > 1) pdfState.handle.goToPage(targetPage);
       if ($('#pdf-search').value.trim()) performPdfSearch(true);
@@ -5860,11 +6465,34 @@
     });
   }
 
+  function revealPdfAnnotation(annotationId) {
+    if (!annotationsForAttachment(pdfState.paper, pdfState.attachment).some(function (item) { return item.id === annotationId; })) return;
+    if (window.LitAgentUi && window.LitAgentUi.switchPane) window.LitAgentUi.switchPane('anno');
+    renderPdfAnnotations(annotationId);
+    var item = $('#pdf-annotation-list [data-annotation-id="' + annotationId + '"]');
+    if (item) item.scrollIntoView({ block: 'nearest' });
+  }
+
   function focusPdfAnnotation(annotationId) {
     if (!pdfState.paper) return;
     var annotation = annotationsForAttachment(pdfState.paper, pdfState.attachment).find(function (item) { return item.id === annotationId; });
     if (!annotation) return;
-    if (pdfState.handle) pdfState.handle.goToPage(annotation.position.pageIndex + 1);
+    var paperId = pdfState.paper.id, attachmentId = pdfState.attachment.id;
+    if (pdfState.handle) pdfState.handle.goToPage(annotation.position.pageIndex + 1).then(function () {
+      if (!pdfState.paper || pdfState.paper.id !== paperId || !pdfState.attachment || pdfState.attachment.id !== attachmentId) return;
+      var sheet = $('#pdf-scroll .pdf-page-sheet[data-page="' + (annotation.position.pageIndex + 1) + '"]');
+      if (!sheet) return;
+      var marks = sheet.querySelectorAll('.pdf-annotation-mark');
+      var first = null;
+      marks.forEach(function (mark) {
+        if (mark.dataset.annotationId !== annotationId) return;
+        if (!first) first = mark;
+        mark.classList.remove('pdf-annotation-flash');
+        void mark.offsetWidth;
+        mark.classList.add('pdf-annotation-flash');
+      });
+      if (first) first.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+    });
     renderPdfAnnotations(annotationId);
     var item = $('#pdf-annotation-list [data-annotation-id="' + annotationId + '"]');
     if (item) item.scrollIntoView({ block: 'nearest' });
@@ -6602,7 +7230,11 @@
 
   // ---------- 库内查重与合并 ----------
   function mergeGroupIntoState(group) {
-    var merged = window.LitModel.normalizePaper(window.LitDedupe.merge(group), uid);
+    var mergedSource = window.LitDedupe.merge(group);
+    var attachmentMerge = window.LitDedupe.mergeAttachmentsDetailed({ attachments: mergedSource.attachments }, null);
+    mergedSource.attachments = attachmentMerge.attachments;
+    mergedSource.pdfAnnotations = remapAnnotationAttachments(mergedSource.pdfAnnotations, attachmentMerge.aliases).annotations;
+    var merged = window.LitModel.normalizePaper(mergedSource, uid);
     var dropIds = {};
     group.forEach(function (p) { if (p.id !== merged.id) dropIds[p.id] = true; });
     var now = Date.now();
@@ -6643,6 +7275,13 @@
     });
     Object.keys(dropIds).forEach(function (id) { delete state.selected[id]; });
     if (drawerId && dropIds[drawerId]) closeDrawer();
+    if (window.LitPdfSearch && LitPdfSearch.invalidate) {
+      Object.keys(attachmentMerge.aliases).forEach(function (removedId) {
+        if (removedId && removedId !== attachmentMerge.aliases[removedId]) {
+          LitPdfSearch.invalidate(merged.id, removedId);
+        }
+      });
+    }
   }
 
   function renderDedupeModal() {
@@ -6715,8 +7354,8 @@
 
   // ---------- 示例数据 ----------
   var DEMO = [
-    { title: 'Attention Is All You Need', authors: ['Ashish Vaswani', 'Noam Shazeer', 'Niki Parmar'], year: 2017, venue: 'NeurIPS', doi: '10.48550/arXiv.1706.03762', tags: [T('深度学习'), T('经典')], status: 'read', rating: 5, entryType: 'inproceedings' },
-    { title: 'Deep Residual Learning for Image Recognition', authors: ['Kaiming He', 'Xiangyu Zhang', 'Shaoqing Ren', 'Jian Sun'], year: 2016, venue: 'CVPR', doi: '10.1109/CVPR.2016.90', tags: [T('深度学习'), T('经典')], status: 'read', rating: 5, entryType: 'inproceedings' },
+    { title: 'Attention Is All You Need', authors: ['Ashish Vaswani', 'Noam Shazeer', 'Niki Parmar'], year: 2017, venue: 'NeurIPS', doi: '10.48550/arXiv.1706.03762', tags: [T('深度学习'), T('经典')], status: 'reading', rating: 5, entryType: 'inproceedings' },
+    { title: 'Deep Residual Learning for Image Recognition', authors: ['Kaiming He', 'Xiangyu Zhang', 'Shaoqing Ren', 'Jian Sun'], year: 2016, venue: 'CVPR', doi: '10.1109/CVPR.2016.90', tags: [T('深度学习'), T('经典')], status: 'reading', rating: 5, entryType: 'inproceedings' },
     { title: 'Highly accurate protein structure prediction with AlphaFold', authors: ['John Jumper', 'Richard Evans'], year: 2021, venue: 'Nature', doi: '10.1038/s41586-021-03819-2', tags: ['AI for Science'], status: 'reading', rating: 0 },
     { title: 'Language Models are Few-Shot Learners', authors: ['Tom B. Brown', 'Benjamin Mann'], year: 2020, venue: 'NeurIPS', doi: '10.48550/arXiv.2005.14165', tags: [T('深度学习'), 'LLM'], status: 'unread', rating: 0, entryType: 'inproceedings' },
     { title: 'A survey on evaluation of large language models', authors: ['Yupeng Chang', 'Xu Wang'], year: 2024, venue: 'ACM TIST', doi: '10.1145/3641289', tags: ['LLM', T('综述')], status: 'unread', rating: 0 }
@@ -7615,20 +8254,40 @@
     }
     var registerBtn = $('#sync-research-register');
     if (registerBtn) {
+      /* 一次点击跑全量（主进程分片 + 逐片进度）；运行中按钮变「停止」，
+       * 再点一次置停止位——主进程当前片收尾后带着已完成部分返回 */
+      var registerRunning = false;
       registerBtn.addEventListener('click', function () {
+        if (registerRunning) {
+          desktop.researchRegisterCancel();
+          setSyncInlineStatus('sync-research-status', T('正在停止补登记…'), 'pending');
+          return;
+        }
         var button = this;
-        button.disabled = true;
+        var label = button.textContent;
+        registerRunning = true;
+        button.textContent = T('停止');
         setSyncInlineStatus('sync-research-status', T('补登记中（DOI 直查 + 本地身份）…'), 'pending');
-        desktop.researchRegister({ limit: 200 }).then(function (r) {
+        desktop.researchRegister({ limit: 0 }).then(function (r) {
           var applied = applyResearchProposals(r.proposals || []);
-          var msg = T('✓ 扫描 ') + (r.scanned || 0) + T(' 条，补登记 ') + applied + T(' 条');
+          var msg = (r.stopped ? T('已停止：扫描 ') : T('✓ 扫描 ')) + (r.scanned || 0) + T(' 条，补登记 ') + applied + T(' 条');
           // 带 DOI 但在线反查也没解析到的条目如实报出——否则「补登记 0 条」会把用户搞糊涂
           if (r.unresolved) msg += T('；有 ') + r.unresolved + T(' 条带 DOI 但暂未解析到调研身份（需联网反查 OpenAlex，稍后再试）');
-          setSyncInlineStatus('sync-research-status', msg, r.unresolved ? 'warning' : 'success');
+          setSyncInlineStatus('sync-research-status', msg, r.unresolved || r.stopped ? 'warning' : 'success');
         }).catch(function (error) {
           setSyncInlineStatus('sync-research-status', error && error.message || String(error), 'error');
-        }).finally(function () { button.disabled = false; });
+        }).finally(function () {
+          registerRunning = false;
+          button.textContent = label;
+        });
       });
+      if (desktop.onResearchRegisterProgress) {
+        desktop.onResearchRegisterProgress(function (p) {
+          if (!registerRunning) return;
+          setSyncInlineStatus('sync-research-status',
+            T('补登记中 ') + (p.done || 0) + '/' + (p.total || 0) + T('（已解析 ') + (p.proposed || 0) + T(' 条）'), 'pending');
+        });
+      }
     }
     var embedBtn = $('#sync-embed-build');
     if (embedBtn) {
@@ -7707,6 +8366,18 @@
     document.body.classList.toggle('reading-open', reading);
     dockAnnotations(pdfOpen);
     var ws = document.querySelector('.workspace');
+    var rightCollapsed = !!(ws && ws.classList.contains('rail-collapsed'));
+    var detailSidebar = $('#detail-sidebar');
+    if (detailSidebar) {
+      detailSidebar.setAttribute('aria-hidden', String(rightCollapsed));
+      detailSidebar.inert = rightCollapsed;
+    }
+    var rightToggle = $('#btn-right-sidebar-toggle');
+    if (rightToggle) {
+      rightToggle.setAttribute('aria-expanded', String(!rightCollapsed));
+      var icon = rightToggle.querySelector('use');
+      if (icon) icon.setAttribute('href', rightCollapsed ? '#lb-i-chev-l' : '#lb-i-chev-r');
+    }
     var railW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--rail-width')) || 42;
     var detail = 0;
     if (ws && !ws.classList.contains('rail-collapsed')) {
@@ -7737,9 +8408,18 @@
 
   /** 观察两个阅读层的 hidden 与 workspace 的 rail-collapsed 类，保持 body 状态与让位宽度实时同步 */
   function watchReadingRail() {
-    [$('#pdf-overlay'), $('#epub-overlay'), document.querySelector('.workspace')].forEach(function (node) {
+    var workspace = document.querySelector('.workspace');
+    [$('#pdf-overlay'), $('#epub-overlay'), workspace].forEach(function (node) {
       if (!node || typeof MutationObserver === 'undefined') return;
-      new MutationObserver(syncReadingRail).observe(node, { attributes: true, attributeFilter: ['hidden', 'class'] });
+      new MutationObserver(function (mutations) {
+        syncReadingRail();
+        if (node === workspace && mutations.some(function (mutation) { return mutation.attributeName === 'class'; })) {
+          try {
+            localStorage.setItem(RIGHT_SIDEBAR_COLLAPSED_KEY,
+              workspace.classList.contains('rail-collapsed') ? '1' : '0');
+          } catch (error) {}
+        }
+      }).observe(node, { attributes: true, attributeFilter: ['hidden', 'class'] });
     });
     if (typeof window !== 'undefined') window.addEventListener('resize', syncReadingRail);
     syncReadingRail();
@@ -8042,9 +8722,24 @@
     });
   }
 
+  /** 调研暂存 PDF 先补内容指纹，复制前即可命中同文件，避免建出重复条目。 */
+  function fingerprintStagedDrafts(pairs, isCancelled) {
+    if (!window.LitPdf || !LitPdf.fingerprint) return Promise.resolve();
+    var cursor = 0;
+    function worker() {
+      if (isCancelled && isCancelled()) return Promise.resolve();
+      var pair = pairs[cursor++];
+      if (!pair) return Promise.resolve();
+      var attachment = pair.draft.attachments[0];
+      return LitPdf.fingerprint(attachment.path).then(function (fingerprint) {
+        if (/^[a-f0-9]{64}$/i.test(String(fingerprint || ''))) attachment.fingerprint = fingerprint.toLowerCase();
+      }).catch(function () {}).then(worker);
+    }
+    return Promise.all([worker(), worker(), worker()]);
+  }
+
   /** PDF 第二步：已暂存进受管目录的 PDF → 建/并条目挂附件（researchIds 同样回写）。
-   *  opts.isCancelled：A-followup #6——确认框挂着时用户可能点了「停止」，确认通过后、
-   *  实际写库前必须再核一次同一取消信号（返回 { canceled:true, stopped:true }）。 */
+   *  opts.isCancelled：确认框与复制/哈希后的异步边界都需复核取消信号。 */
   function importStagedPdfs(storedList, folderId, opts) {
     if (!desktop || !desktop.researchGetWorks) return Promise.reject(new Error(T('需要桌面版')));
     var stored = (Array.isArray(storedList) ? storedList : []).filter(function (s) { return s && s.path; });
@@ -8073,24 +8768,47 @@
         if (opts && typeof opts.isCancelled === 'function' && opts.isCancelled()) {
           return { canceled: true, stopped: true, added: 0, merged: 0 };
         }
-        var r = addPapers(pairs.map(function (pair) { return pair.draft; }), { folderId: target });
-        var touched = false;
-        pairs.forEach(function (pair, i) {
-          var entry = (r.indexMap || [])[i];
-          if (!entry) return;
-          touched = applyResearchIds([entry.id], pair.work.id) || touched;
+        return fingerprintStagedDrafts(pairs, opts && opts.isCancelled).then(function () {
+          if (opts && typeof opts.isCancelled === 'function' && opts.isCancelled()) {
+            return { canceled: true, stopped: true, added: 0, merged: 0 };
+          }
+          return storeImportedPdfFiles(pairs.map(function (pair) { return pair.draft; }), opts);
+        }).catch(function (error) {
+          if (opts && typeof opts.isCancelled === 'function' && opts.isCancelled()) {
+            return { canceled: true, stopped: true, added: 0, merged: 0 };
+          }
+          throw error;
+        }).then(function (staged) {
+          if (staged && staged.canceled) return staged;
+          if (opts && typeof opts.isCancelled === 'function' && opts.isCancelled()) {
+            return { canceled: true, stopped: true, added: 0, merged: 0 };
+          }
+          var r = addPapers(pairs.map(function (pair) { return pair.draft; }), { folderId: target });
+          return waitForLocalSave().then(function (saved) {
+            if (!saved) throw new Error(T('导入结果未能保存到本地'));
+            var touched = false;
+            pairs.forEach(function (pair, i) {
+              var entry = (r.indexMap || [])[i];
+              if (!entry) return;
+              touched = applyResearchIds([entry.id], pair.work.id) || touched;
+            });
+            return touched ? save() : true;
+          }).then(function (saved) {
+            if (!saved) throw new Error(T('导入结果未能保存到本地'));
+            return backfillPdfFingerprints((r.addedIds || []).concat((r.matches || []).map(function (m) { return m.id; })));
+          }).then(function () {
+            renderAll();
+            // 新挂载的 PDF 排队建全文索引（reindex 只处理缺失或指纹变化的附件）。
+            if (window.LitPdfSearch && LitPdfSearch.reindex) {
+              var affectedIds = {};
+              (r.addedIds || []).concat((r.matches || []).map(function (m) { return m.id; }))
+                .forEach(function (pid) { affectedIds[pid] = true; });
+              var affected = state.papers.filter(function (p) { return affectedIds[p.id]; });
+              if (affected.length) LitPdfSearch.reindex(affected, function () {}).catch(function () {});
+            }
+            return { added: r.added || 0, merged: r.merged || 0, attached: r.attached || 0 };
+          });
         });
-        if (touched) save();
-        renderAll();
-        // 新挂载的 PDF 排队建全文索引（reindex 只处理「未索引/指纹变化」的附件，增量）
-        if (window.LitPdfSearch && LitPdfSearch.reindex) {
-          var affectedIds = {};
-          (r.addedIds || []).concat((r.matches || []).map(function (m) { return m.id; }))
-            .forEach(function (pid) { affectedIds[pid] = true; });
-          var affected = state.papers.filter(function (p) { return affectedIds[p.id]; });
-          if (affected.length) LitPdfSearch.reindex(affected, function () {}).catch(function () {});
-        }
-        return { added: r.added || 0, merged: r.merged || 0, attached: r.attached || 0 };
       });
     });
   }
@@ -8205,6 +8923,29 @@
     refreshBridgeStatus();
   }
   function closeBridgePanel() { $('#bridge-panel-mask').hidden = true; }
+
+  function checkForAppUpdate(manual) {
+    if (!desktop || !desktop.checkAppUpdate) return;
+    var button = $('#settings-check-update');
+    if (manual && button) button.disabled = true;
+    desktop.checkAppUpdate().then(function (result) {
+      if (result && result.version) {
+        toast(T('发现 LitBoard 新版本 ') + result.version, 30000, {
+          label: T('下载新版'),
+          fn: function () {
+            desktop.downloadAppUpdate().catch(function (error) {
+              toast(T('⚠ 无法打开下载链接：') + (error && error.message || error));
+            });
+          }
+        });
+        if (button) button.textContent = T('下载新版 ') + result.version;
+      } else if (manual) {
+        toast(T('当前已是最新版本'));
+      }
+    }).catch(function (error) {
+      if (manual) toast(T('⚠ 检查更新失败：') + (error && error.message || error));
+    }).finally(function () { if (button) button.disabled = false; });
+  }
 
   function openSyncSettings(sectionId) {
     if (!desktop || !desktop.getIntegrationConfig) { toast(T('同步功能仅在桌面版可用')); return; }
@@ -8503,6 +9244,7 @@
   function localPdfUnitCount() {
     var count = 0;
     state.papers.forEach(function (paper) {
+      if (paper.deletedAt) return;
       var list = (paper.attachments || []).filter(function (attachment) {
         return attachment && (attachment.kind === 'pdf' || attachment.kind === 'epub') && attachment.path;
       });
@@ -8587,7 +9329,8 @@
       }
       CONFLICT_FIELDS.forEach(function (field) {
         var localValue = existing[field], remoteValue = incoming[field];
-        if (localValue && remoteValue && String(localValue) !== String(remoteValue)) {
+        if (localValue && remoteValue && String(localValue) !== String(remoteValue) &&
+            (field !== 'doi' || window.LitDedupe.normDoi(localValue) !== window.LitDedupe.normDoi(remoteValue))) {
           conflicts.push({ zoteroKey: incoming.zoteroKey, paperId: existing.id, field: field,
             localValue: String(localValue).slice(0, 300), zoteroValue: String(remoteValue).slice(0, 300) });
         }
@@ -8720,6 +9463,8 @@
       return Promise.resolve(false);
     }
     syncBusy = true;
+    $('#sync-stop').hidden = false;
+    $('#sync-stop').disabled = false;
     setSyncIndicator('syncing');
     if (!silent) { $('#sync-status').classList.remove('error'); $('#sync-status').textContent = T('正在同步…'); }
     var current = workspacePayload();
@@ -8768,6 +9513,11 @@
         return true;
       });
     }).catch(function (error) {
+      if (error && String(error.message || error).indexOf('同步已停止') !== -1) {
+        setSyncIndicator('', T('同步已停止'));
+        if (!silent) $('#sync-status').textContent = T('同步已停止；已上传附件下次可续传');
+        return false;
+      }
       setSyncIndicator('error', error && error.message || String(error));
       if (!silent) {
         $('#sync-status').classList.add('error');
@@ -8777,6 +9527,7 @@
       return false;
     }).finally(function () {
       syncBusy = false;
+      $('#sync-stop').hidden = true;
     });
   }
 
@@ -8844,7 +9595,15 @@
   function bindEvents() {
     bindPaneResizer('resizer-left', 'left');
     bindPaneResizer('resizer-right', 'right');
+    $('#btn-left-sidebar-collapse').addEventListener('click', function () { setLeftSidebarCollapsed(true, true); });
+    $('#btn-left-sidebar-open').addEventListener('click', function () { setLeftSidebarCollapsed(false, true); });
+    $('#btn-right-sidebar-toggle').addEventListener('click', function () {
+      setRightSidebarCollapsed(!$('.workspace').classList.contains('rail-collapsed'), true);
+    });
+    new ResizeObserver(function () { applyTableColumns(true); }).observe($('#table-wrap'));
     bindModalResizer($('.sync-modal'), $('#sync-resize-grip'), 'settings', 560, 360);
+    bindModalResizer($('.graph-modal'), $('#graph-resize-grip'), 'graph', 900, 560);
+    applyModalSize($('.graph-modal'), readModalSizes().graph, 900, 560);
     window.addEventListener('resize', debounce(function () {
       applyPaneSizes({
         left: Number($('.workspace').dataset.leftWidth) || 220,
@@ -8873,6 +9632,14 @@
       if (btn) activateSyncGroup(btn.dataset.syncGroup);
     });
     $('#sync-close').addEventListener('click', closeSyncSettings);
+    $('#settings-check-update').addEventListener('click', function () {
+      var button = $('#settings-check-update');
+      if (button.textContent.indexOf(T('下载新版 ')) === 0) {
+        desktop.downloadAppUpdate().catch(function (error) {
+          toast(T('⚠ 无法打开下载链接：') + (error && error.message || error));
+        });
+      } else checkForAppUpdate(true);
+    });
     // 设置项改动即自动保存：文本输入在失焦/回车时（change），勾选与下拉即时
     ['sync-nutstore-url', 'sync-nutstore-user', 'sync-nutstore-password', 'sync-nutstore-folder',
       'sync-zotero-webdav-folder', 'sync-translator-provider', 'sync-translator-target',
@@ -8916,6 +9683,15 @@
     $('#sync-backup-now').addEventListener('click', runBackupNow);
     $('#sync-backup-restore').addEventListener('click', restoreFromBackup);
     $('#sync-backup-open').addEventListener('click', openBackupDir);
+    $('#sync-stop').addEventListener('click', function () {
+      if (!syncBusy || !desktop || !desktop.cancelNutstoreSync) return;
+      this.disabled = true;
+      $('#sync-status').textContent = T('正在停止同步…');
+      desktop.cancelNutstoreSync().catch(function (error) {
+        $('#sync-stop').disabled = false;
+        $('#sync-status').textContent = error && error.message || String(error);
+      });
+    });
     /* 远端对照/冲突弹窗整体在 js/app/remote-plan.js */
     initRemotePlan();
     $('#sync-translator-provider').addEventListener('change', updateTranslatorFields);
@@ -8964,12 +9740,11 @@
         setSyncInlineStatus('sync-scigreat-test-status', error && error.message || String(error), 'error');
       }).finally(function () { button.disabled = false; });
     });
-    /* 检索与元数据服务：一个按钮测四个源（OpenAlex / Semantic Scholar / Elsevier / TinyFish）。
+    /* 检索与元数据服务：一个按钮测设置页可配置的三个源（OpenAlex / Elsevier / TinyFish）。
      * 逐行列出「哪个源能用、为什么不能用」——只报一句成功/失败等于没说。服务名是专有名词，
      * 不进词典；状态与细节走 T()。 */
     var SOURCE_TEST_LABELS = {
-      openalex: 'OpenAlex', semanticscholar: 'Semantic Scholar',
-      elsevier: 'Elsevier', tinyfish: 'TinyFish'
+      openalex: 'OpenAlex', elsevier: 'Elsevier', tinyfish: 'TinyFish'
     };
     function sourceStatusText(item) {
       if (item.status === 'ok') return T('可用');
@@ -8985,10 +9760,9 @@
     function sourceDetailText(item) {
       if (item.status !== 'ok') return '';
       var parts = [];
-      if (item.id === 'openalex' || item.id === 'semanticscholar') {
+      if (item.id === 'openalex') {
         parts.push(item.channel === 'key' ? T('带 API Key')
-          : (item.channel === 'shared_pool' ? T('共享池（可能限流）')
-            : (item.channel === 'email' ? T('polite pool（邮箱）') : T('未填邮箱'))));
+          : (item.channel === 'email' ? T('polite pool（邮箱）') : T('未填邮箱')));
         parts.push(T('命中 {n} 条').replace('{n}', String(item.count == null ? 0 : item.count)));
       } else if (item.id === 'elsevier') {
         // 摘要回填（只需 Key）与 Scopus 检索（另需机构订阅）分开说：常见情形是前者通、
@@ -9193,6 +9967,15 @@
       var item = e.target.closest('[data-folder]');
       if (item) selectFolder(item.dataset.folder, { multi: e.ctrlKey || e.metaKey });
     });
+    // 内置视图右键菜单（全部文献/未分类/最近阅读/回收站）；与文件夹树一致，右击先选中该项
+    $('#library-nav').addEventListener('contextmenu', function (e) {
+      var item = e.target.closest('.library-item[data-folder]');
+      if (!item) return;
+      e.preventDefault();
+      var folderId = item.dataset.folder;
+      if (state.activeFolderId !== folderId || state.activeFolderIds.length) selectFolder(folderId);
+      showCtxMenu(e.clientX, e.clientY, buildLibraryCtxItems(folderId));
+    });
     $('#folder-list').addEventListener('click', function (e) {
       var toggle = e.target.closest('[data-toggle-folder]');
       if (toggle) { toggleFolder(toggle.dataset.toggleFolder); return; }
@@ -9201,34 +9984,109 @@
       var del = e.target.closest('[data-delete-folder]');
       if (del) { deleteFolder(del.dataset.deleteFolder); return; }
       var item = e.target.closest('[data-folder]');
-      if (item) { selectFolder(item.dataset.folder, { multi: e.ctrlKey || e.metaKey });  }
+      if (item) { selectFolder(item.dataset.folder, { multi: e.ctrlKey || e.metaKey, range: e.shiftKey });  }
     });
-    // 文件夹右键菜单（Zotero 式：新建/子文件夹/重命名/删除）
+    // 文件夹树键盘导航：↑↓ 移动选中、←→ 折叠/展开（或跳父级/子级）、Enter 选中、F2 重命名、Delete 删除
+    $('#folder-list').addEventListener('keydown', function (e) {
+      var entries = folderTree();
+      if (!entries.length) return;
+      var ids = entries.map(function (entry) { return entry.folder.id; });
+      var idx = state.folderFocusId ? ids.indexOf(state.folderFocusId) : -1;
+      var entry = idx === -1 ? null : entries[idx];
+      var handled = true;
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        var step = e.key === 'ArrowDown' ? 1 : -1;
+        var next = idx === -1 ? (step > 0 ? 0 : ids.length - 1)
+          : Math.max(0, Math.min(ids.length - 1, idx + step));
+        selectFolder(ids[next], { range: e.shiftKey, multi: e.ctrlKey || e.metaKey });
+      } else if (e.key === 'ArrowRight') {
+        if (entry && entry.hasChildren) {
+          if (state.collapsedFolders[entry.folder.id]) toggleFolder(entry.folder.id);
+          else if (idx + 1 < ids.length) selectFolder(ids[idx + 1]);
+        } else handled = false;
+      } else if (e.key === 'ArrowLeft') {
+        if (entry) {
+          if (entry.hasChildren && !state.collapsedFolders[entry.folder.id]) toggleFolder(entry.folder.id);
+          else if (entry.folder.parentId && ids.indexOf(entry.folder.parentId) !== -1) selectFolder(entry.folder.parentId);
+          else handled = false;
+        } else handled = false;
+      } else if (e.key === 'Enter') {
+        if (entry) selectFolder(entry.folder.id); else handled = false;
+      } else if (e.key === 'F2') {
+        if (entry) renameFolder(entry.folder.id); else handled = false;
+      } else if (e.key === 'Delete') {
+        if (!entry) handled = false;
+        else if (state.activeFolderIds.length > 1 && state.activeFolderIds.indexOf(entry.folder.id) !== -1) {
+          deleteFolders(state.activeFolderIds.slice());
+        } else deleteFolder(entry.folder.id);
+      } else {
+        handled = false;
+      }
+      if (handled) {
+        e.preventDefault();
+        var focusedRow = $('#folder-list .folder-item.focused');
+        if (focusedRow && focusedRow.scrollIntoView) focusedRow.scrollIntoView({ block: 'nearest' });
+      }
+    });
+    // 文件夹右键菜单（Zotero 式：新建/子文件夹/重命名/删除；多选时批量）
     $('#folder-list').addEventListener('contextmenu', function (e) {
       var row = e.target.closest('.folder-item[data-folder]');
       if (row) {
         var folder = state.folders.find(function (f) { return f.id === row.dataset.folder; });
         if (!folder) return;
         e.preventDefault();
-        showCtxMenu(e.clientX, e.clientY, buildFolderCtxItems(folder));
+        // 右击已在多选集合内的行 → 菜单对整组生效；集合外的行先单选（Zotero 行为）
+        var selIds = state.activeFolderIds.length ? state.activeFolderIds.slice() : [state.activeFolderId];
+        if (selIds.indexOf(folder.id) === -1) {
+          selectFolder(folder.id);
+          selIds = [folder.id];
+        }
+        if (selIds.length > 1) showCtxMenu(e.clientX, e.clientY, buildFolderCtxItemsMulti(selIds));
+        else showCtxMenu(e.clientX, e.clientY, buildFolderCtxItems(folder));
       } else {
         e.preventDefault();
         showCtxMenu(e.clientX, e.clientY, [
-          { label: T('新建文件夹'), icon: 'lb-i-folder-new', fn: function () { openFolderCreator(''); } }
+          { label: T('新建文件夹'), icon: 'lb-i-folder-new', fn: function () { openFolderCreator(''); } },
+          { label: T('导入文件夹…'), icon: 'lb-i-folder-import', fn: function () { chooseFolderImport(''); } }
         ]);
       }
     });
     $('#folder-empty').addEventListener('contextmenu', function (e) {
       e.preventDefault();
       showCtxMenu(e.clientX, e.clientY, [
-        { label: T('新建文件夹'), icon: 'lb-i-folder-new', fn: function () { openFolderCreator(''); } }
+        { label: T('新建文件夹'), icon: 'lb-i-folder-new', fn: function () { openFolderCreator(''); } },
+        { label: T('导入文件夹…'), icon: 'lb-i-folder-import', fn: function () { chooseFolderImport(''); } }
       ]);
     });
-    // 文件夹拖拽排序
-    var folderDragId = null;
+    // 文件夹拖拽排序（支持多选整组拖）
+    var folderDragId = null;          // 拖拽源行（多选拖时为主行）
+    var folderDragIds = null;         // 被拖集合（可见树序的 id 数组）
+    var folderDragSubtree = null;     // 被拖集合 ∪ 各自子树（防环 + 缺口判定）
     // 当前预览对应的落点（目标行 + 方式），供「在缺口处松手」时取用
     var folderDragHover = null;
     var FOLDER_DRAG_TYPE = 'application/x-litboard-folder';
+    // 悬停折叠节点自动展开
+    var folderAutoExpandTimer = null;
+    var folderAutoExpandId = null;
+    function cancelFolderAutoExpand() {
+      if (folderAutoExpandTimer) { clearTimeout(folderAutoExpandTimer); folderAutoExpandTimer = null; }
+      folderAutoExpandId = null;
+    }
+    function scheduleFolderAutoExpand(folderId) {
+      var folder = state.folders.find(function (f) { return f.id === folderId; });
+      var hasKids = !!folder && state.folders.some(function (f) { return f.parentId === folderId; });
+      if (!hasKids || !state.collapsedFolders[folderId]) { cancelFolderAutoExpand(); return; }
+      if (folderAutoExpandId === folderId) return;
+      cancelFolderAutoExpand();
+      folderAutoExpandId = folderId;
+      folderAutoExpandTimer = setTimeout(function () {
+        folderAutoExpandTimer = null; folderAutoExpandId = null;
+        if (!folderDragId) return;
+        delete state.collapsedFolders[folderId];
+        saveCollapsedFolders();
+        renderFolders();   // 重建后拖拽继续，行标记/落点随 dragover 重绘
+      }, 600);
+    }
     $('#folder-list').addEventListener('dragstart', function (e) {
       var row = e.target.closest('.folder-item[data-folder]');
       if (!row || !e.dataTransfer) return;
@@ -9236,19 +10094,36 @@
         e.preventDefault();
         return;
       }
-      folderDragId = row.dataset.folder;
+      var dragId = row.dataset.folder;
+      // 多选整组拖：被拖行在多选集合内时拖整个集合（applyMove 再清洗后代/防环）
+      var ids = state.activeFolderIds.indexOf(dragId) !== -1 ? state.activeFolderIds.slice() : [dragId];
+      folderDragId = dragId;
+      folderDragIds = ids;
+      folderDragSubtree = window.LitFolderTree.collectSubtreeIds(state.folders, ids);
       folderDragHover = null;
-      e.dataTransfer.setData(FOLDER_DRAG_TYPE, folderDragId);
+      e.dataTransfer.setData(FOLDER_DRAG_TYPE, JSON.stringify(ids));
       e.dataTransfer.effectAllowed = 'move';
-      row.classList.add('dragging');
+      $all('#folder-list .folder-item[data-folder]').forEach(function (item) {
+        if (ids.indexOf(item.dataset.folder) !== -1) item.classList.add('dragging');
+      });
+      if (ids.length > 1) row.setAttribute('data-drag-count', String(ids.length));
       $('#folder-list').classList.add('folder-reordering');
     });
     $('#folder-list').addEventListener('dragend', function () {
       folderDragId = null;
+      folderDragIds = null;
+      folderDragSubtree = null;
       folderDragHover = null;
+      cancelFolderAutoExpand();
+      $('#folder-list').classList.remove('folder-root-drop');
+      $('#folder-empty').classList.remove('folder-root-drop');
+      $('#library-nav [data-folder="all"]').classList.remove('folder-root-drop');
       clearFolderDropMarks();
       resetFolderOrderPreview();
-      $all('#folder-list .folder-item').forEach(function (row) { row.classList.remove('dragging'); });
+      $all('#folder-list .folder-item').forEach(function (row) {
+        row.classList.remove('dragging');
+        row.removeAttribute('data-drag-count');
+      });
       // 等回位动画播完再摘掉过渡类；期间若已开始新一次拖拽则保留
       setTimeout(function () {
         if (!folderDragId) $('#folder-list').classList.remove('folder-reordering');
@@ -9261,17 +10136,31 @@
       if (e.clientX >= bounds.left && e.clientX <= bounds.right &&
           e.clientY >= bounds.top && e.clientY <= bounds.bottom) return;
       folderDragHover = null;
+      cancelFolderAutoExpand();
+      $('#folder-list').classList.remove('folder-root-drop');
       clearFolderDropMarks();
       resetFolderOrderPreview();
     });
     $('#folder-list').addEventListener('dragover', function (e) {
       if (!folderDragId) return;
+      var list = $('#folder-list');
       var row = e.target.closest('.folder-item[data-folder]');
-      if (!row) return;
+      if (!row) {
+        // 列表空白区 = 移到根级末尾
+        clearFolderDropMarks();
+        resetFolderOrderPreview();
+        cancelFolderAutoExpand();
+        list.classList.add('folder-root-drop');
+        folderDragHover = { targetId: null, mode: 'rootEnd' };
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+        return;
+      }
+      if (list.classList.contains('folder-root-drop')) list.classList.remove('folder-root-drop');
       clearFolderDropMarks(row);
-      var dragged = state.folders.find(function (folder) { return folder.id === folderDragId; });
-      if (!dragged) return;
-      if (row.dataset.folder === folderDragId) {
+      if (folderDragSubtree && folderDragSubtree[row.dataset.folder]) {
+        // 落在被拖集合（自身行 = 缺口 / 被拖后代 = 防环）上
+        if (row.dataset.folder !== folderDragId) { folderDragHover = null; return; }
         // 缺口 = 被拖行当前的视觉位置：允许在缺口上松手，落点取已预览的插入位
         if (folderDragHover) {
           e.preventDefault();
@@ -9279,18 +10168,21 @@
         }
         return;
       }
-      if (isFolderDescendant(folderDragId, row.dataset.folder)) { folderDragHover = null; return; }
+      scheduleFolderAutoExpand(row.dataset.folder);
       e.preventDefault();
       e.dataTransfer.dropEffect = 'move';
       var rect = row.getBoundingClientRect();
       var ratio = (e.clientY - rect.top) / rect.height;
-      if (ratio < 0.35) {
+      var mode = window.LitFolderTree.dropModeFromRatio(ratio);
+      if (mode === 'before') {
         row.classList.add('drag-before');
-        previewFolderOrder(row, 'before', folderDragId);
+        if (folderDragIds.length === 1) previewFolderOrder(row, 'before', folderDragIds[0]);
+        else resetFolderOrderPreview();
         folderDragHover = { targetId: row.dataset.folder, mode: 'before' };
-      } else if (ratio > 0.65) {
+      } else if (mode === 'after') {
         row.classList.add('drag-after');
-        previewFolderOrder(row, 'after', folderDragId);
+        if (folderDragIds.length === 1) previewFolderOrder(row, 'after', folderDragIds[0]);
+        else resetFolderOrderPreview();
         folderDragHover = { targetId: row.dataset.folder, mode: 'after' };
       } else {
         row.classList.add('drag-over');
@@ -9298,70 +10190,116 @@
         folderDragHover = null;
       }
     });
-    $('#folder-list').addEventListener('drop', function (e) {
-      var row = e.target.closest('.folder-item[data-folder]');
-      if (!row || !folderDragId) return;
-      var targetId = row.dataset.folder;
-      var dragged = state.folders.find(function (folder) { return folder.id === folderDragId; });
-      if (!dragged) return;
-      var mode;
-      if (targetId === folderDragId) {
-        // 在缺口（被拖行自身）上松手：采用当前预览的插入位
-        if (!folderDragHover) return;
-        targetId = folderDragHover.targetId;
-        mode = folderDragHover.mode;
+    /** 文件夹落定的统一收尾：undo 快照（变更前）+ applyMove + 反馈 + 延迟保存。row 为 null 表示根级末尾。 */
+    function handleFolderDrop(e, row) {
+      var targetId, mode;
+      if (!row) {
+        targetId = null; mode = 'rootEnd';
       } else {
-        if (isFolderDescendant(folderDragId, targetId)) return;
-        var rect = row.getBoundingClientRect();
-        var ratio = (e.clientY - rect.top) / rect.height;
-        mode = ratio < 0.35 ? 'before' : (ratio > 0.65 ? 'after' : 'inside');
+        targetId = row.dataset.folder;
+        if (folderDragSubtree && folderDragSubtree[targetId]) {
+          // 缺口（被拖行自身）或防环位置松手：采用已预览的插入位
+          if (!folderDragHover) return;
+          targetId = folderDragHover.targetId;
+          mode = folderDragHover.mode;
+        } else {
+          var rect = row.getBoundingClientRect();
+          var ratio = (e.clientY - rect.top) / rect.height;
+          mode = window.LitFolderTree.dropModeFromRatio(ratio);
+        }
       }
+      var dragIds = folderDragIds || [folderDragId];
       e.preventDefault();
       e.stopPropagation();
       folderDragId = null;
+      folderDragIds = null;
+      folderDragSubtree = null;
       folderDragHover = null;
-      // undo 快照必须在 reorderFolder 变更之前抓（否则 before=after，撤销成空操作）；
-      // 受影响的不仅是拖拽双方——两侧父级的同级列表都会被重排，一并纳入快照
-      var targetFolder = null;
-      for (var fi = 0; fi < state.folders.length; fi++) {
-        if (state.folders[fi].id === targetId) { targetFolder = state.folders[fi]; break; }
-      }
+      cancelFolderAutoExpand();
+      $('#folder-list').classList.remove('folder-root-drop');
+      $('#folder-empty').classList.remove('folder-root-drop');
+      $('#library-nav [data-folder="all"]').classList.remove('folder-root-drop');
+      // undo 快照必须在 applyMove 变更之前抓：被拖集合 + 旧父组 + 新父组都会被重排
       var undoIds = {};
-      undoIds[dragged.id] = true;
-      undoIds[targetId] = true;
-      folderChildren(dragged.parentId || '').forEach(function (item) { undoIds[item.id] = true; });
-      if (targetFolder) {
-        var newParentId = mode === 'inside' ? targetId : (targetFolder.parentId || '');
-        folderChildren(newParentId).forEach(function (item) { undoIds[item.id] = true; });
+      dragIds.forEach(function (id) { undoIds[id] = true; });
+      state.folders.forEach(function (f) {
+        if (dragIds.indexOf(f.id) !== -1) return;
+        var sharesParentWithDragged = dragIds.some(function (id) {
+          var df = state.folders.find(function (x) { return x.id === id; });
+          return df && (df.parentId || '') === (f.parentId || '');
+        });
+        if (sharesParentWithDragged) undoIds[f.id] = true;
+      });
+      if (targetId) {
+        undoIds[targetId] = true;
+        var tf = state.folders.find(function (x) { return x.id === targetId; });
+        if (tf) {
+          var newParentId = mode === 'inside' ? targetId : (tf.parentId || '');
+          state.folders.forEach(function (f) { if ((f.parentId || '') === newParentId) undoIds[f.id] = true; });
+        }
+      } else {
+        state.folders.forEach(function (f) { if (!(f.parentId || '')) undoIds[f.id] = true; });
       }
       var undoIdList = Object.keys(undoIds);
       var undoBefore = makeSnapshot({ folders: undoIdList });
-      if (reorderFolder(dragged.id, targetId, mode)) {
-        commitUndo(mode === 'inside' ? T('移动文件夹') : T('调整文件夹顺序'), undoBefore, { folders: undoIdList });
-        clearFolderDropMarks();
-        renderFolders();
-        // 落定反馈：被拖行（移入已折叠父级时退而闪目标行）短暂描边闪光
-        var rows = $all('#folder-list .folder-item[data-folder]');
-        var landed = rows.find(function (item) { return item.dataset.folder === dragged.id; }) ||
-          rows.find(function (item) { return item.dataset.folder === targetId; });
-        if (landed) {
-          landed.classList.add('drop-flash');
-          setTimeout(function () { landed.classList.remove('drop-flash'); }, 600);
-        }
-        toast(mode === 'inside' ? T('✓ 已移入「') + dragged.name + '」' : T('✓ 已调整顺序'));
-        // save() 要给全库算两遍内容签名、再把整个工作区序列化过 IPC，
-        // 几千条文献就是上百毫秒的同步阻塞——同步调用会卡住松手后的第一帧，
-        // 表现为「落定瞬间卡顿一下」。让到新顺序绘制完成后再保存；
-        // 窗口被隐藏时 rAF 不触发，用定时器兜底（只执行一次）。
-        var saved = false;
-        var deferredSave = function () {
-          if (saved) return;
-          saved = true;
-          save();
-        };
-        requestAnimationFrame(function () { requestAnimationFrame(deferredSave); });
-        setTimeout(deferredSave, 200);
-      }
+      var result = window.LitFolderTree.applyMove(state.folders, dragIds, targetId, mode);
+      if (!result.changed) return;
+      commitUndo(mode === 'inside' || mode === 'rootEnd' ? T('移动文件夹') : T('调整文件夹顺序'), undoBefore, { folders: undoIdList });
+      clearFolderDropMarks();
+      renderFolders();
+      // 落定反馈：所有被动过的行短暂描边闪光
+      $all('#folder-list .folder-item[data-folder]').forEach(function (landed) {
+        if (result.touchedIds.indexOf(landed.dataset.folder) === -1) return;
+        landed.classList.add('drop-flash');
+        setTimeout(function () { landed.classList.remove('drop-flash'); }, 600);
+      });
+      var firstDragged = state.folders.find(function (f) { return f.id === dragIds[0]; });
+      toast(dragIds.length > 1
+        ? T('✓ 已移动 ') + dragIds.length + T(' 个文件夹')
+        : (mode === 'inside'
+          ? T('✓ 已移入「') + (firstDragged ? firstDragged.name : '') + '」'
+          : (mode === 'rootEnd' ? T('✓ 已移到根级') : T('✓ 已调整顺序'))));
+      // save() 要给全库算两遍内容签名、再把整个工作区序列化过 IPC，
+      // 几千条文献就是上百毫秒的同步阻塞——同步调用会卡住松手后的第一帧，
+      // 表现为「落定瞬间卡顿一下」。让到新顺序绘制完成后再保存；
+      // 窗口被隐藏时 rAF 不触发，用定时器兜底（只执行一次）。
+      var saved = false;
+      var deferredSave = function () {
+        if (saved) return;
+        saved = true;
+        save();
+      };
+      requestAnimationFrame(function () { requestAnimationFrame(deferredSave); });
+      setTimeout(deferredSave, 200);
+    }
+    $('#folder-list').addEventListener('drop', function (e) {
+      if (!folderDragId) return;
+      handleFolderDrop(e, e.target.closest('.folder-item[data-folder]'));
+    });
+    // 空态（无文件夹时的占位行）同样接受文件夹拖放 = 根级末尾
+    [$('#folder-empty'), $('#library-nav [data-folder="all"]')].forEach(function (folderEmptyEl) {
+      if (!folderEmptyEl) return;
+      folderEmptyEl.addEventListener('dragover', function (e) {
+        if (!folderDragId) return;
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = 'move';
+        folderDragHover = { targetId: null, mode: 'rootEnd' };
+        folderEmptyEl.classList.add('folder-root-drop');
+      });
+      folderEmptyEl.addEventListener('dragleave', function (e) {
+        if (!folderDragId) return;
+        var bounds = e.currentTarget.getBoundingClientRect();
+        if (e.clientX >= bounds.left && e.clientX <= bounds.right &&
+            e.clientY >= bounds.top && e.clientY <= bounds.bottom) return;
+        folderEmptyEl.classList.remove('folder-root-drop');
+      });
+      folderEmptyEl.addEventListener('drop', function (e) {
+        if (!folderDragId) return;
+        e.preventDefault();
+        e.stopPropagation();
+        handleFolderDrop(e, null);
+      });
     });
     // 导入
     var pendingImportFolderId = '';
@@ -9422,12 +10360,13 @@
       $('#paste-mask').hidden = false;
       $('#paste-area').focus();
     });
-    // 导入文件夹（左侧栏拖放的兜底入口；浏览器版拿不到文件路径，toast 引导）
+    // 菜单按当前单选文件夹导入；右键菜单可指定具体落点。
     $('#more-import-folder').addEventListener('click', function () {
-      if (!desktop || !desktop.chooseDirectory || !desktop.scanFolder) { toast(T('导入文件夹需要桌面版')); return; }
-      desktop.chooseDirectory({}).then(function (dirPath) {
-        if (dirPath) importDroppedFolder(dirPath, '');
-      }).catch(function () {});
+      chooseFolderImport(currentImportFolderId());
+    });
+    $('#more-stop-folder-import').addEventListener('click', function () {
+      folderImportCancelled = true;
+      toast(T('正在停止导入，已处理的文件会保留'));
     });
     $('#paste-cancel').addEventListener('click', function () { $('#paste-mask').hidden = true; });
     $('#paste-ok').addEventListener('click', function () {
@@ -9438,13 +10377,8 @@
       pendingPasteFolderId = '';
     });
 
-    // 拖放。三个落点：统计仪表盘或列表区空白处 = 导入（统计区虚线框 + 提示胶囊，
-    // 列表区整卡虚线框）；条目行 = 附加到该条（Zotero 式行级高亮）。
-    // 拖到其他区域不接文件，只提示落点。
-    var dragDepth = 0;
+    // 外部文件只接受明确的目标：文献行添附件，文件夹树导入目录/文档。
     var fileDropTr = null;
-    var statsDropActive = false;
-    var listDropActive = false;
     function dragHasFiles(e) {
       var types = e.dataTransfer && e.dataTransfer.types;
       return !!(types && Array.prototype.indexOf.call(types, 'Files') !== -1);
@@ -9455,83 +10389,39 @@
       fileDropTr = tr || null;
       if (fileDropTr) fileDropTr.classList.add('file-drop-target');
     }
-    function setStatsDropActive(on) {
-      if (statsDropActive === on) return;
-      statsDropActive = on;
-      var row = $('#stats-row');
-      if (row) row.classList.toggle('drop-zone-active', on);
-      var hint = $('#stats-drop-hint');
-      if (hint) hint.hidden = !on;
-    }
-    function setListDropActive(on) {
-      if (listDropActive === on) return;
-      listDropActive = on;
-      var card = document.querySelector('.table-card');
-      if (card) card.classList.toggle('list-drop-zone', on);
-    }
-    function clearFileDropZones() {
-      setFileDropTr(null);
-      setStatsDropActive(false);
-      setListDropActive(false);
-    }
-    document.addEventListener('dragenter', function (e) {
-      e.preventDefault();
-      if (!dragHasFiles(e)) return;
-      dragDepth++;
-      var pill = $('#drag-hint-pill');
-      if (pill) pill.hidden = false;
-    });
     document.addEventListener('dragleave', function (e) {
-      e.preventDefault();
       if (!dragHasFiles(e)) return;
-      dragDepth = Math.max(0, dragDepth - 1);
-      if (!dragDepth) {
-        var pill = $('#drag-hint-pill');
-        if (pill) pill.hidden = true;
-        clearFileDropZones();
-      }
+      if (!fileDropTr || fileDropTr.contains(e.relatedTarget)) return;
+      setFileDropTr(null);
     });
     document.addEventListener('dragover', function (e) {
-      e.preventDefault();
       if (!dragHasFiles(e)) return;
-      // 行级 / 仪表盘落区只在桌面版有意义（浏览器拿不到文件路径，附加无从谈起）
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
       var tr = (!desktop || !e.target.closest) ? null : e.target.closest('#table-body tr[data-id]');
       var paper = tr ? getById(tr.dataset.id) : null;
       if (paper && paper.deletedAt) { tr = null; paper = null; }
       setFileDropTr(tr);
-      // 仪表盘落区在收起态也激活（细条上只显示虚线框，胶囊由 CSS 隐藏），保证导入入口常在
-      var statsHit = e.target.closest ? e.target.closest('#stats-row') : null;
-      setStatsDropActive(!tr && !!statsHit);
-      // 列表区空白处（非行、非统计区）同样接收导入：用户直觉是“拖进来就该进库”，
-      // 不必瞄准顶部统计区；浏览器版行级落区不存在，列表整卡（含行）都算空白落区
-      var listHit = !tr && !statsDropActive && !!(e.target.closest && e.target.closest('.table-card'));
-      setListDropActive(listHit);
-      // 悬停仪表盘落区时由框头胶囊接管，其余位置保持全局胶囊
-      var pill = $('#drag-hint-pill');
-      if (pill) pill.hidden = statsDropActive;
-      if ((fileDropTr || listDropActive) && e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      if (tr) {
+        e.dataTransfer.dropEffect = 'copy';
+      }
     });
     document.addEventListener('drop', function (e) {
+      if (!dragHasFiles(e)) return;
       e.preventDefault();
-      dragDepth = 0;
-      var pill = $('#drag-hint-pill');
-      if (pill) pill.hidden = true;
-      var files = e.dataTransfer && e.dataTransfer.files.length
-        ? Array.prototype.slice.call(e.dataTransfer.files) : null;
-      var tr = fileDropTr;
-      var inStats = statsDropActive;
-      var inList = listDropActive;
-      clearFileDropZones();
-      if (tr) {
-        var paper = getById(tr.dataset.id);
-        if (paper && !paper.deletedAt && files) attachDroppedFiles(paper, files);
-        return;
-      }
-      if (!files) return;
-      if (inStats || inList) {
-        promptImportFolder(function (folderId) { handleFiles(files, folderId); }, currentImportFolderId());
+      var tr = e.target.closest ? e.target.closest('#table-body tr[data-id]') : null;
+      setFileDropTr(null);
+      var paper = tr ? getById(tr.dataset.id) : null;
+      if (paper && !paper.deletedAt && e.dataTransfer.files.length) {
+        var clearBusy = toast(T('正在处理拖入的文件…'), 0);
+        attachDroppedFiles(paper, Array.prototype.slice.call(e.dataTransfer.files)).catch(function (error) {
+          toast('⚠ ' + (error && error.message || error));
+        }).finally(clearBusy);
       } else {
-        toast(T('拖到列表空白处或顶部统计区导入文献；拖到条目行附加为附件'));
+        var clearImportBusy = toast(T('正在处理拖入的文件…'), 0);
+        importExternalDrop(e, currentImportFolderId()).catch(function (error) {
+          toast('⚠ ' + (error && error.message || error));
+        }).finally(clearImportBusy);
       }
     });
 
@@ -9544,6 +10434,7 @@
       if (sidebarFileRow) { sidebarFileRow.classList.remove('folder-file-drop'); sidebarFileRow = null; }
       $('#folder-list').classList.remove('folder-file-drop');
       $('#folder-empty').classList.remove('folder-file-drop');
+      $('#library-nav [data-folder="all"]').classList.remove('folder-file-drop');
     }
     function sidebarFileDragOver(e) {
       if (folderDragId || dragPayloadIds) return;
@@ -9558,8 +10449,10 @@
       }
       var inList = !row && !!(e.target.closest && e.target.closest('#folder-list'));
       var inEmpty = !row && !!(e.target.closest && e.target.closest('#folder-empty'));
+      var inRoot = !row && !!(e.target.closest && e.target.closest('#library-nav [data-folder="all"]'));
       $('#folder-list').classList.toggle('folder-file-drop', inList);
       $('#folder-empty').classList.toggle('folder-file-drop', inEmpty);
+      $('#library-nav [data-folder="all"]').classList.toggle('folder-file-drop', inRoot);
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
     }
     function sidebarFileDragLeave(e) {
@@ -9570,57 +10463,106 @@
           e.clientY >= bounds.top && e.clientY <= bounds.bottom) return;
       clearSidebarFileDrop();
     }
-    function sidebarFileDrop(e) {
-      if (folderDragId || dragPayloadIds) return;
-      if (!dragHasFiles(e)) return;
-      e.preventDefault();
-      e.stopPropagation();
-      var row = e.target.closest ? e.target.closest('.folder-item[data-folder]') : null;
-      var targetFolderId = row ? row.dataset.folder : '';
-      clearSidebarFileDrop();
-      // document 级 drop 被截停，这里手动收掉全局拖放提示与落区状态
-      dragDepth = 0;
-      var pill = $('#drag-hint-pill');
-      if (pill) pill.hidden = true;
-      clearFileDropZones();
+    async function pathFromDroppedDirectory(rootEntry) {
+      var queue = [rootEntry], visited = 0;
+      while (queue.length && visited++ < 5000) {
+        var entry = queue.shift();
+        if (entry.isFile && entry.file) {
+          var file = await new Promise(function (resolve) { entry.file(resolve, function () { resolve(null); }); });
+          var filePath = '';
+          try { if (file) filePath = desktop.getPathForFile(file) || ''; } catch (error) { filePath = ''; }
+          var rootRel = String(rootEntry.fullPath || '');
+          var leafRel = String(entry.fullPath || '');
+          if (filePath && rootRel && leafRel.indexOf(rootRel + '/') === 0) {
+            var segments = leafRel.slice(rootRel.length + 1).split('/');
+            var rootPath = filePath;
+            segments.forEach(function () { rootPath = rootPath.replace(/[\\/][^\\/]+$/, ''); });
+            return rootPath;
+          }
+        } else if (entry.isDirectory && entry.createReader) {
+          var reader = entry.createReader();
+          while (visited + queue.length < 5000) {
+            var children = await new Promise(function (resolve) {
+              reader.readEntries(resolve, function () { resolve([]); });
+            });
+            if (!children.length) break;
+            queue.push.apply(queue, children);
+          }
+        }
+      }
+      return '';
+    }
+    async function importExternalDrop(e, targetFolderId) {
       if (!desktop || !desktop.getPathForFile || !desktop.scanFolder) {
         toast(T('导入文件夹需要桌面版'));
         return;
       }
-      // dataTransfer.items 离开事件处理器即失效，必须同步取全：目录项 + 散 PDF 一起处理
-      var dirPaths = [];
-      var loosePdfs = [];
-      var unresolvable = 0;
-      Array.prototype.forEach.call(e.dataTransfer.items || [], function (item) {
+      if (folderImportBusy) { toast(T('已有文件夹正在导入，请稍后再试')); return; }
+      folderImportCancelled = false;
+      // 同一 drop 中的多个根目录只处理一次；目录的 File 可能位于 dataTransfer.files 而非 getAsFile()。
+      var dirPaths = [], looseFiles = [], directoryEntries = [], unresolvable = 0;
+      var transferredFiles = Array.prototype.slice.call(e.dataTransfer.files || []);
+      var items = Array.prototype.slice.call(e.dataTransfer.items || []);
+      items.forEach(function (item, index) {
         if (!item || item.kind !== 'file') return;
         var entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
-        var file = item.getAsFile();
-        if (!file) return;
-        var p = '';
-        try { p = desktop.getPathForFile(file) || ''; } catch (err) { p = ''; }
-        if (!p) { unresolvable++; return; }
-        if (entry && entry.isDirectory) dirPaths.push(p);
-        else if (/\.pdf$/i.test(file.name)) loosePdfs.push({ name: file.name, path: p });
+        var file = (item.getAsFile && item.getAsFile()) ||
+          transferredFiles.find(function (candidate) { return entry && candidate.name === entry.name; }) ||
+          (!entry && transferredFiles[index]);
+        if (!file) {
+          if (entry && entry.isDirectory) directoryEntries.push(entry);
+          else unresolvable++;
+          return;
+        }
+        var path = '';
+        try { path = desktop.getPathForFile(file) || ''; } catch (error) { path = ''; }
+        if (!path) {
+          if (entry && entry.isDirectory) directoryEntries.push(entry);
+          else unresolvable++;
+          return;
+        }
+        if (entry && entry.isDirectory) dirPaths.push(path);
+        else looseFiles.push({ name: file.name, path: path, size: file.size });
       });
-      if (!dirPaths.length && !loosePdfs.length) {
+      if (!items.length) transferredFiles.forEach(function (file) {
+        var path = '';
+        try { path = desktop.getPathForFile(file) || ''; } catch (error) { path = ''; }
+        if (path) looseFiles.push({ name: file.name, path: path, size: file.size });
+        else unresolvable++;
+      });
+      for (var j = 0; j < directoryEntries.length; j++) {
+        var resolved = await pathFromDroppedDirectory(directoryEntries[j]);
+        if (resolved) dirPaths.push(resolved);
+        else unresolvable++;
+      }
+      if (!dirPaths.length && !looseFiles.length) {
         toast(unresolvable ? T('无法读取拖入项的路径，请改用「更多 → 导入文件夹…」')
-          : T('拖到列表空白处或顶部统计区导入文献；拖到条目行附加为附件'));
+          : T('无法读取拖入项'));
         return;
       }
-      // 多目录按序导入（同路径去重，重复拖入由规划层幂等复用）；散 PDF 归入同一落点
-      var seen = {};
       var chain = Promise.resolve();
-      dirPaths.forEach(function (p) {
-        var key = p.toLowerCase();
-        if (seen[key]) return;
-        seen[key] = true;
-        chain = chain.then(function () { return importDroppedFolder(p, targetFolderId); });
+      window.LitFolderImport.collapseRootPaths(dirPaths).forEach(function (path) {
+        chain = chain.then(function () {
+          if (!folderImportCancelled) return importDroppedFolder(path, targetFolderId);
+        });
       });
-      if (loosePdfs.length) {
-        chain = chain.then(function () { importPdfFiles(loosePdfs, targetFolderId); });
-      }
+      if (looseFiles.length) chain = chain.then(function () {
+        if (!folderImportCancelled) return importLooseDocuments(looseFiles, targetFolderId);
+      });
+      return chain;
     }
-    ['#folder-list', '#folder-empty'].forEach(function (sel) {
+    function sidebarFileDrop(e) {
+      if (folderDragId || dragPayloadIds || !dragHasFiles(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      var row = e.target.closest ? e.target.closest('.folder-item[data-folder]') : null;
+      clearSidebarFileDrop();
+      var clearBusy = toast(T('正在处理拖入的文件…'), 0);
+      importExternalDrop(e, row ? row.dataset.folder : '').catch(function (error) {
+        toast('⚠ ' + (error && error.message || error));
+      }).finally(clearBusy);
+    }
+    ['#folder-list', '#folder-empty', '#library-nav [data-folder="all"]'].forEach(function (sel) {
       var el = $(sel);
       if (!el) return;
       el.addEventListener('dragover', sidebarFileDragOver);
@@ -9630,6 +10572,7 @@
 
     // 拖动表格行到左侧文件夹归类
     var dragPayloadIds = null;
+    var dragSourceFolderId = '';
     var DRAG_TYPE = 'application/x-litboard-papers';
     $('#table-body').addEventListener('dragstart', function (e) {
       var tr = e.target.closest('tr[data-id]');
@@ -9637,12 +10580,15 @@
       var id = tr.dataset.id;
       var ids = state.selected[id] ? selectedIds() : [id];
       e.dataTransfer.setData(DRAG_TYPE, JSON.stringify(ids));
-      e.dataTransfer.effectAllowed = 'copy';
+      e.dataTransfer.effectAllowed = 'copyMove';
       dragPayloadIds = ids;
+      var sourceFolder = currentFolderLinkTarget();
+      dragSourceFolderId = sourceFolder ? sourceFolder.id : '';
       tr.classList.add('dragging');
     });
     $('#table-body').addEventListener('dragend', function () {
       dragPayloadIds = null;
+      dragSourceFolderId = '';
       $all('.lit-table tr.dragging').forEach(function (tr) { tr.classList.remove('dragging'); });
       $all('.drag-over').forEach(function (el) { el.classList.remove('drag-over'); });
     });
@@ -9656,7 +10602,7 @@
       var target = e.target.closest('#folder-list [data-folder]') || e.target.closest('#library-nav [data-folder="unfiled"]');
       if (!target || !dragPayloadIds) return;
       e.preventDefault();
-      e.dataTransfer.dropEffect = 'copy';
+      e.dataTransfer.dropEffect = e.shiftKey && dragSourceFolderId ? 'move' : 'copy';
       $all('.drag-over').forEach(function (el) { if (el !== target) el.classList.remove('drag-over'); });
       target.classList.add('drag-over');
     });
@@ -9673,6 +10619,8 @@
       if (!ids || !ids.length) return;
       var papers = ids.map(getById).filter(Boolean);
       if (!papers.length) return;
+      var sourceFolderId = dragSourceFolderId;
+      dragSourceFolderId = '';
       if (target.dataset.folder === 'unfiled') {
         papers.forEach(function (paper) { paper.folderIds = []; });
         save(); renderAll();
@@ -9681,11 +10629,23 @@
       }
       var folder = state.folders.find(function (item) { return item.id === target.dataset.folder; });
       if (!folder) return;
+      var moving = e.shiftKey && sourceFolderId && sourceFolderId !== folder.id;
+      var changedPapers = papers.filter(function (paper) {
+        return (paper.folderIds || []).indexOf(folder.id) === -1 ||
+          moving && (paper.folderIds || []).indexOf(sourceFolderId) !== -1;
+      });
+      if (!changedPapers.length) return;
+      var undoIds = changedPapers.map(function (paper) { return paper.id; });
+      var undoBefore = makeSnapshot({ papers: undoIds });
       papers.forEach(function (paper) {
         if ((paper.folderIds || []).indexOf(folder.id) === -1) paper.folderIds.push(folder.id);
+        if (moving) paper.folderIds = paper.folderIds.filter(function (id) { return id !== sourceFolderId; });
+        window.LitModel.touch(paper);
       });
+      commitUndo(moving ? T('移动文献') : T('加入文件夹'), undoBefore, { papers: undoIds });
       save(); renderAll();
-      toast(T('✓ 已将 ') + papers.length + T(' 篇加入「') + folder.name + '」');
+      toast(moving ? T('✓ 已将 ') + papers.length + T(' 篇移至「') + folder.name + '」'
+        : T('✓ 已将 ') + papers.length + T(' 篇加入「') + folder.name + '」');
     });
 
     // 补全 / 导出菜单
@@ -9715,29 +10675,63 @@
     $('#add-id').addEventListener('keydown', function (e) { if (e.key === 'Enter') quickAdd(this.value); });
     $('#add-manual').addEventListener('click', function () { $('#add-mask').hidden = true; openEditModal(null); });
 
-    // 智能文件夹
-    $('#btn-save-search').addEventListener('click', saveCurrentSearch);
-    $('#saved-search-list').addEventListener('click', function (e) {
-      var del = e.target.closest('[data-delete-saved-search]');
-      if (del) {
-        var id = del.dataset.deleteSavedSearch;
-        var removedSearch = state.savedSearches.find(function (search) { return search.id === id; });
-        state.savedSearches = state.savedSearches.filter(function (s) { return s.id !== id; });
-        if (removedSearch) {
-          state.savedSearchTombstones = state.savedSearchTombstones.filter(function (search) { return search.id !== id; });
-          state.savedSearchTombstones.push(Object.assign({}, removedSearch, { deletedAt: Date.now() }));
-        }
-        if (state.activeSavedSearchId === id) state.activeSavedSearchId = '';
-        save(); renderAll();
-        return;
-      }
-      var sel = e.target.closest('[data-saved-search]');
-      if (sel) { applySavedSearch(sel.dataset.savedSearch, e.ctrlKey || e.metaKey); return; }
-      var editSearch = e.target.closest('[data-edit-saved-search]');
-      if (editSearch) { editSavedSearch(editSearch.dataset.editSavedSearch);  }
-    });
-
     // 标签管理
+    var sidebarTags = $('#sidebar-tag-panel');
+    var tagCollapseButton = $('#btn-tag-collapse');
+    var tagResizeGrip = $('#tag-list-resize');
+    var tagListHeight = 112;
+    try { tagListHeight = Number(localStorage.getItem(TAG_LIST_HEIGHT_KEY)) || 112; } catch (error) {}
+    function setTagListHeight(value, persist) {
+      tagListHeight = clamp(Math.round(value), 56, 180);
+      sidebarTags.style.setProperty('--tag-panel-height', tagListHeight + 'px');
+      tagResizeGrip.setAttribute('aria-valuenow', String(tagListHeight));
+      if (persist) {
+        try { localStorage.setItem(TAG_LIST_HEIGHT_KEY, String(tagListHeight)); } catch (error) {}
+      }
+    }
+    setTagListHeight(tagListHeight, false);
+    var tagResizeStartY = 0, tagResizeStartHeight = 0;
+    tagResizeGrip.addEventListener('pointerdown', function (event) {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      tagResizeStartY = event.clientY;
+      tagResizeStartHeight = tagListHeight;
+      tagResizeGrip.setPointerCapture(event.pointerId);
+      document.body.classList.add('resizing-tags');
+    });
+    tagResizeGrip.addEventListener('pointermove', function (event) {
+      if (!tagResizeGrip.hasPointerCapture(event.pointerId)) return;
+      setTagListHeight(tagResizeStartHeight - (event.clientY - tagResizeStartY), false);
+    });
+    function finishTagResize(event) {
+      if (!tagResizeGrip.hasPointerCapture(event.pointerId)) return;
+      tagResizeGrip.releasePointerCapture(event.pointerId);
+      document.body.classList.remove('resizing-tags');
+      setTagListHeight(tagListHeight, true);
+    }
+    tagResizeGrip.addEventListener('pointerup', finishTagResize);
+    tagResizeGrip.addEventListener('pointercancel', finishTagResize);
+    tagResizeGrip.addEventListener('lostpointercapture', function () {
+      document.body.classList.remove('resizing-tags');
+    });
+    tagResizeGrip.addEventListener('keydown', function (event) {
+      if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+      event.preventDefault();
+      setTagListHeight(tagListHeight + (event.key === 'ArrowUp' ? 12 : -12), true);
+    });
+    var tagsCollapsed = false;
+    try { tagsCollapsed = localStorage.getItem(TAG_LIST_COLLAPSED_KEY) === '1'; } catch (error) {}
+    function setTagsCollapsed(collapsed, persist) {
+      sidebarTags.classList.toggle('tag-list-collapsed', collapsed);
+      tagCollapseButton.setAttribute('aria-expanded', String(!collapsed));
+      if (persist) {
+        try { localStorage.setItem(TAG_LIST_COLLAPSED_KEY, collapsed ? '1' : '0'); } catch (error) {}
+      }
+    }
+    setTagsCollapsed(tagsCollapsed, false);
+    tagCollapseButton.addEventListener('click', function () {
+      setTagsCollapsed(!sidebarTags.classList.contains('tag-list-collapsed'), true);
+    });
     $('#btn-manage-tags').addEventListener('click', function () {
       renderTagManageList();
       $('#tags-mask').hidden = false;
@@ -9942,6 +10936,21 @@
         this.scrollLeft += e.deltaY;
       }
     }, { passive: false });
+    $('#pdf-scroll').addEventListener('click', function (e) {
+      if (e.target.closest('a, button, input, textarea')) return;
+      var selection = window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+      var sheet = e.target.closest('.pdf-page-sheet');
+      if (!sheet) return;
+      var marks = sheet.querySelectorAll('.pdf-annotation-mark:not(.pdf-annotation-ink)');
+      for (var i = marks.length - 1; i >= 0; i--) {
+        var rect = marks[i].getBoundingClientRect();
+        if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+          revealPdfAnnotation(marks[i].dataset.annotationId);
+          return;
+        }
+      }
+    });
     $('#pdf-annotation-list').addEventListener('click', function (e) {
       var removeButton = e.target.closest('[data-delete-annotation]');
       if (removeButton) {
@@ -10064,11 +11073,67 @@
     $('#pdf-external').addEventListener('click', function () {
       if (pdfState.paper && desktop) desktop.openPath(pdfState.paper.pdfPath);
     });
-    $('#pdf-side-toggle').addEventListener('click', function () {
-      togglePdfSide($('#pdf-side').dataset.tab === 'thumbs' ? 'thumbs' : 'outline');
+    try {
+      var savedPdfSideWidth = Number(localStorage.getItem(PDF_SIDE_WIDTH_KEY));
+      if (savedPdfSideWidth) $('#pdf-reader-main').style.setProperty('--pdf-side-width', clamp(savedPdfSideWidth, 160, 420) + 'px');
+      if (localStorage.getItem(PDF_SIDE_COLLAPSED_KEY) === '1') setPdfSideVisible(false);
+    } catch (e) {}
+    $('#pdf-side-toggle').addEventListener('click', function () { setPdfSideVisible($('#pdf-side').hidden); });
+    $('#pdf-side-collapse').addEventListener('click', function () { setPdfSideVisible(false); });
+    $('#pdf-side-open').addEventListener('click', function () { setPdfSideVisible(true); });
+    $('#pdf-side-tab-outline').addEventListener('click', function () { selectPdfSideTab('outline'); });
+    $('#pdf-side-tab-thumbs').addEventListener('click', function () { selectPdfSideTab('thumbs'); });
+    $('#pdf-side').querySelector('.pdf-side-tabs').addEventListener('keydown', function (e) {
+      if (!e.target.classList.contains('pdf-side-tab') || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+      e.preventDefault();
+      var next = e.target.id === 'pdf-side-tab-outline' ? 'thumbs' : 'outline';
+      selectPdfSideTab(next);
+      $('#pdf-side-tab-' + next).focus();
     });
-    $('#pdf-side-tab-outline').addEventListener('click', function () { togglePdfSide('outline'); });
-    $('#pdf-side-tab-thumbs').addEventListener('click', function () { togglePdfSide('thumbs'); });
+    (function () {
+      var grip = $('#pdf-side-resizer');
+      var main = $('#pdf-reader-main');
+      var startX = 0, startWidth = 240;
+      function width() { return parseFloat(getComputedStyle(main).getPropertyValue('--pdf-side-width')) || 240; }
+      function resize(value) {
+        var max = Math.max(160, Math.min(420, main.clientWidth - 340));
+        var next = clamp(value, 160, max);
+        main.style.setProperty('--pdf-side-width', next + 'px');
+        grip.setAttribute('aria-valuenow', String(next));
+        grip.setAttribute('aria-valuemax', String(max));
+      }
+      function saveWidth() {
+        try { localStorage.setItem(PDF_SIDE_WIDTH_KEY, String(width())); } catch (e) {}
+      }
+      grip.setAttribute('aria-valuemin', '160');
+      grip.setAttribute('aria-valuemax', '420');
+      grip.setAttribute('aria-valuenow', String(width()));
+      grip.addEventListener('pointerdown', function (e) {
+        startX = e.clientX;
+        startWidth = width();
+        grip.setPointerCapture(e.pointerId);
+        grip.classList.add('dragging');
+        document.body.classList.add('resizing-panes');
+      });
+      grip.addEventListener('pointermove', function (e) {
+        if (grip.hasPointerCapture(e.pointerId)) resize(startWidth + e.clientX - startX);
+      });
+      function finish(e) {
+        if (grip.hasPointerCapture(e.pointerId)) grip.releasePointerCapture(e.pointerId);
+        grip.classList.remove('dragging');
+        document.body.classList.remove('resizing-panes');
+        saveWidth();
+      }
+      grip.addEventListener('pointerup', finish);
+      grip.addEventListener('pointercancel', finish);
+      grip.addEventListener('dblclick', function () { resize(240); saveWidth(); });
+      grip.addEventListener('keydown', function (e) {
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+        e.preventDefault();
+        resize(width() + (e.key === 'ArrowRight' ? 10 : -10));
+        saveWidth();
+      });
+    })();
     $('#pdf-ocr-page').addEventListener('click', function () {
       if (!pdfState.handle || !pdfState.pageCount) return;
       ocrPdfPages([pdfState.currentPage - 1]);
@@ -10226,9 +11291,85 @@
       renderAll();
     });
 
+    function showTableColumnsMenu(x, y, anchor) {
+      var items = [{ header: T('显示列') }];
+      TABLE_COLUMNS.filter(function (column) { return !column.fixed; }).forEach(function (column) {
+        items.push({ label: (tableColumns[column.key].visible ? '✓  ' : '    ') + T(column.label), fn: function () {
+          tableColumns[column.key].visible = !tableColumns[column.key].visible;
+          saveTableColumns();
+          renderTable();
+        } });
+      });
+      items.push('sep');
+      items.push({ label: T('恢复默认列'), fn: function () {
+        TABLE_COLUMNS.forEach(function (column) {
+          tableColumns[column.key] = { visible: !column.optional, width: column.width };
+        });
+        saveTableColumns();
+        renderTable();
+      } });
+      showCtxMenu(x, y, items, anchor ? { anchor: anchor } : null);
+    }
+    $('#table-columns-btn').addEventListener('click', function (event) {
+      event.stopPropagation();
+      var rect = event.currentTarget.getBoundingClientRect();
+      showTableColumnsMenu(rect.left, rect.top, rect);
+    });
+    $('#lit-table thead').addEventListener('contextmenu', function (event) {
+      if (!event.target.closest('th[data-column]')) return;
+      event.preventDefault();
+      showTableColumnsMenu(event.clientX, event.clientY);
+    });
+    var suppressHeaderClick = false;
+    var suppressHeaderClickTimer = 0;
+    $('#lit-table thead').addEventListener('click', function (event) {
+      if (!suppressHeaderClick) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      suppressHeaderClick = false;
+      clearTimeout(suppressHeaderClickTimer);
+    }, true);
+    $all('.lit-table th[data-column]').forEach(function (th) {
+      if (th.dataset.column === 'attachment') return;
+      var grip = document.createElement('span');
+      grip.className = 'column-resizer';
+      grip.setAttribute('aria-hidden', 'true');
+      th.appendChild(grip);
+      grip.addEventListener('pointerdown', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        suppressHeaderClick = true;
+        clearTimeout(suppressHeaderClickTimer);
+        var key = th.dataset.column;
+        var startX = event.clientX;
+        var startWidth = th.getBoundingClientRect().width;
+        grip.classList.add('dragging');
+        document.body.classList.add('resizing-columns');
+        function move(moveEvent) {
+          tableColumns[key].width = Math.max(key === 'title' ? 180 : 48,
+            Math.min(800, Math.round(startWidth + moveEvent.clientX - startX)));
+          applyTableColumns(true);
+        }
+        function stop() {
+          document.removeEventListener('pointermove', move);
+          document.removeEventListener('pointerup', stop);
+          document.removeEventListener('pointercancel', stop);
+          grip.classList.remove('dragging');
+          document.body.classList.remove('resizing-columns');
+          saveTableColumns();
+          // pointerup 后浏览器可能把 click 派给 th，而不是握柄；只吞这次收尾点击。
+          suppressHeaderClickTimer = setTimeout(function () { suppressHeaderClick = false; }, 500);
+        }
+        document.addEventListener('pointermove', move);
+        document.addEventListener('pointerup', stop);
+        document.addEventListener('pointercancel', stop);
+      });
+    });
+
     // 表头排序
     $all('.lit-table th.sortable').forEach(function (th) {
       th.addEventListener('click', function (e) {
+        if (e.target && e.target.closest && e.target.closest('.column-resizer')) return;
         // 分区列内嵌的「补查缺失分区」按钮：不触发排序（bind 里另有 stopPropagation 兜底双保险）
         if (e.target && e.target.closest && e.target.closest('#rank-refresh-all')) return;
         var key = th.dataset.sort;
@@ -10323,22 +11464,25 @@
         return;
       }
       // Windows 风格选择：Ctrl 切换单选，Shift 区间多选，均不打开抽屉
-      if (e.ctrlKey || e.metaKey) {
-        state.selAnchor = state.selAnchor || p.id;
-        toggleSelectId(p.id);
-        state.focusId = p.id;
-        return;
-      }
       if (e.shiftKey) {
         state.selAnchor = state.selAnchor || p.id;
-        selectRangeTo(p.id);
+        selectRangeTo(p.id, e.ctrlKey || e.metaKey);
         state.focusId = p.id;
         updateSelectionUi();
         return;
       }
+      if (e.ctrlKey || e.metaKey) {
+        state.selAnchor = p.id;
+        toggleSelectId(p.id);
+        state.focusId = p.id;
+        return;
+      }
+      state.selected = {};
+      state.selected[p.id] = true;
       state.selAnchor = p.id;
       state.focusId = p.id;
       openDrawerAndReveal(p.id);
+      updateSelectionUi();
     });
     // 双击表格行：双击附件子行打开该附件；双击文献行打开其主 PDF
     $('#table-body').addEventListener('dblclick', function (e) {
@@ -10414,12 +11558,7 @@
       var act = b.dataset.bulk;
       var ids = selectedIds(); if (!ids.length) return;
       var papers = ids.map(getById).filter(Boolean);
-      if (act === 'unread' || act === 'reading' || act === 'read') {
-        var undoBefore = makeSnapshot({ papers: papers.map(function (p) { return p.id; }) });
-        papers.forEach(function (p) { p.status = act; });
-        commitUndo(T('批量标记') + STATUS_LABEL[act], undoBefore, { papers: papers.map(function (p) { return p.id; }) });
-        save(); renderAll(); toast(T('✓ 已标记 ') + papers.length + T(' 篇为') + STATUS_LABEL[act]);
-      } else if (act === 'edit-fields') {
+      if (act === 'edit-fields') {
         openBulkEdit(papers);
       } else if (act === 'tag') {
         dlgPrompt(T('添加标签'), T('给选中的 ') + papers.length + T(' 篇添加标签（逗号分隔）'), T('如：综述, 机器学习')).then(function (t) {
@@ -10461,17 +11600,7 @@
       } else if (act === 'export-ris') {
         download('litboard-selected-' + stamp() + '.ris', window.LitCite.ris(papers), 'application/x-research-info-systems');
       } else if (act === 'delete') {
-        var linkFolder = currentFolderLinkTarget();
-        if (linkFolder) {
-          dlgConfirm(T('从当前文件夹移出'), T('将选中的 ') + papers.length + T(' 篇从“') + linkFolder.name +
-            T('”移出？文献、附件及其它文件夹中的链接都会保留。'), T('移出')).then(function (ok) {
-            if (ok) removePapersFromFolder(papers, linkFolder);
-          });
-        } else {
-          dlgConfirm(T('移入回收站'), T('删除选中的 ') + papers.length + T(' 篇？可在提示条点「撤销」恢复，也可稍后在回收站找回。'), T('移入回收站')).then(function (ok) {
-            if (ok) removePapers(ids);
-          });
-        }
+        confirmPapersToTrash(ids);
       } else if (act === 'restore') {
         var restored = restorePapers(ids);
         state.selected = {};
@@ -10549,6 +11678,13 @@
       }
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       switch (e.key) {
+        case 'Delete': {
+          if (e.target.closest('#folder-list, #library-nav') || state.activeFolderId === 'trash' || state.resultView !== 'papers') break;
+          var deleteIds = selectedIds();
+          if (!deleteIds.length && state.focusId) deleteIds = [state.focusId];
+          if (deleteIds.length) { e.preventDefault(); confirmPapersToTrash(deleteIds); }
+          break;
+        }
         case '/': e.preventDefault(); $('#search').focus(); break;
         case 'j': e.preventDefault(); moveFocus(1, e.shiftKey); break;
         case 'k': e.preventDefault(); moveFocus(-1, e.shiftKey); break;
@@ -10719,12 +11855,12 @@
       saveNotes(p.id);
     });
     window.addEventListener('beforeunload', function () { if (saveNotes) saveNotes.flush(); });
-    $('#d-enrich').addEventListener('click', function () {
+    function enrichDrawerPaper() {
       var p = getById(drawerId); if (!p) return;
-      var btn = $('#d-enrich');
-      btn.disabled = true; setBtnLabel(btn, T('查询中…'));
+      if (drawerEnriching) return;
+      drawerEnriching = true;
+      toast(T('查询中…'));
       window.LitEnrich.enrichPaper(p).then(function (patch) {
-        btn.disabled = false; setBtnLabel(btn, T('补全'));
         if (patch) {
           var updated = applyPatch(p, patch);
           save(); renderAll(); openDrawer(updated.id);
@@ -10733,18 +11869,19 @@
           toast(T('三个数据源均未找到该文献（可检查 DOI 或标题）'));
         }
       }).catch(function (err) {
-        btn.disabled = false; setBtnLabel(btn, T('补全'));
         toast(T('⚠ 查询失败：') + (err && err.message || T('网络错误')));
+      }).finally(function () {
+        drawerEnriching = false;
       });
-    });
+    }
     $('#d-fetch-pdf').addEventListener('click', function () {
       var p = getById(drawerId); if (!p) return;
       fetchPdfForPaper(p);
     });
-    $('#d-copy-bib').addEventListener('click', function () {
+    function copyDrawerBib() {
       var p = getById(drawerId); if (!p) return;
       copyToClipboard(window.LitBib.paperToBibtex(p)).then(function () { toast(T('✓ BibTeX 已复制')); });
-    });
+    }
     $('#d-edit').addEventListener('click', function () {
       if (drawerInlineEditing) cancelDrawerInlineEdit();
       else startDrawerInlineEdit();
@@ -10759,20 +11896,21 @@
       var p = getById(drawerId); if (!p) return;
       openCiteModal(p);
     });
-    $('#d-delete').addEventListener('click', function () {
+    function deleteDrawerPaper() {
       var p = getById(drawerId); if (!p) return;
-      var linkFolder = currentFolderLinkTarget();
-      if (linkFolder) {
-        dlgConfirm(T('从当前文件夹移出'), T('将「') + p.title.slice(0, 40) + T('」从“') + linkFolder.name +
-          T('”移出？文献、附件及其它文件夹中的链接都会保留。'), T('移出')).then(function (ok) {
-          if (ok) removePapersFromFolder([p], linkFolder);
-        });
-      } else {
-        dlgConfirm(T('删除文献'), T('删除「') + p.title.slice(0, 40) + T('…」？可在提示条点「撤销」恢复。'), T('删除'), true).then(function (ok) {
-          if (!ok) return;
-          removePapers([p.id], T('已删除「') + p.title.slice(0, 24) + '」');
-        });
-      }
+      dlgConfirm(T('移入回收站'), T('删除「') + p.title.slice(0, 40) + T('…」？可在提示条点「撤销」恢复。'), T('移入回收站'), true).then(function (ok) {
+        if (ok) removePapers([p.id]);
+      });
+    }
+    $('#d-more').addEventListener('click', function (e) {
+      e.stopPropagation();
+      var rect = e.currentTarget.getBoundingClientRect();
+      showCtxMenu(rect.right - 190, rect.bottom + 4, [
+        { label: T('补全元数据'), icon: 'lb-i-sparkle', fn: enrichDrawerPaper },
+        { label: T('复制 BibTeX'), icon: 'lb-i-doc', fn: copyDrawerBib },
+        'sep',
+        { label: T('删除文献'), icon: 'lb-i-trash', danger: true, fn: deleteDrawerPaper }
+      ]);
     });
   }
 
@@ -10800,6 +11938,8 @@
     if (!btn) return;
     btn.disabled = !!disabled;
     setBtnLabel(btn, label);
+    btn.title = label === 'PDF' ? T('从 OpenAlex / Semantic Scholar 查找开放获取 PDF 并保存到本机') : label;
+    btn.setAttribute('aria-label', label === 'PDF' ? T('获取 PDF') : label);
   }
   /* 下载落盘后静默构建该篇全文索引：新附件不在索引 meta 里，reindex 只提取这一篇 */
   function indexPaperFulltext(paper) {
@@ -10814,7 +11954,8 @@
     setPdfButton(c.source + '…', true);
     return desktop.downloadPdf({
       url: c.url,
-      name: pdfDownloadBaseName(p)
+      name: pdfDownloadBaseName(p),
+      paperId: p.id
     }).then(function (result) {
       if (!result || result.canceled) {
         if (!quiet) toast(T('已取消下载'));
@@ -10913,6 +12054,7 @@
     initWindowControls();
     state.collapsedFolders = readCollapsedFolders();
     state.shortcuts = readShortcutSettings();
+    setLeftSidebarCollapsed(readCollapsedPreference(LEFT_SIDEBAR_COLLAPSED_KEY), false);
     applyPaneSizes(readPaneSizes());
     initWorkspaceStore();
     initHistory();
@@ -10920,6 +12062,7 @@
     initReaderNotePanels();
     bindEvents();
     initAgentUi();
+    setRightSidebarCollapsed(readCollapsedPreference(RIGHT_SIDEBAR_COLLAPSED_KEY), false);
     /* 阅读模式右栏可达性：PDF/EPUB 全屏层打开时，右栏（详情/AI/批注）浮到层上，
      * 阅读层右侧让出同等宽度（css body.reading-open；AI 对话由此可达）。
      * hidden/class 都会被各处直接赋值，统一 MutationObserver 同步，不逐点插桩。 */
@@ -11022,7 +12165,9 @@
       renderPdfTabs();
       reportCurrentFolder(); // 启动时同步一次当前文件夹给浏览器扩展
       window.litboardReadyAt = performance.now();
+      if (desktop && desktop.checkAppUpdate) setTimeout(function () { checkForAppUpdate(false); }, 3000);
     });
   }
+  if (desktop && desktop.isSmokeTest) window.litboardSmokeImportFolder = importDroppedFolder;
   start();
 })();

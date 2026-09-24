@@ -2,7 +2,7 @@
  *
  * 各服务商的推理控制参数、合法取值、甚至「能否关闭思考」都不一致；统一档位直接下发
  * 会造成静默降级（medium 被归一到 high，用户以为降了实际没降）或直接 400。
- * 本模块按 Base URL + **模型名**识别能力，只暴露官方支持的档位，并给出实际下发的参数。
+ * 本模块只按模型 ID 识别能力；服务商容器可能承载其他系列模型。
  *
  * 官方取值（2026-09-20 逐家核对官方文档）：
  * - DeepSeek（api-docs.deepseek.com）：reasoning_effort = low|high|max（默认 high）；
@@ -15,11 +15,11 @@
  * - 智谱 GLM（docs.bigmodel.cn）：thinking.type = enabled(默认)|disabled；reasoning_effort
  *   仅 GLM-5.2 及以上支持（max|high|low，GLM-5.2 另接受 xhigh/medium/minimal 并归一到
  *   max/high/none）；GLM-5.3/5.3-FLASH **不允许 disabled**（传了报错）。
- * - 通义千问 / DashScope：enable_thinking = true|false（混合思考模型开关）；官方另有
- *   thinking_budget / reasoning_effort，但 qwen3.8 系列禁止两者同时下发——本项目只用
- *   最稳的 enable_thinking 开关，不猜离散档位。
- * - OpenAI：reasoning_effort = minimal|low|medium|high（推理系模型）；非推理模型不支持该参数。
- * - 未知端点（本地 ollama / vLLM / 自建代理）：官方取值未知，**一律不下发推理参数**，
+ * - Qwen3.8：reasoning_effort = none|low|medium|xhigh；其他已识别 Qwen 使用
+ *   enable_thinking 开关。不同托管端点的兼容性仍需以实际 API 为准。
+ * - GPT-5：按型号限制 reasoning_effort 档位；GPT-4o/4.1 不提供推理强度。
+ * - Claude：支持 effort 的型号按 ID 开放档位；Messages API 发送 output_config.effort。
+ * - 未知模型（本地 ollama / vLLM / 自建模型）：官方取值未知，**一律不下发推理参数**，
  *   宁可少一个开关，也不制造 400 或伪造控制力。
  *
  * 注意：输出上限（max_tokens）不由本模块决定——它来自 设置 → AI 助手 → 最大输出
@@ -35,16 +35,10 @@
   'use strict';
 
   // 全部档位（UI 按能力裁剪展示；'' = 默认，不下发任何参数）
-  var ALL_LEVELS = ['off', 'low', 'medium', 'high', 'max'];
+  var ALL_LEVELS = ['off', 'low', 'medium', 'high', 'xhigh', 'max'];
 
   // 参数形态：effort → reasoning_effort；thinking → thinking.type；switch → enable_thinking
   var PARAM_KINDS = { EFFORT: 'effort', THINKING: 'thinking', SWITCH: 'enable_thinking' };
-
-  function hostOf(baseUrl) {
-    var raw = String(baseUrl == null ? '' : baseUrl).trim().toLowerCase();
-    if (!raw) return '';
-    try { return new URL(raw).hostname.toLowerCase(); } catch (error) { return raw; }
-  }
 
   function capability(provider, label, param, levels, official, remap, notes, extra) {
     return {
@@ -71,7 +65,13 @@
       { offViaThinking: true });
   }
 
-  function qwen() {
+  function qwen(model) {
+    if (/^qwen3\.8(?:-|$)/.test(model)) {
+      return capability('qwen', 'Qwen 3.8', PARAM_KINDS.EFFORT,
+        ['off', 'low', 'medium', 'xhigh'],
+        { off: 'none', low: 'low', medium: 'medium', xhigh: 'xhigh' },
+        { high: 'xhigh', max: 'xhigh' });
+    }
     return capability('qwen', '通义千问 / DashScope', PARAM_KINDS.SWITCH,
       ['off', 'high'],
       { off: 'false', high: 'true' },
@@ -137,7 +137,15 @@
       });
   }
 
-  function openai() {
+  function openai(model) {
+    if (/^gpt-5\.[45]-pro(?:-|$)/.test(model)) return capability('openai', 'GPT-5 Pro', PARAM_KINDS.EFFORT,
+      ['medium', 'high', 'xhigh'], { medium: 'medium', high: 'high', xhigh: 'xhigh' });
+    if (/^gpt-5\.[4-9](?:-|$)/.test(model)) return capability('openai', 'GPT-5.4+', PARAM_KINDS.EFFORT,
+      ['off', 'low', 'medium', 'high', 'xhigh'],
+      { off: 'none', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' });
+    if (/^gpt-5\.1(?:-|$)/.test(model)) return capability('openai', 'GPT-5.1', PARAM_KINDS.EFFORT,
+      ['off', 'low', 'medium', 'high'],
+      { off: 'none', low: 'low', medium: 'medium', high: 'high' });
     return capability('openai', 'OpenAI', PARAM_KINDS.EFFORT,
       ['off', 'low', 'medium', 'high'],
       { off: 'minimal', low: 'low', medium: 'medium', high: 'high' },
@@ -145,18 +153,29 @@
       { max: 'OpenAI 无 max 档，已按 high 下发' });
   }
 
-  /** 未知端点：不下发任何推理参数 */
+  function claude(model) {
+    if (/^claude-(?:opus-(?:4-[678]|5)|sonnet-(?:4-6|5))(?:-|$)/.test(model)) {
+      var extended = /^claude-(?:opus-(?:4-[78]|5)|sonnet-5)(?:-|$)/.test(model);
+      var levels = extended ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high', 'max'];
+      var official = { low: 'low', medium: 'medium', high: 'high', max: 'max' };
+      if (extended) official.xhigh = 'xhigh';
+      return capability('claude', 'Claude', PARAM_KINDS.EFFORT, levels, official);
+    }
+    return generic();
+  }
+
+  /** 未知模型：不下发任何推理参数 */
   function generic() {
-    return capability('generic', '未知端点', PARAM_KINDS.EFFORT,
+    return capability('generic', '未知模型', PARAM_KINDS.EFFORT,
       [],
       {},
       { off: '', low: 'high', medium: 'high', high: 'high', max: 'high' },
       {
-        off: '该端点未识别，推理参数不会下发',
-        low: '该端点未识别，推理参数不会下发',
-        medium: '该端点未识别，推理参数不会下发',
-        high: '该端点未识别，推理参数不会下发',
-        max: '该端点未识别，推理参数不会下发'
+        off: '该模型未识别，推理参数不会下发',
+        low: '该模型未识别，推理参数不会下发',
+        medium: '该模型未识别，推理参数不会下发',
+        high: '该模型未识别，推理参数不会下发',
+        max: '该模型未识别，推理参数不会下发'
       });
   }
 
@@ -169,18 +188,17 @@
       .test(String(model || '').toLowerCase());
   }
 
-  /** 按 Base URL + 模型名识别服务商与可用档位 */
+  /** 只按模型 ID 识别能力；未知 ID 保持默认，不猜测托管服务商的参数兼容性。 */
   function detect(input) {
-    var host = hostOf(input && input.baseUrl);
-    var model = String(input && input.model || '').trim().toLowerCase();
+    var model = String(input && input.model || '').trim().toLowerCase().split('/').pop();
     var cap;
-    if (host.indexOf('deepseek') !== -1 || /^deepseek/.test(model)) cap = deepseek();
-    // DashScope 承载多种模型（Qwen/GLM/Kimi 均有），但其 API 面统一用 enable_thinking
-    else if (host.indexOf('dashscope') !== -1 || host.indexOf('aliyuncs') !== -1) cap = qwen();
-    else if (host.indexOf('moonshot') !== -1 || /^kimi/.test(model)) cap = kimi(model);
-    else if (host.indexOf('bigmodel') !== -1 || host.indexOf('z.ai') !== -1 || /^glm/.test(model)) cap = glm(model);
-    else if (/^(qwen|qwq)/.test(model)) cap = qwen();
-    else if (/^(gpt-5|gpt5|gpt-4o|gpt-4\.1|o1|o3|o4)/.test(model)) cap = openai();
+    if (/^deepseek(?:-|$)/.test(model)) cap = deepseek();
+    else if (/^kimi(?:-|$)/.test(model)) cap = kimi(model);
+    else if (/^glm(?:-|$)/.test(model)) cap = glm(model);
+    else if (/^(qwen|qwq)(?:[\d.-]|$)/.test(model)) cap = qwen(model);
+    else if (/^claude(?:-|$)/.test(model)) cap = claude(model);
+    else if (/^gpt-5(?:[.-]|$)|^o[134](?:-|$)/.test(model)) cap = openai(model);
+    else if (/^gpt-4(?:o|\.1)(?:-|$)/.test(model)) cap = capability('openai', 'GPT-4', PARAM_KINDS.EFFORT, [], {});
     else cap = generic();
     // vision：已知服务商 × 模型名粗判；未知端点一律 false（宁可不发图）
     cap.vision = cap.provider !== 'generic' && modelLooksVisionCapable(model);

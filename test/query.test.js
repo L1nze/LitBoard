@@ -7,7 +7,7 @@ const LitQuery = require('../js/query.js');
 const papers = [
   { id: 'p1', title: 'Attention Is All You Need', authors: ['Ashish Vaswani'], year: 2017,
     entryType: 'article', venue: 'NeurIPS', tags: ['transformer', 'nlp'], citations: 90000, rating: 5,
-    status: 'read', doi: '10.1/abc', abstract: 'self-attention', notes: '里程碑', key: 'vaswani2017' },
+    status: 'reading', doi: '10.1/abc', abstract: 'self-attention', notes: '里程碑', key: 'vaswani2017' },
   { id: 'p2', title: '深度学习综述', authors: ['Yann LeCun'], year: 2015,
     entryType: 'article', venue: 'Nature', tags: ['综述'], citations: 30000, rating: 4,
     status: 'reading', doi: '', abstract: 'deep learning review', notes: '', key: 'lecun2015' },
@@ -73,9 +73,27 @@ test('field matching and numeric comparisons', function () {
   assert.deepEqual(match('citations>50000'), ['p1']);
   assert.deepEqual(match('rating>=4'), ['p1', 'p2']);
   assert.deepEqual(match('year<2016'), ['p2']);
-  assert.deepEqual(match('status:reading'), ['p2']);
+  assert.deepEqual(match('status:reading'), ['p1', 'p2']);
   assert.deepEqual(match('key:lecun2015'), ['p2']);
-  assert.deepEqual(match('type:article status:read'), ['p1']);
+  assert.deepEqual(match('type:article status:read'), ['p1', 'p2']); // 旧智能文件夹兼容
+});
+
+test('quoted field values stay intact and DOI display labels are accepted', function () {
+  const paper = { id: 'p', title: 'Battery health', doi: '10.3969/j.issn.1002-087X.2026.08.015' };
+  const queries = [
+    'doi:10.3969/j.issn.1002-087X.2026.08.015',
+    'doi:"DOI 10.3969/j.issn.1002-087X.2026.08.015"',
+    'doi:"DOI: 10.3969/j.issn.1002-087X.2026.08.015"',
+    'doi:https://doi.org/10.3969/j.issn.1002-087X.2026.08.015',
+    'doi:"https://doi.org/10.3969/j.issn.1002-087X.2026.08.015"'
+  ];
+  queries.forEach(function (query) {
+    const parsed = LitQuery.parse(query);
+    assert.equal(parsed.error, null, query);
+    assert.equal(parsed.matcher(paper), true, query);
+  });
+  assert.deepEqual(match('abstract:"deep learning"'), ['p2']);
+  assert.match(LitQuery.parse('doi:"DOI 10.3969/abc').error, /引号未闭合/);
 });
 
 test('has:/is: flags', function () {
@@ -104,6 +122,8 @@ test('isPlainText detects simple queries', function () {
   assert.equal(LitQuery.isPlainText('深度学习'), true);
   assert.equal(LitQuery.isPlainText('year>=2020'), false);
   assert.equal(LitQuery.isPlainText('a OR b'), false);
+  assert.equal(LitQuery.isPlainText('battery -health'), false);
+  assert.equal(LitQuery.isPlainText('battery-health'), true);
 });
 
 /* ---------- 阶段四：AST / 新字段 / 跨层级组 / Unicode 规范化 ---------- */
@@ -120,6 +140,66 @@ test('parseAst returns versioned AST and serialize round-trips', function () {
   const m2 = LitQuery.compile(JSON.parse(LitQuery.serializeAst(ast))).matcher;
   assert.equal(m1(paper), true);
   assert.equal(m2(paper), true);
+});
+
+test('search-box parse accepts workspace context for note and folder conditions', function () {
+  const context = {
+    notes: [{ id: 'n1', paperId: 'p1', title: '实验记录', content: '电池状态估计' }],
+    folders: [{ id: 'f1', name: '电池研究', parentId: '' }]
+  };
+  const paper = { id: 'p1', title: 'Battery paper', folderIds: ['f1'] };
+  const matching = LitQuery.parse('note("电池状态") folder:"电池研究"', context);
+  assert.equal(matching.error, null);
+  assert.equal(matching.matcher(paper), true);
+  assert.equal(matching.matcher({ id: 'p2', title: 'Other', folderIds: [] }), false);
+});
+
+test('AST text round-trip preserves AND, OR and NOT grouping', function () {
+  const cases = [
+    { query: '(alpha OR beta) gamma', titles: ['alpha', 'alpha gamma', 'beta gamma'] },
+    { query: 'NOT (alpha OR beta)', titles: ['alpha', 'gamma'] },
+    { query: 'alpha OR (beta gamma)', titles: ['alpha', 'beta', 'beta gamma'] }
+  ];
+  cases.forEach(function (item) {
+    const original = LitQuery.parseAst(item.query);
+    const restored = LitQuery.parseAst(LitQuery.astToText(original));
+    assert.equal(original.error, undefined, item.query);
+    assert.equal(restored.error, undefined, item.query);
+    item.titles.forEach(function (title) {
+      const paper = { title: title };
+      assert.equal(LitQuery.compile(restored).matcher(paper),
+        LitQuery.compile(original).matcher(paper), item.query + ' on ' + title);
+    });
+  });
+});
+
+test('serialized regex AST keeps its pattern and never becomes match-all', function () {
+  const source = LitQuery.parseAst('/battery/');
+  const restored = JSON.parse(LitQuery.serializeAst(source));
+  const matcher = LitQuery.compile(restored).matcher;
+  assert.equal(matcher({ title: 'Battery health' }), true);
+  assert.equal(matcher({ title: 'Unrelated paper' }), false);
+  const legacy = { v: 3, root: { op: 'regex', re: {} } };
+  const repaired = LitQuery.repairLegacyRegexAst(legacy, '/battery/');
+  assert.equal(LitQuery.compile(repaired).matcher({ title: 'Battery health' }), true);
+  assert.equal(LitQuery.compile(repaired).matcher({ title: 'Unrelated paper' }), false);
+  assert.equal(LitQuery.compile(legacy).matcher({ title: 'Unrelated paper' }), false);
+});
+
+test('plain, notes field and regex searches include every active top-level note', function () {
+  const paper = { id: 'p1', title: 'Battery paper', notes: 'first note' };
+  const context = {
+    notes: [
+      { id: 'n1', paperId: 'p1', content: 'first note' },
+      { id: 'n2', paperId: 'p1', title: 'Important methods', content: 'second-note keyword' },
+      { id: 'n3', paperId: 'p1', content: 'deleted-only', deletedAt: 1 }
+    ]
+  };
+  assert.equal(LitQuery.rankPlainText(paper, 'keyword', context).matched, true);
+  assert.equal(LitQuery.parse('notes:keyword', context).matcher(paper), true);
+  assert.equal(LitQuery.parse('/second-note/', context).matcher(paper), true);
+  assert.equal(LitQuery.parse('methods', context).matcher(paper), true);
+  assert.equal(LitQuery.parse('notes:deleted-only', context).matcher(paper), false);
 });
 
 test('ann() group requires the SAME annotation to satisfy all inner conditions', function () {
@@ -291,6 +371,18 @@ test('entity search returns attachment-scoped navigable hits', function () {
   assert.equal(topics.total, 1);
   assert.equal(topics.items[0].paperId, '');
   assert.equal(topics.items[0].target.noteId, 'n1');
+});
+
+test('invalid entity search does not return every entity', function () {
+  const workspace = {
+    papers: [{ id: 'p1', title: 'Battery', pdfAnnotations: [
+      { id: 'a1', text: 'health', position: { pageIndex: 0 } }
+    ] }],
+    notes: [], folders: []
+  };
+  const result = LitQuery.searchEntities('title:"unclosed', workspace, { scope: 'annotation' });
+  assert.equal(result.total, 0);
+  assert.match(result.error, /引号未闭合/);
 });
 
 test('F07 回归：author+ann 混合条件实体命中不为空', function () {

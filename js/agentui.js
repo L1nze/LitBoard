@@ -26,9 +26,10 @@ window.LitAgentUi = (function () {
   var current = null;
   var activePane = 'detail';   // 当前右栏面板：detail | ai | anno
   var agentReady = false;    // 端点 + Key 配置齐 → 对话模式；否则显示配置引导
-  var thinking = '';         // ''=默认 | off | low | medium | high | max
+  var thinking = '';         // ''=默认 | off | low | medium | high | xhigh | max
   var lastConfig = null;
-  var chipState = { paper: true, folder: true, selection: true };
+  // 文献/文件夹上下文恒携带（界面不再渲染对应 chip，无开关）；划词上下文仍可由「选中」chip 切换
+  var chipState = { selection: true };
   var openSeq = 0;           // A09：会话打开请求序号，慢返回不覆盖新选择
   var bumpTimer = null;
   var subscriber = null;
@@ -42,7 +43,7 @@ window.LitAgentUi = (function () {
   var autoCompactEnabled = true;   // R17：上下文压缩（设置 → AI 助手；关闭则只走裁剪+旧工具结果掩码）
   var MASK_KEEP_LAST = 30;         // R17：掩码保留的最近消息条数（压缩关闭时的零成本降级）
   var compactBusy = false;         // H3：手动压缩进行中——与正常发送互斥（控制器按会话唯一，并发会互相顶掉）
-  var recentGraphAvailable = false;
+  var recentGraphSessionId = null;
 
   function $(id) { return document.getElementById(id); }
   function el(tag, cls, text) {
@@ -153,10 +154,10 @@ window.LitAgentUi = (function () {
       getPapersInFolder: deps.getPapersInFolder || function () { return []; },
       collectWorks: deps.collectWorks,
       importStagedPdfs: deps.importStagedPdfs,
-      openGraphPanel: function (data, title) {
+      openGraphPanel: function (data, sessionId) {
         if (!deps.openGraphPanel) return;
-        deps.openGraphPanel(data, title);
-        recentGraphAvailable = true;
+        deps.openGraphPanel(data);
+        recentGraphSessionId = sessionId || null;
         renderAttachments(current ? runs.get(current) : null);
       },
       saveGraphHtmlToSession: deps.saveGraphHtmlToSession,
@@ -272,7 +273,7 @@ window.LitAgentUi = (function () {
     });
   }
 
-  var LEVEL_LABELS = { off: '推理：关', low: '推理：低', medium: '推理：中', high: '推理：高', max: '推理：最高' };
+  var LEVEL_LABELS = { off: '关', low: '低', medium: '中', high: '高', xhigh: '更高', max: '最高' };
 
   function renderThinkingOptions() {
     var sel = $('agent-thinking');
@@ -283,9 +284,7 @@ window.LitAgentUi = (function () {
     Reason.options(cap).forEach(function (option) {
       var node = document.createElement('option');
       node.value = option.value;
-      var text = option.value ? T(LEVEL_LABELS[option.value]) : T('推理：默认');
-      // 官方取值直接标在标签上，避免「以为降了其实没降」
-      node.textContent = option.official ? text + ' · ' + option.official : text;
+      node.textContent = option.value ? T(LEVEL_LABELS[option.value]) : T('默认');
       sel.appendChild(node);
     });
     // 旧值该模型不支持时归一，并说明实际下发了什么
@@ -296,7 +295,8 @@ window.LitAgentUi = (function () {
     }
     sel.value = thinking;
     sel.title = cap.label + (cap.param === 'enable_thinking' ? '：官方以开关键制'
-      : (cap.param === 'thinking' ? '：官方以 thinking.type 开关控制' : '：官方 reasoning_effort'))
+      : (cap.param === 'thinking' ? '：官方以 thinking.type 开关控制'
+        : (cap.provider === 'claude' ? '：官方 output_config.effort' : '：官方 reasoning_effort')))
       + (effective.note ? '。' + effective.note : '');
     if (effective.note) setStatus(effective.note);
   }
@@ -304,7 +304,6 @@ window.LitAgentUi = (function () {
   function renderModelLabel() {
     var node = $('agent-model');
     var button = $('agent-model-btn');
-    renderProviderLabel();
     if (!node) return;
     if (lastConfig && lastConfig.agentModel) {
       node.textContent = lastConfig.agentModel;
@@ -320,22 +319,6 @@ window.LitAgentUi = (function () {
       node.title = hint;
       if (button) button.title = T('切换服务商与模型') + '\n' + hint;
     }
-  }
-
-  /** 底部服务商徽标：优先自定义名称（设置里给服务商起的名字），
-   *  否则由当前 Base URL 判定（与发送路径同一份纯函数规则）；未配置端点就隐藏——
-   *  「哪个模型、经谁的端点」在面板里必须可见，否则多端点用户只能靠记忆判断自己在跟谁说话。 */
-  function renderProviderLabel() {
-    var node = $('agent-provider');
-    if (!node) return;
-    var provider = null;
-    if (window.LitAgentCfg && lastConfig) provider = LitAgentCfg.activeProvider(lastConfig);
-    var baseUrl = (provider && provider.baseUrl) || (lastConfig && lastConfig.agentBaseUrl) || '';
-    var label = (provider && window.LitAgentCfg) ? LitAgentCfg.providerLabel(provider, window.LitAgentProto) : '';
-    if (!label && window.LitAgentProto && LitAgentProto.providerLabel) label = LitAgentProto.providerLabel(baseUrl);
-    node.textContent = label;
-    node.hidden = !label;
-    node.title = baseUrl || '';
   }
 
   /* ---------------- 底部「模型」切换（不打开设置即换服务商 / 模型） ----------------
@@ -606,25 +589,23 @@ window.LitAgentUi = (function () {
     var paper = null;
     var reading = null;
     var selection = null;
-    if (chipState.paper) {
-      // R19：阅读层可见时把正在读的位置一并冻结（PDF 页码 / EPUB 进度）——
-      // 「当前页讲了什么」不再让模型从第 1 页猜起；位置与文献同源，随轮持久化
-      var now = deps.getCurrentReading ? deps.getCurrentReading() : null;
-      if (now && now.paper) {
-        paper = now.paper;
-        reading = now.kind === 'pdf'
-          ? { kind: 'pdf', page: now.page || 1, pageCount: now.pageCount || 0, attachmentId: now.attachmentId || '' }
-          : { kind: 'epub', progress: typeof now.progress === 'number' ? now.progress : null };
-        // 划词上下文：阅读器里有有效选区时一并冻结（VSCode 式「当前选中」）——PDF 带页码、
-        // EPUB 带 CFI+章节+进度；形态归一（截断/空白折叠）走纯函数层，getter 按阅读层自分发
-        if (chipState.selection && deps.getCurrentSelection && window.LitAgentContext) {
-          selection = window.LitAgentContext.normalizeSelectionContext(deps.getCurrentSelection());
-        }
-      } else if (deps.getCurrentPaper) {
-        paper = deps.getCurrentPaper();
+    // R19：阅读层可见时把正在读的位置一并冻结（PDF 页码 / EPUB 进度）——
+    // 「当前页讲了什么」不再让模型从第 1 页猜起；位置与文献同源，随轮持久化
+    var now = deps.getCurrentReading ? deps.getCurrentReading() : null;
+    if (now && now.paper) {
+      paper = now.paper;
+      reading = now.kind === 'pdf'
+        ? { kind: 'pdf', page: now.page || 1, pageCount: now.pageCount || 0, attachmentId: now.attachmentId || '' }
+        : { kind: 'epub', progress: typeof now.progress === 'number' ? now.progress : null };
+      // 划词上下文：阅读器里有有效选区时一并冻结（VSCode 式「当前选中」）——PDF 带页码、
+      // EPUB 带 CFI+章节+进度；形态归一（截断/空白折叠）走纯函数层，getter 按阅读层自分发
+      if (chipState.selection && deps.getCurrentSelection && window.LitAgentContext) {
+        selection = window.LitAgentContext.normalizeSelectionContext(deps.getCurrentSelection());
       }
+    } else if (deps.getCurrentPaper) {
+      paper = deps.getCurrentPaper();
     }
-    var folderName = chipState.folder && deps.getCurrentFolder ? deps.getCurrentFolder() : null;
+    var folderName = deps.getCurrentFolder ? deps.getCurrentFolder() : null;
     var limits = agentLimits(null);
     var frozen = {
       model: (lastConfig && lastConfig.agentModel) || '',
@@ -1060,7 +1041,7 @@ window.LitAgentUi = (function () {
     if (!wrap) return;
     wrap.innerHTML = '';
     var list = run && Array.isArray(run.doc.attachments) ? run.doc.attachments : [];
-    var canReopenGraph = recentGraphAvailable && typeof deps.reopenGraphPanel === 'function';
+    var canReopenGraph = !!(run && run.id === recentGraphSessionId && typeof deps.reopenGraphPanel === 'function');
     if (!list.length && !canReopenGraph) { wrap.hidden = true; return; }
     wrap.hidden = false;
     if (canReopenGraph) {
@@ -1069,7 +1050,7 @@ window.LitAgentUi = (function () {
       graphNode.title = T('在 LitBoard 中重新打开最近一次引文网络');
       graphNode.addEventListener('click', function () {
         if (!deps.reopenGraphPanel()) {
-          recentGraphAvailable = false;
+          recentGraphSessionId = null;
           renderAttachments(run);
         }
       });
@@ -1091,12 +1072,26 @@ window.LitAgentUi = (function () {
     });
   }
 
+  /** bundle 输入行挂载好后（composerSlotReady）把模型/推理/状态/token 四个 plain-DOM 控件
+   *  从底部预备行移进输入行插槽（发送按钮旁）。预备行只是 bundle 未加载时的兜底位置，
+   *  移空后移除；事件监听随节点走，不用重绑。 */
+  function fillComposerSlot(slot) {
+    if (!slot) return;
+    ['agent-compact-btn', 'agent-model-control', 'agent-status', 'agent-tokens'].forEach(function (id) {
+      var node = $(id);
+      if (node && node.parentNode !== slot) slot.appendChild(node);
+    });
+    var fallbackRow = document.querySelector('.agent-composer-row');
+    if (fallbackRow && !fallbackRow.children.length) fallbackRow.remove();
+  }
+
   function bridge() {
     return {
       getSnapshot: getSnapshot,
       subscribe: function (cb) { subscriber = cb; setTimeout(function () { cb(getSnapshot()); }, 0); return function () { subscriber = null; }; },
       T: T,
       sendSuggestion: function (text) { sendText(text); },
+      composerSlotReady: fillComposerSlot,
       retry: function (turnId) {
         var run = current ? runs.get(current) : null;
         if (run) runner.rerunTurn(run, turnId);
@@ -1283,7 +1278,9 @@ window.LitAgentUi = (function () {
   var chipsShownFrozen = false; // 上次渲染 chips 时是否处于「显示冻结值」状态（bump 据此检测翻转）
 
   /** 生成中显示冻结值（本轮模型实际看到的）；空闲时显示当前偏好 + 实时上下文
-   *  （下一条消息将携带什么）——点击立即翻转亮/暗，翻页换文献也会跟着刷新。 */
+   *  （下一条消息将携带什么）——点击立即翻转亮/暗，翻页换文献也会跟着刷新。
+   *  文献/文件夹 chip 已撤（当前项在主界面一目了然，chip 只挡视线），其上下文恒携带；
+   *  这里只渲染「选中」chip。 */
   function renderChips() {
     var wrap = $('agent-chips');
     if (!wrap) return;
@@ -1294,34 +1291,10 @@ window.LitAgentUi = (function () {
     var showFrozen = !!(frozen && run && run.streaming);
     chipsShownFrozen = showFrozen;
     var chips = [];
-    if (deps.getCurrentPaper) {
-      var livePaper = deps.getCurrentPaper();
-      var liveReading = deps.getCurrentReading ? deps.getCurrentReading() : null;
-      var paper = showFrozen ? frozen.paper : (chipState.paper ? livePaper : null);
-      var reading = showFrozen ? frozen.reading : (chipState.paper ? liveReading : null);
-      // 关掉开关或发送时未带文献：chip 仍显示（当前文献名作参考），只是暗着——
-      // 否则消失后没有地方把它点回来。冻结值为空时回落实时名称，避免空标题 chip
-      var name = (paper && paper.title) || (livePaper && livePaper.title) || '';
-      if (name || paper || livePaper) {
-        var pageInfo = '';
-        if (reading && reading.kind === 'pdf' && reading.page) {
-          pageInfo = T('第 {n} 页', { n: reading.page });
-        } else if (reading && reading.kind === 'epub' && reading.progress != null) {
-          pageInfo = T('约 {n}%', { n: reading.progress });
-        }
-        chips.push({
-          label: T('当前文献：') + String(name || '').slice(0, 18),
-          page: pageInfo,
-          on: !!(showFrozen ? frozen.paper : chipState.paper),
-          toggle: function () { chipState.paper = !chipState.paper; }
-        });
-      }
-    }
     if (deps.getCurrentSelection) {
       var liveSel = deps.getCurrentSelection();
       var sel = showFrozen ? frozen.selection : (chipState.selection ? liveSel : null);
-      // 无选区时 chip 不占位；开关关掉或冻结轮未带选区时仍显示（暗）留点回来的入口——与文献 chip 同纪律。
-      // 选中依附于文献上下文：文献 chip 关掉时选中不会发送（freezeContext 不捕获），亮态如实反映
+      // 无选区时 chip 不占位；开关关掉或冻结轮未带选区时仍显示（暗）留点回来的入口
       var selText = (sel && sel.text) || (liveSel && liveSel.text) || '';
       if (selText) {
         // 位置段按形态取：PDF 显示页码，EPUB 无页码显示进度百分比（冻结值优先于实时值）
@@ -1331,19 +1304,8 @@ window.LitAgentUi = (function () {
         chips.push({
           label: T('选中：') + selText.slice(0, 12) + (selText.length > 12 ? '…' : ''),
           page: selPos,
-          on: !!(showFrozen ? sel : (chipState.selection && chipState.paper)),
+          on: !!(showFrozen ? sel : chipState.selection),
           toggle: function () { chipState.selection = !chipState.selection; }
-        });
-      }
-    }
-    if (deps.getCurrentFolder) {
-      var liveFolder = deps.getCurrentFolder();
-      var folder = showFrozen ? frozen.folder : (chipState.folder ? liveFolder : null);
-      if (folder || liveFolder) {
-        chips.push({
-          label: T('当前文件夹：') + String(folder || liveFolder || '').slice(0, 14),
-          on: !!(showFrozen ? frozen.folder : chipState.folder),
-          toggle: function () { chipState.folder = !chipState.folder; }
         });
       }
     }
@@ -1426,7 +1388,8 @@ window.LitAgentUi = (function () {
     window.MathJax = {
       startup: { typeset: false },
       options: { enableMenu: false },
-      svg: { fontCache: 'global' }
+      // tex2svgPromise 逐节点使用时，全局字形缓存不会挂进页面；每张 SVG 自带字形定义。
+      svg: { fontCache: 'local' }
     };
     mathjaxPromise = new Promise(function (resolve, reject) {
       var script = document.createElement('script');

@@ -157,7 +157,12 @@ window.LitGraphView = (function () {
     if (!G()) return;
     destroyView();
     var palette = currentPalette();
-    var view = G().viewerData(data, { palette: palette, texts: viewerTexts() });
+    var view = G().viewerData(data, {
+      palette: palette,
+      texts: viewerTexts(),
+      // 主进程 Rust 内核随图下发的预置布局（[[id,[x,y]],...]）：有则直接用，渲染层不再现算
+      layout: data.layout ? new Map(data.layout) : undefined
+    });
     lastView = view;
     view.nodes.forEach(function (node) { nodeIndex.set(node.id, node); });
     $('graph-list-head').textContent = view.texts.papers;

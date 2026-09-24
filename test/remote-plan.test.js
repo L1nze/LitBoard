@@ -40,7 +40,7 @@ function makeHarness(planOverride) {
     '#sync-remote-plan-cancel', '#sync-remote-plan-progress', '#sync-remote-plan-progress-text',
     '#sync-remote-plan-progress-percent', '#sync-remote-plan-progress-bar',
     '#sync-remote-choose-local', '#sync-remote-choose-remote', '#sync-remote-inspect',
-    '#sync-remote-config', '#sync-remote-restore', '#sync-remote-merge', '#sync-conflict-close', '#sync-conflict-export'
+    '#sync-remote-restore', '#sync-remote-merge', '#sync-conflict-close', '#sync-conflict-export'
   ];
   ids.forEach(function (id) {
     els[id] = makeNode(id === '#sync-remote-plan-list' ? 'div' : 'button');
@@ -55,7 +55,7 @@ function makeHarness(planOverride) {
     createDocumentFragment: function () { return makeNode('fragment'); },
     querySelector: function () { return null; }
   };
-  const calls = { created: null, applied: null, appliedWorkspace: 0, indicator: [], statuses: [], integrationConfig: null };
+  const calls = { created: null, applied: null, appliedWorkspace: 0, indicator: [], statuses: [] };
   const PLAN = planOverride || {
     mode: 'merge', remoteCount: 5, remoteExists: true,
     conflicts: [
@@ -85,7 +85,6 @@ function makeHarness(planOverride) {
     applyPortableConfigRuntime: function () {},
     fillSyncForm: function () {},
     setSyncIndicator: function (stateName) { calls.indicator.push(stateName); },
-    setIntegrationConfig: function (config) { calls.integrationConfig = config; },
     isSyncBusy: function () { return false; },
     download: function () {},
     stamp: function () { return '2026-09-22'; }

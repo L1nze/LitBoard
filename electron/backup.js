@@ -1261,6 +1261,32 @@ function createBackupManager(options) {
         if (isManagedKey.test(entry.name) || /\.litwrite$/i.test(entry.name)) await addOrphan(full);
       }
 
+      // 新版条目目录：只清理可确认由 storeFileInto/storeDirInto 生成的 z 键副本。
+      // 用户自行放入目录的其它文件不参与自动清理。
+      const itemRoot = path.join(syncedDir, 'items');
+      const referencedPaths = Array.from(referenced);
+      for (const paperDirEntry of await listEntries(itemRoot)) {
+        if (!paperDirEntry.isDirectory() || !/^[A-Za-z0-9_-]{1,120}$/.test(paperDirEntry.name)) continue;
+        const paperDir = path.join(itemRoot, paperDirEntry.name);
+        for (const entry of await listEntries(paperDir)) {
+          const full = path.join(paperDir, entry.name);
+          if (entry.isDirectory()) {
+            if (!isManagedKey.test(entry.name)) continue;
+            const normalizedFull = normPath(full);
+            const prefix = normalizedFull + path.sep;
+            if (referencedPaths.some(function (ref) { return ref === normalizedFull || ref.startsWith(prefix); })) continue;
+            let stat = null;
+            try { stat = await fs.stat(full); } catch (error) { continue; }
+            if (stat.mtimeMs > orphanCutoff) continue;
+            add('orphanManaged', full, await dirBytes(full), stat.mtimeMs);
+            continue;
+          }
+          if (!entry.isFile()) continue;
+          if (/\.litbak$/i.test(entry.name)) { await addWriteBackup(full); continue; }
+          if (isManagedKey.test(entry.name) || /\.litwrite$/i.test(entry.name)) await addOrphan(full);
+        }
+      }
+
       // annotation-images：批注截图逐文件判孤儿
       const annDir = path.join(configDir, 'annotation-images');
       for (const entry of await listEntries(annDir)) {

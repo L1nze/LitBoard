@@ -23,6 +23,22 @@ function createResearchDb(options) {
   const dir = options.dir;
   let works = null;
   let vec = null;
+  // cosineSearch 的进程内缓存（闭包状态，随实例生命周期）：
+  // - vecCache：单一 (model, recipe) 的平铺向量 + id 列表——语义检索 / find-literature
+  //   （最坏 12 论点 × 2 变体连发）反复全扫时，免掉整批 BLOB 读取与对象物化
+  //   （实测 20k×1024d 时读库占 ~57%）；年份过滤的全表 id→year 一并缓存（替代逐批 IN 回查，
+  //   两库连接本就无法 SQL join）。两者都只加速，不改语义：冷热路径结果逐位一致。
+  // 失效钩子挂在所有写 works/vecs 的路径上（upsertWorks / updateWorkText / vecPut /
+  // vecDelete / vecClear）。漏挂一处 = 「库里删了向量、缓存里还在」，会绕过 R13 硬规则
+  // 静默给出过期命中——动这两个变量前先读这段。
+  let vecCache = null;
+  let yearCache = null;
+  const VEC_CACHE_MAX_BYTES = 256 * 1024 * 1024;
+
+  function invalidateVecCache(withYears) {
+    vecCache = null;
+    if (withYears) yearCache = null;
+  }
 
   function applyPragmas(db) {
     db.exec('PRAGMA journal_mode = WAL');
@@ -181,6 +197,8 @@ function createResearchDb(options) {
 
   async function open() {
     await fs.mkdir(dir, { recursive: true });
+    vecCache = null;
+    yearCache = null;
     works = new DatabaseSync(path.join(dir, 'research.db'));
     applyPragmas(works);
     migrateWorks(works);
@@ -332,6 +350,8 @@ function createResearchDb(options) {
         staleVecIds.forEach(function (id) { vecDeleteStmt.run(id); });
       }
       works.exec('COMMIT');
+      // 新增 id / 年份变化 / stale 向量删除都发生在这里：向量与年份缓存一起失效
+      invalidateVecCache(true);
     } catch (error) {
       works.exec('ROLLBACK');
       throw error;
@@ -598,6 +618,7 @@ function createResearchDb(options) {
         if (vec) vec.prepare('DELETE FROM vecs WHERE work_id = ?').run(id);
       }
       works.exec('COMMIT');
+      invalidateVecCache(true);
       return { updated: changed };
     } catch (error) {
       works.exec('ROLLBACK');
@@ -711,6 +732,8 @@ function createResearchDb(options) {
   function close() {
     if (works) { try { works.close(); } catch (error) {} works = null; }
     if (vec) { try { vec.close(); } catch (error) {} vec = null; }
+    vecCache = null;
+    yearCache = null;
   }
 
   /* ---------------- 向量层（vec.db；可再生缓存，损坏删库重建即可） ---------------- */
@@ -746,6 +769,7 @@ function createResearchDb(options) {
         });
       });
       vec.exec('COMMIT');
+      invalidateVecCache(false);
     } catch (error) {
       vec.exec('ROLLBACK');
       throw error;
@@ -762,6 +786,7 @@ function createResearchDb(options) {
     try {
       list.forEach(function (id) { stmt.run(id); });
       vec.exec('COMMIT');
+      invalidateVecCache(false);
     } catch (error) {
       vec.exec('ROLLBACK');
       throw error;
@@ -771,6 +796,7 @@ function createResearchDb(options) {
   function vecClear() {
     vecEnsure();
     vec.exec('DELETE FROM vecs');
+    invalidateVecCache(false);
   }
 
   /**
@@ -843,6 +869,8 @@ function createResearchDb(options) {
    * vec.db 与 research.db 是两个独立连接，无法 SQL 跨库 join——先取候选再在 works 库过滤年份。
    * R13：传入 model/recipe 时只检索同模型同配方的向量——相同维度不代表同一向量空间，
    * 不筛会混用不同模型的向量给出虚假满分；不传（旧调用）保持全量（兼容存量索引）。
+   * 带 model/recipe 的调用走进程内缓存（见 createResearchDb 顶部的失效钩子说明）；
+   * 冷热路径的候选顺序都来自同一条 SELECT 的读出顺序，结果逐位一致。
    */
   function cosineSearch(queryVec, options) {
     vecEnsure();
@@ -855,37 +883,55 @@ function createResearchDb(options) {
     qNorm = Math.sqrt(qNorm) || 1;
     const model = String(opts.model || '');
     const recipe = Number(opts.recipe) || 0;
-    const candidates = (model || recipe
-      ? vec.prepare('SELECT work_id AS id, vec AS vec FROM vecs WHERE model = ? AND recipe = ?').all(model, recipe)
-      : vec.prepare('SELECT work_id AS id, vec AS vec FROM vecs').all());
-    if (!candidates.length) return [];
-    // 年份过滤：批量查 works 表（id → year）
-    const yearOf = new Map();
-    const CHUNK = 400;
-    for (let i = 0; i < candidates.length; i += CHUNK) {
-      const ids = candidates.slice(i, i + CHUNK).map(function (row) { return row.id; });
-      const marks = ids.map(function () { return '?'; }).join(',');
-      const stmt = works.prepare('SELECT id, year FROM works WHERE id IN (' + marks + ')');
-      stmt.all(...ids).forEach(function (row) { yearOf.set(row.id, row.year); });
+    const cacheable = !!(model || recipe);
+    let ids = null;
+    let flat = null;
+    if (cacheable && vecCache && vecCache.model === model && vecCache.recipe === recipe) {
+      ids = vecCache.ids;
+      flat = vecCache.flat;
+    } else {
+      const candidates = (model || recipe
+        ? vec.prepare('SELECT work_id AS id, vec AS vec FROM vecs WHERE model = ? AND recipe = ?').all(model, recipe)
+        : vec.prepare('SELECT work_id AS id, vec AS vec FROM vecs').all());
+      if (!candidates.length) return [];
+      // 平铺成连续 Float32Array：维度不符的行在这里剔除（与旧的逐行 v.length 检查同语义），
+      // 之后的点积都在连续内存上跑
+      const usable = candidates.filter(function (row) {
+        return row.vec && (row.vec.byteLength || 0) === q.byteLength;
+      });
+      ids = usable.map(function (row) { return row.id; });
+      flat = new Float32Array(usable.length * q.length);
+      usable.forEach(function (row, index) {
+        flat.set(new Float32Array(row.vec.buffer || row.vec, row.vec.byteOffset || 0), index * q.length);
+      });
+      if (cacheable && flat.byteLength <= VEC_CACHE_MAX_BYTES) {
+        vecCache = { model: model, recipe: recipe, ids: ids, flat: flat };
+      }
+    }
+    // 年份过滤：works 全表 id→year 一次读取建缓存（随 works 写入失效，见顶部钩子）
+    if (!yearCache) {
+      yearCache = new Map();
+      works.prepare('SELECT id, year FROM works').all().forEach(function (row) { yearCache.set(row.id, row.year); });
     }
     const yearFrom = opts.yearFrom != null && isFinite(Number(opts.yearFrom)) ? Number(opts.yearFrom) : null;
     const yearTo = opts.yearTo != null && isFinite(Number(opts.yearTo)) ? Number(opts.yearTo) : null;
+    const dim = q.length;
     const scored = [];
-    candidates.forEach(function (row) {
-      const year = yearOf.get(row.id);
-      if (yearFrom != null && (year == null || year < yearFrom)) return;
-      if (yearTo != null && (year == null || year > yearTo)) return;
-      const v = new Float32Array(row.vec.buffer || row.vec, row.vec.byteOffset || 0);
-      if (v.length !== q.length) return;
+    for (let n = 0; n < ids.length; n++) {
+      const year = yearCache.get(ids[n]);
+      if (yearFrom != null && (year == null || year < yearFrom)) continue;
+      if (yearTo != null && (year == null || year > yearTo)) continue;
+      const base = n * dim;
       let dot = 0, norm = 0;
-      for (let i = 0; i < v.length; i++) {
-        dot += v[i] * q[i];
-        norm += v[i] * v[i];
+      for (let i = 0; i < dim; i++) {
+        const x = flat[base + i];
+        dot += x * q[i];
+        norm += x * x;
       }
       norm = Math.sqrt(norm);
-      if (!norm) return;
-      scored.push({ workId: row.id, score: dot / (norm * qNorm) });
-    });
+      if (!norm) continue;
+      scored.push({ workId: ids[n], score: dot / (norm * qNorm) });
+    }
     scored.sort(function (a, b) { return b.score - a.score; });
     return scored.slice(0, limit);
   }

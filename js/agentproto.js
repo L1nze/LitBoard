@@ -338,9 +338,8 @@
   /**
    * → Anthropic Messages。差异都在这里抹平：
    * system 提到顶层；工具结果并进紧随其后的 user 消息块；工具 schema 用 input_schema；
-   * max_tokens 必填；推理参数只透传 Anthropic 自己的 `thinking:{type:'enabled',…}` 形态
-   * （OpenAI 形态的 reasoning_effort / thinking.type='disabled' 在这里丢弃——发过去只会 400，
-   * 该端点的思考开关由服务商默认值决定）。
+   * max_tokens 必填；Claude 的 reasoning_effort 转为 Anthropic output_config.effort。
+   * 其他模型的 OpenAI 形态推理参数仍不透传到 Messages API。
    */
   function toMessagesBody(body, options) {
     var src = body || {};
@@ -351,6 +350,9 @@
     };
     if (src.model) out.model = src.model;
     if (src.temperature != null) out.temperature = src.temperature;
+    if (/^claude-/.test(modelTail(src.model)) && src.reasoning_effort) {
+      out.output_config = { effort: str(src.reasoning_effort) };
+    }
     if (src.thinking && src.thinking.type === 'enabled') {
       out.thinking = {
         type: 'enabled',

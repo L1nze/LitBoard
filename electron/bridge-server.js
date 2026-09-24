@@ -11,7 +11,7 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const fs = require('node:fs/promises');
-const { downloadPdfToFile } = require('./pdfdownload.js');
+const { downloadPdfToFile, availablePdfPath } = require('./pdfdownload.js');
 
 const DEFAULT_PORT = 24117;
 const MAX_PORT_ATTEMPTS = 8;
@@ -19,8 +19,7 @@ const MAX_PORT_ATTEMPTS = 8;
 function createBridgeServer(options) {
   const libraryDb = options.libraryDb;
   const netFetch = options.fetch;
-  // PDF 落盘目录：优先用 resolveDownloadDir()（主进程注入，每次保存时现读「PDF 自动下载目录」设置，
-  // 未设置回退配置目录下的 open-access-pdf 受管目录）；旧调用方只传静态 downloadsDir 时保持兼容。
+  // PDF 落盘目录：主进程按条目 ID 返回独立受管目录；旧调用方的静态 downloadsDir 仍兼容。
   const resolveDownloadDir = typeof options.resolveDownloadDir === 'function'
     ? options.resolveDownloadDir
     : async function () { return options.downloadsDir; };
@@ -179,9 +178,9 @@ function createBridgeServer(options) {
 
   async function attachPdf(paperId, pdfUrl) {
     try {
-      const dir = await resolveDownloadDir();
+      const dir = await resolveDownloadDir(paperId);
       await fs.mkdir(dir, { recursive: true });
-      const target = path.join(dir, 'litboard-' + paperId + '.pdf');
+      const target = await availablePdfPath(dir, 'litboard-' + paperId + '.pdf');
       const result = await downloadPdfToFile(pdfUrl, target, { fetch: netFetch, timeoutMs: 30000 });
       if (result && result.error) return false;
       return attachPdfFile(paperId, result.path);
@@ -196,10 +195,11 @@ function createBridgeServer(options) {
       if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(String(base64 || ''))) return false;
       const bytes = Buffer.from(base64, 'base64');
       if (bytes.length < 1024 || bytes.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) return false;
-      const dir = await resolveDownloadDir();
+      const dir = await resolveDownloadDir(paperId);
       await fs.mkdir(dir, { recursive: true });
       const safeName = String(fileName || '').replace(/[^\w\u4e00-\u9fff\-. ]/g, '_').slice(-120).trim();
-      const target = path.join(dir, 'litboard-' + paperId + (safeName && /\.pdf$/i.test(safeName) ? '-' + safeName : '.pdf'));
+      const target = await availablePdfPath(dir,
+        'litboard-' + paperId + (safeName && /\.pdf$/i.test(safeName) ? '-' + safeName : '.pdf'));
       await fs.writeFile(target, bytes);
       return attachPdfFile(paperId, target);
     } catch (error) {

@@ -8,11 +8,13 @@ const { app, dialog } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { storeFileInto } = require('../integrations.js');
+const { itemAttachmentDir } = require('../item-storage.js');
 const LitResearch = require('../../js/research.js');
 const LitGraphGen = require('../../js/graphgen.js');
 const LitLitSearch = require('../../js/litsearch.js');
 const LitWebFetch = require('../../js/webfetch.js');
 const LitMarkdown = require('../../js/markdown.js');
+const litgraph = require('../litgraph.js');
 const ctx = require('./context.js');
 const { createSafePublicHttpsFetch } = require('../safe-fetch.js');
 
@@ -82,6 +84,10 @@ function cacheFetchPage(key, entry) {
  * 每轮白付一次就会看到「一调工具就卡」。库一写 lastLibraryWriteAt 就变，缓存随之失效。 */
 const IN_LIBRARY_CACHE_MS = 30000;
 let inLibraryCache = { key: -1, at: 0, index: new Set() };
+
+/* 补登记（research:register）的活动运行标记：research:register-cancel 置 canceled，
+ * 分片循环在片头检查、当前片收尾后带着已完成部分返回。同一时刻只有渲染层一个调用方。 */
+let activeRegisterRun = null;
 
 async function inLibraryIndex() {
   const key = Number(ctx.lastLibraryWriteAt) || 0;
@@ -721,8 +727,7 @@ function register() {
       if (!paper) return { ok: false, error: ctx.T('未找到该正式库文献：') + paperId };
       const crypto = require('node:crypto');
       const attId = 'att' + crypto.randomBytes(10).toString('hex');
-      const dirName = crypto.randomBytes(10).toString('hex');
-      const dir = path.join(ctx.dataPathState.configDir, 'attachments', dirName);
+      const dir = path.join(itemAttachmentDir(ctx.dataPathState.configDir, paperId), attId + '.snapshot');
       await fs.mkdir(dir, { recursive: true });
       const titleText = String(parsed.title || '网页快照').replace(/[&<>"']/g, function (c) {
         return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -893,69 +898,124 @@ function register() {
     if (!ctx.researchDb || !ctx.researchNet) throw new Error(ctx.T('调研库未就绪'));
     const seeds = (Array.isArray(input && input.workIds) ? input.workIds : []).map(String).filter(Boolean).slice(0, 500);
     if (!seeds.length) throw new Error(ctx.T('没有可作为种子的调研身份'));
-    return LitGraphGen.buildGraphData(seeds, {
-      depth: input && input.depth,
-      maxNodes: input && input.maxNodes
-    }, {
+    // Rust 图谱内核可用时：社区划分/PageRank/布局在 libuv 线程池算（napi 异步任务，
+    // 不堵主进程消息泵），布局随图数据下发、渲染层 viewerData 直接用预置坐标；
+    // 不可用回退 graphgen 纯 JS 路径（渲染层现算布局，结果同为确定性、只是较慢）
+    const native = litgraph.load();
+    let nativeLayout = null;
+    const deps = {
       getWorks: async function (ids) { return ctx.researchDb.getWorks(ids); },
       fetchMissing: async function (ids) {
         const rows = await ctx.researchNet.fetchWorksByIds(ids);
         ctx.researchDb.upsertWorks(rows);
         return rows;
       }
-    });
+    };
+    if (native) {
+      deps.computeMetrics = async function (ids, edges) {
+        const metrics = await native.computeGraphMetrics(ids, edges, null);
+        const communities = new Map();
+        const ranks = new Map();
+        ids.forEach(function (id, index) {
+          communities.set(id, metrics.communities[index]);
+          ranks.set(id, metrics.pagerank[index]);
+        });
+        nativeLayout = metrics.layout.map(function (p) { return [p.id, [p.x, p.y]]; });
+        return { communities: communities, ranks: ranks };
+      };
+    }
+    const graph = await LitGraphGen.buildGraphData(seeds, {
+      depth: input && input.depth,
+      maxNodes: input && input.maxNodes
+    }, deps);
+    if (nativeLayout) graph.layout = nativeLayout;
+    return graph;
   });
   /* 补登记：正式库条目 ↔ 调研库身份。主进程只产提案（DOI 直查 + 无 DOI 建本地身份）；
-   * 写回 paper.researchIds 由渲染层完成（save 管线与同步语义归渲染层所有）。 */
-  ctx.handle('research:register', async function (_event, input) {
+   * 写回 paper.researchIds 由渲染层完成（save 管线与同步语义归渲染层所有）。
+   * 一次跑全量（limit 缺省/0 = 不设限），分片处理：片间让出主进程消息泵（主进程即
+   * 窗口的消息泵，长循环必须呼吸），逐片推 research:register-progress；
+   * research:register-cancel 置停止位，当前片收尾后带着已完成部分返回。 */
+  ctx.handle('research:register', async function (event, input) {
     if (!ctx.researchDb) throw new Error(ctx.T('调研库未就绪'));
-    const limit = Math.max(1, Math.min(500, Number(input && input.limit) || 200));
+    const rawLimit = Math.floor(Number(input && input.limit) || 0);
+    const limit = rawLimit > 0 ? Math.min(50000, rawLimit) : 0;
     const state = await ctx.libraryDb.loadState();
-    const candidates = (state.papers || []).filter(function (p) {
+    let candidates = (state.papers || []).filter(function (p) {
       return p && !p.deletedAt && !(Array.isArray(p.researchIds) && p.researchIds.length);
-    }).slice(0, limit);
-    // 第一遍：本地 ext_ids 直查 DOI；查不到的收集起来批量向 OpenAlex 反查——
-    // 「DOI 直查」必须真的解析：从未检索过的带 DOI 条目此前在这里被整个跳过，
-    // 永远拿不到调研身份，右键构建引文网络就永远停在「还没有调研身份」
-    const missedDois = new Set();
-    for (const paper of candidates) {
-      const doi = paper.doi ? LitResearch.normalizeDoi(paper.doi) : '';
-      if (doi && !ctx.researchDb.findByExtId('doi', doi)) missedDois.add(doi);
-    }
-    if (missedDois.size && ctx.researchNet && typeof ctx.researchNet.fetchWorksByDois === 'function') {
+    });
+    if (limit) candidates = candidates.slice(0, limit);
+    const total = candidates.length;
+    const sendProgress = function (p) {
       try {
-        const fetched = await ctx.researchNet.fetchWorksByDois(Array.from(missedDois));
-        if (fetched.length) ctx.researchDb.upsertWorks(fetched);
-      } catch (error) {
-        // 在线反查失败（离线/限流）不阻断——标题认领与本地身份兜底照常，未解析数如实上报
-      }
-    }
+        if (event.sender && typeof event.sender.send === 'function' &&
+            !(typeof event.sender.isDestroyed === 'function' && event.sender.isDestroyed())) {
+          event.sender.send('research:register-progress', p);
+        }
+      } catch (_error) { /* 进度推送失败不影响补登记本体 */ }
+    };
     const proposals = [];
     let unresolved = 0;
-    for (const paper of candidates) {
-      const doi = paper.doi ? LitResearch.normalizeDoi(paper.doi) : '';
-      let researchId = doi ? ctx.researchDb.findByExtId('doi', doi) : null;
-      let createdLocal = false;
-      if (!researchId && paper.title) {
-        // A-followup #5：先按规范化标题认领**既有**身份（检索早已入库的同一篇论文），
-        // 认不到才考虑分配本地身份——否则补登记会为同一篇论文造出第二个 local: 身份。
-        // 带 DOI 的条目同样先试这条：认领既有身份零分裂风险
-        researchId = ctx.researchDb.findIdByNormalizedTitle(paper.title);
+    let scanned = 0;
+    let stopped = false;
+    const run = { canceled: false };
+    activeRegisterRun = run;
+    try {
+      const CHUNK = 200;
+      for (let start = 0; start < total; start += CHUNK) {
+        if (run.canceled) { stopped = true; break; }
+        const slice = candidates.slice(start, start + CHUNK);
+        // 第一遍：本地 ext_ids 直查 DOI；查不到的收集起来批量向 OpenAlex 反查——
+        // 「DOI 直查」必须真的解析：从未检索过的带 DOI 条目此前在这里被整个跳过，
+        // 永远拿不到调研身份，右键构建引文网络就永远停在「还没有调研身份」
+        const missedDois = new Set();
+        for (const paper of slice) {
+          const doi = paper.doi ? LitResearch.normalizeDoi(paper.doi) : '';
+          if (doi && !ctx.researchDb.findByExtId('doi', doi)) missedDois.add(doi);
+        }
+        if (missedDois.size && ctx.researchNet && typeof ctx.researchNet.fetchWorksByDois === 'function') {
+          try {
+            const fetched = await ctx.researchNet.fetchWorksByDois(Array.from(missedDois));
+            if (fetched.length) ctx.researchDb.upsertWorks(fetched);
+          } catch (error) {
+            // 在线反查失败（离线/限流）不阻断——标题认领与本地身份兜底照常，未解析数如实上报
+          }
+        }
+        for (const paper of slice) {
+          const doi = paper.doi ? LitResearch.normalizeDoi(paper.doi) : '';
+          let researchId = doi ? ctx.researchDb.findByExtId('doi', doi) : null;
+          let createdLocal = false;
+          if (!researchId && paper.title) {
+            // A-followup #5：先按规范化标题认领**既有**身份（检索早已入库的同一篇论文），
+            // 认不到才考虑分配本地身份——否则补登记会为同一篇论文造出第二个 local: 身份。
+            // 带 DOI 的条目同样先试这条：认领既有身份零分裂风险
+            researchId = ctx.researchDb.findIdByNormalizedTitle(paper.title);
+          }
+          if (!researchId && !doi && paper.title) {
+            // 无 DOI：分配本地身份（代理键永不变更；日后匹配合并走 merge_log 重定向）。
+            // 带 DOI 的条目不建 local:——doi→local: 进了 ext_ids 会挡住日后的真实身份解析
+            researchId = 'local:' + require('node:crypto').randomBytes(8).toString('hex');
+            ctx.researchDb.upsertWorks([{ id: researchId, title: paper.title, year: paper.year || null, doi: '' }]);
+            createdLocal = true;
+          }
+          if (researchId) {
+            proposals.push({ paperId: paper.id, researchId: researchId, title: paper.title || '', createdLocal: createdLocal });
+          } else {
+            unresolved += 1;
+          }
+        }
+        scanned += slice.length;
+        sendProgress({ done: scanned, total: total, proposed: proposals.length, unresolved: unresolved });
+        if (start + CHUNK < total) await new Promise(function (resolve) { setImmediate(resolve); });
       }
-      if (!researchId && !doi && paper.title) {
-        // 无 DOI：分配本地身份（代理键永不变更；日后匹配合并走 merge_log 重定向）。
-        // 带 DOI 的条目不建 local:——doi→local: 进了 ext_ids 会挡住日后的真实身份解析
-        researchId = 'local:' + require('node:crypto').randomBytes(8).toString('hex');
-        ctx.researchDb.upsertWorks([{ id: researchId, title: paper.title, year: paper.year || null, doi: '' }]);
-        createdLocal = true;
-      }
-      if (researchId) {
-        proposals.push({ paperId: paper.id, researchId: researchId, title: paper.title || '', createdLocal: createdLocal });
-      } else {
-        unresolved += 1;
-      }
+    } finally {
+      if (activeRegisterRun === run) activeRegisterRun = null;
     }
-    return { proposals: proposals, scanned: candidates.length, unresolved: unresolved };
+    return { proposals: proposals, scanned: scanned, unresolved: unresolved, stopped: stopped };
+  });
+  ctx.handle('research:register-cancel', function () {
+    if (activeRegisterRun) activeRegisterRun.canceled = true;
+    return { ok: true };
   });
   /* R18 文献检索能力补齐（对照 literature-mcp）：精确取文献（DOI / OpenAlex ID / 标题精确）、
    * 实体名 → OpenAlex ID 联想、库内引文邻接。三个都是「检索即入库」幂等语义，不动正式库。 */

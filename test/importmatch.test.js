@@ -39,6 +39,13 @@ test('findMatch hits by DOI case-insensitively', function () {
   assert.equal(hit.reason, 'metadata');
 });
 
+test('normDoi aligns case and doi.org URL after trimming whitespace', function () {
+  assert.equal(LitDedupe.normDoi('  https://doi.org/10.1039/C5EE00111K  '),
+    LitDedupe.normDoi('10.1039/c5ee00111k'));
+  assert.notEqual(LitDedupe.normDoi('10.1039/C5EE00111K'),
+    LitDedupe.normDoi('10.1039/c5ee00111x'));
+});
+
 test('findMatch does not auto-match by normalized title', function () {
   const target = p({ id: 't1', title: 'Attention Is All You Need', year: 2017, authors: ['Ashish Vaswani'] });
   const index = LitDedupe.createMatchIndex([target]);
@@ -135,6 +142,30 @@ test('mergeAttachments dedupes by fingerprint, path (case-insensitive) and id', 
   const merged = LitDedupe.mergeAttachments(target, incoming);
   assert.equal(merged.length, 2);
   assert.equal(merged[1].id, 'x3');
+});
+
+test('mergeAttachmentsDetailed collapses duplicate PDFs already on the same entry', function () {
+  const fingerprint = 'g'.repeat(64);
+  const target = p({ attachments: [
+    att({ id: 'keep', path: 'C:/library/paper.pdf', fingerprint: fingerprint }),
+    att({ id: 'duplicate', path: 'D:/folder/copy.pdf', fingerprint: fingerprint })
+  ] });
+
+  const merged = LitDedupe.mergeAttachmentsDetailed(target, p({}));
+
+  assert.deepEqual(merged.attachments.map(function (item) { return item.id; }), ['keep']);
+  assert.equal(merged.aliases.duplicate, 'keep');
+  assert.deepEqual(merged.added, []);
+  assert.equal(target.attachments.length, 2, '不得修改原条目');
+});
+
+test('mergeAttachmentsDetailed keeps different PDF versions on one entry', function () {
+  const target = p({ attachments: [att({ id: 'v1', fingerprint: 'h'.repeat(64) })] });
+  const incoming = p({ attachments: [att({ id: 'v2', fingerprint: 'i'.repeat(64) })] });
+
+  const merged = LitDedupe.mergeAttachmentsDetailed(target, incoming);
+
+  assert.deepEqual(merged.attachments.map(function (item) { return item.id; }), ['v1', 'v2']);
 });
 
 test('mergeAttachments does not mutate inputs', function () {

@@ -26,6 +26,8 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   getDataPaths: function () { return ipcRenderer.invoke('data-paths:get'); },
   stageDataPaths: function (value) { return ipcRenderer.invoke('data-paths:stage', value); },
   getAppVersion: function () { return ipcRenderer.invoke('app:get-version'); },
+  checkAppUpdate: function () { return ipcRenderer.invoke('app:check-update'); },
+  downloadAppUpdate: function () { return ipcRenderer.invoke('app:download-update'); },
   relaunchApp: function () { return ipcRenderer.invoke('app:relaunch'); },
   chooseImportFiles: function () { return ipcRenderer.invoke('files:choose-import'); },
   saveFile: function (options) { return ipcRenderer.invoke('files:save', options); },
@@ -34,6 +36,8 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   revealInFolder: function (filePath) { return ipcRenderer.invoke('files:reveal', filePath); },
   exportPdfs: function (options) { return ipcRenderer.invoke('files:export-pdfs', options); },
   storePdf: function (options) { return ipcRenderer.invoke('files:store-pdf', options); },
+  storeAttachment: function (options) { return ipcRenderer.invoke('files:store-attachment', options); },
+  organizeItemAttachments: function (options) { return ipcRenderer.invoke('files:organize-item', options); },
   scanFolder: function (options) { return ipcRenderer.invoke('files:scan-folder', options); },
   copyText: function (value) { return ipcRenderer.invoke('clipboard:write', value); },
   fetchJson: function (url) { return ipcRenderer.invoke('api:fetch-json', url); },
@@ -45,7 +49,7 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   inspectNutstoreRemote: function (value) { return ipcRenderer.invoke('integrations:inspect-nutstore', value); },
   createNutstoreSyncPlan: function (value) { return ipcRenderer.invoke('integrations:create-sync-plan', value); },
   applyNutstoreSyncPlan: function (value) { return ipcRenderer.invoke('integrations:apply-sync-plan', value); },
-  pullNutstoreConfig: function (value) { return ipcRenderer.invoke('integrations:pull-config', value); },
+  cancelNutstoreSync: function () { return ipcRenderer.invoke('integrations:cancel-sync'); },
   testNutstoreConnection: function (config) { return ipcRenderer.invoke('integrations:test-nutstore', config); },
   translateSelection: function (value) { return ipcRenderer.invoke('integrations:translate', value); },
   testTranslationConnection: function (value) { return ipcRenderer.invoke('integrations:test-translation', value); },
@@ -143,6 +147,13 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   researchDownloadPdfs: function (input) { return ipcRenderer.invoke('research:download-pdfs', input); },
   researchStagePdfs: function (input) { return ipcRenderer.invoke('research:stage-pdfs', input); },
   researchRegister: function (input) { return ipcRenderer.invoke('research:register', input); },
+  /* 补登记分片全量跑：进度逐片推送，运行中再点按钮走 cancel 停止 */
+  researchRegisterCancel: function () { return ipcRenderer.invoke('research:register-cancel'); },
+  onResearchRegisterProgress: function (handler) {
+    var listener = function (_event, payload) { handler(payload); };
+    ipcRenderer.on('research:register-progress', listener);
+    return function () { ipcRenderer.removeListener('research:register-progress', listener); };
+  },
   /* R18：精确取文献 / 实体联想 / 引文邻接（agent 工具与检索面板共用） */
   researchGetWork: function (input) { return ipcRenderer.invoke('research:get-work', input); },
   researchAutocomplete: function (input) { return ipcRenderer.invoke('research:autocomplete', input); },

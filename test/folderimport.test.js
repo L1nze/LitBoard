@@ -48,7 +48,7 @@ test('基本规划：目录链按深度建、PDF 带归属、根待新建', () =
   assert.deepEqual(plan.pdfs.map(p => p.dirRel), ['sub1', 'sub1/inner', 'sub2', '']);
 });
 
-test('剪枝：没有 PDF 后代的目录不进计划，非 PDF 计数', () => {
+test('剪枝：支持文档所在目录都进入计划，未知格式计数', () => {
   const plan = LitFolderImport.planFolderImport({
     scan: scan([
       { rel: '只放word的分支/nested/deep.docx' },
@@ -59,21 +59,35 @@ test('剪枝：没有 PDF 后代的目录不进计划，非 PDF 计数', () => {
     folders: [],
     targetFolderId: ''
   });
-  assert.deepEqual(plan.createList.map(c => c.key), ['有货']);
-  assert.equal(plan.skippedNonPdf, 3);
+  assert.deepEqual(plan.createList.map(c => c.key), ['只放word的分支', '有货', '只放word的分支/nested']);
+  assert.equal(plan.skippedUnsupported, 1);
   assert.equal(plan.pdfs.length, 1);
+  assert.equal(plan.otherFiles.length, 2);
   assert.equal(plan.pdfs[0].dirRel, '有货');
 });
 
-test('无 PDF：空计划，连根也不建', () => {
+test('无支持格式：空计划，连根也不建', () => {
   const plan = LitFolderImport.planFolderImport({
-    scan: scan([{ rel: 'a.docx' }, { rel: 'b.png' }]),
+    scan: scan([{ rel: 'a.txt' }, { rel: 'b.png' }]),
     folders: FOLDERS,
     targetFolderId: 'f-root'
   });
   assert.equal(plan.pdfs.length, 0);
   assert.equal(plan.createList.length, 0);
   assert.equal(plan.createdCount, 0);
+});
+
+test('文档格式与多目录根去重按插件规则处理', () => {
+  const extensions = ['pdf', 'epub', 'djvu', 'mobi', 'azw3', 'doc', 'docx', 'odt', 'rtf'];
+  const plan = LitFolderImport.planFolderImport({
+    scan: scan(extensions.map(ext => ({ rel: 'sub/file.' + ext })).concat([{ rel: 'sub/file.csv' }])),
+    folders: [], targetFolderId: ''
+  });
+  assert.equal(plan.files.length, 9);
+  assert.equal(plan.skippedUnsupported, 1);
+  assert.deepEqual(plan.createList.map(item => item.key), ['sub']);
+  assert.deepEqual(LitFolderImport.collapseRootPaths(['C:\\docs\\A', 'C:\\docs', 'C:\\docs\\B', 'C:\\docs2']),
+    ['C:\\docs', 'C:\\docs2']);
 });
 
 test('同名复用：根与子层大小写不敏感、精确大小写优先、墓碑不参与', () => {
@@ -162,5 +176,5 @@ test('PDF 判定兼容大写扩展名（ext 缺失时按文件名兜底）', () 
   raw.files[0].ext = ''; // 模拟上游 ext 缺失，防御分支按 name 判定
   const plan = LitFolderImport.planFolderImport({ scan: raw, folders: [], targetFolderId: '' });
   assert.equal(plan.pdfs.length, 2);
-  assert.equal(plan.skippedNonPdf, 1);
+  assert.equal(plan.skippedUnsupported, 0);
 });

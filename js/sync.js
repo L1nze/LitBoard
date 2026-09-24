@@ -220,7 +220,7 @@
       papers.push(result.merged);
     });
 
-    // ---- 智能文件夹 / 标签颜色 / 笔记 ----
+    // ---- 历史保存查询 / 标签颜色 / 笔记 ----
     var savedSearches = mergeEntityLists(local.savedSearches, remote.savedSearches, function (search) { return search.id; });
     var tagColorRecords = mergeEntityLists(local.tagColorRecords, remote.tagColorRecords, function (record) { return record.tag; });
     var notes = mergeEntityLists(local.notes, remote.notes, function (note) { return note.id; });

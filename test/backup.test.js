@@ -47,7 +47,7 @@ async function makeEnv(t) {
 
 async function seedLibrary(db, configDir, options) {
   const files = options && options.files;
-  const managedPdf = path.join(configDir, 'synced-attachments', 'zABC12345.pdf');
+  const managedPdf = path.join(configDir, 'synced-attachments', 'items', 'p1', 'zABC12345.pdf');
   await fs.mkdir(path.dirname(managedPdf), { recursive: true });
   await fs.writeFile(managedPdf, files && files.managed || '%PDF-1.4 managed attachment', 'utf8');
   const externalSupp = path.join(configDir, '..', 'external-supp.txt');
@@ -695,8 +695,14 @@ test('managed orphan files and stale .litbak backups are scanned and cleaned', a
   await fs.writeFile(livePdf, 'LIVE', 'utf8');
   const tombPdf = path.join(syncedDir, 'zTOMB0002.pdf');
   await fs.writeFile(tombPdf, 'TOMB', 'utf8');
+  const nestedLive = path.join(syncedDir, 'items', 'p1', 'zLIVE0003.pdf');
+  await fs.mkdir(path.dirname(nestedLive), { recursive: true });
+  await fs.writeFile(nestedLive, 'NESTED-LIVE', 'utf8');
   await env.db.saveState({ papers: [
-    { id: 'p1', title: 'Live', attachments: [{ id: 'a1', kind: 'pdf', fileName: 'live.pdf', path: livePdf }] },
+    { id: 'p1', title: 'Live', attachments: [
+      { id: 'a1', kind: 'pdf', fileName: 'live.pdf', path: livePdf },
+      { id: 'a3', kind: 'pdf', fileName: 'nested.pdf', path: nestedLive }
+    ] },
     { id: 'p2', title: 'Tomb', deletedAt: Date.now(),
       attachments: [{ id: 'a2', kind: 'pdf', fileName: 'tomb.pdf', path: tombPdf }] }
   ] });
@@ -705,6 +711,9 @@ test('managed orphan files and stale .litbak backups are scanned and cleaned', a
   const orphanPdf = path.join(syncedDir, 'zORPH0003.pdf');
   await fs.writeFile(orphanPdf, 'ORPHAN', 'utf8');
   await fs.utimes(orphanPdf, old, old);
+  const nestedOrphan = path.join(syncedDir, 'items', 'p1', 'zORPH0004.pdf');
+  await fs.writeFile(nestedOrphan, 'NESTED-ORPHAN', 'utf8');
+  await fs.utimes(nestedOrphan, old, old);
   const litwrite = path.join(syncedDir, 'zORPH0003.pdf.litwrite');
   await fs.writeFile(litwrite, 'PARTIAL', 'utf8');
   await fs.utimes(litwrite, old, old);
@@ -738,12 +747,14 @@ test('managed orphan files and stale .litbak backups are scanned and cleaned', a
   const byPath = {};
   scan.items.forEach(function (item) { byPath[item.path] = item; });
   assert.ok(byPath[orphanPdf] && byPath[orphanPdf].category === 'orphanManaged', '孤儿 z 键文件应被列出');
+  assert.ok(byPath[nestedOrphan] && byPath[nestedOrphan].category === 'orphanManaged', '条目目录内的孤儿 z 键文件应被列出');
   assert.ok(byPath[litwrite] && byPath[litwrite].category === 'orphanManaged', '.litwrite 残留应被列出');
   assert.ok(byPath[orphanImg] && byPath[orphanImg].category === 'orphanManaged', '孤儿批注截图应被列出');
   assert.ok(byPath[orphanNote] && byPath[orphanNote].category === 'orphanManaged', '孤儿笔记图片应被列出');
   assert.ok(byPath[orphanSnapDir] && byPath[orphanSnapDir].category === 'orphanManaged', '孤儿下载快照目录应被列出');
   assert.ok(!byPath[freshOrphan], '未到 7 天的孤儿不应被列出');
   assert.ok(!byPath[livePdf], '被库引用的文件不应被列出');
+  assert.ok(!byPath[nestedLive], '条目目录内仍被引用的附件不应被列出');
   assert.ok(!byPath[tombPdf], '墓碑条目引用的文件不应被列出（回收站语义）');
   assert.ok(!byPath[stranger], '非受管命名的文件不应被列出');
   assert.ok(byPath[staleBak] && byPath[staleBak].category === 'writeBackups', '陈旧 .litbak 应被列出');
@@ -753,12 +764,14 @@ test('managed orphan files and stale .litbak backups are scanned and cleaned', a
   const result = await env.manager.cleanLeftovers();
   assert.equal(result.ok, true, JSON.stringify(result.failed));
   await assert.rejects(fs.stat(orphanPdf));
+  await assert.rejects(fs.stat(nestedOrphan));
   await assert.rejects(fs.stat(litwrite));
   await assert.rejects(fs.stat(orphanImg));
   await assert.rejects(fs.stat(orphanNote));
   await assert.rejects(fs.stat(orphanSnapDir));
   await assert.rejects(fs.stat(staleBak));
   await fs.stat(livePdf);
+  await fs.stat(nestedLive);
   await fs.stat(tombPdf);
   await fs.stat(freshOrphan);
   await fs.stat(stranger);

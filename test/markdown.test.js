@@ -117,6 +117,12 @@ test('公式：$$ 走独立块级元素；金额、行内代码、跨行都不�
   const multiline = LitMarkdown.render('$$\n\\begin{aligned} a \\\\ b \\end{aligned}\n$$');
   assert.match(multiline, /lb-math-block/);
 
+  // agent 会把首尾 $$ 与公式正文写在同一行，中间的长公式再换行。
+  const wrapped = LitMarkdown.render('式 (11)：\n$$v_2^i(y_2) = \\sigma\\left[A_2^i\\cos(\\omega_2 y_2)\\right],\\quad v_3^i(y_3) =\n\\sigma\\left[A_3^i\\cos(\\omega_3 y_3)\\right]$$');
+  assert.match(wrapped, /<div class="lb-math lb-math-block">v_2\^i\(y_2\) = /);
+  assert.match(wrapped, /\\sigma\\left\[A_3\^i/);
+  assert.doesNotMatch(wrapped, /<p>\$\$v_2/, '换行的 $$ 公式不能退化为原始文本');
+
   // 只有起止标记成对才按块公式消费，未闭合文本保持原样。
   const broken = LitMarkdown.render('$$\na\n\nb');
   assert.doesNotMatch(broken, /lb-math/);

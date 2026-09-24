@@ -337,36 +337,6 @@ test('remote restore downloads and verifies attachment and snapshot assets atomi
   assert.equal(await fs.readFile(imagePath, 'utf8'), image.toString('utf8'));
 });
 
-test('portable configuration can be restored independently', async function (t) {
-  const dirA = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-portable-a-'));
-  const dirB = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-portable-b-'));
-  t.after(function () { return Promise.all([fs.rm(dirA, { recursive: true, force: true }), fs.rm(dirB, { recursive: true, force: true })]); });
-  const cloud = new Map();
-  const safeStorage = {
-    isEncryptionAvailable: function () { return true; },
-    encryptString: function (value) { return Buffer.from(value, 'utf8'); },
-    decryptString: function (value) { return value.toString('utf8'); }
-  };
-  const fetchFactory = function () { return async function (url, init) {
-    if (init.method === 'GET') { const body = cloud.get(url); return body ? new Response(body, { status: 200 }) : new Response('', { status: 404 }); }
-    if (init.method === 'MKCOL') return new Response('', { status: 201 });
-    if (init.method === 'PUT') { cloud.set(url, init.body); return new Response('', { status: 201 }); }
-    throw new Error('Unexpected request ' + init.method + ' ' + url);
-  }; };
-  const A = createIntegrations({ baseDir: dirA, homeDir: dirA, safeStorage: safeStorage, fetch: fetchFactory() });
-  const B = createIntegrations({ baseDir: dirB, homeDir: dirB, safeStorage: safeStorage, fetch: fetchFactory() });
-  await A.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p', configSyncPassword: 'shared', translatorProvider: 'openai', translatorTarget: 'en', renameTemplate: '{title}', trashRetentionDays: 7, autoWriteBack: true });
-  await A.nutstoreSync({ papers: [], folders: [] });
-  await B.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p', configSyncPassword: 'shared' });
-  const pulled = await B.pullPortableConfig({});
-  assert.equal(pulled.found, true);
-  assert.equal(pulled.config.translatorProvider, 'openai');
-  assert.equal(pulled.config.translatorTarget, 'en');
-  assert.equal(pulled.config.renameTemplate, '{title}');
-  assert.equal(pulled.config.trashRetentionDays, 7);
-  assert.equal(pulled.config.autoWriteBack, true);
-});
-
 test('nutstore WebDAV sync reads, merges, and writes the library envelope', async function (t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-sync-'));
   t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
@@ -385,6 +355,8 @@ test('nutstore WebDAV sync reads, merges, and writes the library envelope', asyn
       if (init.method === 'GET' && url.endsWith('litboard-library.json')) {
         return new Response(JSON.stringify(remote), { status: 200 });
       }
+      if (init.method === 'GET' && url.endsWith('litboard-config.enc')) return new Response('', { status: 404 });
+      if (init.method === 'PUT' && url.endsWith('litboard-config.enc')) return new Response('', { status: 201 });
       if (init.method === 'PUT' && url.endsWith('litboard-library.json')) {
         written = JSON.parse(init.body); remote = written; return new Response('', { status: 201 });
       }
@@ -423,6 +395,8 @@ test('nutstore sync initializes the LitBoard directory when first read returns 4
       if (init.method === 'GET' && url.endsWith('litboard-library.json')) {
         return libraryBody ? new Response(libraryBody, { status: 200 }) : new Response('', { status: 404 });
       }
+      if (init.method === 'GET' && url.endsWith('litboard-config.enc')) return new Response('', { status: 404 });
+      if (init.method === 'PUT' && url.endsWith('litboard-config.enc')) return new Response('', { status: 201 });
       if (init.method === 'MKCOL') { createdFolders.push(url); return new Response('', { status: 201 }); }
       if (init.method === 'PUT' && url.endsWith('litboard-library.json')) {
         libraryBody = init.body;
@@ -578,7 +552,7 @@ test('nutstore sync writes sensitive app settings as an encrypted config file', 
   });
   await integrations.saveConfig({
     nutstoreUser: 'user@example.com', nutstorePassword: 'nutstore-secret',
-    translatorApiKey: 'translator-secret', scigreatApiKey: 'scigreat-secret', configSyncPassword: 'shared-config-password'
+    translatorApiKey: 'translator-secret', scigreatApiKey: 'scigreat-secret'
   });
   await integrations.nutstoreSync({ papers: [], folders: [] });
   const envelope = JSON.parse(encryptedConfig);
@@ -611,7 +585,7 @@ test('nutstore config sync propagates API keys across devices and never wipes lo
       if (init.method === 'MKCOL') return new Response('', { status: 201 });
       if (init.method === 'PUT') {
         if (url.endsWith('litboard-config.enc')) {
-          assert.doesNotMatch(init.body, /translator-secret|scigreat-secret|nutstore-secret/);
+          assert.doesNotMatch(init.body, /translator-secret|scigreat-secret|openalex-secret|embed-secret|agent-secret|nutstore-secret/);
         }
         cloud.set(url, init.body);
         return new Response('', { status: 201 });
@@ -624,9 +598,11 @@ test('nutstore config sync propagates API keys across devices and never wipes lo
 
   await A.saveConfig({
     nutstoreUser: 'user@example.com', nutstorePassword: 'nutstore-secret',
-    translatorApiKey: 'translator-secret', scigreatApiKey: 'scigreat-secret', configSyncPassword: 'shared-config-password'
+    translatorApiKey: 'translator-secret', scigreatApiKey: 'scigreat-secret',
+    openalexApiKey: 'openalex-secret', embedApiKey: 'embed-secret',
+    agentProviders: [{ id: 'default', name: 'Main', baseUrl: 'https://api.example/v1', models: ['m'], activeModel: 'm', apiKey: 'agent-secret' }]
   });
-  await B.saveConfig({ nutstoreUser: 'user@example.com', nutstorePassword: 'nutstore-secret', configSyncPassword: 'shared-config-password' });
+  await B.saveConfig({ nutstoreUser: 'user@example.com', nutstorePassword: 'nutstore-secret' });
 
   // B 先同步（没有 Key），云端变成“空 Key”配置
   await B.nutstoreSync({ papers: [], folders: [] });
@@ -639,6 +615,14 @@ test('nutstore config sync propagates API keys across devices and never wipes lo
   const configB = await B.getConfig();
   assert.equal(configB.hasTranslatorApiKey, true);
   assert.equal(configB.hasScigreatApiKey, true);
+  assert.equal(configB.hasOpenalexApiKey, true);
+  assert.equal(configB.hasEmbedApiKey, true);
+  assert.equal(configB.agentProviders[0].hasApiKey, true);
+  const configUrl = Array.from(cloud.keys()).find(function (url) { return url.endsWith('litboard-config.enc'); });
+  const encryptedBefore = cloud.get(configUrl);
+  await B.saveConfig({ nutstorePassword: 'different-app-password' });
+  await assert.rejects(B.nutstoreSync({ papers: [], folders: [] }), /无法解密云端设置/);
+  assert.equal(cloud.get(configUrl), encryptedBefore, 'wrong password must not overwrite encrypted cloud settings');
 });
 
 test('partial integration config saves preserve the selected translation target', async function (t) {
@@ -686,7 +670,7 @@ test('unchanged encrypted config is not rewritten on every sync', async function
   });
   await integrations.saveConfig({
     nutstoreUser: 'user@example.com', nutstorePassword: 'secret',
-    translatorApiKey: 'api-key', configSyncPassword: 'shared-password'
+    translatorApiKey: 'api-key'
   });
   await integrations.nutstoreSync({ papers: [], folders: [] });
   await integrations.nutstoreSync({ papers: [], folders: [] });
@@ -1044,6 +1028,8 @@ test('Zotero cloud migration downloads a keyed archive into LitBoard storage', a
     papers: [{ id: 'p1', title: 'Cloud Paper', zoteroAttachmentKey: 'ATTACH1', pdfFileName: 'paper.pdf' }], folders: []
   });
   assert.equal(result.downloaded, 1);
+  assert.equal(path.dirname(result.workspace.papers[0].pdfPath),
+    path.join(dir, 'synced-attachments', 'items', 'p1'));
   assert.equal(await fs.readFile(result.workspace.papers[0].pdfPath, 'utf8'), '%PDF-cloud');
 });
 
@@ -1370,6 +1356,107 @@ test('an unexpected empty remote library pauses automatic sync for local recover
   assert.equal(libraryPuts, 0);
 });
 
+test('stopping sync keeps the cloud library uploaded before attachments and preserves completed uploads', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-sync-cancel-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const firstPath = path.join(dir, 'first.pdf');
+  const secondPath = path.join(dir, 'second.pdf');
+  await fs.writeFile(firstPath, '%PDF-first');
+  await fs.writeFile(secondPath, '%PDF-second');
+  let startSecond;
+  const secondStarted = new Promise(function (resolve) { startSecond = resolve; });
+  let attachmentPuts = 0;
+  let libraryPuts = 0;
+  let remoteBody = '';
+  const writeOrder = [];
+  const integrations = createIntegrations({
+    baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(),
+    fetch: async function (url, init) {
+      if (init.method === 'GET' && url.endsWith('litboard-library.json')) {
+        return remoteBody ? new Response(remoteBody, { status: 200 }) : new Response('', { status: 404 });
+      }
+      if (init.method === 'GET' && url.endsWith('litboard-config.enc')) return new Response('', { status: 404 });
+      if (init.method === 'PROPFIND') return new Response('', { status: 404 });
+      if (init.method === 'MKCOL') return new Response('', { status: 201 });
+      if (init.method === 'PUT' && url.includes('/attachments/')) {
+        writeOrder.push('attachment');
+        attachmentPuts++;
+        if (attachmentPuts === 1) return new Response('', { status: 201 });
+        startSecond();
+        return new Promise(function (_resolve, reject) {
+          init.signal.addEventListener('abort', function () { reject(new Error('aborted')); }, { once: true });
+        });
+      }
+      if (init.method === 'PUT' && url.endsWith('litboard-config.enc')) return new Response('', { status: 201 });
+      if (init.method === 'PUT' && url.endsWith('litboard-library.json')) {
+        libraryPuts++;
+        writeOrder.push('library');
+        remoteBody = String(init.body);
+        return new Response('', { status: 201 });
+      }
+      throw new Error('Unexpected request ' + init.method + ' ' + url);
+    }
+  });
+  await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
+  const running = integrations.nutstoreSync({ papers: [{ id: 'p1', title: 'Paper', attachments: [
+    { id: 'a1', kind: 'pdf', fileName: 'first.pdf', path: firstPath },
+    { id: 'a2', kind: 'pdf', fileName: 'second.pdf', path: secondPath }
+  ] }], folders: [] });
+  await secondStarted;
+  assert.equal(integrations.cancelNutstoreSync(), true);
+  await assert.rejects(running, function (error) { return error.code === 'SYNC_CANCELLED'; });
+  assert.equal(attachmentPuts, 2);
+  assert.equal(libraryPuts, 1);
+  assert.equal(writeOrder[0], 'library');
+  assert.equal(JSON.parse(remoteBody).papers[0].title, 'Paper');
+  assert.equal(integrations.cancelNutstoreSync(), false);
+  const ledger = JSON.parse(await fs.readFile(path.join(dir, 'sync-asset-ledger.json'), 'utf8'));
+  assert.ok(ledger.assets['p1.pdf'], 'completed upload remains available for resuming');
+});
+
+test('new cloud library is written before PDF upload and finalized with its cloud hash', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-sync-library-first-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const pdfPath = path.join(dir, 'paper.pdf');
+  await fs.writeFile(pdfPath, '%PDF-library-first');
+  let cloudLibrary = '';
+  let etag = '';
+  const writes = [];
+  const integrations = createIntegrations({
+    baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(),
+    fetch: async function (url, init) {
+      if (init.method === 'GET' && url.endsWith('litboard-library.json')) {
+        return cloudLibrary ? new Response(cloudLibrary, { status: 200, headers: { ETag: etag } })
+          : new Response('', { status: 404 });
+      }
+      if (init.method === 'GET') return new Response('', { status: 404 });
+      if (init.method === 'PROPFIND') return new Response('', { status: 404 });
+      if (init.method === 'MKCOL') return new Response('', { status: 201 });
+      if (init.method === 'PUT' && url.endsWith('litboard-library.json')) {
+        writes.push('library');
+        cloudLibrary = String(init.body);
+        etag = '"v' + writes.length + '"';
+        return new Response('', { status: 201, headers: { ETag: etag } });
+      }
+      if (init.method === 'PUT' && url.includes('/attachments/')) {
+        writes.push('attachment');
+        assert.equal(JSON.parse(cloudLibrary).papers.length, 1, 'library is already readable during PDF upload');
+        return new Response('', { status: 201 });
+      }
+      if (init.method === 'PUT') return new Response('', { status: 201 });
+      throw new Error('Unexpected request ' + init.method + ' ' + url);
+    }
+  });
+  await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
+  const result = await integrations.nutstoreSync({ papers: [{ id: 'p1', title: 'Paper',
+    attachments: [{ id: 'a1', kind: 'pdf', path: pdfPath, fileName: 'paper.pdf' }] }], folders: [] });
+  assert.deepEqual(writes, ['library', 'attachment', 'library']);
+  const cloudAsset = JSON.parse(cloudLibrary).papers[0].attachments[0];
+  assert.equal(cloudAsset.cloudName, 'p1.pdf');
+  assert.match(cloudAsset.cloudHash, /^[a-f0-9]{64}$/);
+  assert.equal(result.uploaded, true);
+});
+
 test('clearing the remote library reuploads locally verified assets and creates the attachment root', async function (t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-sync-remote-assets-cleared-'));
   t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
@@ -1527,15 +1614,20 @@ test('WebDAV rate limiting stops the asset loop immediately', async function (t)
   await fs.writeFile(firstPath, '%PDF-first');
   await fs.writeFile(secondPath, '%PDF-second');
   let assetPuts = 0;
+  let remoteBody = JSON.stringify({ syncVersion: 6, papers: [], folders: [] });
   const fetch = async function (url, init) {
     if (init.method === 'GET' && url.endsWith('litboard-library.json')) {
-      return new Response(JSON.stringify({ syncVersion: 6, papers: [], folders: [] }), { status: 200, headers: { ETag: '"v1"' } });
+      return new Response(remoteBody, { status: 200, headers: { ETag: '"v1"' } });
     }
     if (init.method === 'GET') return new Response('', { status: 404 });
     if (init.method === 'MKCOL') return new Response('', { status: 201 });
     if (init.method === 'PUT' && url.includes('/attachments/')) {
       assetPuts++;
       return new Response('', { status: 429, headers: { 'Retry-After': '60' } });
+    }
+    if (init.method === 'PUT' && url.endsWith('litboard-library.json')) {
+      remoteBody = String(init.body);
+      return new Response('', { status: 201 });
     }
     if (init.method === 'PUT') return new Response('', { status: 201 });
     throw new Error('Unexpected request ' + init.method + ' ' + url);
@@ -1651,6 +1743,8 @@ async function makeZoteroWizardFixture(t) {
   // ATTACH5 的文件故意不创建（云端未下载）
   const db = new DatabaseSync(path.join(dataDir, 'zotero.sqlite'));
   db.exec(`
+    CREATE TABLE libraries (libraryID INTEGER PRIMARY KEY);
+    INSERT INTO libraries VALUES (1);
     CREATE TABLE itemTypes (itemTypeID INTEGER PRIMARY KEY, typeName TEXT);
     CREATE TABLE items (itemID INTEGER PRIMARY KEY, itemTypeID INTEGER, key TEXT);
     CREATE TABLE deletedItems (itemID INTEGER);
@@ -1726,6 +1820,7 @@ test('Zotero wizard scans, imports with asset copy, and skips copies on re-impor
   const { integrations, baseDir } = wizardIntegrations(t, home);
 
   const scan = await integrations.scanZoteroLibrary({ dir: dataDir });
+  assert.ok(!scan.report.queryFailures.some(function (failure) { return failure.query === 'libraries'; }));
   assert.equal(scan.stats.source.items, 3); // ITEMKEY1/BOOKKEY1/DSKEY1（DELETED1 已删不计；独立附件不占 items）
   assert.equal(scan.stats.source.notes, 2);
   assert.equal(scan.stats.source.annotations, 1);
@@ -1745,7 +1840,7 @@ test('Zotero wizard scans, imports with asset copy, and skips copies on re-impor
   assert.equal(p1.series, 'Nature Series');
   assert.equal(p1.journalAbbreviation, 'Nature');
   assert.equal(p1.accessDate, '2025-06-01');
-  assert.equal(p1.status, 'read'); // extra 的 LitBoard 标记
+  assert.equal(p1.status, 'reading'); // 旧 extra 的 LitBoard 标记归并
   assert.equal(p1.bibtexExtra.numpages, '31'); // 未映射字段兜底
   assert.deepEqual(p1.creators.map(function (c) { return c.creatorType + ':' + (c.name || c.family); }),
     ['author:Doe', 'author:World Health Organization']);
@@ -1754,12 +1849,13 @@ test('Zotero wizard scans, imports with asset copy, and skips copies on re-impor
   // 附件：PDF + 快照目录复制进受管目录；未下载的 ATTACH5 保留空路径记录
   assert.equal(p1.attachments.length, 3);
   const pdfAtt = p1.attachments.find(function (a) { return a.kind === 'pdf' && a.path; });
-  assert.ok(pdfAtt.path.startsWith(baseDir));
+  const itemDir = path.join(baseDir, 'synced-attachments', 'items', p1.id);
+  assert.equal(path.dirname(pdfAtt.path), itemDir);
   assert.equal(await fs.readFile(pdfAtt.path, 'utf8'), '%PDF-main');
   const missingAtt = p1.attachments.find(function (a) { return a.zoteroKey === 'ATTACH5'; });
   assert.equal(missingAtt.path, '');
   const snapAtt = p1.attachments.find(function (a) { return a.kind === 'snapshot'; });
-  assert.ok(snapAtt.path.startsWith(path.join(baseDir, 'synced-attachments')));
+  assert.equal(path.dirname(snapAtt.path), itemDir);
   assert.equal(await fs.readFile(path.join(snapAtt.path, 'snap.html'), 'utf8'), '<html>snapshot</html>');
   assert.equal(await fs.readFile(path.join(snapAtt.path, 'style.css'), 'utf8'), 'body{}');
   // 批注：类型/定位/评论/颜色/attachmentId
@@ -1940,6 +2036,7 @@ test('empty local workspace against a non-empty sync base pauses and requires an
       }
       if (init.method === 'GET') return new Response('', { status: 404 });
       if (init.method === 'MKCOL') return new Response('', { status: 405 });
+      if (init.method === 'PUT' && url.endsWith('litboard-config.enc')) return new Response('', { status: 201 });
       if (init.method === 'PUT') {
         puts.push(JSON.parse(init.body));
         remoteBody = init.body;

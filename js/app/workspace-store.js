@@ -91,47 +91,63 @@
         .then(function (result) { return result !== false; }, function () { return false; });
       return promise;
     }
-    function save(skipSync) {
-      model.assignCitationKeys(options.state.papers);
-      if (options.clearQueryCache) options.clearQueryCache();
+    function persistDesktop(skipSync, desktop) {
       var workspace = payload();
       if (persistedSignatures) model.touchWorkspaceChanges(workspace, persistedSignatures, Date.now());
-      var saveRevision = ++revision;
+      workspace = JSON.parse(JSON.stringify(workspace));
+      // 与 saveState 同口径归一化后再签名/发送：库端落库前会跑同一套 normalizeWorkspace
+      // （重投影 paper.notes、过滤墓碑文件夹的 folderIds、迁移旧笔记等），若用内存原始
+      // 状态算签名，任何兼容投影漂移都会让写后校验误判失败且锚点停摆、后续保存全挂。
+      // 不传 idFactory，与 db.js saveState 的 normalizeWorkspace(value) 完全一致。
+      workspace = model.normalizeWorkspace(workspace);
       var nextSignatures = model.workspaceSignatures(workspace);
       var oldBase = persistedSignatures;
-      var desktop = options.desktop();
-      function confirmSaved(result) {
-        if (desktop && (!result || !signaturesContain(result.signatures, nextSignatures))) {
-          throw new Error(options.T('SQLite 写入后校验失败：数据库返回的内容签名与当前工作区不一致'));
-        }
-        if (revision !== saveRevision) return true;
-        persistedSignatures = (result && result.signatures) || nextSignatures;
-        refreshBase(workspace, oldBase);
-        if (!skipSync) options.scheduleSync();
-        return true;
-      }
-      if (desktop) {
-        return track(desktop.saveLibrary(workspace, persistedSignatures).then(function (result) {
-          if (!result || !result.conflicts || !result.conflicts.length) return confirmSaved(result);
-          if (revision !== saveRevision) return true;
-          persistedSignatures = (result && result.signatures) || oldBase;
+      return desktop.saveLibrary(workspace, oldBase).then(function (result) {
+        if (result && result.conflicts && result.conflicts.length) {
+          persistedSignatures = result.signatures || oldBase;
           refreshBase(workspace, oldBase);
           return options.resolveConflicts(result.conflicts, baseEntities).then(function (resolved) {
             if (!resolved) {
               options.toast(options.T('⚠ 保存冲突未解决，本地修改已保留，请重试'));
               return false;
             }
-            return save(skipSync);
+            return persistDesktop(skipSync, desktop);
           });
-        }).catch(function (error) {
-          options.toast(options.T('⚠ 本地数据保存失败：') + (error && error.message || error));
-          return false;
-        }));
+        }
+        if (!result || !signaturesContain(result.signatures, nextSignatures)) {
+          // saveState 已经提交，拒绝推进锚点只会死锁（每次保存都失败直到重启）：
+          // 先把锚点推进到数据库返回的真实签名，让下一次保存有机会自愈，错误照常上报。
+          if (result && result.signatures) persistedSignatures = result.signatures;
+          throw new Error(options.T('SQLite 写入后校验失败：数据库返回的内容签名与当前工作区不一致'));
+        }
+        persistedSignatures = (result && result.signatures) || nextSignatures;
+        refreshBase(workspace, oldBase);
+        if (!skipSync) options.scheduleSync();
+        return true;
+      }).catch(function (error) {
+        options.toast(options.T('⚠ 本地数据保存失败：') + (error && error.message || error));
+        return false;
+      });
+    }
+    function save(skipSync) {
+      ++revision;
+      model.assignCitationKeys(options.state.papers);
+      if (options.clearQueryCache) options.clearQueryCache();
+      var desktop = options.desktop();
+      if (desktop) {
+        var pending = saveChain.then(function () { return persistDesktop(skipSync, desktop); });
+        saveChain = pending.then(function (result) { return result !== false; }, function () { return false; });
+        return pending;
       }
+      var workspace = payload();
+      if (persistedSignatures) model.touchWorkspaceChanges(workspace, persistedSignatures, Date.now());
+      var oldBase = persistedSignatures;
       var ok = true;
       try {
         options.localStorage.setItem(options.storeKey, JSON.stringify(workspace));
-        confirmSaved(null);
+        persistedSignatures = model.workspaceSignatures(workspace);
+        refreshBase(workspace, oldBase);
+        if (!skipSync) options.scheduleSync();
       } catch (error) {
         ok = false;
         options.toast(options.T('⚠ 本地存储已满，数据未能保存，请导出 JSON 备份'));

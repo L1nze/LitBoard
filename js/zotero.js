@@ -441,7 +441,8 @@
     var typeNameByPaperId = {};
     asArray(raw.allItems).forEach(function (it) {
       if (!it || it.itemID == null || deleted[it.itemID]) return;
-      if (asArray(raw.personalLibraryIds).length && raw.personalLibraryIds.indexOf(it.libraryID) === -1) return;
+      if (it.libraryID != null && asArray(raw.personalLibraryIds).length &&
+          raw.personalLibraryIds.indexOf(it.libraryID) === -1) return;
       var typeName = text(it.typeName);
       if (typeName === 'attachment' || typeName === 'note' || typeName === 'annotation') return;
       var key = text(it.key);

@@ -85,6 +85,17 @@ test('reindex without desktop bridge short-circuits', async function () {
   assert.deepEqual(Object.assign({}, result), { indexed: 0, total: 0, stale: 0 });
 });
 
+test('deleted papers are excluded from full-text indexing and search', async function () {
+  const bridge = fakeDesktopBridge();
+  const module = loadPdfSearchModule(bridge);
+  const papers = [{ id: 'deleted', deletedAt: 123, attachments: [{ id: 'a1', kind: 'pdf', path: 'D:/x/old.pdf' }] }];
+  const result = await module.reindex(papers);
+  assert.deepEqual(Object.assign({}, result), { indexed: 0, total: 0, stale: 0 });
+  assert.equal(bridge.puts.length, 0);
+  await module.search('hello', papers);
+  assert.equal(bridge.puts.length, 0);
+});
+
 test('pdfimport exposes word-level search fragments and a search highlight layer', function () {
   const source = fs.readFileSync(path.join(root, 'js', 'pdfimport.js'), 'utf8');
   const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');

@@ -175,6 +175,8 @@ test('toMessagesBody: 图像走 base64/url source，不支持的媒体类型丢�
   // Anthropic 原生 thinking 形态原样透传
   const thinking = P.toMessagesBody({ model: 'm', thinking: { type: 'enabled', budget_tokens: 2048 }, messages: [{ role: 'user', content: 'q' }] });
   assert.deepEqual(thinking.thinking, { type: 'enabled', budget_tokens: 2048 });
+  const claude = P.toMessagesBody({ model: 'claude-opus-4-7', reasoning_effort: 'xhigh', messages: [{ role: 'user', content: 'q' }] });
+  assert.deepEqual(claude.output_config, { effort: 'xhigh' });
 });
 
 test('convertBody: chat 原样返回', function () {

@@ -134,6 +134,7 @@
   function expandUnits(candidates) {
     var units = [];
     (candidates || []).forEach(function (paper) {
+      if (!paper || paper.deletedAt) return;
       paperAttachments(paper).forEach(function (attachment) { units.push({ paper: paper, attachment: attachment }); });
     });
     return units;
@@ -181,7 +182,7 @@
         var paper = byId[hit.paperId];
         var attachment = paper ? paperAttachments(paper).find(function (item) { return item.id === hit.attachmentId; }) : null;
         return paper ? { paper: paper, attachment: attachment || null, attachmentId: hit.attachmentId || '',
-          pages: hit.pages, count: hit.count, snippets: hit.snippets || [] } : null;
+          pages: hit.pages, count: hit.count, snippets: hit.snippets || [], truncated: hit.truncated === true } : null;
       }).filter(Boolean);
     });
   }
@@ -249,7 +250,7 @@
    */
   function search(query, papers, onProgress) {
     var needle = norm(query).trim();
-    var candidates = (papers || []).filter(function (paper) { return paper && paperAttachments(paper).length; });
+    var candidates = (papers || []).filter(function (paper) { return paper && !paper.deletedAt && paperAttachments(paper).length; });
     if (!needle) return Promise.resolve([]);
     if (DESKTOP && window.litboardDesktop.pdfSearchQuery) {
       return searchDesktop(query, candidates, onProgress);

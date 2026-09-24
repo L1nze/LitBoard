@@ -130,7 +130,7 @@ test('extra 字段的 LitBoard 标记解析，余量进 bibtexExtra.extra', func
   ];
   const ws = LitZotero.mapLibrary(raw, {}).workspace;
   const p = ws.papers[0];
-  assert.equal(p.status, 'read');
+  assert.equal(p.status, 'reading');
   assert.equal(p.rating, 4);
   assert.equal(p.bibtexExtra.extra, 'PMID: 12345');
   // LitBoard Markdown 经旧 notes 字段迁移为 Note 实体并投影回 paper.notes

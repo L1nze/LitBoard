@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const zlib = require('node:zlib');
 const crypto = require('node:crypto');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const LitModel = require('../js/model.js');
 const LitSync = require('../js/sync.js');
 const LitZotero = require('../js/zotero.js');
@@ -11,6 +12,8 @@ const LitNoteMl = require('../js/noteml.js');
 const LitTranslate = require('../js/translate.js');
 const LitEmbedCfg = require('../js/embedcfg.js');
 const LitAgentCfg = require('../js/agentcfg.js');
+const { itemAttachmentDir } = require('./item-storage.js');
+const { availablePdfPath } = require('./pdfdownload.js');
 
 /** 快照入口解析：目录 → 内部 index.html / 首个 .html；文件 → 原样返回（Zotero 快照是目录型附件，F12） */
 async function resolveSnapshotEntry(filePath) {
@@ -171,14 +174,47 @@ async function storeDirInto(dir, srcDir, limits) {
 function createIntegrations(options) {
   const configFile = path.join(options.baseDir, 'integrations.json');
   const rawRequest = options.fetch;
+  const syncContext = new AsyncLocalStorage();
+  let activeSync = null;
+  function syncCancelled() {
+    const error = new Error('同步已停止');
+    error.code = 'SYNC_CANCELLED';
+    return error;
+  }
+  function throwIfSyncCancelled() {
+    if (syncContext.getStore() && syncContext.getStore().signal.aborted) throw syncCancelled();
+  }
+  async function runSyncTask(task) {
+    if (activeSync) throw new Error('已有同步任务正在进行');
+    const controller = new AbortController();
+    activeSync = controller;
+    try { return await syncContext.run(controller, task); }
+    finally { if (activeSync === controller) activeSync = null; }
+  }
+  function cancelNutstoreSync() {
+    if (!activeSync) return false;
+    activeSync.abort();
+    return true;
+  }
   const configuredTimeout = Number(options.requestTimeoutMs);
   const REQUEST_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 30000;
   const request = function (url, init) {
     return new Promise(function (resolve, reject) {
       let settled = false;
       const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      const sync = syncContext.getStore();
+      if (sync && sync.signal.aborted) { reject(syncCancelled()); return; }
       const requestInit = Object.assign({}, init || {});
       if (controller) requestInit.signal = controller.signal;
+      function finish() { clearTimeout(timer); if (sync) sync.signal.removeEventListener('abort', onAbort); }
+      function onAbort() {
+        if (settled) return;
+        settled = true;
+        if (controller) controller.abort();
+        finish();
+        reject(syncCancelled());
+      }
+      if (sync) sync.signal.addEventListener('abort', onAbort, { once: true });
       // 上传大附件时 30s 默认值会中途掐死传输：按负载大小放宽最后期限
       const reqBody = requestInit.body;
       const bodySize = reqBody == null ? 0 : (typeof reqBody === 'string' ? Buffer.byteLength(reqBody) :
@@ -188,17 +224,18 @@ function createIntegrations(options) {
         if (settled) return;
         settled = true;
         if (controller) controller.abort();
+        finish();
         reject(new Error('网络请求超时（' + Math.round(timeoutMs / 1000) + 's）：' + String(url)));
       }, timeoutMs);
-      Promise.resolve().then(function () { return rawRequest(url, requestInit); }).then(function (response) {
+      Promise.resolve().then(function () { if (sync && sync.signal.aborted) throw syncCancelled(); return rawRequest(url, requestInit); }).then(function (response) {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        finish();
         resolve(response);
       }, function (error) {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        finish();
         reject(error);
       });
     });
@@ -465,7 +502,6 @@ function createIntegrations(options) {
       rankProvider: resolveRankProvider(current, input),
       scigreatApiKey: input.scigreatApiKey ? encrypt(String(input.scigreatApiKey)) : current.scigreatApiKey || '',
       easyscholarApiKey: input.easyscholarApiKey ? encrypt(String(input.easyscholarApiKey)) : current.easyscholarApiKey || '',
-      configSyncPassword: input.configSyncPassword ? encrypt(String(input.configSyncPassword)) : current.configSyncPassword || '',
       pdfCacheDir: String(input.pdfCacheDir != null ? input.pdfCacheDir : current.pdfCacheDir || '').trim(),
       pdfDownloadDir: String(input.pdfDownloadDir != null ? input.pdfDownloadDir : current.pdfDownloadDir || '').trim(),
       renameTemplate: String(input.renameTemplate != null ? input.renameTemplate : current.renameTemplate || '').trim(),
@@ -580,7 +616,7 @@ function createIntegrations(options) {
       const decoded = JSON.parse(Buffer.concat([decipher.update(Buffer.from(envelope.data, 'base64')), decipher.final()]).toString('utf8'));
       if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) throw new Error('配置同步内容无效');
       return decoded;
-    } catch (error) { throw new Error('无法解密配置同步文件，请确认配置加密密码一致'); }
+    } catch (error) { throw new Error('无法解密云端设置，请确认坚果云应用密码与加密时一致'); }
   }
   function syncedPortableSettings(value) {
     const source = value && typeof value === 'object' ? value : {};
@@ -605,6 +641,19 @@ function createIntegrations(options) {
       translatorApiKey: decrypt(raw.translatorApiKey),
       scigreatApiKey: decrypt(raw.scigreatApiKey),
       easyscholarApiKey: decrypt(raw.easyscholarApiKey),
+      agentProviders: storedAgentProviders(raw).map(function (provider) {
+        return Object.assign({}, provider, { apiKey: decrypt(provider.apiKey) });
+      }),
+      agentActiveProviderId: LitAgentCfg.normalizeConfig(raw).activeId,
+      embedProvider: String(raw.embedProvider || ''),
+      embedBaseUrl: String(raw.embedBaseUrl || ''),
+      embedModel: String(raw.embedModel || ''),
+      embedApiKey: decrypt(raw.embedApiKey),
+      openalexEmail: String(raw.openalexEmail || ''),
+      openalexApiKey: decrypt(raw.openalexApiKey),
+      elsevierApiKey: decrypt(raw.elsevierApiKey),
+      tinyfishApiKey: decrypt(raw.tinyfishApiKey),
+      semanticscholarApiKey: decrypt(raw.semanticscholarApiKey),
       rankProvider: 'easyscholar' === raw.rankProvider ? 'easyscholar' : 'scigreat',
       zoteroWebDavFolder: String(raw.zoteroWebDavFolder || 'zotero'),
       renameTemplate: String(raw.renameTemplate || ''),
@@ -622,6 +671,17 @@ function createIntegrations(options) {
       translatorApiKey: String(value.translatorApiKey || ''),
       scigreatApiKey: String(value.scigreatApiKey || ''),
       easyscholarApiKey: String(value.easyscholarApiKey || ''),
+      agentProviders: Array.isArray(value.agentProviders) ? value.agentProviders : undefined,
+      agentActiveProviderId: value.agentActiveProviderId,
+      embedProvider: value.embedProvider,
+      embedBaseUrl: value.embedBaseUrl,
+      embedModel: value.embedModel,
+      embedApiKey: value.embedApiKey,
+      openalexEmail: value.openalexEmail,
+      openalexApiKey: value.openalexApiKey,
+      elsevierApiKey: value.elsevierApiKey,
+      tinyfishApiKey: value.tinyfishApiKey,
+      semanticscholarApiKey: value.semanticscholarApiKey,
       rankProvider: value.rankProvider === 'easyscholar' ? 'easyscholar' : 'scigreat',
       zoteroWebDavFolder: String(value.zoteroWebDavFolder || 'zotero'),
       renameTemplate: String(value.renameTemplate || ''),
@@ -638,10 +698,27 @@ function createIntegrations(options) {
       remote = Object.assign({}, remote, { translatorProvider: DEFAULT_TRANSLATOR, translatorApiKey: '' });
     }
     const local = syncedConfigPayload(raw, options && options.portableSettings);
+    const localProviders = new Map(local.agentProviders.map(function (provider) { return [provider.id, provider]; }));
+    const remoteProviders = Array.isArray(remote.agentProviders) ? remote.agentProviders : local.agentProviders;
+    const mergedProviders = remoteProviders.map(function (provider) {
+      const previous = localProviders.get(provider.id);
+      return Object.assign({}, provider, { apiKey: provider.apiKey || previous && previous.apiKey || '' });
+    });
     const merged = Object.assign({}, remote, {
       translatorApiKey: remote.translatorApiKey || local.translatorApiKey,
       scigreatApiKey: remote.scigreatApiKey || local.scigreatApiKey,
       easyscholarApiKey: remote.easyscholarApiKey || local.easyscholarApiKey,
+      agentProviders: mergedProviders,
+      agentActiveProviderId: remote.agentActiveProviderId || local.agentActiveProviderId,
+      embedProvider: remote.embedProvider != null ? remote.embedProvider : local.embedProvider,
+      embedBaseUrl: remote.embedBaseUrl != null ? remote.embedBaseUrl : local.embedBaseUrl,
+      embedModel: remote.embedModel != null ? remote.embedModel : local.embedModel,
+      embedApiKey: remote.embedApiKey || local.embedApiKey,
+      openalexEmail: remote.openalexEmail != null ? remote.openalexEmail : local.openalexEmail,
+      openalexApiKey: remote.openalexApiKey || local.openalexApiKey,
+      elsevierApiKey: remote.elsevierApiKey || local.elsevierApiKey,
+      tinyfishApiKey: remote.tinyfishApiKey || local.tinyfishApiKey,
+      semanticscholarApiKey: remote.semanticscholarApiKey || local.semanticscholarApiKey,
       // v1 payloads predate these settings; absent values must not reset a
       // device's existing behaviour configuration.
       renameTemplate: remote.renameTemplate != null ? remote.renameTemplate : local.renameTemplate,
@@ -662,6 +739,15 @@ function createIntegrations(options) {
       translatorApiKey: storedKey(merged.translatorApiKey, raw.translatorApiKey || ''),
       scigreatApiKey: storedKey(merged.scigreatApiKey, raw.scigreatApiKey || ''),
       easyscholarApiKey: storedKey(merged.easyscholarApiKey, raw.easyscholarApiKey || ''),
+      embedProvider: String(merged.embedProvider || ''),
+      embedBaseUrl: String(merged.embedBaseUrl || ''),
+      embedModel: String(merged.embedModel || ''),
+      embedApiKey: storedKey(merged.embedApiKey, raw.embedApiKey || ''),
+      openalexEmail: String(merged.openalexEmail || ''),
+      openalexApiKey: storedKey(merged.openalexApiKey, raw.openalexApiKey || ''),
+      elsevierApiKey: storedKey(merged.elsevierApiKey, raw.elsevierApiKey || ''),
+      tinyfishApiKey: storedKey(merged.tinyfishApiKey, raw.tinyfishApiKey || ''),
+      semanticscholarApiKey: storedKey(merged.semanticscholarApiKey, raw.semanticscholarApiKey || ''),
       rankProvider: merged.rankProvider === 'easyscholar' ? 'easyscholar' : 'scigreat',
       zoteroWebDavFolder: String(merged.zoteroWebDavFolder || raw.zoteroWebDavFolder || 'zotero'),
       renameTemplate: String(merged.renameTemplate != null ? merged.renameTemplate : raw.renameTemplate || '').trim(),
@@ -672,6 +758,11 @@ function createIntegrations(options) {
         ? Number(remote.updatedAt) || 0
         : Math.max(Number(remote.updatedAt) || 0, Number(raw.configUpdatedAt) || 0) + 1
     });
+    next.agentProviders = merged.agentProviders.map(function (provider) {
+      const current = storedAgentProviders(raw).find(function (item) { return item.id === provider.id; });
+      return storedShape(Object.assign({}, provider, { apiKey: storedKey(provider.apiKey, current && current.apiKey) }));
+    });
+    Object.assign(next, agentMirror(next.agentProviders, merged.agentActiveProviderId));
     if (JSON.stringify(next) !== JSON.stringify(raw)) await writeRawConfig(next);
     return next;
   }
@@ -768,7 +859,7 @@ function createIntegrations(options) {
 
   async function syncEncryptedConfig(folderUrl, headers, rawConfig, options) {
     const settings = options || {};
-    const password = settings.passwordOverride || decrypt(rawConfig.configSyncPassword);
+    const password = settings.passwordOverride || decrypt(rawConfig.nutstorePassword);
     if (!password) return rawConfig;
     const configFolderUrl = joinUrl(folderUrl, 'config');
     const configFileUrl = joinUrl(configFolderUrl, 'litboard-config.enc');
@@ -1186,7 +1277,6 @@ function createIntegrations(options) {
     const folderName = normalizeWebDavFolder(supplied.nutstoreFolder != null ? supplied.nutstoreFolder : raw.nutstoreFolder, 'LitBoard');
     const user = String(supplied.nutstoreUser != null ? supplied.nutstoreUser : raw.nutstoreUser || '').trim();
     const password = supplied.nutstorePassword ? String(supplied.nutstorePassword) : decrypt(raw.nutstorePassword);
-    const configSyncPassword = supplied.configSyncPassword ? String(supplied.configSyncPassword) : decrypt(raw.configSyncPassword);
     if (!user || !password) throw new Error('请先配置坚果云账号和应用密码');
     const folderUrl = joinUrl(url, folderName);
     return {
@@ -1195,7 +1285,7 @@ function createIntegrations(options) {
       folderName: folderName,
       user: user,
       password: password,
-      configSyncPassword: configSyncPassword,
+      configPassword: password,
       headers: { Authorization: basicAuth(user, password) },
       folderUrl: folderUrl,
       fileUrl: joinUrl(folderUrl, 'litboard-library.json'),
@@ -1242,6 +1332,27 @@ function createIntegrations(options) {
     throw error;
   }
 
+  async function writeCloudLibrary(remoteOptions, workspace, baseline, reportProgress) {
+    const sameContent = hashWorkspace(workspace) === hashWorkspace(baseline.remote);
+    const currentVersion = Number(baseline.remote && baseline.remote.syncVersion) >= LitSync.SYNC_VERSION;
+    if (baseline.exists && sameContent && currentVersion) return { current: baseline, uploaded: false };
+    if (baseline.exists && !baseline.etag) {
+      const latest = await readRemoteLibrary(remoteOptions);
+      if (!latest.exists || hashWorkspace(latest.remote) !== hashWorkspace(baseline.remote)) {
+        throw new RemoteChangedError('云端内容已变化，请重新生成同步计划', remoteOptions.fileUrl);
+      }
+    }
+    throwIfSyncCancelled();
+    reportProgress('upload', '正在写入云端库…');
+    const payload = LitSync.createSyncEnvelope(workspace);
+    await conditionalPut(remoteOptions.fileUrl, JSON.stringify(payload, null, 2), remoteOptions.headers,
+      baseline.etag, { contentType: 'application/json; charset=utf-8', label: '坚果云写入',
+        conditional: baseline.exists, createOnly: !baseline.exists });
+    reportProgress('verify-write', '正在确认云端写入结果…');
+    const verified = await verifyRemoteLibraryWrite(remoteOptions, workspace);
+    return { current: verified, uploaded: true };
+  }
+
   async function hashBuffer(buffer) {
     return crypto.createHash('sha256').update(buffer).digest('hex');
   }
@@ -1259,13 +1370,12 @@ function createIntegrations(options) {
     return /^[.][a-z0-9]{1,12}$/.test(ext) ? ext : fallback;
   }
 
-  function assetTarget(downloadDir, paper, asset, snapshot) {
+  function assetTarget(paper, asset, snapshot) {
     const paperId = String(paper && paper.id || 'paper').replace(/[^A-Za-z0-9_-]/g, '_');
     const assetId = String(asset && (asset.id || asset.cloudName) || 'asset').replace(/[^A-Za-z0-9_-]/g, '_');
     const ext = assetExtension(asset && (asset.fileName || asset.cloudName), snapshot ? '.png' : '.pdf');
-    return path.join(downloadDir, snapshot ? paperId + '.snapshot.' + assetId + ext :
-      (asset && asset.kind === 'pdf' && asset.id === (paper && paper.attachments || []).find(function (a) { return a.kind === 'pdf'; })?.id
-        ? paperId + ext : paperId + '.' + assetId + ext));
+    return path.join(itemAttachmentDir(options.baseDir, paperId),
+      snapshot ? 'snapshot.' + assetId + ext : assetId + ext);
   }
 
   async function ensureAssetFolders(attachmentsUrl, cloudName, headers, made) {
@@ -1375,7 +1485,7 @@ function createIntegrations(options) {
         throwIfWebDavRateLimited(response);
         if (!response.ok) throw new Error('HTTP ' + response.status);
       } catch (error) {
-        if (error && error.code === 'WEBDAV_RATE_LIMITED') throw error;
+        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
         throw assetError('附件上传失败：' + (error && error.message || error), item, error);
       }
       asset.cloudHash = actualHash;
@@ -1417,7 +1527,7 @@ function createIntegrations(options) {
           if (!isSnapshot) asset.syncSignature = assetLocalSignature(stat, asset.cloudHash);
           return;
         } catch (error) {
-          if (error && error.code === 'WEBDAV_RATE_LIMITED') throw error;
+          if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
           if (error && error.item) {
             failures.push(error);
             return;
@@ -1434,7 +1544,7 @@ function createIntegrations(options) {
       cloudName = cloudName || safeCloudName(asset.cloudName);
       if (!cloudName) return;
       asset.cloudName = cloudName;
-      const target = assetTarget(downloadDir, paper, asset, isSnapshot);
+      const target = assetTarget(paper, asset, isSnapshot);
       const expectedHash = String(asset.cloudHash || '').toLowerCase();
       const expectedSize = asset.cloudSize == null ? null : Number(asset.cloudSize);
       try {
@@ -1474,7 +1584,7 @@ function createIntegrations(options) {
         if (!asset.fileName && !isSnapshot) asset.fileName = path.posix.basename(cloudName);
         downloaded++;
       } catch (error) {
-        if (error && error.code === 'WEBDAV_RATE_LIMITED') throw error;
+        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
         failures.push(error && error.item ? error : assetError(error.message || '附件下载失败', item, error));
       }
     };
@@ -1515,7 +1625,7 @@ function createIntegrations(options) {
         throwIfWebDavRateLimited(response);
         if (!response.ok) throw new Error('HTTP ' + response.status);
       } catch (error) {
-        if (error && error.code === 'WEBDAV_RATE_LIMITED') throw error;
+        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
         throw assetError('附件上传失败：' + (error && error.message || error), item, error);
       }
       asset.cloudHash = actualHash;
@@ -1566,7 +1676,7 @@ function createIntegrations(options) {
           asset.syncSignature = listingSig + ':' + String(asset.cloudHash || '').toLowerCase();
           return;
         } catch (error) {
-          if (error && error.code === 'WEBDAV_RATE_LIMITED') throw error;
+          if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
           if (error && error.item) {
             failures.push(error);
             return;
@@ -1579,7 +1689,7 @@ function createIntegrations(options) {
       asset.cloudName = cloudName;
       const paperId = String(paper.id || 'paper').replace(/[^A-Za-z0-9_-]/g, '_');
       const assetId = String(asset.id || 'asset').replace(/[^A-Za-z0-9_-]/g, '_');
-      const targetDir = path.join(downloadDir, paperId + '.' + assetId + '.snapshot');
+      const targetDir = path.join(itemAttachmentDir(options.baseDir, paperId), assetId + '.snapshot');
       try {
         const stat = await fs.stat(targetDir);
         if (stat.isDirectory() && asset.cloudHash) { asset.path = targetDir; verified++; return; }
@@ -1625,7 +1735,7 @@ function createIntegrations(options) {
         await noteLedger(cloudName, snapshotHash, body.length);
         downloaded++;
       } catch (error) {
-        if (error && error.code === 'WEBDAV_RATE_LIMITED') throw error;
+        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
         failures.push(error && error.item ? error : assetError(error.message || '快照下载失败', item, error));
       }
     }
@@ -1654,7 +1764,7 @@ function createIntegrations(options) {
           }
           return;
         } catch (error) {
-          if (error && error.code === 'WEBDAV_RATE_LIMITED') throw error;
+          if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
           if (error && error.item) {
             failures.push(error);
             return;
@@ -1686,7 +1796,7 @@ function createIntegrations(options) {
         await noteLedger(cloudName, result.hash, result.size);
         downloaded++;
       } catch (error) {
-        if (error && error.code === 'WEBDAV_RATE_LIMITED') throw error;
+        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
         failures.push(error && error.item ? error : assetError(error.message || '笔记资产下载失败', item, error));
       }
     }
@@ -1725,11 +1835,13 @@ function createIntegrations(options) {
     if (reportAssets) reportAssets({ done: 0, total: assetTotal });
 
     for (const paper of papersList) {
+      throwIfSyncCancelled();
       if (paper && paper.deletedAt) continue;
       if (skipped('papers', paper.id)) continue;
       const attachments = Array.isArray(paper.attachments) ? paper.attachments : [];
       const primary = attachments.find(function (asset) { return asset.kind === 'pdf'; });
       for (const asset of attachments) {
+        throwIfSyncCancelled();
         beginAsset(asset);
         if (asset && asset.kind === 'snapshot') await processSnapshotDir(paper, asset);
         else await processAsset(paper, asset, false, primary && primary.id);
@@ -1737,6 +1849,7 @@ function createIntegrations(options) {
       }
       const annotations = Array.isArray(paper.pdfAnnotations) ? paper.pdfAnnotations : [];
       for (const annotation of annotations) {
+        throwIfSyncCancelled();
         if (annotation && annotation.type === 'snapshot') {
           beginAsset(annotation);
           await processAsset(paper, annotation, true, '');
@@ -1747,9 +1860,11 @@ function createIntegrations(options) {
     // 笔记资产（单文件，如导入的笔记图片）：云端名为 notes/<noteId>/<fileName>
     const noteAssetsDir = path.join(options.baseDir, 'note-assets');
     for (const note of notesList) {
+      throwIfSyncCancelled();
       if (!note || note.deletedAt) continue;
       if (skipped('notes', note.id)) continue;
       for (const noteAsset of Array.isArray(note.assets) ? note.assets : []) {
+        throwIfSyncCancelled();
         beginAsset(noteAsset);
         await processNoteAsset(note, noteAsset, noteAssetsDir);
         tickAsset(noteAsset);
@@ -1802,7 +1917,7 @@ function createIntegrations(options) {
   async function inspectNutstoreRemote(input) {
     const remoteOptions = await resolveNutstoreOptions(input);
     const library = input && input._library ? input._library : await readRemoteLibrary(remoteOptions);
-    const configPassword = remoteOptions.configSyncPassword;
+    const configPassword = remoteOptions.configPassword;
     const remoteConfig = configPassword
       ? await readRemoteConfig(remoteOptions.folderUrl, remoteOptions.headers, configPassword, { publicOnly: true })
       : { exists: false, locked: false, etag: '', value: null, pathConflict: false };
@@ -1946,10 +2061,10 @@ function createIntegrations(options) {
     // Keep the decrypted config only in the main-process plan state.  The
     // public object above deliberately contains booleans instead of secrets.
     try {
-      const privateConfig = await readRemoteConfig(remoteOptions.folderUrl, remoteOptions.headers, remoteOptions.configSyncPassword, {});
+      const privateConfig = await readRemoteConfig(remoteOptions.folderUrl, remoteOptions.headers, remoteOptions.configPassword, {});
       plan._remoteConfig = privateConfig.value || null;
     } catch (error) {
-      if (remoteOptions.configSyncPassword) throw error;
+      if (remoteOptions.configPassword) throw error;
     }
     pendingSyncPlans.set(planId, plan);
     return Object.assign({}, plan, { _options: undefined, _remoteConfig: undefined, corePlan: undefined });
@@ -2157,6 +2272,9 @@ function createIntegrations(options) {
         throw new Error('坚果云路径冲突：请确认“' + plan._options.folderName + '”是文件夹而非普通文件');
       }
     }
+    const firstWrite = await writeCloudLibrary(plan._options, cloudWorkspace, current, function (phase, message) {
+      reportProgress(phase, { message: message });
+    });
     const knownRemoteAssets = await resolveRemoteAssetNames(current.remote, workspace, plan._options, function () {
       reportProgress('scan-assets', { message: '正在读取云端附件清单，避免重复上传…' });
     });
@@ -2171,24 +2289,21 @@ function createIntegrations(options) {
           message: progress.total > 0 ? '正在同步附件与快照（' + progress.done + '/' + progress.total + '）' + current + '…' : '正在核对附件…' });
       }
     });
-    const remoteHash = hashWorkspace(current.remote);
-    const remoteHadCurrentVersion = Number(current.remote && current.remote.syncVersion) >= LitSync.SYNC_VERSION;
-    let uploaded = false, response = null, verifiedLibrary = null;
-    if (hashWorkspace(cloudWorkspace) !== remoteHash || !remoteHadCurrentVersion || !current.exists) {
-      reportProgress('upload', { message: '正在写入云端库…' });
-      const payload = LitSync.createSyncEnvelope(cloudWorkspace);
-      response = await conditionalPut(plan._options.fileUrl, JSON.stringify(payload, null, 2), plan._options.headers,
-        current.etag, { contentType: 'application/json; charset=utf-8', label: '坚果云写入', conditional: current.exists, createOnly: !current.exists });
-      reportProgress('verify-write', { message: '正在确认云端写入结果…' });
-      verifiedLibrary = await verifyRemoteLibraryWrite(plan._options, cloudWorkspace);
-      uploaded = true;
-    }
-    reportProgress('config', { message: '正在同步配置…' });
-    if (plan.mode === 'restore' && plan._remoteConfig) await applySyncedConfig(await loadRawConfig(), plan._remoteConfig, { portableSettings: plan.portableSettings });
-    else await syncEncryptedConfig(plan._options.folderUrl, plan._options.headers, await loadRawConfig(), {
-      passwordOverride: plan._options.configSyncPassword, portableSettings: plan.portableSettings
+    throwIfSyncCancelled();
+    const finalWrite = await writeCloudLibrary(plan._options, cloudWorkspace, firstWrite.current, function (phase, message) {
+      reportProgress(phase, { message: message });
     });
-    const etag = responseEtag(response) || verifiedLibrary && verifiedLibrary.etag || current.etag || '';
+    const uploaded = firstWrite.uploaded || finalWrite.uploaded;
+    reportProgress('config', { message: '正在同步配置…' });
+    if (plan.mode === 'restore' && plan._remoteConfig) {
+      await applySyncedConfig(await loadRawConfig(), plan._remoteConfig, { portableSettings: plan.portableSettings });
+    }
+    await syncEncryptedConfig(plan._options.folderUrl, plan._options.headers, await loadRawConfig(), {
+      passwordOverride: plan._options.configPassword,
+      portableSettings: plan.portableSettings
+    });
+    const etag = finalWrite.current.etag || '';
+    throwIfSyncCancelled();
     await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: plan.remoteKey, etag: etag,
       workspace: LitSync.syncWorkspace(cloudWorkspace), pins: pins });
     pendingSyncPlans.delete(plan.planId);
@@ -2218,7 +2333,9 @@ function createIntegrations(options) {
     const conflicts = [];
     const pins = plan.pins || {};
     const cloudWorkspace = LitSync.applyPinsToWorkspace(merged, pins);
-    const remoteHash = hashWorkspace(remote);
+    const firstWrite = await writeCloudLibrary(remoteOptions, cloudWorkspace, library, function (phase, message) {
+      emitSyncProgress({ scope: 'sync', phase: phase, message: message });
+    });
     const knownRemoteAssets = await resolveRemoteAssetNames(remote, merged, remoteOptions, function () {
       emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取云端附件清单，避免重复上传…' });
     });
@@ -2233,38 +2350,24 @@ function createIntegrations(options) {
           message: progress.total > 0 ? '正在同步附件与快照（' + progress.done + '/' + progress.total + '）' + current + '…' : '正在核对附件…' });
       }
     });
+    throwIfSyncCancelled();
     emitSyncProgress({ scope: 'sync', phase: 'config', message: '正在同步配置…' });
     await syncEncryptedConfig(remoteOptions.folderUrl, remoteOptions.headers, remoteOptions.raw, {
       portableSettings: localValue && localValue.portableSettings
     });
-    // v5 起写入当前协议版本（旧 nutstoreSync() 的 v3 写入兼容到此结束）：
-    // 旧端读到更高 syncVersion 会拒绝读写，避免把含 Note 实体的新格式改坏后写回。
-    const remoteHadCurrentVersion = Number(remote && remote.syncVersion) >= LitSync.SYNC_VERSION;
-    let uploaded = false, response = null, verifiedLibrary = null;
-    if (hashWorkspace(cloudWorkspace) !== remoteHash || !remoteHadCurrentVersion || !library.exists) {
-      if (library.exists && !library.etag) {
-        const latest = await readRemoteLibrary(remoteOptions);
-        if (latest.exists !== library.exists || hashWorkspace(latest.remote) !== remoteHash) {
-          throw new RemoteChangedError('云端内容已变化，请重新生成同步计划', remoteOptions.fileUrl);
-        }
-      }
-      emitSyncProgress({ scope: 'sync', phase: 'upload', message: '正在写入云端库…' });
-      const payload = LitSync.createSyncEnvelope(cloudWorkspace);
-      response = await conditionalPut(remoteOptions.fileUrl, JSON.stringify(payload, null, 2), remoteOptions.headers, library.etag, {
-        contentType: 'application/json; charset=utf-8', label: '坚果云写入', conditional: !!library.etag, createOnly: !library.exists
-      });
-      emitSyncProgress({ scope: 'sync', phase: 'verify-write', message: '正在确认云端写入结果…' });
-      verifiedLibrary = await verifyRemoteLibraryWrite(remoteOptions, cloudWorkspace);
-      uploaded = true;
-    }
+    const finalWrite = await writeCloudLibrary(remoteOptions, cloudWorkspace, firstWrite.current, function (phase, message) {
+      emitSyncProgress({ scope: 'sync', phase: phase, message: message });
+    });
+    const uploaded = firstWrite.uploaded || finalWrite.uploaded;
     if (conflicts.length) {
       const lines = conflicts.map(function (c) {
         return JSON.stringify({ at: new Date().toISOString(), id: c.id, title: c.title, direction: c.direction, overwritten: c.overwritten });
       }).join('\n') + '\n';
       await fs.appendFile(path.join(options.baseDir, 'sync-conflicts.jsonl'), lines, 'utf8').catch(function () {});
     }
+    throwIfSyncCancelled();
     await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: remoteOptions.user + '\n' + remoteOptions.fileUrl,
-      etag: responseEtag(response) || verifiedLibrary && verifiedLibrary.etag || library.etag || '',
+      etag: finalWrite.current.etag || '',
       workspace: LitSync.syncWorkspace(cloudWorkspace), pins: pins });
     emitSyncProgress({ scope: 'sync', phase: 'done', message: '同步完成', uploaded: uploaded, pinned: Object.keys(pins).length });
     return { workspace: merged, conflicts: conflicts, uploaded: uploaded, assets: assetResult,
@@ -2286,18 +2389,6 @@ function createIntegrations(options) {
       }
     }
     throw lastError;
-  }
-
-  async function pullPortableConfig(input) {
-    const remoteOptions = await resolveNutstoreOptions(input);
-    const password = remoteOptions.configSyncPassword;
-    if (!password) throw new Error('请先提供配置同步密码');
-    const remoteConfig = await readRemoteConfig(remoteOptions.folderUrl, remoteOptions.headers, password, { publicOnly: false });
-    if (!remoteConfig.exists) return { ok: true, found: false, config: await getConfig(), etag: '', value: null };
-    if (!remoteConfig.value) throw new Error('云端配置无法读取');
-    const raw = await loadRawConfig();
-    await applySyncedConfig(raw, remoteConfig.value);
-    return { ok: true, found: true, config: await getConfig(), etag: remoteConfig.etag || '', value: portableConfigView(remoteConfig.value) };
   }
 
   async function inspectRemote(input) { return inspectNutstoreRemote(input); }
@@ -2501,7 +2592,9 @@ function createIntegrations(options) {
   function extractZoteroRaw(db) {
     const raw = { queryFailures: [] };
     const failures = raw.queryFailures;
-    const libraries = zoteroQuery(db, 'SELECT libraryID, libraryType FROM libraries', failures, 'libraries');
+    const libraryColumns = zoteroTableColumns(db, 'libraries');
+    const libraries = libraryColumns.length ? zoteroQuery(db,
+      'SELECT libraryID' + (libraryColumns.includes('libraryType') ? ', libraryType' : '') + ' FROM libraries', failures, 'libraries') : [];
     raw.personalLibraryIds = libraries.filter(function (row) { return row.libraryType === 'user' || Number(row.libraryID) === 1; })
       .map(function (row) { return row.libraryID; });
     raw.libraryId = raw.personalLibraryIds.length ? String(raw.personalLibraryIds[0]) : '1';
@@ -2718,14 +2811,15 @@ function createIntegrations(options) {
             const paper = paperById[job.paperId];
             const attachment = paper && paper.attachments.find(function (att) { return att.id === job.attachmentId; });
             if (!attachment) throw new Error('附件记录不存在');
-            const stored = await storeFileInto(attachmentsDir, job.sourcePath, path.extname(job.fileName));
+            const stored = await storeFileInto(itemAttachmentDir(options.baseDir, job.paperId),
+              job.sourcePath, path.extname(job.fileName));
             attachment.path = stored.path;
             if (job.zoteroKey) assetMap[job.zoteroKey] = stored.path;
           } else if (job.kind === 'snapshot-dir') {
             const paper = paperById[job.paperId];
             const attachment = paper && paper.attachments.find(function (att) { return att.id === job.attachmentId; });
             if (!attachment) throw new Error('快照附件记录不存在');
-            const stored = await storeDirInto(attachmentsDir, job.sourcePath);
+            const stored = await storeDirInto(itemAttachmentDir(options.baseDir, job.paperId), job.sourcePath);
             attachment.path = stored.path;
             if (job.zoteroKey) assetMap[job.zoteroKey] = stored.path;
           } else if (job.kind === 'note-image') {
@@ -2780,8 +2874,6 @@ function createIntegrations(options) {
     const headers = { Authorization: basicAuth(config.nutstoreUser, password) };
     const cloudFolder = joinUrl(config.nutstoreUrl || 'https://dav.jianguoyun.com/dav/', config.zoteroWebDavFolder || 'zotero');
     const workspace = LitModel.normalizeWorkspace(value);
-    const targetDir = path.join(options.baseDir, 'zotero-migrated-attachments');
-    await fs.mkdir(targetDir, { recursive: true });
     const candidates = workspace.papers.filter(function (paper) { return !!paper.zoteroAttachmentKey; });
     let cursor = 0, downloaded = 0, existing = 0, missing = 0, failed = 0;
     async function worker() {
@@ -2796,10 +2888,22 @@ function createIntegrations(options) {
         try {
           const archive = Buffer.from(await response.arrayBuffer());
           const pdf = extractFirstPdfFromZip(archive);
-          const target = path.join(targetDir, paper.id + '.pdf');
+          const targetDir = itemAttachmentDir(options.baseDir, paper.id);
+          await fs.mkdir(targetDir, { recursive: true });
+          const target = await availablePdfPath(targetDir, paper.id + '.pdf');
           await fs.writeFile(target, pdf.data);
-          paper.pdfPath = target;
-          paper.pdfFileName = pdf.name || paper.pdfFileName || 'PDF';
+          const primary = (paper.attachments || []).find(function (att) { return att && att.kind === 'pdf'; });
+          if (primary) {
+            primary.path = target;
+            primary.fileName = pdf.name || primary.fileName || 'PDF';
+          } else {
+            paper.attachments = [LitModel.normalizeAttachment({
+              id: 'at' + crypto.randomBytes(8).toString('hex'), kind: 'pdf',
+              path: target, fileName: pdf.name || 'PDF'
+            })].concat(paper.attachments || []);
+          }
+          const normalized = LitModel.normalizePaper(paper);
+          workspace.papers[workspace.papers.indexOf(paper)] = normalized;
           downloaded++;
         } catch (error) { failed++; }
       }
@@ -2888,9 +2992,12 @@ function createIntegrations(options) {
     });
   }
 
-  return { getConfig, saveConfig, getResearchRuntimeConfig, getAgentProviderRuntime, revealSecret, setAgentSelection, nutstoreSync,
-    inspectNutstoreRemote, createNutstoreSyncPlan, applyNutstoreSyncPlan,
-    pullPortableConfig, pullNutstoreConfig: pullPortableConfig, inspectRemote, createSyncPlan, applySyncPlan,
+  return { getConfig, saveConfig, getResearchRuntimeConfig, getAgentProviderRuntime, revealSecret, setAgentSelection,
+    nutstoreSync: function (value) { return runSyncTask(function () { return nutstoreSync(value); }); }, cancelNutstoreSync,
+    inspectNutstoreRemote, createNutstoreSyncPlan,
+    applyNutstoreSyncPlan: function (value) { return runSyncTask(function () { return applyNutstoreSyncPlan(value); }); },
+    inspectRemote, createSyncPlan,
+    applySyncPlan: function (value) { return runSyncTask(function () { return applySyncPlan(value); }); },
     testNutstoreConnection, translateText, testTranslationConnection, getScigreatRank, testScigreatConnection, getJournalRank, testJournalRankConnection, detectZoteroDataDir, setZoteroDataDir,
     importZoteroLocal, scanZoteroLibrary, importZoteroLibrary, migrateZoteroCloudAttachments };
 }

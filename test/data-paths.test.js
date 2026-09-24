@@ -79,9 +79,9 @@ test('managed attachment paths are rebased while external paths stay unchanged',
   const workspace = {
     papers: [{
       id: 'p1',
-      pdfPath: path.join(from, 'synced-attachments', 'p1.pdf'),
+      pdfPath: path.join(from, 'synced-attachments', 'items', 'p1', 'a1.pdf'),
       attachments: [
-        { id: 'a1', kind: 'pdf', path: path.join(from, 'synced-attachments', 'p1.pdf') },
+        { id: 'a1', kind: 'pdf', path: path.join(from, 'synced-attachments', 'items', 'p1', 'a1.pdf') },
         { id: 'a2', kind: 'supp', path: external }
       ],
       pdfAnnotations: [
@@ -92,8 +92,8 @@ test('managed attachment paths are rebased while external paths stay unchanged',
   };
   const result = manager.rebaseWorkspacePaths(workspace, from, to);
   assert.equal(result.changed, 3);
-  assert.equal(workspace.papers[0].pdfPath, path.join(to, 'synced-attachments', 'p1.pdf'));
-  assert.equal(workspace.papers[0].attachments[0].path, path.join(to, 'synced-attachments', 'p1.pdf'));
+  assert.equal(workspace.papers[0].pdfPath, path.join(to, 'synced-attachments', 'items', 'p1', 'a1.pdf'));
+  assert.equal(workspace.papers[0].attachments[0].path, path.join(to, 'synced-attachments', 'items', 'p1', 'a1.pdf'));
   assert.equal(workspace.papers[0].attachments[1].path, external);
   assert.equal(workspace.papers[0].pdfAnnotations[0].imagePath, path.join(to, 'annotation-images', 'n1.png'));
   assert.equal(workspace.papers[0].pdfAnnotations[1].imagePath, external);

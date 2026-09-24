@@ -2,7 +2,118 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 const LitTranslators = require('../js/translators.js');
+
+test('CNKI EndNote export fills missing metadata on a detail page', async function () {
+  let listener;
+  const title = { textContent: '保障数据隐私的锂电池多用户协同智能健康监测通用基础模型' };
+  const elements = {
+    '.wx-tit h1, .doc-top, #paramfilename': title,
+    '.wx-tit > h1, .wx-tit h1': title,
+    '#paramfilename': { value: 'JXGC20260826014' }
+  };
+  const document = {
+    head: { innerHTML: '' },
+    querySelector: selector => elements[selector] || null,
+    querySelectorAll: () => []
+  };
+  const context = {
+    document,
+    location: { hostname: 'kns.cnki.net', pathname: '/kcms2/article/abstract', href: 'https://kns.cnki.net/kcms2/article/abstract?v=1' },
+    URL,
+    fetch: async () => ({ ok: true, json: async () => ({ code: 1, data: [{ key: 'EndNote', value: [
+      '%0 Journal Article<br>%T 保障数据隐私的锂电池多用户协同智能健康监测通用基础模型<br>' +
+      '%A 张微<br>%A 常希鹏<br>%A 李响<br>%A 杨绍杰<br>%J 机械工程学报<br>' +
+      '%D 2026<br>%V 62<br>%N 11<br>%P 1-12<br>%I 0577-6686<br>%R 10.3901/JME.260773'
+    ] }] }) }),
+    chrome: { runtime: { onMessage: { addListener: fn => { listener = fn; } } } },
+    window: {}
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'extension', 'content.js'), 'utf8'), context);
+  const result = await new Promise(resolve => listener({ type: 'litboard-extract' }, {}, resolve));
+
+  assert.deepEqual(Array.from(result.authors), ['张微', '常希鹏', '李响', '杨绍杰']);
+  assert.equal(result.venue, '机械工程学报');
+  assert.equal(result.year, '2026');
+  assert.equal(result.volume, '62');
+  assert.equal(result.issue, '11');
+  assert.equal(result.pages, '1-12');
+  assert.equal(result.issn, '0577-6686');
+  assert.equal(result.doi, '10.3901/JME.260773');
+  assert.equal(result.sourceType, 'translator:cnki');
+});
+
+test('CNKI journal tooltip does not become part of the captured journal name', async function () {
+  let listener;
+  const title = { textContent: '基于超声时频域主成分分析的磷酸铁锂储能电池荷电状态评估' };
+  const elements = {
+    '.wx-tit h1, .doc-top, #paramfilename': title,
+    '.wx-tit > h1, .wx-tit h1': title,
+    '.top-tip': { innerText: '高电压技术 · 查看该刊数据库收录来源' },
+    '#paramfilename': { value: 'SMOKE20260818' }
+  };
+  const context = {
+    document: { head: { innerHTML: '' }, querySelector: selector => elements[selector] || null, querySelectorAll: () => [] },
+    location: { hostname: 'kns.cnki.net', pathname: '/kcms2/article/abstract', href: 'https://kns.cnki.net/kcms2/article/abstract?v=1' },
+    URL,
+    fetch: async () => ({ ok: true, json: async () => ({ code: 1, data: [
+      { key: 'EndNote', value: ['%T 基于超声时频域主成分分析的磷酸铁锂储能电池荷电状态评估<br>%J 高电压技术'] }
+    ] }) }),
+    chrome: { runtime: { onMessage: { addListener: fn => { listener = fn; } } } },
+    window: { LitTranslators }
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'extension', 'content.js'), 'utf8'), context);
+  const result = await new Promise(resolve => listener({ type: 'litboard-extract' }, {}, resolve));
+  assert.equal(result.venue, '高电压技术');
+  assert.equal(LitTranslators.parseCnkiPublicationInfo('高电压技术，查看该刊数据库收录来源').venue, '高电压技术');
+});
+
+test('CNKI journal meta fallback also removes the database-source tooltip', async function () {
+  let listener;
+  const title = { textContent: '基于超声时频域主成分分析的磷酸铁锂储能电池荷电状态评估' };
+  const elements = {
+    '.wx-tit h1, .doc-top, #paramfilename': title,
+    '.wx-tit > h1, .wx-tit h1': title,
+    'meta[name="citation_journal_title"], meta[property="citation_journal_title"]':
+      { content: '高电压技术 · 查看该刊数据库收录来源' }
+  };
+  const context = {
+    document: { head: { innerHTML: '' }, querySelector: selector => elements[selector] || null, querySelectorAll: () => [] },
+    location: { hostname: 'kns.cnki.net', pathname: '/kcms2/article/abstract', href: 'https://kns.cnki.net/kcms2/article/abstract?v=article' },
+    URL,
+    chrome: { runtime: { onMessage: { addListener: fn => { listener = fn; } } } },
+    window: { LitTranslators }
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'extension', 'content.js'), 'utf8'), context);
+  const result = await new Promise(resolve => listener({ type: 'litboard-extract' }, {}, resolve));
+  assert.equal(result.venue, '高电压技术');
+});
+
+test('CNKI generic metadata fallback removes the journal tooltip when detail selectors change', async function () {
+  let listener;
+  const elements = {
+    'meta[name="citation_title"], meta[property="citation_title"]': { content: '储能电池荷电状态评估' },
+    'meta[name="citation_journal_title"], meta[property="citation_journal_title"]':
+      { content: '高电压技术 · 查看该刊数据库收录来源' }
+  };
+  const context = {
+    document: {
+      title: '储能电池荷电状态评估', body: { innerText: '' },
+      querySelector: selector => elements[selector] || null,
+      querySelectorAll: () => []
+    },
+    location: { hostname: 'kns.cnki.net', pathname: '/kcms2/article/abstract', href: 'https://kns.cnki.net/kcms2/article/abstract?v=article' },
+    URL,
+    chrome: { runtime: { onMessage: { addListener: fn => { listener = fn; } } } },
+    window: { LitTranslators }
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'extension', 'content.js'), 'utf8'), context);
+  const result = await new Promise(resolve => listener({ type: 'litboard-extract' }, {}, resolve));
+  assert.equal(result.venue, '高电压技术');
+});
 
 function ctx(url, metaMap, texts, opts) {
   // metaMap 值可为 string（单值）或 string[]（真多值，模拟重复 meta 标签）

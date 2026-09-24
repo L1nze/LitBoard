@@ -15,7 +15,7 @@
   }
 
   function normDoi(value) {
-    return String(value || '').replace(/^(https?:\/\/)?(dx\.)?doi\.org\//i, '').toLowerCase().trim();
+    return String(value || '').trim().replace(/^(https?:\/\/)?(dx\.)?doi\.org\//i, '').toLowerCase();
   }
 
   function validFingerprint(value) {
@@ -242,54 +242,71 @@
     return null;
   }
 
+  /** 合并附件并给被合并副本返回保留附件 ID；不会修改任一输入。 */
+  function mergeAttachmentsDetailed(target, candidate) {
+    var existing = target && target.attachments || [];
+    var incoming = candidate && candidate.attachments || [];
+    var keptExisting = [], keptIncoming = [], aliases = Object.create(null);
+    var byFingerprint = Object.create(null), byPath = Object.create(null), byId = Object.create(null);
+
+    function addKeys(attachment, canonical) {
+      if (attachment.fingerprint) {
+        var fingerprint = String(attachment.fingerprint).toLowerCase();
+        if (!byFingerprint[fingerprint]) byFingerprint[fingerprint] = canonical;
+      }
+      if (attachment.path) {
+        var path = String(attachment.path).toLowerCase();
+        if (!byPath[path]) byPath[path] = canonical;
+      }
+      if (attachment.id && !byId[attachment.id]) byId[attachment.id] = canonical;
+    }
+
+    function append(attachment, isIncoming) {
+      if (!attachment) return;
+      var fingerprint = String(attachment.fingerprint || '').toLowerCase();
+      var path = String(attachment.path || '').toLowerCase();
+      var canonical = (fingerprint && byFingerprint[fingerprint]) ||
+        (path && byPath[path]) || (attachment.id && byId[attachment.id]);
+      if (canonical) {
+        if (attachment.id && canonical.id && attachment.id !== canonical.id) aliases[attachment.id] = canonical.id;
+        // 让通过不同键连起来的后续副本也归到同一份附件。
+        addKeys(attachment, canonical);
+        return;
+      }
+      (isIncoming ? keptIncoming : keptExisting).push(attachment);
+      addKeys(attachment, attachment);
+    }
+
+    existing.forEach(function (attachment) { append(attachment, false); });
+    incoming.forEach(function (attachment) { append(attachment, true); });
+
+    var targetHasPdf = existing.some(function (attachment) { return attachment && attachment.kind === 'pdf'; });
+    if (targetHasPdf) return {
+      attachments: keptExisting.concat(keptIncoming), aliases: aliases, added: keptIncoming
+    };
+
+    // 首个新 PDF 置首位，normalizePaper 重投影后成为主 PDF。
+    for (var i = 0; i < keptIncoming.length; i++) {
+      if (keptIncoming[i] && keptIncoming[i].kind === 'pdf') {
+        keptIncoming.unshift(keptIncoming.splice(i, 1)[0]);
+        break;
+      }
+    }
+    return { attachments: keptIncoming.concat(keptExisting), aliases: aliases, added: keptIncoming };
+  }
+
   /**
    * 把 candidate 的附件并入 target（Zotero 式导入：命中已有条目时挂 PDF）。
-   * 判重优先级：指纹 > 路径（忽略大小写）> id；target 原本没有 PDF 附件时，
-   * 新 PDF 置首位成为主 PDF，已有主 PDF 则追加为普通附件。
-   * 返回新数组，不改动入参；candidate 无附件时为无操作（bib/ris/json 导入安全）。
+   * 按指纹 > 路径（忽略大小写）> id 合并 target 自身和新附件中的副本，
+   * 返回新数组，不改动入参；candidate 无附件且 target 无副本时保持原样。
    */
   function mergeAttachments(target, candidate) {
-    var result = (target && target.attachments || []).slice();
-    var incoming = (candidate && candidate.attachments || []);
-    if (!incoming.length) return result;
-    var seenFps = {}, seenPaths = {}, seenIds = {};
-    result.forEach(function (a) {
-      if (!a) return;
-      if (a.fingerprint) seenFps[String(a.fingerprint).toLowerCase()] = true;
-      if (a.path) seenPaths[String(a.path).toLowerCase()] = true;
-      if (a.id) seenIds[a.id] = true;
-    });
-    var additions = [];
-    incoming.forEach(function (a) {
-      if (!a) return;
-      var fp = String(a.fingerprint || '').toLowerCase();
-      var p = String(a.path || '').toLowerCase();
-      if (fp && seenFps[fp]) return;
-      if (p && seenPaths[p]) return;
-      if (a.id && seenIds[a.id]) return;
-      if (fp) seenFps[fp] = true;
-      if (p) seenPaths[p] = true;
-      if (a.id) seenIds[a.id] = true;
-      additions.push(a);
-    });
-    if (!additions.length) return result;
-    var hasPdf = result.some(function (a) { return a && a.kind === 'pdf'; });
-    if (!hasPdf) {
-      // 首个 PDF 附件置首位 → normalizePaper 重投影后成为主 PDF
-      for (var i = 0; i < additions.length; i++) {
-        if (additions[i] && additions[i].kind === 'pdf') {
-          var first = additions.splice(i, 1)[0];
-          additions.unshift(first);
-          break;
-        }
-      }
-      return additions.concat(result);
-    }
-    return result.concat(additions);
+    return mergeAttachmentsDetailed(target, candidate).attachments;
   }
 
   return { findGroups: findGroups, merge: merge, completeness: completeness, isDuplicate: isDuplicate,
     createMatchIndex: createMatchIndex, indexPaper: indexPaper, findMatch: findMatch,
-    mergeAttachments: mergeAttachments, pdfFingerprints: pdfFingerprints, normDoi: normDoi,
+    mergeAttachments: mergeAttachments, mergeAttachmentsDetailed: mergeAttachmentsDetailed,
+    pdfFingerprints: pdfFingerprints, normDoi: normDoi,
     isTitleCandidate: isTitleCandidate };
 });

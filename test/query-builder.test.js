@@ -70,7 +70,7 @@ test('批量编辑：status 合法值生效并进撤销栈；非法值不动', (
   h2.els['#bulk-edit-field'].value = 'status';
   h2.els['#bulk-edit-value'].value = 'bogus'; // 白名单外 → 该条跳过
   h2.els['#bulk-edit-confirm'].click();
-  assert.strictEqual(bad[0].status, 'read', '非法 status 不落');
+  assert.strictEqual(bad[0].status, 'reading', '非法 status 不落');
 });
 
 test('批量编辑：rating 越界拒绝、year 联动 date、tags 去重', () => {

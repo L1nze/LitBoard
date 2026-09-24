@@ -11,6 +11,7 @@
  * - onNew({text}) / onEdit({turnId, text}) / onReload({turnId}) / onCancel()
  * - sendSuggestion(text): 空态建议点击直接发送
  * - retry(turnId): 错误卡重试
+ * - composerSlotReady(el): 输入行宿主插槽挂载完成，宿主把模型/推理等控件移入 el
  * - T(s): i18n；openPaper(id): 来源卡跳转
  */
 import React, { useEffect, useState } from 'react';
@@ -43,12 +44,14 @@ function MarkdownText(props) {
 
 /** 思考过程（reasoning part）：默认折叠，可展开查看 */
 function ReasoningBlock(props) {
+  const bridge = bridgeRef;
+  const T = makeT(bridge);
   const [open, setOpen] = useState(false);
   const text = String(props.text || '');
   if (!text) return null;
   return (
     <details className={'aui-reasoning' + (open ? ' open' : '')} open={open}>
-      <summary onClick={(e) => { e.preventDefault(); setOpen(!open); }}>💭 思考过程</summary>
+      <summary onClick={(e) => { e.preventDefault(); setOpen(!open); }}>{T('思考过程')}</summary>
       <div className="aui-reasoning-body">{text}</div>
     </details>
   );
@@ -174,16 +177,23 @@ function AssistantMessage() {
 
 /** 底部输入区：发送与停止合并为**一个**图标按钮，不再出现「发送」文字。
  *  未运行 = 向上箭头（发送），运行中 = 方块（停止）——按钮形态与当前能做的事严格一一对应，
- *  避免两个按钮同时挂在行尾时「哪个能点」要靠猜。（编辑态 composer 仍保留文字按钮。） */
+ *  避免两个按钮同时挂在行尾时「哪个能点」要靠猜。（编辑态 composer 仍保留文字按钮。）
+ *  行内不再显示「Enter 发送」提示（占位符里已有）；aui-host-slot 是宿主插槽——
+ *  agentui 挂载后把模型/推理/状态/token 等 plain-DOM 控件移进来（发送按钮旁），
+ *  React 不接管槽内节点（槽自身无 React 子节点，重渲染不会清掉外部插入的 DOM）。 */
 function ComposerArea({ bridge, isRunning }) {
   const T = makeT(bridge);
   const label = isRunning ? T('停止') : T('发送');
+  const slotRef = React.useRef(null);
+  useEffect(() => {
+    if (slotRef.current && bridge.composerSlotReady) bridge.composerSlotReady(slotRef.current);
+  }, []);
   return (
     <div className="aui-composer-wrap">
       <ComposerPrimitive.Root className="aui-composer">
         <ComposerPrimitive.Input className="aui-input" autoFocus rows={1} placeholder={T('问点什么…（Enter 发送，Shift+Enter 换行）')} />
         <div className="aui-composer-row">
-          <span className="aui-hint">{T('Enter 发送 · Shift+Enter 换行')}</span>
+          <div className="aui-host-slot" ref={slotRef} />
           {isRunning ? (
             <ComposerPrimitive.Cancel className="aui-send primary aui-icon-btn" title={label} aria-label={label}>
               <svg className="aui-ic" viewBox="0 0 16 16" aria-hidden="true">

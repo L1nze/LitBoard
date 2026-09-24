@@ -4,10 +4,13 @@
  * （自 main.js registerIpc 平移）。三个组共享 ctx.forceQuitNext：恢复/目录切换重启
  * 跳过渲染层保存收尾（数据库已切换，收尾无意义），关闭拦截读同一标志放行。 */
 
-const { app, dialog, shell } = require('electron');
+const { app, dialog, net, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const ctx = require('./context.js');
+const LitUpdate = require('../../js/update.js');
+
+let availableUpdate = null;
 
 module.exports = { register: register };
 
@@ -104,6 +107,23 @@ function register() {
     return result;
   });
   ctx.handle('app:get-version', function () { return app.getVersion(); });
+  ctx.handle('app:check-update', async function () {
+    if (!app.isPackaged) return null;
+    availableUpdate = null;
+    const response = await net.fetch('https://api.github.com/repos/L1nze/LitBoard/releases/latest', {
+      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'LitBoard' },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (response.status === 404) return null; // 尚未发布正式 Release
+    if (!response.ok) throw new Error('GitHub Release: HTTP ' + response.status);
+    const release = await response.json();
+    availableUpdate = LitUpdate.releaseInfo(release, app.getVersion(), !!process.env.PORTABLE_EXECUTABLE_FILE);
+    return availableUpdate && { version: availableUpdate.version };
+  });
+  ctx.handle('app:download-update', function () {
+    if (!availableUpdate) return false;
+    return shell.openExternal(availableUpdate.url).then(function () { return true; });
+  });
   ctx.handle('app:relaunch', function () {
     const current = ctx.dataPathManager.getState();
     if (!current.restartRequired) return false;

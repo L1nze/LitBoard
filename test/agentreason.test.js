@@ -68,15 +68,21 @@ test('GLM: 4.x 只有 thinking 开关，5.2+ 有 effort，5.3 不能关', functi
   assert.deepEqual(Reason.buildBody(g53, 'low'), { reasoning_effort: 'low' });
 });
 
-test('DashScope/Qwen: enable_thinking 开关；承载的其他模型同样走该 API 面', function () {
+test('Qwen: 旧系列开关，3.8 按官方档位；能力只取决于模型 ID', function () {
   const q = cap({ baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' });
   assert.equal(q.provider, 'qwen');
   assert.deepEqual(q.levels, ['off', 'high']);
   assert.deepEqual(Reason.buildBody(q, 'off'), { enable_thinking: false });
   assert.deepEqual(Reason.buildBody(q, 'high'), { enable_thinking: true });
   assert.deepEqual(Reason.buildBody(q, 'medium'), { enable_thinking: true });
-  // DashScope 上的 GLM/Kimi 也走 enable_thinking，不被模型名改判
-  assert.equal(cap({ baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'glm-4.6' }).provider, 'qwen');
+  const q38 = cap({ baseUrl: 'https://proxy.example.com/v1', model: 'qwen3.8-max' });
+  assert.deepEqual(q38.levels, ['off', 'low', 'medium', 'xhigh']);
+  assert.deepEqual(Reason.buildBody(q38, 'off'), { reasoning_effort: 'none' });
+  assert.deepEqual(Reason.buildBody(q38, 'xhigh'), { reasoning_effort: 'xhigh' });
+  assert.equal(cap({ baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'glm-5.3' }).provider, 'glm');
+  assert.equal(cap({ baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'ZHIPU/GLM-5.3' }).provider, 'glm');
+  assert.equal(cap({ baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'kimi-k3' }).provider, 'kimi');
+  assert.equal(cap({ baseUrl: 'https://api.deepseek.com', model: 'qwen3.8-flash' }).provider, 'qwen');
 });
 
 test('OpenAI: minimal/low/medium/high，max 归一到 high', function () {
@@ -86,11 +92,27 @@ test('OpenAI: minimal/low/medium/high，max 归一到 high', function () {
   assert.deepEqual(Reason.buildBody(o, 'off'), { reasoning_effort: 'minimal' });
   assert.deepEqual(Reason.buildBody(o, 'medium'), { reasoning_effort: 'medium' });
   assert.deepEqual(Reason.buildBody(o, 'max'), { reasoning_effort: 'high' });
+  const current = cap({ baseUrl: 'https://proxy.example.com/v1', model: 'gpt-5.5' });
+  assert.deepEqual(current.levels, ['off', 'low', 'medium', 'high', 'xhigh']);
+  assert.deepEqual(Reason.buildBody(current, 'off'), { reasoning_effort: 'none' });
+  const pro = cap({ model: 'gpt-5.5-pro' });
+  assert.deepEqual(pro.levels, ['medium', 'high', 'xhigh']);
+  assert.deepEqual(Reason.buildBody(pro, 'off'), {});
+});
+
+test('Claude: 支持的型号显示 effort 档位，旧型号只显示默认', function () {
+  const opus = cap({ baseUrl: 'https://proxy.example.com/v1', model: 'claude-opus-4-7' });
+  assert.deepEqual(opus.levels, ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.deepEqual(Reason.buildBody(opus, 'xhigh'), { reasoning_effort: 'xhigh' });
+  const sonnet = cap({ model: 'claude-sonnet-4-6' });
+  assert.deepEqual(sonnet.levels, ['low', 'medium', 'high', 'max']);
+  assert.deepEqual(Reason.options(cap({ model: 'claude-haiku-4-5' })).map((o) => o.value), ['']);
 });
 
 test('未知端点不下发任何推理参数（不制造 400、不伪造控制力）', function () {
   for (const input of [
     { baseUrl: 'http://localhost:11434/v1', model: 'llama3' },
+    { baseUrl: 'https://api.deepseek.com', model: 'internal-model-7b' },
     { baseUrl: '', model: '' },
     { baseUrl: 'https://my-proxy.example.com/v1', model: 'internal-model-7b' }
   ]) {

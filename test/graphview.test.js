@@ -81,3 +81,24 @@ test('Agent 侧提供最近引文网络快捷项并接到 GraphView.reopen', fun
   assert.match(agentUi, /reopenGraphPanel/);
   assert.match(app, /LitGraphView\.reopen\(\)/);
 });
+
+test('最近引文网络快捷项只显示在生成它的对话', function () {
+  const source = fs.readFileSync(path.join(__dirname, '../js/agentui.js'), 'utf8');
+  const start = source.indexOf('  function renderAttachments(run) {');
+  const end = source.indexOf('  function bridge()', start);
+  assert.ok(start >= 0 && end > start);
+  const wrap = { hidden: true, innerHTML: '', children: [], appendChild(node) { this.children.push(node); } };
+  const context = {
+    $: () => wrap, T: (s) => s,
+    el: (_tag, _class, label) => ({ label, appendChild(child) { this.label = child.label; }, addEventListener() {} }),
+    deps: { reopenGraphPanel: () => true },
+    recentGraphSessionId: 'session-a', desk: {}
+  };
+  vm.runInNewContext(source.slice(start, end) + '\nthis.renderAttachments = renderAttachments;', context);
+  context.renderAttachments({ id: 'session-b', doc: { attachments: [] } });
+  assert.equal(wrap.hidden, true);
+  assert.equal(wrap.children.length, 0);
+  context.renderAttachments({ id: 'session-a', doc: { attachments: [] } });
+  assert.equal(wrap.hidden, false);
+  assert.equal(wrap.children.at(-1).label, '重开最近引文网络');
+});

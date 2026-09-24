@@ -17,6 +17,10 @@
       .replace(/[).,;\]]+$/, '').trim();
   }
 
+  function cleanCnkiVenue(value) {
+    return String(value || '').replace(/\s*[·•,，.．]?\s*查看该刊数据库收录来源[\s\S]*$/, '').trim();
+  }
+
   function elText(el) {
     return el ? String(el.innerText || el.textContent || '').trim() : '';
   }
@@ -66,7 +70,7 @@
   }
 
   function cnkiDetailExtract() {
-    var result = { source: 'CNKI', url: location.href };
+    var result = { source: 'CNKI', sourceType: 'translator:cnki', url: location.href };
     var label = cnkiLabeledData();
 
     var titleNode = document.querySelector('.wx-tit > h1, .wx-tit h1');
@@ -92,8 +96,8 @@
     var pubInfo = elText(document.querySelector('.top-tip'));
     var parsedPubInfo = window.LitTranslators && window.LitTranslators.parseCnkiPublicationInfo
       ? window.LitTranslators.parseCnkiPublicationInfo(pubInfo) : {};
-    result.venue = parsedPubInfo.venue || label['来源期刊'] || label['期刊'] || label['刊名'] ||
-      meta(['citation_journal_title', 'dc.source']) || elText(document.querySelector('.top-tip > a, .top-tip a')) || '';
+    result.venue = cleanCnkiVenue(parsedPubInfo.venue || label['来源期刊'] || label['期刊'] || label['刊名'] ||
+      meta(['citation_journal_title', 'dc.source']) || elText(document.querySelector('.top-tip > a, .top-tip a')) || '');
     result.year = parsedPubInfo.year || ((label['发表时间'] || label['出版年'] || label['年'] || '').match(/(?:19|20)\d{2}/) || [])[0] || '';
     result.volume = parsedPubInfo.volume || '';
     result.issue = parsedPubInfo.issue || '';
@@ -113,7 +117,7 @@
     }
 
     result.doi = cleanDoi(label['DOI'] || meta(['citation_doi']));
-    result.issn = label['ISSN'] || label['CN'] || '';
+    result.issn = label['ISSN'] || '';
 
     // PDF 下载链接（登录/未登录都可能指向下载接口）
     var pdfLink = document.querySelector('.btn-dlpdf > a, .btn-qwxz > a, .download-pdf a');
@@ -157,27 +161,29 @@
       var json = await resp.json();
       if (!json || json.code !== 1 || !Array.isArray(json.data)) return meta;
       var refworks = '';
-      json.data.forEach(function (entry) { if (entry && entry.key === 'EndNote' && entry.value && entry.value[0]) refworks = entry.value[0].replace(/<br>/g, '\\n'); });
+      json.data.forEach(function (entry) { if (entry && entry.key === 'EndNote' && entry.value && entry.value[0]) refworks = entry.value[0].replace(/<br\s*\/?\s*>/gi, '\n'); });
       if (!refworks) return meta;
       var fields = {};
-      refworks.split(/\\r?\\n/).forEach(function (line) {
-        var m = line.match(/^%(\\w)\\s?([\\s\\S]*?)\\s*$/);
+      refworks.split(/\r?\n/).forEach(function (line) {
+        var m = line.match(/^%([A-Za-z!])\s?([\s\S]*?)\s*$/);
         if (!m || !m[2]) return;
         var key = m[1], value = m[2].trim();
         if (!value) return;
         if (key === 'T' || key === '!') { if (!fields.title) fields.title = value; }
         else if (key === 'A') { (fields.authors = fields.authors || []).push(value); }
         else if (key === 'J') { if (!fields.venue) fields.venue = value; }
-        else if (key === 'D') { var y = value.match(/(\\d{4})/); if (y) fields.year = y[1]; }
+        else if (key === 'D') { var y = value.match(/(\d{4})/); if (y) fields.year = y[1]; }
         else if (key === 'V') { if (!fields.volume) fields.volume = value; }
         else if (key === 'N') { if (!fields.issue) fields.issue = value; }
-        else if (key === 'P') { if (!fields.pages) fields.pages = value.replace(/[^0-9\\s,，-]/g, '').trim(); }
+        else if (key === 'P') { if (!fields.pages) fields.pages = value.replace(/[^0-9\s,，-]/g, '').trim(); }
         else if (key === 'I') { if (!fields.issn) fields.issn = value; }
         else if (key === 'K') { (fields.tags = fields.tags || []).push(value); }
         else if (key === 'X') { if (!fields.abstract) fields.abstract = value; }
         else if (key === 'R') { var doi = cleanDoi(value); if (doi && doi.indexOf('(') === -1 && doi.indexOf('.') !== -1) fields.doi = doi; }
       });
-      ['title', 'venue', 'year', 'volume', 'issue', 'pages', 'doi', 'abstract', 'issn'].forEach(function (f) {
+      // 题录 %J 是刊名权威来源；页面 .top-tip 可能夹带“查看该刊数据库收录来源”等说明。
+      if (fields.venue) meta.venue = cleanCnkiVenue(fields.venue);
+      ['title', 'year', 'volume', 'issue', 'pages', 'doi', 'abstract', 'issn'].forEach(function (f) {
         if (!meta[f] && fields[f]) meta[f] = fields[f];
       });
       if (fields.authors && fields.authors.length && !(meta.authors && meta.authors.length)) meta.authors = uniqueStrings(fields.authors);
@@ -227,7 +233,9 @@
       var m = document.body.innerText.slice(0, 20000).match(/\b10\.\d{4,9}\/[^\s"'<>]{4,80}/);
       if (m) result.doi = cleanDoi(m[0]);
     }
-    return applyTranslator(result);
+    result = applyTranslator(result);
+    if (/(^|\.)cnki\.net$/i.test(location.hostname)) result.venue = cleanCnkiVenue(result.venue);
+    return result;
   }
 
   /** 阶段五：专用 translator 优先补字段；命中但解析失败时透传原因（popup 展示），再走通用兜底 */

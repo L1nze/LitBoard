@@ -26,7 +26,9 @@
     return text(value).split(/;\s*/).map(function (s) { return s.trim(); }).filter(Boolean);
   }
   function parseCnkiPublicationInfo(value) {
-    var source = text(value).replace(/\s+/g, ' ').replace(/[。.]$/, '').trim();
+    var source = text(value).replace(/\s+/g, ' ')
+      .replace(/\s*[·•,，.．]?\s*查看该刊数据库收录来源[\s\S]*$/, '')
+      .replace(/[。.]$/, '').trim();
     if (!source) return {};
     var yearMatch = /(?:^|\D)((?:19|20)\d{2})(?=\D|$)/.exec(source);
     if (!yearMatch) return { venue: source };

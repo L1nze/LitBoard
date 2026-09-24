@@ -536,7 +536,8 @@
             snippets: (hit.snippets || []).slice(0, 2)
           };
         });
-        return JSON.stringify({ source: '全文索引（PDF / EPUB / 网页快照）', query: String(a.query || ''), count: mapped.length, hits: mapped });
+        return JSON.stringify({ source: '全文索引（PDF / EPUB / 网页快照）', query: String(a.query || ''),
+          count: mapped.length, truncated: (hits || []).some(function (hit) { return hit.truncated === true; }), hits: mapped });
       }
       if (name === 'summarize_paper') {
         var summaryPaperId = String(a.paperId || '');
@@ -803,7 +804,7 @@
             gFile = gSaved && gSaved.file || '';
           } catch (error) { /* 快照失败不阻断展示 */ }
         }
-        if (deps.openGraphPanel) deps.openGraphPanel(g);
+        if (deps.openGraphPanel) deps.openGraphPanel(g, context.sessionId);
         // truncated/hidden/missing 如实回报：模型不能说「这就是全部引用网络」
         return JSON.stringify({
           built: true, nodes: g.meta.nodeCount, edges: g.meta.edgeCount,

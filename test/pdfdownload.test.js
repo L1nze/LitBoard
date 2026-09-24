@@ -9,7 +9,8 @@ const {
   downloadPdfResponseToFile,
   isProbablyPdfBytes,
   safePdfFileName,
-  composeAutoDownloadPath
+  composeAutoDownloadPath,
+  availablePdfPath
 } = require('../electron/pdfdownload.js');
 
 test('PDF download rejects non-PDF bytes even when the response is not HTML', async function (t) {
@@ -77,4 +78,13 @@ test('auto download target joins the configured dir and applies safe naming', fu
   // 目录未设置 → null，调用方回退弹保存框
   assert.equal(composeAutoDownloadPath('', 'x'), null);
   assert.equal(composeAutoDownloadPath('   ', 'x'), null);
+});
+
+test('同一条目的第二份 PDF 下载使用新路径，不覆盖主 PDF', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-pdf-multiple-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  await fs.writeFile(path.join(dir, 'paper.pdf'), '%PDF-old');
+  const next = await availablePdfPath(dir, 'paper.pdf');
+  assert.equal(next, path.join(dir, 'paper-2.pdf'));
+  assert.equal(await fs.readFile(path.join(dir, 'paper.pdf'), 'utf8'), '%PDF-old');
 });

@@ -287,6 +287,49 @@ test('inspectPdf reads a repeated Chinese journal name from MuPDF page edges', a
   assert.equal(info.venue, '电源技术');
 });
 
+test('inspectPdf removes the volume marker from a repeated Chinese journal header', async function () {
+  const header = item('机械工程学报第 62 卷第 11 期', 9, 775);
+  const loaded = loadPdfImport({ pages: [
+    [header, item('保障数据隐私的锂电池多用户协同智能健康监测通用基础模型', 20, 650),
+      item('DOI: 10.3901/JME.260773', 9, 710)],
+    [header, item('正文内容', 10, 600)]
+  ] });
+  const info = await loaded.LitPdf.inspectPdf(null, new Uint8Array([1, 2, 3]));
+
+  assert.equal(info.venue, '机械工程学报');
+});
+
+test('inspectPdf parses the published JME first page without online metadata', async function () {
+  const header = item('机械工程学报 第62 卷第11 期', 9, 775);
+  const loaded = loadPdfImport({ pages: [
+    [header, item('2026 年6 月', 9, 760), item('DOI：10.3901/JME.260773', 10.5, 720),
+      item('保障数据隐私的锂电池多用户协同智能健康', 22, 685),
+      item('监测通用基础模型∗', 22, 660),
+      item('张  微1  常希鹏1  李  响2  杨绍杰3', 14, 620),
+      item('(1. 沈阳航空航天大学航空宇航学院)', 10.5, 600),
+      item('摘要：锂电池健康监测对储能等工业领域至关重要。', 9, 535),
+      item('关键词：锂离子电池；隐私保护', 9, 500)],
+    [header, item('正文内容', 10, 600)]
+  ] });
+  const info = await loaded.LitPdf.inspectPdf(null, new Uint8Array([1, 2, 3]));
+
+  assert.equal(info.title, '保障数据隐私的锂电池多用户协同智能健康监测通用基础模型');
+  assert.deepEqual(Array.from(info.authors), ['张微', '常希鹏', '李响', '杨绍杰']);
+  assert.equal(info.venue, '机械工程学报');
+  assert.equal(info.doi, '10.3901/JME.260773');
+  assert.equal(info.year, 2026);
+  assert.equal(info.volume, '62');
+  assert.equal(info.issue, '11');
+  const paper = await loaded.LitPdf.pdfToPaper({
+    name: '保障数据隐私的锂电池多用户协同智能健康监测通用基础模型_张微.pdf',
+    arrayBuffer: function () { return Promise.resolve(new Uint8Array([1, 2, 3])); }
+  });
+  assert.equal(paper.title, info.title);
+  assert.deepEqual(Array.from(paper.authors), ['张微', '常希鹏', '李响', '杨绍杰']);
+  assert.equal(paper.venue, '机械工程学报');
+  assert.deepEqual(loaded.calls.doi, ['10.3901/JME.260773']);
+});
+
 test('pdfToPaper keeps a MuPDF journal name without calling the ISSN fallback', async function () {
   const firstPage = POWER_JOURNAL_PAGE.concat([item('电源技术', 8, 36)]);
   const secondPage = [

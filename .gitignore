@@ -70,6 +70,27 @@ Desktop.ini
 /AGENTS.md
 /AGENTS_DETAIL.md
 
-# ---------- 本地工作记录与 AI 审查文档 ----------
+# ---------- 本地工作记录与内部文档（不入库）----------
 /CHANGELOG.md
 /docs/audits/agent-*.md
+/docs/handoff-ocr-epub.md
+/docs/refactor-app-slim-plan.md
+/docs/task-ledger.md
+/docs/audit-baseline.md
+/docs/roadmap.md
+/docs/releasing.md
+/docs/limitations.md
+# ---------- 一次性探针与本地调试脚本 ----------
+/scripts/one-off/
+
+/test/*
+!/test/attachment-multipdf.test.js
+!/test/folder-delete.test.js
+!/test/folder-import-flow.test.js
+!/test/folder-drop-routing.test.js
+!/test/folder-selection.test.js
+!/test/foldertree.test.js
+!/test/library-crud.test.js
+!/test/pdf-open-race.test.js
+!/test/paper-folder-drag.test.js
+.zcodeignore

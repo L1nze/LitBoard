@@ -91,18 +91,33 @@ async function downloadPdfToFile(rawUrl, target, options) {
   return downloadPdfResponseToFile(response, target, options && options.onProgress);
 }
 
-/* 自动下载目标的落盘路径：目录 + 模板名（自动补 .pdf）。目录为空返回 null（防御用：
- * 调用方 pdf:download 已在更早处把空目录解析为配置目录下的 open-access-pdf 受管目录）。
- * 同名覆盖：命名模板含标题，重名基本只发生在重复下载同一篇时，覆盖即幂等更新
- * （downloadPdfToFile 先写 .part 再 rename）。 */
+/* 自动下载目标的初始路径：目录 + 模板名（自动补 .pdf）。调用方用 availablePdfPath
+ * 找未占用的名称，避免同一条目多份 PDF 互相覆盖。 */
 function composeAutoDownloadPath(dir, baseName) {
   const directory = String(dir || '').trim();
   if (!directory) return null;
   return path.join(directory, safePdfFileName(baseName || 'paper.pdf'));
 }
 
+/** 同一条目可能挂多个 PDF；下载目标不能覆盖已经挂载的文件。 */
+async function availablePdfPath(dir, baseName) {
+  const first = composeAutoDownloadPath(dir, baseName);
+  const parsed = path.parse(first);
+  let target = first;
+  let suffix = 2;
+  while (true) {
+    try {
+      await fs.access(target);
+      target = path.join(parsed.dir, parsed.name + '-' + suffix++ + parsed.ext);
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return target;
+      throw error;
+    }
+  }
+}
+
 module.exports = {
-  composeAutoDownloadPath,
+  composeAutoDownloadPath, availablePdfPath,
   downloadPdfResponseToFile,
   downloadPdfToFile,
   isProbablyPdfBytes,

@@ -148,15 +148,19 @@
       });
       var changed = false;
       var cursor = 0;
-      function updateGroup(group, source) {
+      function updateGroup(group, source, forceRender) {
+        var groupChanged = false;
         group.forEach(function (paper) {
           if (paper !== source && (paper.journalRank !== source.journalRank ||
-              paper.journalRankCheckedAt !== source.journalRankCheckedAt)) changed = true;
+              paper.journalRankCheckedAt !== source.journalRankCheckedAt)) {
+            changed = true;
+            groupChanged = true;
+          }
           paper.journalRank = source.journalRank;
           paper.journalRankCheckedAt = source.journalRankCheckedAt;
           if (drawerId() === paper.id) renderJournalRank(paper);
         });
-        if (run === journalRankAutoRun && state.activeFolderId === folderId) renderTable();
+        if ((forceRender || groupChanged) && run === journalRankAutoRun && state.activeFolderId === folderId) renderTable();
       }
       function worker() {
         if (run !== journalRankAutoRun || state.activeFolderId !== folderId) return Promise.resolve();
@@ -165,7 +169,8 @@
         var group = groups[key];
         var cached = group.find(function (paper) { return !shouldRefreshJournalRank(paper); });
         if (cached) {
-          updateGroup(group, cached);
+          var stale = group.filter(shouldRefreshJournalRank);
+          if (stale.length) updateGroup(stale, cached);
           return worker();
         }
         journalRankPending[key] = true;
@@ -173,7 +178,7 @@
         return requestFolderJournalRank(group[0]).then(function () {
           changed = true;
           delete journalRankPending[key];
-          updateGroup(group, group[0]);
+          updateGroup(group, group[0], true);
         }).catch(function () {
           delete journalRankPending[key];
           if (run === journalRankAutoRun && state.activeFolderId === folderId) renderTable();

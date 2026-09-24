@@ -19,3 +19,4 @@ extension/icons/**  linguist-generated=true
 build/icon*.png     linguist-generated=true
 build/icon.ico      linguist-generated=true
 package-lock.json   linguist-generated=true
+*.zcodeignore

@@ -55,7 +55,7 @@
         '<div class="search-help-section">' + esc(T('常用')) + '</div><div>' + rows(commonRows()) + '</div>' +
         '<details class="search-help-adv"><summary>' + esc(T('高级语法（字段全表 · 批注/笔记/附件组 · 正则）')) +
         '</summary>' + rows(advancedRows()) + '</details><div class="search-help-foot">' +
-        T('不想记语法：点筛选行右侧的放大镜按钮用「可视化构建器」点选条件；筛好的结果可在左侧栏存为智能文件夹。') + '</div>';
+        T('不想记语法：点筛选行右侧的放大镜按钮用「可视化构建器」点选条件。') + '</div>';
     }
     function close() {
       var pop = popover();

@@ -49,6 +49,7 @@
   var LBEX_QUOTE = /^>\s?(.*)$/;
   var MATH_SINGLE = /^\s*\$\$(.*?)\$\$\s*$/;
   var MATH_DD_OPEN = /^\s*\$\$\s*$/;
+  var MATH_DD_START = /^\s*\$\$(.+)$/;
   var MATH_BRACKET_OPEN = /^\s*\\\[\s*$/;
 
   /* ---------------- 摘录块（lbex）块规则 ----------------
@@ -118,7 +119,7 @@
   }
 
   /* ---------------- 数学块规则 ----------------
-   * 独立行 $$…$$（同行或跨行）与 \[ … \] → div.lb-math.lb-math-block；起止标记
+   * 独立行 $$…$$（同行或跨行，包括正文与起止符同行）与 \[ … \] → div.lb-math.lb-math-block；起止标记
    * 不成对时不消费（保持字面文本），与旧实现的行级语义一致。 */
   function mathBlock(state, startLine, endLine, silent) {
     var text = state.src.slice(
@@ -130,13 +131,24 @@
     if (single) {
       bodyLines.push(single[1]);
     } else {
+      var doubleStart = MATH_DD_START.exec(text);
       if (MATH_DD_OPEN.test(text)) endMarker = '$$';
-      else if (MATH_BRACKET_OPEN.test(text)) endMarker = '\\]';
+      else if (doubleStart) {
+        endMarker = '$$';
+        bodyLines.push(doubleStart[1]);
+      } else if (MATH_BRACKET_OPEN.test(text)) endMarker = '\\]';
       else return false;
       var closeLine = -1;
       for (var scan = startLine + 1; scan < endLine; scan++) {
         var raw = state.src.slice(state.bMarks[scan], state.eMarks[scan]);
-        if (raw.trim() === endMarker) { closeLine = scan; break; }
+        if (endMarker === '$$') {
+          var close = /^(.*?)\$\$\s*$/.exec(raw);
+          if (close) {
+            if (close[1]) bodyLines.push(close[1]);
+            closeLine = scan;
+            break;
+          }
+        } else if (raw.trim() === endMarker) { closeLine = scan; break; }
         bodyLines.push(raw);
       }
       if (closeLine < 0) return false;

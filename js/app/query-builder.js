@@ -27,7 +27,7 @@
     var QB_FIELD_LABELS = { title: T('标题'), author: T('作者'), venue: T('期刊/会议'), tag: T('标签'), type: T('类型'), status: T('状态'),
       year: T('年份'), citations: T('被引次数'), rating: T('评分'), doi: 'DOI', key: T('引用键'), notes: T('笔记'), abstract: T('摘要'),
       folderid: T('文件夹 ID'), lastread: T('最近阅读'), annotations: T('批注数'), attachments: T('附件数') };
-    var QB_FLAGS = ['pdf', 'notes', 'annotations', 'epub', 'snapshot', 'doi', 'abstract', 'unread', 'reading', 'read'];
+    var QB_FLAGS = ['pdf', 'notes', 'annotations', 'epub', 'snapshot', 'doi', 'abstract', 'unread', 'reading'];
 
     function openQueryBuilder() {
       qbRows = [{ join: 'AND', kind: 'field', field: 'title', cmp: ':', value: '' }];
@@ -197,7 +197,7 @@
         var next = clear ? '' : value;
         if (bulkEditCurrentValue(p, field) === next) return;
         if (field === 'status') {
-          if (['unread', 'reading', 'read'].indexOf(next) === -1 && !clear) return;
+          if (['unread', 'reading'].indexOf(next) === -1 && !clear) return;
           p.status = clear ? 'unread' : next;
         } else if (field === 'rating') {
           var r = clear ? 0 : Number(next);

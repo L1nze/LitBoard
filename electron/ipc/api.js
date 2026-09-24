@@ -6,7 +6,8 @@
 const { net } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { downloadPdfToFile, safePdfFileName, composeAutoDownloadPath } = require('../pdfdownload.js');
+const { downloadPdfToFile, safePdfFileName, availablePdfPath } = require('../pdfdownload.js');
+const { itemAttachmentDir } = require('../item-storage.js');
 const ctx = require('./context.js');
 
 module.exports = { register: register, openAccessPdfDir: openAccessPdfDir };
@@ -73,14 +74,18 @@ function register() {
     if (url.protocol !== 'https:' && url.protocol !== 'http:') return { error: ctx.T('无效的下载地址') };
 
     const suggestedName = safePdfFileName(options && options.name || 'paper.pdf');
-    const autoDir = openAccessPdfDir();
+    let autoDir;
+    try {
+      autoDir = options && options.paperId
+        ? itemAttachmentDir(ctx.dataPathState.configDir, options.paperId) : openAccessPdfDir();
+    } catch (error) { return { error: ctx.T('无效的条目 ID') }; }
     if (!path.isAbsolute(autoDir)) return { error: ctx.T('PDF 下载目录必须是绝对路径') };
     try {
       await fs.mkdir(autoDir, { recursive: true });
     } catch (error) {
       return { error: ctx.T('PDF 下载目录不可用：') + String(error && error.message || error) };
     }
-    const target = composeAutoDownloadPath(autoDir, suggestedName);
+    const target = await availablePdfPath(autoDir, suggestedName);
 
     return downloadPdfToFile(url.href, target, {
       fetch: function (href, init) { return net.fetch(href, init); },

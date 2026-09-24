@@ -27,8 +27,13 @@ const LitModel = require('../js/model.js');
 const gzipAsync = promisify(zlib.gzip);
 const gunzipAsync = promisify(zlib.gunzip);
 
-const DB_VERSION = 7;
+const DB_VERSION = 8;
 const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+// CJK 检测：日文假名 + 汉字各区块（含扩展区）。覆盖故意偏宽——漏标只会多扫几行，
+// 绝不会漏检。has_cjk 的写入与查询词的判断必须共用这一个正则：
+// 行可被跳过 ⟹ 行内必不含 needle 的任何 CJK 字符。
+const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f\u{20000}-\u{313ff}]/u;
 
 // node:sqlite 的在线备份 API（Node ≥ 23.8）；不存在时回退为 WAL 归档检查点 + 文件复制
 let sqliteBackup = null;
@@ -70,6 +75,10 @@ function createLibraryDb(baseDir) {
   function migrateSchema() {
     const row = db.prepare('PRAGMA user_version').get();
     const version = row && (row.user_version != null ? row.user_version : Object.values(row)[0]);
+    const hasColumn = function (table, column) {
+      return db.prepare('PRAGMA table_info(' + table + ')').all()
+        .some(function (row) { return row.name === column; });
+    };
     if (version < 1) {
       db.exec(`
       CREATE TABLE IF NOT EXISTS papers(
@@ -196,10 +205,6 @@ function createLibraryDb(baseDir) {
         db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
         fsSync.copyFileSync(file, preMigrationBackup);
       }
-      const hasColumn = function (table, column) {
-        return db.prepare('PRAGMA table_info(' + table + ')').all()
-          .some(function (row) { return row.name === column; });
-      };
       db.exec('BEGIN');
       try {
         if (!hasColumn('saved_searches', 'ast')) db.exec('ALTER TABLE saved_searches ADD COLUMN ast TEXT NOT NULL DEFAULT \'\'');
@@ -282,6 +287,24 @@ function createLibraryDb(baseDir) {
       }
       const hasPaperVec = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='paper_vec'").get();
       if (hasPaperVec) db.exec('DROP TABLE paper_vec');
+    }
+    if (version < 8) {
+      // v8：pdf_text 加 has_cjk 派生列（NULL=未知哨兵，0=无 CJK，1=含 CJK）。
+      // 中文两字词走不了 trigram、只能全表回退扫描（pdfTextQuery），借这列跳过纯拉丁行；
+      // 旧行不在迁移里回填——首次被扫描到时惰性回填，启动迁移零成本。
+      const preMigrationBackup = file + '.pre-v8.bak';
+      if (version >= 1 && !fsSync.existsSync(preMigrationBackup)) {
+        db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+        fsSync.copyFileSync(file, preMigrationBackup);
+      }
+      db.exec('BEGIN');
+      try {
+        if (!hasColumn('pdf_text', 'has_cjk')) db.exec('ALTER TABLE pdf_text ADD COLUMN has_cjk INTEGER');
+        db.exec('COMMIT');
+      } catch (error) {
+        try { db.exec('ROLLBACK'); } catch (rollbackError) {}
+        throw error;
+      }
     }
     db.exec('PRAGMA user_version = ' + DB_VERSION);
   }
@@ -807,6 +830,14 @@ function createLibraryDb(baseDir) {
           'date', 'publisher', 'isbn', 'language'].forEach(function (f) {
           if (!existing[f] && input[f]) { existing[f] = input[f]; changed = true; }
         });
+        // 同 DOI 的知网重抓可纠正两种已知污染刊名；其它已有字段保留。
+        const cnkiVenueWithTooltip = String(existing.venue || '').includes('查看该刊数据库收录来源') &&
+          String(existing.venue).replace(/\s*[·•,，.．]?\s*查看该刊数据库收录来源[\s\S]*$/, '').trim() === input.venue;
+        if (input.sourceType === 'translator:cnki' && input.venue &&
+            (existing.venue === input.venue + '第' || cnkiVenueWithTooltip)) {
+          existing.venue = input.venue;
+          changed = true;
+        }
         if (existing.entryType === 'misc' && input.entryType && input.entryType !== 'misc') {
           existing.entryType = input.entryType;
           changed = true;
@@ -966,14 +997,15 @@ function createLibraryDb(baseDir) {
       const value = String(pageText || '');
       return value.length > 200000 ? value.slice(0, 200000) : value;
     });
+    const hasCjk = pages.some(function (pageText) { return CJK_RE.test(String(pageText || '')); }) ? 1 : 0;
     const packed = await gzipAsync(Buffer.from(JSON.stringify(pages), 'utf8'), { level: 1 });
     d.exec('BEGIN');
     try {
-      d.prepare(`INSERT INTO pdf_text(paper_id, attachment_id, fingerprint, method, pages, updated_at) VALUES(?, ?, ?, ?, ?, ?)
+      d.prepare(`INSERT INTO pdf_text(paper_id, attachment_id, fingerprint, method, pages, has_cjk, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(paper_id, attachment_id) DO UPDATE SET fingerprint=excluded.fingerprint, method=excluded.method,
-          pages=excluded.pages, updated_at=excluded.updated_at`)
+          pages=excluded.pages, has_cjk=excluded.has_cjk, updated_at=excluded.updated_at`)
         .run(paperId, attachmentId, String(entry.fingerprint || ''), String(entry.method || 'mupdf'),
-          packed, Date.now());
+          packed, hasCjk, Date.now());
       d.prepare('DELETE FROM pdf_fts WHERE paper_id = ? AND attachment_id = ?').run(paperId, attachmentId);
       const insert = d.prepare('INSERT INTO pdf_fts(paper_id, attachment_id, page, text) VALUES(?, ?, ?, ?)');
       pages.forEach(function (pageText, index) {
@@ -1116,6 +1148,10 @@ function createLibraryDb(baseDir) {
   // 单看行数不够——有的行是一本书（数十 MB 解压后），十几行就能堵上几百毫秒
   const SCAN_YIELD_ROWS = 16;
   const SCAN_YIELD_BYTES = 8 * 1024 * 1024;
+  // 解压的小行/大行分界：异步 gunzip 每次都要往返线程池，整库小行扫一遍时调度开销
+  // 反超解压本身（实测 3000 行把 888ms 的解压+扫描放大到 ~2s 墙钟）。小行同步解压；
+  // 大行（可能是一本书）保持异步——同步解压几十 MB 会直接堵住事件循环，打穿 maxGap 护栏。
+  const SYNC_GZIP_BYTES = 512 * 1024;
 
   function yieldToLoop() {
     return new Promise(function (resolve) { setImmediate(resolve); });
@@ -1125,7 +1161,9 @@ function createLibraryDb(baseDir) {
   async function unpackPageRow(value) {
     try {
       const buffer = value instanceof Uint8Array
-        ? await gunzipAsync(Buffer.from(value))
+        ? (value.byteLength < SYNC_GZIP_BYTES
+          ? zlib.gunzipSync(Buffer.from(value))
+          : await gunzipAsync(Buffer.from(value)))
         : Buffer.from(value == null ? '' : String(value), 'utf8');
       const pages = JSON.parse(buffer.toString('utf8'));
       return Array.isArray(pages) ? pages : null;
@@ -1157,25 +1195,51 @@ function createLibraryDb(baseDir) {
         byPaper[key].snippets.push({ page: page, text: snippetText });
       }
     }
+    let truncated = false;
     if ([...needle].length >= 3) {
       const phrase = '"' + needle.replace(/"/g, '""') + '"';
       const statement = attachmentFilter
-        ? d.prepare('SELECT paper_id, attachment_id, page FROM pdf_fts WHERE pdf_fts MATCH ? AND attachment_id = ? LIMIT ' + QUERY_PAGE_LIMIT)
-        : d.prepare('SELECT paper_id, attachment_id, page FROM pdf_fts WHERE pdf_fts MATCH ? LIMIT ' + QUERY_PAGE_LIMIT);
+        ? d.prepare('SELECT paper_id, attachment_id, page FROM pdf_fts WHERE pdf_fts MATCH ? AND attachment_id = ? LIMIT ' + (QUERY_PAGE_LIMIT + 1))
+        : d.prepare('SELECT paper_id, attachment_id, page FROM pdf_fts WHERE pdf_fts MATCH ? LIMIT ' + (QUERY_PAGE_LIMIT + 1));
       const rows = attachmentFilter ? statement.all(phrase, attachmentFilter) : statement.all(phrase);
-      rows.forEach(function (row) { addHit(row.paper_id, row.attachment_id || '', row.page, ''); });
+      truncated = rows.length > QUERY_PAGE_LIMIT;
+      rows.slice(0, QUERY_PAGE_LIMIT).forEach(function (row) { addHit(row.paper_id, row.attachment_id || '', row.page, ''); });
       await attachSnippets(d, byPaper, needle);
     } else {
       const lower = needle.toLowerCase();
+      // 含 CJK 的短查询词只可能命中含 CJK 的行（匹配语义是子串全等，无音译/转写）：
+      // has_cjk=0 的行在 SQL 层直接跳过，英文为主的库扫描量由此降到个位数百分比。
+      // NULL=未知（v8 之前的存量行）照常扫描，并在解压后惰性回填该行的真实标志。
+      const needleHasCjk = CJK_RE.test(needle);
       const textRows = attachmentFilter
-        ? d.prepare('SELECT paper_id, attachment_id, pages FROM pdf_text WHERE attachment_id = ?').all(attachmentFilter)
-        : d.prepare('SELECT paper_id, attachment_id, pages FROM pdf_text').all();
+        ? d.prepare('SELECT paper_id, attachment_id, pages, has_cjk FROM pdf_text WHERE attachment_id = ?'
+          + (needleHasCjk ? ' AND (has_cjk IS NULL OR has_cjk = 1)' : '')).all(attachmentFilter)
+        : d.prepare('SELECT paper_id, attachment_id, pages, has_cjk FROM pdf_text'
+          + (needleHasCjk ? ' WHERE (has_cjk IS NULL OR has_cjk = 1)' : '')).all();
+      const backfill = d.prepare('UPDATE pdf_text SET has_cjk = ? WHERE paper_id = ? AND attachment_id = ?');
+      let pendingBackfill = [];
+      const flushBackfill = function () {
+        if (!pendingBackfill.length) return;
+        try {
+          d.exec('BEGIN');
+          pendingBackfill.forEach(function (item) { backfill.run(item.flag, item.paperId, item.attId); });
+          d.exec('COMMIT');
+        } catch (error) { /* 回填失败不影响本次查询结果，下次扫描再试 */ }
+        pendingBackfill = [];
+      };
       let scannedBytes = 0;
       let rowsSinceYield = 0;
       for (const row of textRows) {
         scannedBytes += row.pages instanceof Uint8Array ? row.pages.byteLength : 0;
         rowsSinceYield += 1;
         const pages = await unpackPageRow(row.pages);
+        if (row.has_cjk == null) {
+          pendingBackfill.push({
+            paperId: row.paper_id,
+            attId: row.attachment_id || '',
+            flag: (pages || []).some(function (pageText) { return CJK_RE.test(String(pageText || '')); }) ? 1 : 0
+          });
+        }
         if (pages) {
           pages.forEach(function (pageText, index) {
             const textValue = String(pageText || '');
@@ -1185,16 +1249,19 @@ function createLibraryDb(baseDir) {
           });
         }
         if (rowsSinceYield >= SCAN_YIELD_ROWS || scannedBytes >= SCAN_YIELD_BYTES) {
+          flushBackfill();
           scannedBytes = 0;
           rowsSinceYield = 0;
           await yieldToLoop();
         }
       }
+      flushBackfill();
     }
     return Object.keys(byPaper).map(function (key) {
       const hit = byPaper[key];
       const pages = Object.keys(hit.pageSet).map(Number).sort(function (a, b) { return a - b; });
-      return { paperId: hit.paperId, attachmentId: hit.attachmentId, pages: pages, count: pages.length, snippets: hit.snippets };
+      return { paperId: hit.paperId, attachmentId: hit.attachmentId, pages: pages, count: pages.length,
+        snippets: hit.snippets, truncated: !!truncated };
     });
   }
 

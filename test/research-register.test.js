@@ -3,7 +3,9 @@
 /* research:register（补登记）的回归测试——stub electron 模块后驱动真实 handler。
  * 根因回归：带 DOI 的正式库条目若不在调研库 ext_ids 里，旧实现既不做在线反查、
  * 两个兜底分支又被 `!doi` 守卫挡住，永远拿不到调研身份——用户点「补登记」显示
- * 成功，右键「构建引文网络」却始终提示「所选文献还没有调研身份」。 */
+ * 成功，右键「构建引文网络」却始终提示「所选文献还没有调研身份」。
+ * 2026-09 起为分片全量跑：超单片上限逐片处理、逐片推 research:register-progress、
+ * register-cancel 置停止位后当前片收尾返回部分结果。 */
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -14,7 +16,11 @@ const Module = require('node:module');
 
 const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'lb-register-'));
 const handlers = {};
-const fakeSender = {};
+const fakeSender = {
+  isDestroyed: function () { return false; },
+  sent: [],
+  send: function (channel, payload) { this.sent.push({ channel: channel, payload: payload }); }
+};
 const electronStub = {
   app: { getPath: function () { return tmpdir; } },
   ipcMain: { handle: function (ch, fn) { handlers[ch] = fn; } },
@@ -51,6 +57,12 @@ async function setup(opts) {
 
 function invokeRegister(input) {
   return handlers['research:register']({ sender: fakeSender, senderFrame: null }, input || {});
+}
+
+function registerProgressEvents() {
+  return fakeSender.sent
+    .filter(function (e) { return e.channel === 'research:register-progress'; })
+    .map(function (e) { return e.payload; });
 }
 
 function paper(over) {
@@ -154,5 +166,61 @@ test('已有调研身份的条目不重复扫描', async function () {
   const r = await invokeRegister();
   assert.equal(r.scanned, 0);
   assert.equal(r.proposals.length, 0);
+  db.close();
+});
+
+test('全量分片：缺省 limit 跑全部候选，超单片上限逐片推进度', async function () {
+  fakeSender.sent.length = 0;
+  const papers = [];
+  for (let i = 0; i < 450; i++) papers.push(paper({ id: 'p' + i, doi: '', title: 'Bulk paper number ' + i }));
+  const db = await setup({ papers: papers });
+  const r = await invokeRegister();
+  assert.equal(r.scanned, 450, '缺省 limit 不再截断到 200');
+  assert.equal(r.proposals.length, 450);
+  assert.equal(r.unresolved, 0);
+  assert.equal(r.stopped, false);
+  const events = registerProgressEvents();
+  assert.deepEqual(events.map(function (p) { return p.done; }), [200, 400, 450], '每片收尾推一次进度');
+  assert.ok(events.every(function (p) { return p.total === 450; }));
+  // proposed 随片单调不减——进度条不能往回跳
+  for (let i = 1; i < events.length; i++) {
+    assert.ok(events[i].proposed >= events[i - 1].proposed, 'proposed 单调不减');
+  }
+  assert.equal(events[events.length - 1].proposed, 450);
+  db.close();
+});
+
+test('取消：停止位在片头生效，当前片收尾后带部分结果返回', async function () {
+  fakeSender.sent.length = 0;
+  const calls = [];
+  const papers = [];
+  for (let i = 0; i < 450; i++) papers.push(paper({ id: 'p' + i, doi: '10.1000/x' + i, title: 'DOI paper ' + i }));
+  const db = await setup({
+    researchNet: {
+      fetchWorksByDois: async function (dois) {
+        calls.push(dois.slice());
+        // 第二片的在线反查期间用户点了停止——第二片照常收尾，第三片不再处理
+        if (calls.length === 2) handlers['research:register-cancel']({ sender: fakeSender }, {});
+        return [];
+      }
+    },
+    papers: papers
+  });
+  const r = await invokeRegister();
+  assert.equal(calls.length, 2, '第三片不应再触网');
+  assert.equal(r.stopped, true);
+  assert.equal(r.scanned, 400, '已开始的两片完整收尾');
+  assert.equal(r.unresolved, 400, '带 DOI 反查不到计入 unresolved，不建 local:');
+  assert.equal(r.proposals.length, 0);
+  db.close();
+});
+
+test('显式 limit 仍然截断候选（旧调用方语义保留）', async function () {
+  const papers = [];
+  for (let i = 0; i < 10; i++) papers.push(paper({ id: 'p' + i, doi: '', title: 'Limited paper ' + i }));
+  const db = await setup({ papers: papers });
+  const r = await invokeRegister({ limit: 3 });
+  assert.equal(r.scanned, 3);
+  assert.equal(r.proposals.length, 3);
   db.close();
 });

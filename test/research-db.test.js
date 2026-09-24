@@ -528,3 +528,79 @@ test('A-followup #5: title_norm 随 upsert / updateWorkText 同步维护', async
   assert.equal(db.findIdByNormalizedTitle('Solid State Electrolyte Review'), 'W500');
   await db.close();
 });
+
+test('cosineSearch 缓存：同 (model,recipe) 冷热路径结果逐位一致，过滤与维度检查照常', async function () {
+  const { db } = await makeDb();
+  try {
+    db.upsertWorks([
+      { id: 'C1', title: 'Alpha', abstract: 'a', year: 2020 },
+      { id: 'C2', title: 'Beta', abstract: 'b', year: 2023 },
+      { id: 'C3', title: 'Gamma', abstract: 'g', year: 2025 }
+    ]);
+    const model = 'mc';
+    const recipe = 3;
+    // 3 维向量方向各异，避免同分并列的顺序偶然性
+    db.vecPut([
+      { workId: 'C1', model, dim: 3, recipe, hash: 'h1', vec: Buffer.from(new Float32Array([1, 0, 0]).buffer) },
+      { workId: 'C2', model, dim: 3, recipe, hash: 'h2', vec: Buffer.from(new Float32Array([0.6, 0.8, 0]).buffer) },
+      { workId: 'C3', model, dim: 3, recipe, hash: 'h3', vec: Buffer.from(new Float32Array([0, 0.1, 0.99]).buffer) }
+    ]);
+    const q = Buffer.from(new Float32Array([1, 0, 0]).buffer);
+    const cold = db.cosineSearch(q, { limit: 3, model, recipe });
+    const warm = db.cosineSearch(q, { limit: 3, model, recipe });
+    assert.deepEqual(warm, cold, '缓存命中路径与冷路径结果一致');
+    assert.equal(cold[0].workId, 'C1');
+    assert.ok(cold[0].score > 0.99);
+    // 维度不符的行照旧跳过（与旧实现的逐行 v.length 检查同语义）
+    db.vecPut([{ workId: 'C4', model, dim: 2, recipe, hash: 'h4', vec: Buffer.from(new Float32Array([1, 0]).buffer) }]);
+    const mixed = db.cosineSearch(q, { limit: 5, model, recipe });
+    assert.ok(!mixed.some((h) => h.workId === 'C4'), '维度不符的行不得进入结果');
+    assert.equal(mixed.length, 3);
+    // 热缓存下年份过滤 / limit 照常
+    const filtered = db.cosineSearch(q, { limit: 3, model, recipe, yearFrom: 2021 });
+    assert.deepEqual(filtered.map((h) => h.workId), ['C2', 'C3']);
+    assert.equal(db.cosineSearch(q, { limit: 1, model, recipe }).length, 1);
+    // 无 model/recipe 的兼容调用不走缓存也正确，且不得破坏已有缓存
+    assert.equal(db.cosineSearch(q, { limit: 5 }).length, 3);
+    const warmAgain = db.cosineSearch(q, { limit: 3, model, recipe });
+    assert.deepEqual(warmAgain, cold, '兼容调用不得破坏已有缓存');
+  } finally { db.close(); }
+});
+
+test('cosineSearch 缓存失效：vecPut/upsertWorks/updateWorkText/vecClear 各写入路径都要让缓存归零', async function () {
+  const { db } = await makeDb();
+  try {
+    db.upsertWorks([
+      { id: 'D1', title: 'Alpha', abstract: 'a', year: 2020 },
+      { id: 'D2', title: 'Beta', abstract: 'b', year: 2023 }
+    ]);
+    const model = 'md';
+    const recipe = 4;
+    db.vecPut([
+      { workId: 'D1', model, dim: 1, recipe, hash: 'h1', vec: Buffer.from(new Float32Array([1]).buffer) },
+      { workId: 'D2', model, dim: 1, recipe, hash: 'h2', vec: Buffer.from(new Float32Array([0.5]).buffer) }
+    ]);
+    const q = Buffer.from(new Float32Array([1]).buffer);
+    db.cosineSearch(q, { limit: 5, model, recipe });   // 建缓存
+
+    // ① vecPut 新向量：热缓存必须看得到新行
+    db.upsertWorks([{ id: 'D3', title: 'Gamma', abstract: 'g', year: 2024 }]);
+    db.vecPut([{ workId: 'D3', model, dim: 1, recipe, hash: 'h3', vec: Buffer.from(new Float32Array([0.9]).buffer) }]);
+    const afterPut = db.cosineSearch(q, { limit: 5, model, recipe });
+    assert.ok(afterPut.some((h) => h.workId === 'D3'), 'vecPut 后新向量必须可检索');
+
+    // ② upsertWorks 改年份：yearCache 必须失效（年份不进嵌入 hash，向量仍在，只有年份变了）
+    db.upsertWorks([{ id: 'D3', title: 'Gamma', abstract: 'g', year: 2001 }]);
+    const afterYear = db.cosineSearch(q, { limit: 5, model, recipe, yearFrom: 2023 });
+    assert.ok(!afterYear.some((h) => h.workId === 'D3'), '改年份后旧年份不得继续生效');
+
+    // ③ updateWorkText 改摘要（R13 删 vec 行）：该 work 必须退出检索，缓存不得残留旧向量
+    db.updateWorkText('D3', { abstract: 'changed abstract' }, 'bench');
+    const afterText = db.cosineSearch(q, { limit: 5, model, recipe });
+    assert.ok(!afterText.some((h) => h.workId === 'D3'), '内容一变旧向量必须立即退出检索');
+
+    // ④ vecClear：全清后检索为空
+    db.vecClear();
+    assert.equal(db.cosineSearch(q, { limit: 5, model, recipe }).length, 0);
+  } finally { db.close(); }
+});

@@ -458,37 +458,6 @@ test('testOpenAlex: 通道如实回报（Key / 邮箱 / 匿名），429 与断�
   assert.equal(down.code, 'network', '断网与限流必须是不同的 code');
 });
 
-test('testSemanticScholar: 无 Key 报共享池、带 Key 走 x-api-key、403 归 unauthorized', async function () {
-  const seen = [];
-  const shared = await createResearchNet({
-    fetch: async function (url, init) {
-      seen.push({ url: url, key: (init && init.headers && init.headers['x-api-key']) || '' });
-      return jsonResponse({ total: 7, data: [] });
-    }
-  }).testSemanticScholar();
-  assert.equal(shared.status, 'ok');
-  assert.equal(shared.channel, 'shared_pool');
-  assert.equal(shared.count, 7);
-  assert.equal(seen[0].key, '');
-  assert.ok(seen[0].url.indexOf('/graph/v1/paper/search') !== -1);
-
-  const withKey = await createResearchNet({
-    fetch: async function (url, init) {
-      seen.push({ url: url, key: (init.headers || {})['x-api-key'] });
-      return jsonResponse({ total: 1, data: [] });
-    },
-    getConfig: async function () { return { semanticscholarApiKey: 'S2K' }; }
-  }).testSemanticScholar();
-  assert.equal(withKey.channel, 'key');
-  assert.equal(seen[seen.length - 1].key, 'S2K');
-
-  const forbidden = await createResearchNet({
-    fetch: async function () { return statusResponse(403); },
-    sleep: async function () {}, now: function () { return 1000; }
-  }).testSemanticScholar();
-  assert.deepEqual(forbidden, { status: 'error', code: 'unauthorized' });
-});
-
 test('testElsevier: 未配置跳过；摘要回填与 Scopus 检索两种能力分开回报', async function () {
   const skipped = await createResearchNet({
     fetch: async function () { throw new Error('未配置 Key 时不得发请求'); }

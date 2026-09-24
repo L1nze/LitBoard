@@ -1,10 +1,10 @@
 /* LitBoard 拖入文件夹导入的规划层（纯函数，浏览器 / Node 共用）：
  * 输入主进程 files:scan-folder 的目录清单与当前 folders，输出「建哪些文件夹、复用哪些、
- * 每个 PDF 归哪个文件夹」的导入计划。语义对照 zotero-folder-drop-importer：
+ * 每个文档归哪个文件夹」的导入计划。语义对照 zotero-folder-drop-importer：
  * - 拖入的文件夹本身在目标位置建为一个 LitBoard 文件夹（拖到空白 = 根级，拖到某文件夹行 = 它内部）；
- * - 只保留「有 PDF 后代」的目录链（空分支剪枝，避免导入空壳）；
+ * - 只保留「有受支持文档后代」的目录链（空分支剪枝，避免导入空壳）；
  * - 同父层同名文件夹复用（大小写不敏感、精确大小写优先），重复拖入幂等不重不漏。
- * 文件夹本体不落磁盘：目录树以 folders 实体表达，PDF 由调用方拷入受管附件目录。 */
+ * 文件夹本体不落磁盘：目录树以 folders 实体表达，文档由调用方拷入受管附件目录。 */
 (function (root, factory) {
   var api = factory();
   if (typeof module === 'object' && module.exports) module.exports = api;
@@ -13,6 +13,8 @@
   'use strict';
 
   var NAME_MAX = 80; // 与 normalizeFolders 同限
+  var SUPPORTED_EXTENSIONS = { '.pdf': true, '.epub': true, '.djvu': true, '.mobi': true,
+    '.azw3': true, '.doc': true, '.docx': true, '.odt': true, '.rtf': true };
 
   function dirOf(rel) {
     var idx = rel.lastIndexOf('/');
@@ -45,7 +47,8 @@
    * folders = 当前 state.folders（含墓碑也无妨，墓碑不参与复用）
    * targetFolderId = 落点文件夹 id（'' = 根级）
    * 返回 { root:{ id, name }, createList:[{key,name,parentKey}], reuseMap:{key:id},
-   *        pdfs:[{rel,name,abs,size,dirRel}], createdCount, reusedCount, skippedNonPdf }
+   *        files:[{rel,name,abs,size,dirRel,ext,sourceKey}], pdfs, otherFiles,
+   *        createdCount, reusedCount, skippedUnsupported }
    * createList 按深度 BFS 排序，parentKey '' 指向 root（root.id 可能为空串 = 待新建，由调用方建后回填）。
    */
   function planFolderImport(options) {
@@ -64,19 +67,21 @@
         name: String(f && f.name || ''),
         ext: String(f && f.ext || '').toLowerCase(),
         abs: String(f && f.abs || ''),
-        size: f && f.size || 0
+        size: f && f.size || 0,
+        sourceKey: String(f && f.sourceKey || '')
       };
     });
-    var pdfs = [];
-    var skippedNonPdf = 0;
+    var supported = [];
+    var skippedUnsupported = 0;
     all.forEach(function (f) {
-      if (f.ext === '.pdf' || /\.pdf$/i.test(f.name)) pdfs.push(f);
-      else skippedNonPdf++;
+      var ext = f.ext || (f.name.match(/\.[^.]+$/) || [''])[0].toLowerCase();
+      if (SUPPORTED_EXTENSIONS[ext]) { f.ext = ext; supported.push(f); }
+      else skippedUnsupported++;
     });
 
-    // 剪枝：目录集合只从 PDF 的 rel 推导，空分支自然不出现
-    var dirSet = {};
-    pdfs.forEach(function (f) {
+    // 剪枝：目录集合只从受支持文件的 rel 推导，空分支自然不出现
+    var dirSet = Object.create(null);
+    supported.forEach(function (f) {
       var dir = dirOf(f.rel);
       while (dir) {
         dirSet[dir] = true;
@@ -89,7 +94,7 @@
     });
 
     // 落点直接子级 → 复用拖入根（重复拖入同一文件夹时幂等）
-    var childrenOf = {};
+    var childrenOf = Object.create(null);
     folders.forEach(function (f) {
       if (!f || f.deletedAt) return;
       var parent = f.parentId || '';
@@ -100,7 +105,7 @@
     var root = rootHit ? { id: rootHit.id, name: rootName } : { id: '', name: rootName };
 
     // 逐层解析：父层已复用 → 本层可继续复用既有同名子级；父层待新建 → 本层只能新建
-    var reuseMap = {};
+    var reuseMap = Object.create(null);
     var createList = [];
     dirs.forEach(function (key) {
       var parentKey = dirOf(key);
@@ -113,16 +118,35 @@
       createList.push({ key: key, name: name, parentKey: parentKey });
     });
 
+    var files = supported.map(function (f) {
+      return { rel: f.rel, name: f.name, abs: f.abs, size: f.size, ext: f.ext,
+        sourceKey: f.sourceKey, dirRel: dirOf(f.rel) };
+    });
     return {
       root: root,
       createList: createList,
       reuseMap: reuseMap,
-      pdfs: pdfs.map(function (f) { return { rel: f.rel, name: f.name, abs: f.abs, size: f.size, dirRel: dirOf(f.rel) }; }),
-      createdCount: createList.length + (!root.id && pdfs.length ? 1 : 0),
+      files: files,
+      pdfs: files.filter(function (f) { return f.ext === '.pdf'; }),
+      otherFiles: files.filter(function (f) { return f.ext !== '.pdf'; }),
+      createdCount: createList.length + (!root.id && files.length ? 1 : 0),
       reusedCount: Object.keys(reuseMap).length + (root.id ? 1 : 0),
-      skippedNonPdf: skippedNonPdf
+      skippedUnsupported: skippedUnsupported
     };
   }
 
-  return { planFolderImport: planFolderImport };
+  function collapseRootPaths(paths) {
+    var sorted = (paths || []).filter(Boolean).slice().sort(function (a, b) { return a.length - b.length; });
+    var kept = [], keys = [];
+    sorted.forEach(function (path) {
+      var key = String(path).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+      if (keys.some(function (parent) { return key === parent || key.indexOf(parent + '/') === 0; })) return;
+      kept.push(path);
+      keys.push(key);
+    });
+    return kept;
+  }
+
+  return { planFolderImport: planFolderImport, collapseRootPaths: collapseRootPaths,
+    supportedExtensions: Object.keys(SUPPORTED_EXTENSIONS) };
 });

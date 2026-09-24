@@ -756,11 +756,15 @@
       edges = edges.filter(function (edge) { return keptSet.has(edge.from) && keptSet.has(edge.to); });
     }
 
-    // 社区划分（metrics.detect_communities）——在最终节点集上算
+    // 社区划分（metrics.detect_communities）——在最终节点集上算。
+    // deps.computeMetrics：可选注入（主进程的 Rust 内核走这条）；缺省纯 JS，渲染层/Node 测试不受影响
     var nodeIds = nodes.map(function (node) { return node.id; });
-    var communities = detectCommunities(nodeIds, edges);
+    var metrics = deps.computeMetrics
+      ? await deps.computeMetrics(nodeIds, edges)
+      : { communities: detectCommunities(nodeIds, edges), ranks: pageRank(nodeIds, edges) };
+    var communities = metrics.communities;
+    var ranks = metrics.ranks;
     var deg = degreeMaps(nodeIds, edges);
-    var ranks = pageRank(nodeIds, edges);
     var finalNodes = nodes.map(function (node) {
       return Object.assign({}, node, {
         inDeg: deg.inDeg.get(node.id) || 0,
@@ -1262,7 +1266,12 @@
   /** 离线自包含 HTML 快照：三栏版式 + 内嵌 vis-network + 内嵌图数据（对照 literature-mcp 的导出） */
   function renderGraphHtml(graph, libText, options) {
     var opts = options || {};
-    var view = viewerData(graph, { palette: 'light', texts: opts.texts });
+    // 图数据自带预置布局（Rust 内核随图下发）时直接用，快照与面板不产生两套坐标
+    var view = viewerData(graph, {
+      palette: 'light',
+      texts: opts.texts,
+      layout: graph.layout ? new Map(graph.layout) : undefined
+    });
     var title = String(opts.title || view.texts.title);
     var detailById = {};
     view.nodes.forEach(function (node) { detailById[node.id] = detailHtml(node, view.texts); });

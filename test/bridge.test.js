@@ -96,6 +96,41 @@ test('bridge server honors the disabled setting and offline enrichment still sav
   assert.equal(save.title, '离线标题入库');
 });
 
+test('CNKI page metadata repairs a malformed PDF journal name for the same DOI', async function (t) {
+  const { bridge, db } = await makeBridge(t);
+  db.bridgeUpsertPaper({
+    doi: '10.3901/JME.260773', title: '保障数据隐私的锂电池多用户协同智能健康监测通用基础模型',
+    venue: '机械工程学报第', year: 2026
+  });
+  const status = await bridge.start();
+  const response = await fetch('http://127.0.0.1:' + status.port + '/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token },
+    body: JSON.stringify({
+      doi: '10.3901/JME.260773', title: '保障数据隐私的锂电池多用户协同智能健康监测通用基础模型',
+      venue: '机械工程学报', authors: ['张微', '常希鹏', '李响', '杨绍杰'],
+      volume: '62', issue: '11', issn: '0577-6686', sourceType: 'translator:cnki'
+    })
+  }).then(r => r.json());
+  assert.equal(response.duplicated, true);
+  const papers = db.loadState().papers;
+  assert.equal(papers.length, 1);
+  assert.equal(papers[0].venue, '机械工程学报');
+  assert.equal(papers[0].issn, '0577-6686');
+  assert.deepEqual(papers[0].authors, ['张微', '常希鹏', '李响', '杨绍杰']);
+
+  db.bridgeUpsertPaper({ doi: '10.1234/hv-tech', title: '储能电池荷电状态评估',
+    venue: '高电压技术 · 查看该刊数据库收录来源' });
+  const repaired = await fetch('http://127.0.0.1:' + status.port + '/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token },
+    body: JSON.stringify({ doi: '10.1234/hv-tech', title: '储能电池荷电状态评估',
+      venue: '高电压技术', sourceType: 'translator:cnki' })
+  }).then(r => r.json());
+  assert.equal(repaired.duplicated, true);
+  assert.equal(db.loadState().papers.find(p => p.doi === '10.1234/hv-tech').venue, '高电压技术');
+});
+
 test('bridge start is idempotent and stop releases its only listener', async function (t) {
   const { bridge } = await makeBridge(t);
   const first = await bridge.start();

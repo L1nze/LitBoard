@@ -250,6 +250,23 @@ test('db full-text index supports latin, CJK and short queries', async function 
   assert.equal(hits[0].paperId, 'p9');
 });
 
+test('db full-text query reports truncation only when the 2000-page cap is exceeded', async function (t) {
+  const db = await tempDb(t);
+  for (let i = 0; i < 6; i++) {
+    await db.pdfTextPut({
+      paperId: 'cap' + i, attachmentId: 'pdf' + i, fingerprint: 'f' + i,
+      pages: Array(400).fill('distinctive capquery phrase')
+    });
+  }
+  const limited = await db.pdfTextQuery('capquery');
+  assert.equal(limited.reduce(function (sum, hit) { return sum + hit.count; }, 0), 2000);
+  assert.equal(limited.every(function (hit) { return hit.truncated === true; }), true);
+  const oneAttachment = await db.pdfTextQuery('capquery', 'pdf0');
+  assert.equal(oneAttachment.length, 1);
+  assert.equal(oneAttachment[0].count, 400);
+  assert.equal(oneAttachment[0].truncated, false);
+});
+
 test('db text replacement updates the index', async function (t) {
   const db = await tempDb(t);
   await db.pdfTextPut({ paperId: 'p1', fingerprint: 'a', pages: ['old content alpha'] });
@@ -458,7 +475,7 @@ test('db migrates v3 to v4 with a pre-migration backup and preserves data', asyn
   const version = probe.prepare('PRAGMA user_version').get();
   const paperVec = probe.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='paper_vec'").get();
   probe.close();
-  assert.equal(Object.values(version)[0], 7);
+  assert.equal(Object.values(version)[0], 8);
   assert.equal(paperVec, undefined, 'v7 应把正式库语义索引表（paper_vec）删掉');
 });
 
@@ -620,6 +637,51 @@ test('v5 to v6 migration compresses pdf_text pages and keeps a pre-migration bac
   assert.equal((await db.pdfTextQuery('zebra')).length, 1);
 });
 
+test('v7 to v8 migration adds the has_cjk column with a pre-v8 backup', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-db-v8-'));
+  const dbs = [];
+  t.after(async function () {
+    for (const handle of dbs) await handle.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const file = path.join(dir, 'litboard.sqlite');
+
+  const seed = createLibraryDb(dir);
+  dbs.push(seed);
+  await seed.open();
+  await seed.saveState({ papers: [{ id: 'p1', title: 'Legacy Text' }] });
+  await seed.pdfTextPut({ paperId: 'p1', pages: ['存量正文 transformers'] });
+  await seed.close();
+
+  // 退回 v7 形态：撤掉 has_cjk 列、版本号回拨
+  const revert = new DatabaseSync(file);
+  revert.exec('ALTER TABLE pdf_text DROP COLUMN has_cjk');
+  revert.exec('PRAGMA user_version = 7');
+  revert.close();
+
+  const db = createLibraryDb(dir);
+  dbs.push(db);
+  await db.open();
+  assert.ok(fsSync.existsSync(file + '.pre-v8.bak'), '迁移前备份已生成');
+  const probe = new DatabaseSync(file, { readOnly: true });
+  const cols = probe.prepare('PRAGMA table_info(pdf_text)').all().map(function (row) { return row.name; });
+  const flag = probe.prepare("SELECT has_cjk FROM pdf_text WHERE paper_id = 'p1'").get();
+  probe.close();
+  assert.ok(cols.indexOf('has_cjk') !== -1, 'has_cjk 列已补上');
+  assert.equal(flag.has_cjk, null, '存量行回填前保持 NULL（未知哨兵）');
+  const entry = await db.pdfTextGet('p1', '');
+  assert.deepEqual(entry.pages, ['存量正文 transformers']);
+  // 迁移后新写入直接带标志；查询扫描到存量行（含中文 → 回填 1，但不命中）时惰性回填
+  await db.pdfTextPut({ paperId: 'p2', pages: ['量子计算 new entry'] });
+  const hits = await db.pdfTextQuery('量子');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].paperId, 'p2');
+  const after = new DatabaseSync(file, { readOnly: true });
+  const backfilled = after.prepare("SELECT has_cjk FROM pdf_text WHERE paper_id = 'p1'").get();
+  after.close();
+  assert.equal(backfilled.has_cjk, 1, '存量中文行被扫描时回填为 1');
+});
+
 test('pdfTextGet tolerates legacy uncompressed TEXT rows at runtime', async function (t) {
   const db = await tempDb(t);
   const d = new DatabaseSync(db.paths.file);
@@ -634,12 +696,16 @@ test('pdfTextGet tolerates legacy uncompressed TEXT rows at runtime', async func
 
 test('性能回归：短词回退的全表扫描分批让出事件循环，主进程不会长时间「未响应」', async function (t) {
   const db = await tempDb(t);
-  // ~12MB 正文（每篇 200KB），全部不含查询词：旧实现一次性 gunzipSync 全表会把窗口冻住
+  // ~12MB 正文（每篇 200KB），全部不含查询词：旧实现一次性 gunzipSync 全表会把窗口冻住。
+  // 语料用裸 INSERT 写入（has_cjk=NULL，等同 v8 之前的存量行）——pdfTextPut 会直接写好
+  // 标志，CJK 查询词随即跳过纯拉丁行，那样就测不到「全表回退扫描的让出」本身。
   const chunk = 'lorem ipsum dolor sit amet '.repeat(8000);   // ≈200KB
-  for (let i = 0; i < 60; i++) {
-    await db.pdfTextPut({ paperId: 'p' + i, fingerprint: 'fp' + i, method: 'pdfjs', pages: [chunk, chunk] });
-  }
-  await db.pdfTextPut({ paperId: 'hit', fingerprint: 'fphit', method: 'pdfjs', pages: ['量子纠缠与超声成像'] });
+  const pack = function (pages) { return zlib.gzipSync(Buffer.from(JSON.stringify(pages), 'utf8'), { level: 1 }); };
+  const raw = new DatabaseSync(db.paths.file);
+  const ins = raw.prepare("INSERT INTO pdf_text(paper_id, attachment_id, fingerprint, method, pages, updated_at) VALUES(?, '', ?, 'pdfjs', ?, 1)");
+  for (let i = 0; i < 60; i++) ins.run('p' + i, 'fp' + i, pack([chunk, chunk]));
+  ins.run('hit', 'fphit', pack(['量子纠缠与超声成像']));
+  raw.close();
   let maxGap = 0;
   let last = Date.now();
   const heartbeat = setInterval(function () {
@@ -658,6 +724,67 @@ test('性能回归：短词回退的全表扫描分批让出事件循环，主�
   assert.ok(hits[0].snippets[0].text.indexOf('⟪量子⟫') !== -1, '命中处要用标记括出：' + hits[0].snippets[0].text);
   // 事件循环心跳连续：任何一次同步块都不该超过这个量级（旧实现一次性解压全表，实测 0.6–1.3s 卡死）
   assert.ok(maxGap < 300, '最长同步块 ' + maxGap + 'ms（分批让出后应远小于整表解压）');
+});
+
+test('短词回退按 has_cjk 跳过纯拉丁行，扫描存量行时惰性回填标志', async function (t) {
+  const db = await tempDb(t);
+  await db.pdfTextPut({ paperId: 'en', pages: ['plain latin text about sensors and imaging'] });
+  await db.pdfTextPut({ paperId: 'zh', pages: ['量子计算综述正文'] });
+  // v8 之前的存量行：裸 INSERT，has_cjk 为 NULL（未知哨兵）
+  const pack = function (pages) { return zlib.gzipSync(Buffer.from(JSON.stringify(pages), 'utf8'), { level: 1 }); };
+  const raw = new DatabaseSync(db.paths.file);
+  const ins = raw.prepare("INSERT INTO pdf_text(paper_id, attachment_id, fingerprint, method, pages, updated_at) VALUES(?, '', 'fp', 'pdfjs', ?, 1)");
+  ins.run('legacyZh', pack(['旧库里的中文行，含量子一词']));
+  ins.run('legacyEn', pack(['legacy english only row']));
+  raw.close();
+
+  const first = await db.pdfTextQuery('量子');
+  assert.deepEqual(first.map(function (hit) { return hit.paperId; }).sort(), ['legacyZh', 'zh']);
+  // 写入路径直接落标志（en=0/zh=1）；存量行按解压后的真实内容回填（legacyZh=1、legacyEn=0）
+  const probe = new DatabaseSync(db.paths.file, { readOnly: true });
+  const flags = {};
+  probe.prepare('SELECT paper_id, has_cjk FROM pdf_text').all().forEach(function (row) { flags[row.paper_id] = row.has_cjk; });
+  probe.close();
+  assert.deepEqual(flags, { en: 0, zh: 1, legacyZh: 1, legacyEn: 0 });
+  // 回填后再查：被跳过的行本来就不含查询词，结果与第一次完全一致
+  const second = await db.pdfTextQuery('量子');
+  assert.deepEqual(second, first);
+  // 拉丁短词不带行过滤，行为不变（命中 en 的 'latin'）
+  const latinHits = await db.pdfTextQuery('la');
+  assert.equal(latinHits.length, 1);
+  assert.equal(latinHits[0].paperId, 'en');
+});
+
+test('性能回归：超过同步阈值的单行（一本书）走异步解压，同步块仍在护栏内', async function (t) {
+  const db = await tempDb(t);
+  // 高熵随机词（gzip 压不动）× 20 页 × ~200k 字符 ≈ 4MB 正文，压缩后远超 512KB 同步阈值
+  let rngState = 42;
+  const rnd = function () { rngState = (rngState * 1103515245 + 12345) % 2147483648; return rngState / 2147483648; };
+  const pages = [];
+  for (let p = 0; p < 20; p++) {
+    let s = '';
+    while (s.length < 200000) s += Math.floor(rnd() * 1e12).toString(36) + ' ';
+    pages.push(s);
+  }
+  const raw = new DatabaseSync(db.paths.file);
+  raw.prepare("INSERT INTO pdf_text(paper_id, attachment_id, fingerprint, method, pages, updated_at) VALUES('book', '', 'fp', 'pdfjs', ?, 1)")
+    .run(zlib.gzipSync(Buffer.from(JSON.stringify(pages), 'utf8'), { level: 1 }));
+  raw.close();
+  let maxGap = 0;
+  let last = Date.now();
+  const heartbeat = setInterval(function () {
+    const now = Date.now();
+    if (now - last > maxGap) maxGap = now - last;
+    last = now;
+  }, 10);
+  let hits = null;
+  try {
+    hits = await db.pdfTextQuery('ＱＫ');   // 全角词不含 CJK 字符：不带行过滤，必扫大行
+  } finally {
+    clearInterval(heartbeat);
+  }
+  assert.equal(hits.length, 0);
+  assert.ok(maxGap < 300, '最长同步块 ' + maxGap + 'ms（大行必须走异步解压）');
 });
 
 test('性能回归：FTS 路径不再整批取 snippet，片段只对前若干篇现算', async function (t) {

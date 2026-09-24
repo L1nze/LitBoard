@@ -80,19 +80,15 @@ function register() {
       return result;
     });
   });
-  ctx.handle('integrations:pull-config', function (_event, value) {
-    if (!ctx.integrations.pullNutstoreConfig) throw new Error(ctx.T('当前版本不支持云端配置恢复'));
-    return ctx.integrations.pullNutstoreConfig(value || {}).then(async function (result) {
-      await applyPortableSyncSettings(result && result.config);
-      return result;
-    });
+  ctx.handle('integrations:cancel-sync', function () {
+    return ctx.integrations.cancelNutstoreSync();
   });
   ctx.handle('integrations:test-nutstore', function (_event, value) { return ctx.integrations.testNutstoreConnection(value || {}); });
   ctx.handle('integrations:translate', function (_event, value) { return ctx.integrations.translateText(value || {}); });
   ctx.handle('integrations:test-translation', function (_event, value) { return ctx.integrations.testTranslationConnection(value || {}); });
   ctx.handle('integrations:scigreat-rank', function (_event, value) { return ctx.integrations.getJournalRank(value || {}); });
   ctx.handle('integrations:test-scigreat', function (_event, value) { return ctx.integrations.testJournalRankConnection(value || {}); });
-  /* 检索与元数据服务：一次把本节的四个源都测一遍（设置页一个按钮，各源独立回报）。
+  /* 检索与元数据服务：只测试设置页可配置的三个源（OpenAlex / Elsevier / TinyFish）。
    * 只读探测，不进业务链；TinyFish 受「开关 + 出境告知」双重门控——未启用时如实回报
    * skipped，**不发请求**（未经同意的出境不能靠一个测试按钮绕过）。 */
   ctx.handle('integrations:test-sources', async function () {
@@ -109,7 +105,6 @@ function register() {
         : { id: 'tinyfish', status: 'error', code: 'error' });
     const results = await Promise.all([
       ctx.researchNet ? wrap('openalex', ctx.researchNet.testOpenAlex()) : { id: 'openalex', status: 'error', code: 'error' },
-      ctx.researchNet ? wrap('semanticscholar', ctx.researchNet.testSemanticScholar()) : { id: 'semanticscholar', status: 'error', code: 'error' },
       ctx.researchNet ? wrap('elsevier', ctx.researchNet.testElsevier()) : { id: 'elsevier', status: 'error', code: 'error' },
       tinyfish
     ]);

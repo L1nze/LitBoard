@@ -32,6 +32,21 @@ test('MuPDF module worker is the only packaged PDF rendering engine', function (
   });
 });
 
+test('PDF raster resolution maps bitmap pixels 1:1 to device pixels', function () {
+  const ratio = loadPdfModule().renderPixelRatio;
+  // 默认：位图精确等于 devicePixelRatio——合成期零重采样，边缘不带灰晕
+  assert.equal(ratio({ width: 800, height: 1100 }, 1.25), 1.25);
+  assert.equal(ratio({ width: 800, height: 1100 }, 2), 2);
+  assert.equal(ratio({ width: 800, height: 1100 }, 1), 1);
+  // 显式倍率（离屏导出/测试）优先于 dpr
+  assert.equal(ratio({ width: 800, height: 1100 }, 1, 4), 4);
+  // 内存护栏：大页/高 dpr 下按 maxCanvasPixels 平方根收顶（24M RGBA ≈ 96MB/页）
+  const viewport = { width: 4000, height: 5000 };
+  const capped = ratio(viewport, 2);
+  assert.ok(capped < 2, 'oversized page should hit the canvas pixel cap');
+  assert.ok(viewport.width * viewport.height * capped * capped <= 25165824 + 1);
+});
+
 test('renderer override is removed from the PDF toolbar and persisted positions', function () {
   const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
   const appSource = fs.readFileSync(path.join(root, 'js', 'app.js'), 'utf8');

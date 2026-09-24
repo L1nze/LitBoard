@@ -43,8 +43,14 @@
       }
       applyList(state.papers, snap.papers);
       applyList(state.notes, snap.notes);
-      applyList(state.folders, snap.folders);
-      applyList(state.folderTombstones, snap.folders);
+      var liveFolders = Object.create(null), deletedFolders = Object.create(null);
+      Object.keys(snap.folders || {}).forEach(function (id) {
+        var record = snap.folders[id];
+        liveFolders[id] = !record.__absent && !record.deletedAt ? record : { __absent: true };
+        deletedFolders[id] = !record.__absent && record.deletedAt ? record : { __absent: true };
+      });
+      applyList(state.folders, liveFolders);
+      applyList(state.folderTombstones, deletedFolders);
       var normalized = options.normalizeWorkspace(options.payload());
       state.papers = normalized.papers;
       state.notes = normalized.notes;

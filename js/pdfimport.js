@@ -285,7 +285,9 @@
   function cleanTitleText(text) {
     return String(text || '').replace(/\s+/g, ' ').trim()
       .replace(/^题目\s*[:：]\s*/, '')
-      .replace(/^标题\s*[:：]\s*/, '');
+      .replace(/^标题\s*[:：]\s*/, '')
+      .replace(/([\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])/g, '$1')
+      .replace(/\s*[∗*†‡]+$/, '');
   }
 
   /** 期刊封面、网络首发说明、版权页等不应被当成标题的特征 */
@@ -475,6 +477,11 @@
     var text = line.text.replace(/\s+/g, ' ').trim();
     if (!text) return null;
     if (/[\u4e00-\u9fff]/.test(text)) {
+      // 正式期刊常用“张  微1  常希鹏1”：上标机构序号比空格更可靠地分隔姓名。
+      if (/\d/.test(text)) {
+        var indexed = text.split(/\d+\s*/).map(function (s) { return s.replace(/\s+/g, ''); }).filter(Boolean);
+        if (indexed.length >= 2 && indexed.every(function (s) { return /^[\u4e00-\u9fff·]{2,6}$/.test(s); })) return indexed;
+      }
       var names = cleanAuthors(text).map(function (s) { return cleanCjkWhitespace(s); })
         .filter(function (s) { return /^[\u4e00-\u9fff·]{2,6}$/.test(s); });
       return names.length ? names : null;
@@ -525,6 +532,10 @@
         var compact = String(line.text || '').replace(/\s+/g, '');
         var runs = compact.match(/[\u4e00-\u9fff]+/g) || [];
         runs.forEach(function (candidate) {
+          // 页眉“机械工程学报 第 62 卷”按连续汉字切分时会留下“机械工程学报第”。
+          if (/第\s*[0-9一二三四五六七八九十百]+\s*卷/.test(compact) && /第$/.test(candidate)) {
+            candidate = candidate.slice(0, -1);
+          }
           if (candidate.length < 3 || candidate.length > 16 || noise.test(candidate)) return;
           if (/等$/.test(candidate) || authorSet[candidate]) return;
           if (candidate.length >= 6 && normalizedTitle.indexOf(candidate) !== -1) return;
@@ -1512,14 +1523,23 @@
    * MuPDF.js 阅读器内核：页面占位 + 邻近页按需渲染 + 文本/链接/批注层。
    * 返回的 handle 负责导航、搜索、选择坐标转换和释放资源。
    */
+  function renderPixelRatio(viewport, dpr, requested, maxPixels) {
+    // 位图按物理像素 1:1 渲染是唯一不经过浏览器双线性重采样的倍率：
+    // 超采样位图（如 2.5×）显示时被合成器缩小，边缘出现灰晕反而发糊。
+    // 显式 requested（测试/离屏放大导出）优先；默认精确等于 devicePixelRatio。
+    var preferred = Number(requested) > 0 ? Number(requested) : Math.max(1, Number(dpr) || 1);
+    return Math.max(1, Math.min(preferred,
+      Math.sqrt((Number(maxPixels) || 25165824) / Math.max(1, viewport.width * viewport.height))));
+  }
+
   function renderPdf(file, container, opts) {
     opts = opts || {};
     var scale = opts.scale || 1.35;
     var layout = opts.layout === 'spread' ? 'spread' : 'single';
     var rotation = ((Number(opts.rotation) || 0) % 360 + 360) % 360;
     var withTextLayer = opts.textLayer === true;
-    var preferredPixelRatio = Math.max(window.devicePixelRatio || 1, Number(opts.pixelRatio) || 2.5);
-    var maxCanvasPixels = Number(opts.maxCanvasPixels) || 16777216;
+    var preferredPixelRatio = Number(opts.pixelRatio) || 0; // 0 = 未指定：按 1:1 物理像素渲染
+    var maxCanvasPixels = Number(opts.maxCanvasPixels) || 25165824;
     var annotations = Array.isArray(opts.annotations) ? opts.annotations : [];
     var cancelled = false;
     var sourceBytesPromise = null;
@@ -1624,6 +1644,8 @@
         container.removeEventListener('pointerdown', onSelectionPointerDown);
         container.removeEventListener('scroll', onSelectionScroll);
         container.removeEventListener('scroll', scheduleViewportUpdate);
+        window.removeEventListener('resize', onDevicePixelRatioChange);
+        if (pixelRatioMedia) pixelRatioMedia.removeEventListener('change', onDevicePixelRatioChange);
         if (scrollFrame) { cancelAnimationFrame(scrollFrame); scrollFrame = 0; }
         if (nearViewportFrame) { cancelAnimationFrame(nearViewportFrame); nearViewportFrame = 0; }
         if (nearViewportTimer) { clearTimeout(nearViewportTimer); nearViewportTimer = 0; }
@@ -1913,6 +1935,27 @@
       });
     }
 
+    var devicePixelRatio = Number(window.devicePixelRatio) || 1;
+    var pixelRatioMedia = null;
+    function watchDevicePixelRatio() {
+      if (pixelRatioMedia) pixelRatioMedia.removeEventListener('change', onDevicePixelRatioChange);
+      pixelRatioMedia = window.matchMedia ? window.matchMedia('(resolution: ' + devicePixelRatio + 'dppx)') : null;
+      if (pixelRatioMedia) pixelRatioMedia.addEventListener('change', onDevicePixelRatioChange);
+    }
+    function onDevicePixelRatioChange() {
+      if (cancelled) return;
+      var next = Number(window.devicePixelRatio) || 1;
+      if (next === devicePixelRatio) return;
+      devicePixelRatio = next;
+      watchDevicePixelRatio();
+      sheets.forEach(function (sheet) {
+        if (sheet && sheet.querySelector('canvas.pdf-page')) sheet.dataset.rendered = 'stale';
+      });
+      scheduleNearViewportRender();
+    }
+    window.addEventListener('resize', onDevicePixelRatioChange);
+    watchDevicePixelRatio();
+
     function renderPage(pageNumber) {
       if (cancelled) return Promise.resolve(null);
       var page = pages[pageNumber - 1], sheet = sheets[pageNumber - 1];
@@ -1932,15 +1975,15 @@
       }
       var viewport = page.getViewport({ scale: scale, rotation: rotation });
       sheet._litViewport = viewport;
-      var pixelRatio = Math.min(3, preferredPixelRatio,
-        Math.sqrt(maxCanvasPixels / Math.max(1, viewport.width * viewport.height)));
-      pixelRatio = Math.max(1, pixelRatio);
+      var pixelRatio = renderPixelRatio(viewport, window.devicePixelRatio, preferredPixelRatio, maxCanvasPixels);
       var canvas = document.createElement('canvas');
       canvas.className = 'pdf-page';
-      canvas.width = Math.ceil(viewport.width * pixelRatio);
-      canvas.height = Math.ceil(viewport.height * pixelRatio);
-      canvas.style.width = viewport.width + 'px';
-      canvas.style.height = viewport.height + 'px';
+      // 位图边长取整到物理像素，CSS 尺寸反推（宽/dpr）：画布像素与设备像素
+      // 严格一一对应，合成时零重采样，边缘不带灰晕
+      canvas.width = Math.max(1, Math.round(viewport.width * pixelRatio));
+      canvas.height = Math.max(1, Math.round(viewport.height * pixelRatio));
+      canvas.style.width = (canvas.width / pixelRatio) + 'px';
+      canvas.style.height = (canvas.height / pixelRatio) + 'px';
       canvas.dataset.pixelRatio = pixelRatio.toFixed(2);
       canvas.setAttribute('aria-hidden', 'true');
       var canvasContext = canvas.getContext('2d', { alpha: false });
@@ -2132,6 +2175,7 @@
     inspectPdf: inspectPdf,
     extractText: extractText,
     renderPdf: renderPdf,
+    renderPixelRatio: renderPixelRatio,
     renderPageToPng: renderPageToPng,
     renderPagesToPng: renderPagesToPng,
     readAnnotations: readAnnotations,

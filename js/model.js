@@ -11,7 +11,7 @@
   'use strict';
 
   var SCHEMA_VERSION = 14;
-  var VALID_STATUS = { unread: true, reading: true, read: true };
+  var VALID_STATUS = { unread: true, reading: true };
   var VALID_ENTRY_TYPES = {
     article: true, inproceedings: true, book: true, incollection: true,
     phdthesis: true, mastersthesis: true, report: true, newspaper: true,
@@ -73,7 +73,7 @@
   }
   function stringList(v) {
     if (!Array.isArray(v)) return [];
-    var seen = {};
+    var seen = Object.create(null);
     return v.map(function (x) { return text(x).trim(); }).filter(function (x) {
       if (!x || seen[x]) return false;
       seen[x] = true;
@@ -433,7 +433,9 @@
     var added = timestampOrNull(p.addedAt) || Date.now();
 
     // 多附件（v8）：旧版单 PDF 字段自动迁移为主 PDF 附件
-    var attachments = [], seenAttachments = {};
+    // Attachment IDs are persisted/imported values; keep prototype names such as
+    // "toString" from looking already-seen in the dedupe table.
+    var attachments = [], seenAttachments = Object.create(null);
     (Array.isArray(p.attachments) ? p.attachments : []).forEach(function (rawAtt) {
       var att = normalizeAttachment(rawAtt, idFactory);
       if (!att || seenAttachments[att.id]) return;
@@ -534,7 +536,7 @@
         return !!validId(rid) || /^local:[A-Za-z0-9_-]{1,100}$/.test(rid);
       }).slice(0, 20),
       tags: cleanTags(p.tags),
-      status: VALID_STATUS[p.status] ? p.status : 'unread',
+      status: p.status === 'read' ? 'reading' : (VALID_STATUS[p.status] ? p.status : 'unread'),
       rating: rating != null ? Math.max(0, Math.min(5, Math.trunc(rating))) : 0,
       notes: text(p.notes),
       pdfAnnotations: annotations,
@@ -555,7 +557,7 @@
 
   function normalizeLibrary(value, idFactory) {
     var list = Array.isArray(value) ? value : (value && Array.isArray(value.papers) ? value.papers : []);
-    var seenIds = {};
+    var seenIds = Object.create(null);
     var papers = list.map(function (raw) {
       var paper = normalizePaper(raw, idFactory);
       if (seenIds[paper.id]) paper.id = (idFactory || fallbackId)();
@@ -567,7 +569,7 @@
 
   function normalizeFolders(value) {
     var list = Array.isArray(value) ? value : [];
-    var seen = {}, result = list.map(function (raw, index) {
+    var seen = Object.create(null), result = list.map(function (raw, index) {
       var folder = raw && typeof raw === 'object' ? raw : {};
       var id = validId(folder.id);
       var name = text(folder.name).trim().slice(0, 80);
@@ -585,11 +587,11 @@
         deletedAt: timestampOrNull(folder.deletedAt)
       };
     }).filter(Boolean);
-    var byId = {};
+    var byId = Object.create(null);
     result.forEach(function (folder) { byId[folder.id] = folder; });
     result.forEach(function (folder) { if (folder.parentId && !byId[folder.parentId]) folder.parentId = ''; });
     result.forEach(function (folder) {
-      var visited = {}, current = folder;
+      var visited = Object.create(null), current = folder;
       while (current && current.parentId) {
         if (visited[current.id]) { folder.parentId = ''; break; }
         visited[current.id] = true;
@@ -865,7 +867,7 @@
 
   function normalizeWorkspace(value, idFactory) {
     var folders = normalizeFolders(value && value.folders);
-    var folderSet = {};
+    var folderSet = Object.create(null);
     folders.forEach(function (folder) { if (!folder.deletedAt) folderSet[folder.id] = true; });
     var papers = normalizeLibrary(value, idFactory);
     papers.forEach(function (paper) {

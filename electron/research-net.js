@@ -573,23 +573,6 @@ function createResearchNet(options) {
     } catch (error) { return { status: 'error', code: classifyTestError(error) }; }
   }
 
-  /** Semantic Scholar：关键词检索一发。无 Key 走共享池（与他人争用，可能 429），
-   *  有 Key 走 1 req/s 配额——两种都能连通，channel 必须区分开。 */
-  async function testSemanticScholar() {
-    const cfg = (await getConfig()) || {};
-    try {
-      const params = new URLSearchParams({ query: 'literature management', limit: '1', fields: 'title' });
-      const headers = { Accept: 'application/json' };
-      if (cfg.semanticscholarApiKey) headers['x-api-key'] = String(cfg.semanticscholarApiKey);
-      const data = await queue.requestJson(S2_SEARCH + '?' + params.toString(), { headers: headers });
-      return {
-        status: 'ok', code: '',
-        channel: cfg.semanticscholarApiKey ? 'key' : 'shared_pool',
-        count: Number(data && data.total) || 0
-      };
-    } catch (error) { return { status: 'error', code: classifyTestError(error) }; }
-  }
-
   /** Elsevier：两个能力分开回报——摘要检索端点（回填链用的那个，只需 Key）
    *  与 Scopus 检索（另需机构订阅）。「摘要通但 Scopus 无权限」是最常见的组合，
    *  必须分开说，否则用户会以为 Key 坏了。未配置 Key → skipped。
@@ -618,7 +601,6 @@ function createResearchNet(options) {
     fetchWorksByDois: fetchWorksByDois,
     searchScopus: searchScopus,
     testOpenAlex: testOpenAlex,
-    testSemanticScholar: testSemanticScholar,
     testElsevier: testElsevier,
     backfillAbstracts: backfillAbstracts,
     autocomplete: autocomplete,

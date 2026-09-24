@@ -30,6 +30,7 @@ const { registerAll } = require('./ipc');
 const { agentSessionsRoot } = require('./ipc/agent.js');
 const { scheduleAutoEmbed } = require('./ipc/research.js');
 const { openAccessPdfDir } = require('./ipc/api.js');
+const { itemAttachmentDir } = require('./item-storage.js');
 const startupLog = ctx.startupLog;
 
 function ignoreBrokenPipe(stream) {
@@ -48,6 +49,7 @@ const LIFECYCLE_MODE = process.env.LITBOARD_SMOKE_LIFECYCLE || '';
 // M4 分段计时起点：主进程模块加载时刻
 const BOOT_T0 = Date.now();
 const SMOKE_PDF = process.env.LITBOARD_SMOKE_PDF || '';
+const SMOKE_FOLDER = process.env.LITBOARD_SMOKE_FOLDER || '';
 const SMOKE_EPUB = process.env.LITBOARD_SMOKE_EPUB || '';
 // 可选：把 smoke 渲染的 PDF 页截图到指定文件（肉眼检查渲染效果用）
 const SMOKE_SHOT = process.env.LITBOARD_SMOKE_SHOT || '';
@@ -237,6 +239,8 @@ function createWindow() {
         const result = await mainWindow.webContents.executeJavaScript(`(async function () {
           const pdfResourceRequests = [];
           const pdfPath = ${JSON.stringify(SMOKE_PDF)};
+          const folderPath = ${JSON.stringify(SMOKE_FOLDER)};
+          const secondPdfPath = ${JSON.stringify(process.env.LITBOARD_SMOKE_PDF_SECOND || '')};
           const epubPath = ${JSON.stringify(SMOKE_EPUB)};
           const shotWanted = ${SMOKE_SHOT ? 'true' : 'false'};
             await window.LitPdf.load();
@@ -245,6 +249,12 @@ function createWindow() {
             modelLoaded: !!window.LitModel,
             tablePresent: !!document.querySelector('#lit-table'),
             pdfColumnPresent: !!document.querySelector('.col-attachment'),
+            tableColumnsPresent: !!document.querySelector('#table-columns-btn') &&
+              !!document.querySelector('#table-columns-btn .ic use[href="#lb-i-columns"]') &&
+              !!document.querySelector('#table-columns-btn')?.closest('.table-footer-actions') &&
+              !!document.querySelector('#lit-table th[data-column="status"]') &&
+              !!document.querySelector('#lit-table th[data-column="tags"]') &&
+              !!document.querySelector('#lit-table th[data-column="title"] .column-resizer'),
             markdownLoaded: !!window.LitMarkdown,
             syncUiPresent: !!document.querySelector('#sync-mask'),
             syncNavGroups: document.querySelectorAll('#sync-mask .sync-nav-btn').length,
@@ -258,12 +268,14 @@ function createWindow() {
               !!window.litboardDesktop.stageDataPaths && !!window.litboardDesktop.relaunchApp,
             nutstoreTestPresent: !!document.querySelector('#sync-test-nutstore'),
             nutstoreFolderPresent: !!document.querySelector('#sync-nutstore-folder'),
-            remoteRecoveryUiPresent: !!document.querySelector('#sync-remote-inspect') && !!document.querySelector('#sync-remote-config') &&
+            remoteRecoveryUiPresent: !!document.querySelector('#sync-remote-inspect') && !document.querySelector('#sync-remote-config') &&
               !!document.querySelector('#sync-remote-restore') && !!document.querySelector('#sync-remote-merge') &&
               !!document.querySelector('#sync-remote-plan-mask'),
             remotePlanProgressPresent: !!document.querySelector('#sync-remote-plan-progress') &&
               !!document.querySelector('#sync-remote-plan-progress-bar') && !!document.querySelector('#sync-remote-plan-progress-text') &&
               !!window.litboardDesktop.onSyncProgress,
+            syncStopPresent: !!document.querySelector('#sync-stop') && !!window.litboardDesktop.cancelNutstoreSync &&
+              !!document.querySelector('#sync-remote-plan-cancel'),
             autoSyncTogglePresent: !!document.querySelector('#sync-auto-sync') && !!window.litboardDesktop.getSetting &&
               !!window.litboardDesktop.setSetting,
             // 「立即同步」按钮归属云同步分组，不再挂在弹窗页脚（改动本就即时保存，
@@ -271,10 +283,19 @@ function createWindow() {
             syncNowInCloudPresent: !!document.querySelector('#sync-run') &&
               !!document.querySelector('#sync-run').closest('.sync-section[data-sync-group="cloud"]') &&
               !document.querySelector('.sync-modal-actions #sync-run'),
-            remoteRecoveryApiPresent: !!window.litboardDesktop.inspectNutstoreRemote && !!window.litboardDesktop.pullNutstoreConfig &&
+            remoteRecoveryApiPresent: !!window.litboardDesktop.inspectNutstoreRemote && !window.litboardDesktop.pullNutstoreConfig &&
               !!window.litboardDesktop.createNutstoreSyncPlan && !!window.litboardDesktop.applyNutstoreSyncPlan,
+            // 「数据与备份」的排列：本地数据位置 → 会话记录 → Zotero 文献库 → 完整备份…
+            // 前三个都是「数据落在哪」，排在备份/索引等维护动作之前
+            dataSectionOrderPresent: (function () {
+              var secs = document.querySelectorAll('.sync-section[data-sync-group="storage"]');
+              return !!secs[0] && !!secs[0].querySelector('#sync-config-dir') &&
+                !!secs[1] && !!secs[1].querySelector('#sync-agent-session-root') &&
+                !!secs[2] && !!secs[2].querySelector('#sync-zotero-dir');
+            })(),
             inlineTestStatusPresent: !!document.querySelector('#sync-nutstore-test-status') && !!document.querySelector('#sync-scigreat-test-status'),
             nestedFolderUiPresent: !!document.querySelector('#folder-create-parent'),
+            folderTreeModulePresent: !!window.LitFolderTree,
             muPdfLoaded: !!window.LitMuPdf,
             pdfLayoutTogglePresent: !!document.querySelector('#pdf-layout-toggle'),
             translationUiPresent: !!document.querySelector('#pdf-translate-selection') && !!document.querySelector('#sync-translator-provider'),
@@ -288,8 +309,6 @@ function createWindow() {
             agentDrawerPresent: !!document.querySelector('#agent-drawer') && !!document.querySelector('#agent-chat-root') &&
               !!document.querySelector('#agent-history') && !!document.querySelector('#btn-agent') &&
               !!document.querySelector('#agent-model') && !!document.querySelector('#agent-thinking') &&
-              // 底部服务商徽标（自定义名称或由 Base URL 判定）：DOM 必须在，否则「当前经谁的端点」不可见
-              !!document.querySelector('#agent-provider') &&
               // 模型徽标是可点开的切换按钮（分组菜单 + 「管理模型…」）
               !!document.querySelector('#agent-model-btn') && !!window.LitAgentCfg &&
               !!document.querySelector('#agent-provider-items') && !!document.querySelector('#agent-provider-detail') &&
@@ -313,6 +332,9 @@ function createWindow() {
             // M9 三期：引文网络面板 + vis 库 + 组装模块 + IPC 面 + 双入口菜单项
             // （版式对照 literature-mcp：三栏 = 本图论文 / 画布 / 详情 + 图例）
             agentGraphPresent: !!document.querySelector('#graph-mask') && !!document.querySelector('#graph-canvas') &&
+              !!document.querySelector('#graph-resize-grip') &&
+              !!document.querySelector('.graph-modal') &&
+              getComputedStyle(document.querySelector('.graph-modal')).position === 'relative' &&
               !!document.querySelector('#graph-export') &&
               !!document.querySelector('#graph-list') && !!document.querySelector('#graph-detail') &&
               !!document.querySelector('#graph-legend') && !!document.querySelector('#graph-meta') &&
@@ -361,6 +383,12 @@ function createWindow() {
               !!window.LitWebFetch &&
               !window.LitAgent.createTools({ desktop: {} }).tools.some(function (t) { return t.function.name === 'web_search'; }) &&
               window.LitAgent.createTools({ desktop: {}, includeWebSearch: true }).tools.some(function (t) { return t.function.name === 'web_search'; }),
+            sourceApiLinksPresent: !!document.querySelector('a[href="https://openalex.org/settings/api"]') &&
+              !!document.querySelector('a[href="https://dev.elsevier.com/apikey/create"]') &&
+              !!document.querySelector('a[href="https://agent.tinyfish.ai/"]'),
+            updateCheckPresent: !!window.litboardDesktop.checkAppUpdate &&
+              !!window.litboardDesktop.downloadAppUpdate &&
+              !!document.querySelector('#settings-check-update'),
             // PDF 阅读助手（期一）：agent 的按页读取/批注工具 + 页区间 IPC
             //（阅读器「AI 解释」按钮已于 2026-09-20 整体移除，用户反馈无实际作用）
             agentReaderPresent: !!window.litboardDesktop.pdfSearchGetPageRange,
@@ -413,7 +441,40 @@ function createWindow() {
             // 「hidden=false 但被祖先隐藏」这类问题漏网。
             rightRailPresent: !!document.querySelector('#right-rail') && !!document.querySelector('#rail-detail') &&
               !!document.querySelector('#panel-detail') && !!document.querySelector('#agent-drawer') &&
-              document.querySelector('#agent-drawer').parentElement.classList.contains('detail-sidebar'),
+              document.querySelector('#agent-drawer').parentElement.classList.contains('detail-sidebar') &&
+              !!document.querySelector('#btn-right-sidebar-toggle') && !!document.querySelector('#btn-left-sidebar-collapse') &&
+              !!document.querySelector('#btn-left-sidebar-open'),
+            railToggleAtBottom: (function () {
+              const rail = document.querySelector('#right-rail');
+              const toggle = document.querySelector('#btn-right-sidebar-toggle');
+              if (!rail || !toggle || !toggle.closest('.right-rail-footer')) return false;
+              const railRect = rail.getBoundingClientRect();
+              const toggleRect = toggle.getBoundingClientRect();
+              return toggleRect.width <= 36 && toggleRect.top > railRect.top + railRect.height / 2 &&
+                railRect.bottom - toggleRect.bottom <= 12;
+            })(),
+            sidebarCollapseWorks: (function () {
+              try {
+                const ws = document.querySelector('.workspace');
+                const leftClose = document.querySelector('#btn-left-sidebar-collapse');
+                const leftOpen = document.querySelector('#btn-left-sidebar-open');
+                const rightToggle = document.querySelector('#btn-right-sidebar-toggle');
+                const sidebarRect = document.querySelector('#library-sidebar').getBoundingClientRect();
+                const closeRect = leftClose.getBoundingClientRect();
+                const closeAtTop = closeRect.top >= sidebarRect.top && closeRect.bottom <= sidebarRect.top + 42;
+                leftClose.click();
+                const leftOnly = ws.classList.contains('left-collapsed') && !ws.classList.contains('rail-collapsed');
+                const openRect = leftOpen.getBoundingClientRect();
+                const openAtTop = Math.abs(openRect.top - (sidebarRect.top + 12)) <= 2;
+                rightToggle.click();
+                const both = ws.classList.contains('left-collapsed') && ws.classList.contains('rail-collapsed');
+                leftOpen.click();
+                const rightOnly = !ws.classList.contains('left-collapsed') && ws.classList.contains('rail-collapsed');
+                rightToggle.click();
+                const expanded = !ws.classList.contains('left-collapsed') && !ws.classList.contains('rail-collapsed');
+                return closeAtTop && openAtTop && leftOnly && both && rightOnly && expanded;
+              } catch (error) { return String(error && error.message || error); }
+            })(),
             railSwitchWorks: (function () {
               try {
                 const railAi = document.querySelector('#btn-agent');
@@ -427,6 +488,16 @@ function createWindow() {
                 railDetail.click();
                 const toDetail = !visible(aiPane) && visible(detailPane) && railDetail.classList.contains('active');
                 return toAi && toDetail;
+              } catch (error) { return String(error && error.message || error); }
+            })(),
+            // 三栏和图标轨共用工作区的上下边界。
+            workspacePanesAligned: (function () {
+              try {
+                const workspace = document.querySelector('.workspace').getBoundingClientRect();
+                return ['#library-sidebar', '.center-pane', '#detail-sidebar', '.right-rail'].every(function (selector) {
+                  const pane = document.querySelector(selector).getBoundingClientRect();
+                  return Math.abs(pane.top - workspace.top) <= 1 && Math.abs(pane.bottom - workspace.bottom) <= 1;
+                });
               } catch (error) { return String(error && error.message || error); }
             })(),
             // AI 对话层渲染冒烟：隔离容器强制挂载 assistant-ui（无需 Key），用含
@@ -531,18 +602,33 @@ function createWindow() {
               } catch (error) { return String(error && error.message || error); }
             })(),
             // 聊天公式渲染端到端：LitMarkdown 出 .lb-math/.lb-math-block → agentui 的
-            // typesetMath 懒加载 vendor/mathjax/tex-svg.js 并类型化 → mjx-container 真的生成。
-            // 隔离环境全程离线（MathJax 是本地 vendor 单文件），加载失败/渲染失败都会 false。
+            // typesetMath 懒加载 vendor/mathjax/tex-svg.js；SVG 引用的字形必须在 SVG 内有定义，
+            // 否则只生成空壳节点，隐藏辅助 MathML 后公式会彻底不可见。
             chatMathRendered: await (async function () {
               try {
                 if (!window.LitAgentUi || !window.LitAgentUi.typesetMath || !window.LitMarkdown) return false;
                 const probe = document.createElement('div');
-                probe.innerHTML = window.LitMarkdown.render('行内 $x_1 + y_2 = z_3$ 与块级 $$E = mc^2$$ 结束');
+                probe.className = 'aui-md';
+                const slash = String.fromCharCode(92);
+                probe.innerHTML = window.LitMarkdown.render('行内 $x_1 + y_2 = z_3$ 与块级 $$E = mc^2$$ 结束') +
+                  window.LitMarkdown.render('粗体 $' + slash + 'boldsymbol{' + slash + 'sigma}$');
                 document.body.appendChild(probe);
                 const done = await window.LitAgentUi.typesetMath(probe);
+                const inline = probe.querySelector('.lb-math:not(.lb-math-block) mjx-container');
+                const svg = inline && inline.querySelector('svg');
+                const boldSvg = probe.querySelector('p:last-child .lb-math svg');
+                const glyphsVisible = Array.from(probe.querySelectorAll('.lb-math svg')).every(function (formula) {
+                  const ids = new Set(Array.from(formula.querySelectorAll('defs [id]')).map(function (node) { return node.id; }));
+                  const uses = Array.from(formula.querySelectorAll('use'));
+                  return uses.length > 0 && uses.every(function (node) {
+                    return ids.has(String(node.getAttribute('xlink:href') || '').slice(1));
+                  });
+                });
                 const ok = done === true &&
-                  !!probe.querySelector('.lb-math mjx-container') &&
-                  !!probe.querySelector('.lb-math-block mjx-container');
+                  !!inline && !!svg &&
+                  Math.abs(inline.getBoundingClientRect().width - svg.getBoundingClientRect().width) < 2 &&
+                  !!probe.querySelector('.lb-math-block mjx-container') && glyphsVisible &&
+                  !!boldSvg && !!boldSvg.querySelector('defs path[id*="-TEX-BI-"]');
                 probe.remove();
                 return ok;
               } catch (error) { return false; }
@@ -557,6 +643,10 @@ function createWindow() {
             translationAutoTogglePresent: !!document.querySelector('#pdf-auto-translate') && !!document.querySelector('#sync-translator-auto'),
             journalRankUiPresent: !!document.querySelector('#d-journal-rank') && !!document.querySelector('#d-journal-rank-refresh'),
             journalRankColumnPresent: !!document.querySelector('.col-rank[data-sort="journalRank"]'),
+            readingStatusUiPresent: !!document.querySelector('#status-seg [data-status="reading"]') &&
+              !document.querySelector('#status-seg [data-status="read"]') &&
+              !!document.querySelector('#d-status option[value="reading"]') &&
+              !document.querySelector('#d-status option[value="read"]'),
             tagsColumnRemoved: !document.querySelector('.col-tags'),
             // 分区列那颗圆圈按钮是「开始/暂停」开关：三种状态的图标与进度指示都必须就位
             rankRefreshTogglePresent: !!document.querySelector('#rank-refresh-all') &&
@@ -568,18 +658,29 @@ function createWindow() {
               !!document.querySelector('#lb-i-pause') && !!document.querySelector('#lb-i-play'),
             scigreatTestPresent: !!document.querySelector('#sync-scigreat-api-key') && !!document.querySelector('#sync-test-scigreat'),
             easyscholarTestPresent: !!document.querySelector('#sync-rank-provider') && !!document.querySelector('#sync-easyscholar-api-key'),
-            // 检索与元数据服务：一次测四个源（结果区同批就位，缺一即回归）
+            // 检索与元数据服务：测试三个可配置源（结果区同批就位）
             sourcesTestPresent: !!document.querySelector('#sync-test-sources') &&
               !!document.querySelector('#sync-sources-test-status') &&
               !!document.querySelector('#sync-sources-test-result'),
             pdfAnnotationUiPresent: !!document.querySelector('#pdf-annotations') && !!document.querySelector('#pdf-add-highlight') &&
               !!document.querySelector('#pdf-add-underline') && !!document.querySelector('#pdf-add-note'),
             pdfDownloadButtonPresent: !!document.querySelector('#d-fetch-pdf'),
-            // 拖放落点：全局拖入提示胶囊 + 统计仪表盘导入落区（条目行落点是运行时行为无静态标记）
-            importDropZonesPresent: !!document.querySelector('#drag-hint-pill') &&
-              !!document.querySelector('#stats-drop-hint'),
-            statsOverviewPresent: document.querySelectorAll('.stats-summary > .tile').length === 3 &&
+            detailActionsCompact: !!document.querySelector('#d-more') &&
+              !document.querySelector('#d-enrich, #d-copy-bib, #d-delete') &&
+              document.querySelectorAll('.drawer-head-actions > button:not([hidden])').length === 5,
+            // 目录导入落点在侧栏；旧全局提示胶囊和统计区导入框应已移除。
+            simpleFolderDropUi: !document.querySelector('#drag-hint-pill') &&
+              !document.querySelector('#stats-drop-hint'),
+            statsOverviewPresent: document.querySelectorAll('.stats-summary > .tile').length === 4 &&
+              !!document.querySelector('.stats-summary > .chart-card:last-child #year-chart') &&
               !!document.querySelector('#chart-range') && !!document.querySelector('#chart-peak'),
+            sidebarTagPanelPresent: !!document.querySelector('#tag-chips')?.closest('.library-sidebar') &&
+              !!document.querySelector('#btn-manage-tags')?.closest('.library-sidebar') &&
+              document.querySelector('#sidebar-tag-panel')?.parentElement?.id === 'library-sidebar' &&
+              !!document.querySelector('#btn-tag-collapse') &&
+              document.querySelector('#btn-tag-collapse').getAttribute('aria-controls') === 'tag-chips' &&
+              document.querySelector('#tag-list-resize')?.closest('#sidebar-tag-panel') &&
+              document.querySelector('#tag-list-resize').getAttribute('aria-valuemax') === '180',
             // 拖入文件夹导入：规划模块 + 更多菜单兜底入口（落区高亮是运行时行为，行为探针在下方补）
             folderImportPresent: !!window.LitFolderImport && !!document.querySelector('#more-import-folder') &&
               !!document.querySelector('#folder-empty'),
@@ -610,7 +711,7 @@ function createWindow() {
             paginationPresent: !!document.querySelector('#table-pagination'),
             sqliteStorageReady: !!window.litboardSqliteReady,
             trashNavPresent: !!document.querySelector('[data-folder="trash"]'),
-            savedSearchUiPresent: !!document.querySelector('#saved-search-list') && !!document.querySelector('#btn-save-search'),
+            smartFolderUiAbsent: !document.querySelector('#saved-search-list') && !document.querySelector('#btn-save-search'),
             tagManagePresent: !!document.querySelector('#btn-manage-tags') && !!document.querySelector('#tags-mask'),
             cslUiPresent: !!document.querySelector('#cite-csl-style') && !!window.LitCsl,
             syncIndicatorPresent: !!document.querySelector('#sync-indicator'),
@@ -621,6 +722,25 @@ function createWindow() {
               !document.querySelector('#pdf-snapshot-toggle') && !document.querySelector('#pdf-ink-toggle') &&
               !document.querySelector('#pdf-write-back') && !document.querySelector('#pdf-tts') &&
               !document.querySelector('#pdf-translation-settings') && !document.querySelector('#pdf-annotations-toggle'),
+            pdfSideControlsWork: (function () {
+              const side = document.querySelector('#pdf-side');
+              const toggle = document.querySelector('#pdf-side-toggle');
+              const collapse = document.querySelector('#pdf-side-collapse');
+              const open = document.querySelector('#pdf-side-open');
+              const grip = document.querySelector('#pdf-side-resizer');
+              const thumbs = document.querySelector('#pdf-side-tab-thumbs');
+              const outline = document.querySelector('#pdf-side-tab-outline');
+              if (!side || !toggle || !collapse || !open || !grip || !thumbs || !outline) return false;
+              if (side.hidden) open.click();
+              outline.click();
+              const outlineShown = !document.querySelector('#pdf-outline').hidden && document.querySelector('#pdf-thumbs').hidden;
+              thumbs.click();
+              const thumbsShown = !document.querySelector('#pdf-thumbs').hidden && document.querySelector('#pdf-outline').hidden;
+              collapse.click();
+              const collapsed = side.hidden && !open.hidden && grip.hidden && toggle.getAttribute('aria-pressed') === 'false';
+              open.click();
+              return outlineShown && thumbsShown && collapsed && !side.hidden && open.hidden && !grip.hidden;
+            })(),
             pdfTopTabsPresent: !!document.querySelector('#pdf-tabs .pdf-tab .pdf-tab-title') &&
               Array.prototype.some.call(document.querySelectorAll('#pdf-tabs .pdf-tab-title'), function (el) {
                 return el.textContent.indexOf('文献库') !== -1;
@@ -655,9 +775,11 @@ function createWindow() {
               !document.querySelector('#word-panel-mask').closest('#sync-mask') &&
               !document.querySelector('#bridge-panel-mask').closest('#sync-mask'),
             queryBuilderPresent: !!document.querySelector('#query-builder-mask') &&
-              !!document.querySelector('#qb-rows') && !!document.querySelector('#qb-apply'),
+              !!document.querySelector('#qb-rows') && !!document.querySelector('#qb-apply') &&
+              document.querySelector('#btn-query-builder use')?.getAttribute('href') === '#lb-i-query-builder' &&
+              document.querySelector('#btn-query-builder')?.textContent.trim() === '条件检索',
             // 检索引擎脚本本体必须已加载：index.html 曾漏掉 js/query.js 的 script 标签，
-            // 导致全部 field:value / missing: / 智能文件夹 AST 语法静默退化为子串搜索
+            // 导致 field:value / missing: 等 AST 查询语法静默退化为子串搜索
             queryEnginePresent: typeof window.LitQuery === 'object' && !!window.LitQuery &&
               typeof window.LitQuery.parseAst === 'function' && typeof window.LitQuery.compile === 'function',
             bulkEditPresent: !!document.querySelector('#bulk-edit-mask') &&
@@ -667,6 +789,122 @@ function createWindow() {
           document.querySelector('#btn-new-folder').click();
           result.folderCreateOpens = !document.querySelector('#folder-create-form').hidden;
           document.querySelector('#folder-create-cancel').click();
+          // 内置视图右键菜单（全部文献/未分类/最近阅读/回收站）：集合级操作与文件夹菜单对齐，
+          // 回收站换成「恢复全部 / 清空回收站」；菜单必须在点击后关闭（不留残影）
+          result.libraryNavContextMenu = await (async function () {
+            const nav = (id) => document.querySelector('#library-nav [data-folder="' + id + '"]');
+            const openMenu = (id) => {
+              nav(id).dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 150 }));
+              const el = document.querySelector('#ctx-menu');
+              const text = el ? el.textContent : '';
+              document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              return { text: text, closed: !document.querySelector('#ctx-menu') };
+            };
+            const all = openMenu('all');
+            const recent = openMenu('recent');
+            const trash = openMenu('trash');
+            nav('all').click();
+            return all.closed && recent.closed && trash.closed &&
+              all.text.indexOf('导出 BibTeX') !== -1 && all.text.indexOf('构建引文网络') !== -1 &&
+              all.text.indexOf('清空回收站') === -1 &&
+              recent.text.indexOf('导出 PDF') !== -1 &&
+              trash.text.indexOf('恢复全部') !== -1 && trash.text.indexOf('清空回收站') !== -1;
+          })();
+          result.folderCrudAndDragWorks = await (async function () {
+            const query = (s) => document.querySelector(s);
+            const waitFor = async (check) => {
+              for (let i = 0; i < 60; i++) {
+                if (await check()) return true;
+                await new Promise(resolve => setTimeout(resolve, 50));
+              }
+              return false;
+            };
+            const ids = [];
+            result.folderCrudStep = 'create';
+            for (const name of ['smoke-folder-A', 'smoke-folder-B', 'smoke-folder-C']) {
+              query('#btn-new-folder').click();
+              query('#folder-name-input').value = name;
+              query('#folder-create-form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+              const row = Array.from(document.querySelectorAll('#folder-list .folder-item')).find(el => el.querySelector('.folder-item-label').textContent === name);
+              if (!row) return false;
+              ids.push(row.dataset.folder);
+            }
+            const row = id => query('#folder-list .folder-item[data-folder="' + id + '"]');
+            row(ids[0]).dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 120 }));
+            result.folderImportContextAction = !!query('#ctx-menu') &&
+              query('#ctx-menu').textContent.indexOf('在此导入文件夹') !== -1;
+            document.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            const click = (id, opts) => row(id).querySelector('.folder-select').dispatchEvent(new MouseEvent('click', Object.assign({ bubbles: true }, opts)));
+            const selected = () => ids.filter(id => row(id).getAttribute('aria-selected') === 'true');
+            click(ids[0]); click(ids[1], { ctrlKey: true });
+            result.folderCrudStep = 'ctrl-select';
+            if (selected().length !== 2) return false;
+            click(ids[0]); click(ids[2], { shiftKey: true });
+            result.folderCrudStep = 'shift-select';
+            if (selected().length !== 3) return false;
+            const drag = (from, to, ratio) => {
+              click(from);
+              const transfer = new DataTransfer();
+              row(from).dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: transfer }));
+              const target = to ? row(to) : query('#library-nav [data-folder="all"]');
+              const rect = target.getBoundingClientRect();
+              const opts = { bubbles: true, cancelable: true, dataTransfer: transfer, clientX: rect.left + 20, clientY: rect.top + rect.height * ratio };
+              target.dispatchEvent(new DragEvent('dragover', opts));
+              target.dispatchEvent(new DragEvent('drop', opts));
+              query('#folder-list').dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: transfer }));
+            };
+            const persisted = async (id, parent) => {
+              const data = await window.litboardDesktop.loadLibrary();
+              return data.folders.some(f => f.id === id && !f.deletedAt && (f.parentId || '') === parent);
+            };
+            drag(ids[1], ids[0], 0.5);
+            result.folderCrudStep = 'drag-inside';
+            if (!await waitFor(() => persisted(ids[1], ids[0]))) return false;
+            drag(ids[1], null, 0.9);
+            result.folderCrudStep = 'drag-root';
+            if (!await waitFor(() => persisted(ids[1], ''))) return false;
+            drag(ids[2], ids[0], 0.05);
+            result.folderCrudStep = 'drag-sort';
+            if (!await waitFor(async () => {
+              const data = await window.litboardDesktop.loadLibrary();
+              const a = data.folders.find(f => f.id === ids[0]);
+              const c = data.folders.find(f => f.id === ids[2]);
+              return a && c && c.sortIndex < a.sortIndex;
+            })) return false;
+            drag(ids[2], ids[0], 0.5);
+            result.folderCrudStep = 'drag-child';
+            if (!await waitFor(() => persisted(ids[2], ids[0]))) return false;
+            drag(ids[1], ids[2], 0.5);
+            result.folderCrudStep = 'drag-grandchild';
+            if (!await waitFor(() => persisted(ids[1], ids[2]))) return false;
+            for (const id of ids) {
+              result.folderCrudStep = 'delete';
+              if (!row(id)) continue; // 删除父集合必须一并删除两层子集合。
+              row(id).querySelector('.folder-delete').click();
+              query('#dlg-ok').click();
+              if (!await waitFor(() => !row(id))) return false;
+              if (id === ids[0] && (row(ids[1]) || row(ids[2]))) return false;
+            }
+            if (!await waitFor(async () => {
+              const data = await window.litboardDesktop.loadLibrary();
+              return ids.every(id => data.folders.some(f => f.id === id && f.deletedAt));
+            })) return false;
+            query('#btn-undo').click();
+            result.folderCrudStep = 'undo';
+            if (!await waitFor(async () => {
+              const data = await window.litboardDesktop.loadLibrary();
+              const a = data.folders.find(f => f.id === ids[0] && !f.deletedAt);
+              const c = data.folders.find(f => f.id === ids[2] && !f.deletedAt);
+              const b = data.folders.find(f => f.id === ids[1] && !f.deletedAt);
+              return a && c && b && c.parentId === a.id && b.parentId === c.id;
+            })) return false;
+            query('#btn-redo').click();
+            result.folderCrudStep = 'redo';
+            return waitFor(async () => {
+              const data = await window.litboardDesktop.loadLibrary();
+              return ids.every(id => data.folders.some(f => f.id === id && f.deletedAt));
+            });
+          })();
           // 拖入文件夹导入落区行为：合成 dragover（DataTransfer 带 Files 类型）应点亮列表空白
           // （根级导入）与文件夹行（导入到该文件夹内，行悬停时列表空白高亮退位），dragleave 收起
           result.folderImportDropHighlight = await (async function () {
@@ -680,6 +918,9 @@ function createWindow() {
               };
               evOver(list);
               const okList = list.classList.contains('folder-file-drop');
+              const rootNav = document.querySelector('#library-nav [data-folder="all"]');
+              evOver(rootNav);
+              const okRoot = rootNav.classList.contains('folder-file-drop');
               const row = document.createElement('div');
               row.className = 'folder-item';
               row.dataset.folder = 'smoke-probe';
@@ -691,7 +932,7 @@ function createWindow() {
               }));
               const okClear = !list.classList.contains('folder-file-drop') && !row.classList.contains('folder-file-drop');
               row.remove();
-              return okList && okRow && okClear;
+              return okList && okRoot && okRow && okClear;
             } catch (error) { return false; }
           })();
           // 弹窗栈：嵌套打开时后开者必须盖住先开者（设置 → Zotero 导入向导），与 DOM 顺序无关
@@ -956,12 +1197,21 @@ function createWindow() {
                 pages: doc && doc.numPages,
                 canvases: container.querySelectorAll('canvas').length,
                 pixelRatio: canvas ? Number(canvas.dataset.pixelRatio) : 0,
+                // 1:1 物理像素不变量：位图边长 = CSS 尺寸 × dpr（±1px 取整误差）
+                // 默认冒烟容器未挂 DOM，getBoundingClientRect().width 会是 0；读取实际设置的 CSS 宽度。
+                dprAligned: canvas ? Math.abs(canvas.width - Math.round(parseFloat(canvas.style.width) * (Number(window.devicePixelRatio) || 1))) <= 1 : false,
                 renderer: canvas ? canvas.dataset.renderer || 'mupdf' : '',
                 opaqueCanvas: canvas ? canvas.getContext('2d').getContextAttributes().alpha === false : false,
                 renderingProfile: { engine: window.LitPdf.engine },
                 textLayer: !!container.querySelector('.pdf-text-layer'),
                 annotationLayer: !!container.querySelector('.pdf-annotation-mark')
               };
+              const outline = await doc.getOutline();
+              const thumbPage = await doc.getPage(1);
+              const thumbCanvas = document.createElement('canvas');
+              await thumbPage.renderToCanvas(thumbCanvas, 0.2, 0);
+              result.pdfRender.outlineReadable = Array.isArray(outline);
+              result.pdfRender.thumbnailRendered = thumbCanvas.width > 0 && thumbCanvas.height > 0;
               result.pdfRender.pageError = (container.querySelector('.pdf-page-sheet') || {}).dataset
                 ? (container.querySelector('.pdf-page-sheet').dataset.renderError || '') : '';
               // relayout（缩放原位重排）：复用文档、旧 canvas 原子替换，数量不增不减
@@ -977,6 +1227,23 @@ function createWindow() {
               }
               result.pdfRender.relayout = relaidOut;
               result.pdfRender.relayoutOk = relayoutOk;
+              // 模拟把窗口从低 DPI 屏幕移到高 DPI 屏幕：现有文档原位重绘位图。
+              const dprDescriptor = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio');
+              const originalDpr = Number(window.devicePixelRatio) || 1;
+              try {
+                Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: Math.max(2, originalDpr + 1) });
+                const beforeDprCanvas = container.querySelector('canvas.pdf-page');
+                window.dispatchEvent(new Event('resize'));
+                await handle.goToPage(1);
+                const afterDprCanvas = container.querySelector('canvas.pdf-page');
+                result.pdfRender.dprRefresh = !!afterDprCanvas && afterDprCanvas !== beforeDprCanvas &&
+                  Math.abs(Number(afterDprCanvas.dataset.pixelRatio) - window.LitPdf.renderPixelRatio(
+                    afterDprCanvas.parentElement._litViewport, window.devicePixelRatio)) < 0.02;
+              } finally {
+                if (dprDescriptor) Object.defineProperty(window, 'devicePixelRatio', dprDescriptor);
+                else delete window.devicePixelRatio;
+                window.dispatchEvent(new Event('resize'));
+              }
               result.pdfResourceRequests = pdfResourceRequests;
               const writeBytes = await window.litboardDesktop.readFileBytes(pdfPath);
               const writeResult = await window.LitPdf.writeAnnotations(new Uint8Array(writeBytes), [{
@@ -1156,7 +1423,35 @@ function createWindow() {
           const railSeedRow = document.querySelector('#table-body tr.lit-row');
           result.railSeedRow = !!railSeedRow;
           if (railSeedRow) {
-            (railSeedRow.querySelector('td') || railSeedRow).click();
+            const titleCell = railSeedRow.querySelector('.t-title');
+            result.compactTableRows = !!titleCell && getComputedStyle(titleCell).whiteSpace === 'nowrap' &&
+              railSeedRow.getBoundingClientRect().height <= 36 &&
+              railSeedRow.cells.length === document.querySelectorAll('#lit-table thead th').length;
+            const pdfColumnWidth = document.querySelector('#lit-table th[data-column="attachment"]').getBoundingClientRect().width;
+            const yearColumnWidth = document.querySelector('#lit-table th[data-column="year"]').getBoundingClientRect().width;
+            result.tableNarrowColumnsKeepWidth = Math.abs(pdfColumnWidth - 38) < 2 && Math.abs(yearColumnWidth - 64) < 2;
+            document.querySelector('#table-columns-btn').click();
+            const tagsChoice = Array.from(document.querySelectorAll('#ctx-menu .menu-item'))
+              .find(function (item) { return item.textContent.trim() === '标签'; });
+            if (tagsChoice) tagsChoice.click();
+            result.tableColumnPickerWorks = !!tagsChoice &&
+              !document.querySelector('#lit-table th[data-column="tags"]').hidden &&
+              !!document.querySelector('#table-body tr[data-id] td[data-column="tags"]');
+            const titleGrip = document.querySelector('#lit-table th[data-column="title"] .column-resizer');
+            const titleWidthBefore = titleGrip.parentElement.getBoundingClientRect().width;
+            const widthBefore = JSON.parse(localStorage.getItem('litboard.tableColumns') || '{"title":{"width":260}}').title.width;
+            titleGrip.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: 200 }));
+            document.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: 230 }));
+            document.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+            result.tableColumnResizeWorks = JSON.parse(localStorage.getItem('litboard.tableColumns') || '{"title":{"width":0}}').title.width > widthBefore &&
+              titleGrip.parentElement.getBoundingClientRect().width > titleWidthBefore;
+            const sortedBeforeResizeClick = titleGrip.parentElement.classList.contains('sorted');
+            titleGrip.parentElement.click(); // 浏览器可能把拖拽收尾 click 派给表头本身
+            result.tableResizeDoesNotSort = titleGrip.parentElement.classList.contains('sorted') === sortedBeforeResizeClick;
+            titleGrip.parentElement.click();
+            result.tableHeaderStillSorts = titleGrip.parentElement.classList.contains('sorted') !== sortedBeforeResizeClick;
+            const currentRailSeedRow = document.querySelector('#table-body tr.lit-row');
+            (currentRailSeedRow.querySelector('td') || currentRailSeedRow).click();
             await settle();
             result.railPaneSwitchesToDetail = agentPaneShown &&
               document.querySelector('#agent-drawer').hidden &&
@@ -1170,6 +1465,7 @@ function createWindow() {
           // 阅读标签切换必须同步详情抽屉：先分别打开 A/B，再通过顶部标签回切。
           // 这只在传入真实 PDF 的 smoke 中运行，避免标准启动冒烟额外加载 PDF。
           result.pdfTabDetailFollowsActive = !pdfPath;
+          result.multiAttachmentTabsWork = !secondPdfPath;
           if (pdfPath) {
             try {
               const smokePdfPath = String(pdfPath).split(String.fromCharCode(92)).join('/');
@@ -1177,7 +1473,8 @@ function createWindow() {
               const tabTitleB = 'Smoke PDF Tab B';
               document.querySelector('#btn-paste').click();
               document.querySelector('#paste-area').value =
-                '@article{smokePdfTabA, title={' + tabTitleA + '}, author={Doe, Jane}, year={2026}, journal={Smoke}, file={' + smokePdfPath + '}}' + String.fromCharCode(10) +
+                '@article{smokePdfTabA, title={' + tabTitleA + '}, author={Doe, Jane}, year={2026}, journal={Smoke}, file={' + smokePdfPath +
+                  (secondPdfPath ? ';' + String(secondPdfPath).split(String.fromCharCode(92)).join('/') : '') + '}}' + String.fromCharCode(10) +
                 '@article{smokePdfTabB, title={' + tabTitleB + '}, author={Doe, John}, year={2026}, journal={Smoke}, file={' + smokePdfPath + '}}';
               document.querySelector('#paste-ok').click();
               await settle();
@@ -1313,6 +1610,34 @@ function createWindow() {
                   document.querySelector('#d-title').textContent === tabTitleB;
               });
               result.pdfTabDetailFollowsActive = firstOpened && secondOpened && switchedToA && switchedToB;
+              if (secondPdfPath) {
+                document.querySelector('#pdf-tabs .pdf-tab:first-child .pdf-tab-title').click();
+                await selectAndOpen(tabTitleA);
+                const opens = Array.from(document.querySelectorAll('#drawer [data-att-action="open"]'));
+                result.multiAttachmentDiag = { opens: opens.length };
+                if (opens.length === 2) {
+                  const secondId = opens[1].dataset.attId;
+                  opens[1].click();
+                  const openedSecond = await waitFor(() => document.querySelector('#pdf-title').textContent.indexOf('B.pdf') !== -1 &&
+                    !!document.querySelector('#pdf-scroll canvas'));
+                  const samePaperTabs = Array.from(document.querySelectorAll('#pdf-tabs .pdf-tab-title')).filter(button => button.title === tabTitleA);
+                  result.multiAttachmentDiag.openedSecond = openedSecond;
+                  result.multiAttachmentDiag.tabs = samePaperTabs.length;
+                  result.multiAttachmentDiag.title = document.querySelector('#pdf-title').textContent;
+                  if (samePaperTabs.length === 2) {
+                    samePaperTabs[0].click();
+                    const restoredFirst = await waitFor(() => document.querySelector('#pdf-title').textContent.indexOf('A.pdf') !== -1);
+                    samePaperTabs[1].click();
+                    const restoredSecond = await waitFor(() => document.querySelector('#pdf-title').textContent.indexOf('B.pdf') !== -1);
+                    const stored = await window.litboardDesktop.loadLibrary();
+                    const papers = stored.papers.filter(p => p.title === tabTitleA && !p.deletedAt);
+                    Object.assign(result.multiAttachmentDiag, { restoredFirst, restoredSecond, papers: papers.length,
+                      attachments: papers.map(p => p.attachments.map(a => ({ id: a.id, fileName: a.fileName }))) });
+                    result.multiAttachmentTabsWork = openedSecond && restoredFirst && restoredSecond && papers.length === 1 &&
+                      papers[0].attachments.length === 2 && papers[0].attachments.some(a => a.id === secondId);
+                  }
+                }
+              }
             } catch (error) {
               result.pdfTabDetailFollowsActive = false;
               result.pdfTabDetailDiag = String(error && error.message || error);
@@ -1332,12 +1657,33 @@ function createWindow() {
           result.agentModelMenuDiag = {
             button: document.querySelector('#agent-model-btn') ? 'ok' : 'missing',
             label: String(document.querySelector('#agent-model').textContent),
-            provider: String(document.querySelector('#agent-provider').textContent),
             menu: menuText.slice(0, 200)
           };
           // 点菜单外任意处即收起（app.js 的全局 click 监听）
           document.querySelector('.workspace').dispatchEvent(new MouseEvent('click', { bubbles: true }));
           await settle();
+          result.folderImportEndToEnd = !folderPath;
+          if (folderPath && window.litboardSmokeImportFolder) {
+            const scanned = await window.litboardDesktop.scanFolder({ path: folderPath });
+            const planned = window.LitFolderImport.planFolderImport({ scan: scanned, folders: [], targetFolderId: '' });
+            await window.litboardSmokeImportFolder(folderPath, '');
+            const loaded = await window.litboardDesktop.loadLibrary();
+            const root = loaded.folders.find(folder => folder.name === 'folder-import-fixture' && !folder.deletedAt);
+            const child = root && loaded.folders.find(folder => folder.name === 'Nested' && folder.parentId === root.id);
+            const titles = ['smoke-folder-alpha', 'smoke-folder-beta'];
+            const papers = loaded.papers.filter(paper => titles.includes(paper.title) && !paper.deletedAt);
+            const firstPass = scanned.ok && scanned.hiddenSkipped === 1 && scanned.files.length === 3 &&
+              scanned.files.every(file => /^[a-f0-9]{64}$/.test(file.sourceKey)) &&
+              planned.files.length === 2 && planned.skippedUnsupported === 1 &&
+              !!child && papers.length === 2 && papers.every(paper =>
+              paper.folderIds.includes(child.id) && paper.attachments.length === 1 &&
+              paper.attachments[0].path && paper.sourceMeta.folderImportKey);
+            await window.litboardSmokeImportFolder(folderPath, '');
+            const reloaded = await window.litboardDesktop.loadLibrary();
+            result.folderImportEndToEnd = firstPass &&
+              reloaded.folders.filter(folder => !folder.deletedAt && (folder.id === root.id || folder.id === child.id)).length === 2 &&
+              reloaded.papers.filter(paper => titles.includes(paper.title) && !paper.deletedAt).length === 2;
+          }
           return result;
         })()`);
         // M4 分段计时：主进程启动 → 窗口 did-finish-load（含渲染层脚本求值完成）
@@ -1435,12 +1781,13 @@ function createWindow() {
         });
         console.log('LITBOARD_SMOKE ' + JSON.stringify(result));
         const pdfPassed = !SMOKE_PDF || (result.pdfRender && !result.pdfRender.error && result.pdfRender.canvases > 0 &&
-          result.pdfRender.pixelRatio >= 2 && result.pdfRender.renderer === SMOKE_EXPECT_RENDERER && result.pdfRender.opaqueCanvas &&
+          result.pdfRender.pixelRatio >= 1 && result.pdfRender.dprAligned && result.pdfRender.renderer === SMOKE_EXPECT_RENDERER && result.pdfRender.opaqueCanvas &&
           result.pdfRender.textLayer && result.pdfRender.annotationLayer &&
-          result.pdfRender.relayout && result.pdfRender.relayoutOk &&
+          result.pdfRender.outlineReadable && result.pdfRender.thumbnailRendered &&
+          result.pdfRender.relayout && result.pdfRender.relayoutOk && result.pdfRender.dprRefresh &&
           result.pdfRender.renderingProfile && result.pdfRender.renderingProfile.engine === 'mupdf');
         const pdfWritePassed = !SMOKE_PDF || (result.pdfWrite && result.pdfWrite.written === 1 && result.pdfWrite.found === true);
-        const pdfTabDetailPassed = !SMOKE_PDF || result.pdfTabDetailFollowsActive === true;
+        const pdfTabDetailPassed = !SMOKE_PDF || (result.pdfTabDetailFollowsActive === true && result.multiAttachmentTabsWork === true);
         // EPUB（foliate-js）：引擎常驻 + 传入真实 EPUB 时全链路（打开/翻页/进度/批注/恢复）
         const epubPassed = result.epubEnginePresent === true && (!SMOKE_EPUB || (
           result.epubReader && !result.epubReader.error && result.epubReader.relocations > 0 &&
@@ -1449,11 +1796,13 @@ function createWindow() {
         // 划词浮层只在传入真实 PDF 的分支里量得到（需要真实文本层造选区）
         const selectionPopoverPassed = !SMOKE_PDF || result.selectionPopoverInsideReading === true;
         const passed = result.desktopBridge && result.modelLoaded && result.tablePresent && result.pdfColumnPresent &&
+          result.tableColumnsPresent && result.compactTableRows && result.tableNarrowColumnsKeepWidth && result.tableColumnPickerWorks &&
+          result.tableColumnResizeWorks && result.tableResizeDoesNotSort && result.tableHeaderStillSorts &&
            result.markdownLoaded && result.syncUiPresent && result.syncNavGroups === 4 && result.nutstoreTestPresent && result.nutstoreFolderPresent &&
-           result.remoteRecoveryUiPresent && result.remoteRecoveryApiPresent && result.remotePlanProgressPresent &&
+           result.remoteRecoveryUiPresent && result.remoteRecoveryApiPresent && result.remotePlanProgressPresent && result.syncStopPresent &&
            result.autoSyncTogglePresent && result.syncNowInCloudPresent && result.syncRunUnconfiguredGuarded === true &&
           result.dataPathUiPresent && result.dataPathApiPresent && result.dataPathApiWorks && result.dataPathTypable &&
-          result.inlineTestStatusPresent && result.nestedFolderUiPresent &&
+          result.inlineTestStatusPresent && result.nestedFolderUiPresent && result.folderTreeModulePresent &&
           result.muPdfLoaded && result.pdfLayoutTogglePresent && result.translationUiPresent && result.journalRankUiPresent &&
           result.searchHelpUiPresent && result.searchHelpOpens === true && result.searchHelpTryWorks === true &&
           result.wordCiteSearchUiPresent && result.wordCiteHelpOpens === true && result.wordCiteHelpTryWorks === true &&
@@ -1466,23 +1815,26 @@ function createWindow() {
           result.agentProviderEditorWorks === true && result.agentProviderWideLayout === true &&
           result.embeddingZhipuPresetPresent === true && result.inlineStatusCompact === true && result.agentModelMenuWorks === true &&
           result.agentPhase2Present && result.agentGraphPresent && result.graphViewerWorks === true &&
-          result.agentWebSearchPresent &&
+          result.agentWebSearchPresent && result.sourceApiLinksPresent && result.updateCheckPresent &&
           result.agentReaderPresent && result.agentFindLiteraturePresent &&
           result.agentChatRendered === true && result.chatBodyIsFlexColumn === true &&
           result.chatMathRendered === true &&
-          result.rightRailPresent && result.railSwitchWorks === true &&
+          result.rightRailPresent && result.railToggleAtBottom && result.railSwitchWorks === true && result.sidebarCollapseWorks === true &&
+          result.workspacePanesAligned === true &&
           result.readingRailOk === true &&
           result.journalRankColumnPresent && result.rankRefreshTogglePresent &&
           result.scigreatTestPresent && result.easyscholarTestPresent && result.sourcesTestPresent &&
           result.pdfAnnotationUiPresent &&
-          result.pdfDownloadButtonPresent && result.importDropZonesPresent && result.statsOverviewPresent &&
-          result.folderImportPresent && result.folderImportDropHighlight === true &&
+          result.pdfDownloadButtonPresent && result.detailActionsCompact && result.simpleFolderDropUi && result.statsOverviewPresent && result.sidebarTagPanelPresent &&
+          result.folderImportPresent && result.folderImportContextAction && result.folderImportDropHighlight === true &&
+          result.folderImportEndToEnd === true &&
           result.pdfSearchUiPresent && result.pdfSearchTogglePresent && result.pdfSearchOptionsPresent &&
           result.issuesCenterPresent && result.onboardPresent &&
           result.pdfNavigationUiPresent && result.paginationPresent &&
-          result.paginationWorks && result.folderCreateOpens && result.renderedRows <= 100 && result.sqliteStorageReady &&
-          result.trashNavPresent && result.savedSearchUiPresent && result.tagManagePresent && result.cslUiPresent &&
-          result.syncIndicatorPresent && result.bridgeUiPresent && result.pdfReaderExtrasPresent &&
+          result.paginationWorks && result.folderCreateOpens && result.folderCrudAndDragWorks && result.renderedRows <= 100 && result.sqliteStorageReady &&
+          result.libraryNavContextMenu === true &&
+          result.trashNavPresent && result.smartFolderUiAbsent && result.tagManagePresent && result.cslUiPresent &&
+          result.syncIndicatorPresent && result.bridgeUiPresent && result.pdfReaderExtrasPresent && result.pdfSideControlsWork &&
           result.pdfTopTabsPresent && result.titlebarControlsPresent && result.dialogUiPresent && result.zoteroWizardPresent &&
           result.docxExportPresent && result.readerNotePanelPresent && result.epubReaderPresent && result.noteEditorPresent && result.resultViewPresent && result.wordSectionPresent && result.integrationPanelsPresent && result.queryBuilderPresent && result.bulkEditPresent && result.undoPresent &&
           result.queryEnginePresent &&
@@ -1864,15 +2216,15 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
     });
   }, 60 * 60 * 1000);
   registerAll();
-  createWindow();
-  startupLog('main window created');
   // 浏览器扩展桥接服务（仅 127.0.0.1）
   // 主进程网络出口：OpenAlex DOI 补全（api.openalex.org）；知网 PDF 走的浏览器会话，不直连知网。
   ctx.bridgeServer = createBridgeServer({
     libraryDb: ctx.libraryDb,
     fetch: function (url, init) { return net.fetch(url, init); },
     // 扩展抓取的 PDF 一律落受管目录，避免把文献库附件散落到不受 LitBoard 管理的位置。
-    resolveDownloadDir: async function () { return openAccessPdfDir(); },
+    resolveDownloadDir: async function (paperId) {
+      return paperId ? itemAttachmentDir(ctx.dataPathState.configDir, paperId) : openAccessPdfDir();
+    },
     onSaved: function (info) {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('library:externally-updated', {
@@ -1884,6 +2236,9 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
       }
     }
   });
+  // 先建立桥接对象再加载渲染页：页面启动时的“当前文件夹”上报不能落到 null。
+  createWindow();
+  startupLog('main window created');
   ctx.bridgeServer.start().then(function (status) {
     if (status.running) console.log('LitBoard bridge listening on 127.0.0.1:' + status.port);
   }).catch(function (error) { console.error('LitBoard bridge failed:', error); });

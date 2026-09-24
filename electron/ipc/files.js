@@ -6,8 +6,11 @@
 const { clipboard, dialog, net, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { storeFileInto, resolveSnapshotEntry } = require('../integrations.js');
+const crypto = require('node:crypto');
+const { storeFileInto, storeDirInto, resolveSnapshotEntry } = require('../integrations.js');
+const { itemAttachmentDir, duplicatePdfPath, storeItemAttachment } = require('../item-storage.js');
 const ctx = require('./context.js');
+const itemStores = { storeFileInto, storeDirInto };
 
 module.exports = { register: register };
 
@@ -26,6 +29,13 @@ function decodeImportText(bytes) {
     return buffer.subarray(3).toString('utf8');
   }
   return new TextDecoder('utf-8', { fatal: false }).decode(buffer);
+}
+
+function storageError(error) {
+  if (error && error.message === 'INVALID_PAPER_ID') return ctx.T('无效的条目 ID');
+  if (error && error.message === 'INVALID_SOURCE_PATH') return ctx.T('无效的源文件路径');
+  if (error && error.message === 'ATTACHMENT_COPY_MISMATCH') return ctx.T('附件复制校验失败');
+  return String(error && error.message || error);
 }
 
 function register() {
@@ -106,21 +116,36 @@ function register() {
     const rootPath = String(options && options.path || '');
     if (!path.isAbsolute(rootPath)) return { error: ctx.T('无效的目录路径') };
     const MAX_DEPTH = 48, MAX_FILES = 5000, MAX_BYTES = 5 * 1024 * 1024 * 1024;
-    const files = [];
+    const files = [], unreadable = [];
     let hiddenSkipped = 0, totalBytes = 0;
     async function walk(current, prefix, depth) {
       if (depth > MAX_DEPTH) throw new Error('TOO_DEEP');
-      const entries = await fs.readdir(current, { withFileTypes: true });
+      let entries;
+      try { entries = await fs.readdir(current, { withFileTypes: true }); }
+      catch (error) {
+        if (!prefix) throw error;
+        unreadable.push({ rel: prefix, error: String(error && error.message || error) });
+        return;
+      }
       for (const entry of entries) {
         if (entry.name.startsWith('.')) { hiddenSkipped++; continue; }
         const abs = path.join(current, entry.name);
         const rel = prefix ? prefix + '/' + entry.name : entry.name;
         if (entry.isDirectory()) { await walk(abs, rel, depth + 1); continue; }
         if (!entry.isFile()) continue;
-        let size = 0;
-        try { size = (await fs.stat(abs)).size; } catch (error) { continue; } // 不可读条目跳过
+        let stat;
+        try { stat = await fs.stat(abs); }
+        catch (error) {
+          unreadable.push({ rel: rel, error: String(error && error.message || error) });
+          continue;
+        }
+        const size = stat.size;
         totalBytes += size;
-        files.push({ rel: rel, name: entry.name, ext: path.extname(entry.name).toLowerCase(), abs: abs, size: size });
+        const resolved = path.resolve(abs);
+        const sourceKey = crypto.createHash('sha256').update(
+          (process.platform === 'win32' ? resolved.toLowerCase() : resolved) + '\0' + size + '\0' + Math.trunc(stat.mtimeMs)).digest('hex');
+        files.push({ rel: rel, name: entry.name, ext: path.extname(entry.name).toLowerCase(),
+          abs: abs, size: size, sourceKey: sourceKey });
         if (files.length > MAX_FILES) throw new Error('TOO_MANY_FILES');
         if (totalBytes > MAX_BYTES) throw new Error('TOO_MANY_BYTES');
       }
@@ -137,7 +162,8 @@ function register() {
       if (code === 'TOO_DEEP') return { error: ctx.T('目录层级过深（超过 48 层），无法导入') };
       return { error: String(error && error.message || error) };
     }
-    return { ok: true, rootName: path.basename(rootPath), rootPath: rootPath, files: files, hiddenSkipped: hiddenSkipped };
+    return { ok: true, rootName: path.basename(rootPath), rootPath: rootPath,
+      files: files, hiddenSkipped: hiddenSkipped, unreadable: unreadable };
   });
 
   // 通用文件选择（添加附件用）
@@ -220,17 +246,50 @@ function register() {
     }
   });
 
-  // 把导入的 PDF 拷进配置目录/synced-attachments，按该目录惯例命名（z + 8 位随机键），保留原文件
+  // 新附件按文献 ID 存进受管目录；未提供 ID 的旧调用方仍可写入旧平铺目录。
   ctx.handle('files:store-pdf', async function (_event, options) {
     try {
       const src = String(options && options.path || '');
       if (!path.isAbsolute(src)) return { error: ctx.T('无效的源文件路径') };
       try { await fs.access(src); } catch (error) { return { error: ctx.T('源文件不存在：') + src }; }
-      const dir = path.join(ctx.dataPathState.configDir, 'synced-attachments');
-      return await storeFileInto(dir, src, '.pdf');
+      if (options && options.paperId) {
+        return await storeItemAttachment(ctx.dataPathState.configDir, options.paperId, src, '.pdf', false, itemStores);
+      }
+      return await storeFileInto(path.join(ctx.dataPathState.configDir, 'synced-attachments'), src, '.pdf');
     } catch (error) {
-      return { error: String(error && error.message || error) };
+      return { error: storageError(error) };
     }
+  });
+
+  ctx.handle('files:store-attachment', async function (_event, options) {
+    try {
+      const src = String(options && options.path || '');
+      if (!path.isAbsolute(src)) return { error: ctx.T('无效的源文件路径') };
+      const duplicate = await duplicatePdfPath(src, options && options.existing);
+      if (duplicate) return { path: duplicate, name: path.basename(duplicate), duplicate: true };
+      return await storeItemAttachment(ctx.dataPathState.configDir, options && options.paperId,
+        src, path.extname(src), false, itemStores);
+    } catch (error) { return { error: storageError(error) }; }
+  });
+
+  // 旧库逐条迁移：只复制并逐字节校验，渲染层确认保存新路径后原件仍保留。
+  ctx.handle('files:organize-item', async function (_event, options) {
+    const paperId = String(options && options.paperId || '');
+    const list = (Array.isArray(options && options.attachments) ? options.attachments : []).slice(0, 500);
+    try { itemAttachmentDir(ctx.dataPathState.configDir, paperId); }
+    catch (error) { return { error: storageError(error), updated: [], failed: [] }; }
+    const updated = [], failed = [];
+    for (const attachment of list) {
+      if (!attachment || !attachment.id || !attachment.path) continue;
+      try {
+        const copied = await storeItemAttachment(ctx.dataPathState.configDir, paperId, attachment.path,
+          path.extname(String(attachment.fileName || attachment.path)), true, itemStores);
+        if (!copied.unchanged) updated.push({ id: String(attachment.id), from: String(attachment.path), path: copied.path });
+      } catch (error) {
+        failed.push({ id: String(attachment.id), error: storageError(error) });
+      }
+    }
+    return { updated: updated, failed: failed };
   });
 
   // 选择自动导出 .bib 的目标文件

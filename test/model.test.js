@@ -25,6 +25,10 @@ test('normalizePaper repairs unsafe and malformed backup fields', function () {
   assert.equal(paper.url, '');
 });
 
+test('legacy read status becomes reading', function () {
+  assert.equal(LitModel.normalizePaper({ id: 'p1', title: 'Paper', status: 'read' }).status, 'reading');
+});
+
 test('normalizeLibrary accepts both raw arrays and backup envelopes', function () {
   const source = [{ id: 'p1', title: 'Paper', authors: [] }];
   assert.equal(LitModel.normalizeLibrary(source).length, 1);

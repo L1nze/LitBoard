@@ -92,8 +92,13 @@
         i++;
         continue;
       }
-      var k = i;
-      while (k < s.length && !/[\s()]/.test(s[k])) k++;
+      var k = i, inQuote = false;
+      while (k < s.length) {
+        if (s[k] === '"') { inQuote = !inQuote; k++; continue; }
+        if (!inQuote && /[\s()]/.test(s[k])) break;
+        k++;
+      }
+      if (inQuote) return { error: T('引号未闭合') };
       var word = s.slice(i, k);
       if (word === 'AND' || word === 'OR' || word === 'NOT') tokens.push({ t: word });
       else tokens.push({ t: 'word', v: word });
@@ -114,6 +119,13 @@
   }
   function dayEnd(start) {
     return start + 24 * 60 * 60 * 1000;
+  }
+
+  function doiSearchValue(value) {
+    // 详情栏显示/复制的 DOI 往往带“DOI ”标签或 doi.org 前缀；字段查询只匹配标识符。
+    return text(value).trim()
+      .replace(/^doi(?:\s*[:：]\s*|\s+)/i, '')
+      .replace(/^(?:https?:\/\/)?(?:dx\.)?doi\.org\//i, '');
   }
 
   function parseTokens(tokens) {
@@ -169,7 +181,7 @@
   function atomFromToken(token, scope) {
     if (token.t === 'regex') {
       if (scope !== 'paper') throw new Error(T('组内暂不支持正则'));
-      return { op: 'regex', re: token.v };
+      return { op: 'regex', source: token.v.source, re: token.v };
     }
     var word = token.v;
     var m = word.match(/^([A-Za-z]+)\s*(>=|<=|>|<|=|:)(.*)$/);
@@ -229,7 +241,7 @@
         if (!rawValue) throw new Error(T('folderid: 缺少文件夹 ID'));
         return { op: 'folder', id: rawValue };
       }
-      if (COUNT_FIELDS[fieldKey]) {
+      if (COUNT_FIELDS[fieldKey] && !(fieldKey === 'notes' && m[2] === ':')) {
         if (m[2] === ':') throw new Error(T('数量字段 ') + m[1] + T(' 需要比较运算符'));
         var count = Number(rawValue);
         if (!Number.isFinite(count) || count < 0) throw new Error(T('数量字段 ') + m[1] + T(' 需要非负整数'));
@@ -237,7 +249,7 @@
       }
       var field = FIELD_ALIASES[fieldKey];
       if (field) {
-        var value = rawValue;
+        var value = field === 'doi' ? doiSearchValue(rawValue) : rawValue;
         if (value === '') throw new Error(T('字段 ') + m[1] + T(' 缺少比较值'));
         var operator = m[2] === ':' ? ':' : m[2];
         if (NUMERIC_FIELDS[field]) {
@@ -271,43 +283,62 @@
     function walk(node) {
       if (!node || typeof node !== 'object') return node;
       if (node.op === 'regex' && !(node.re instanceof RegExp)) {
-        try { node.re = new RegExp(node.source || '', 'i'); } catch (e) { node.re = /$^/; }
+        var source = typeof node.source === 'string' ? node.source
+          : (node.re && typeof node.re.source === 'string' ? node.re.source : null);
+        try { node.re = source == null ? /$^/ : new RegExp(source, 'i'); } catch (e) { node.re = /$^/; }
       }
       walk(node.a); walk(node.b);
       return node;
     }
     return walk(ast && ast.root);
   }
-  function serializeAst(ast) { return JSON.stringify(ast && ast.root ? { v: AST_VERSION, root: ast.root } : { v: AST_VERSION, root: null }); }
+  function serializeAst(ast) {
+    return JSON.stringify(ast && ast.root ? { v: AST_VERSION, root: ast.root } : { v: AST_VERSION, root: null },
+      function (_key, value) { return value instanceof RegExp ? undefined : value; });
+  }
+
+  function repairLegacyRegexAst(ast, query) {
+    function missingSource(node) {
+      if (!node || typeof node !== 'object') return false;
+      if (node.op === 'regex' && typeof node.source !== 'string' &&
+          !(node.re && typeof node.re.source === 'string')) return true;
+      return missingSource(node.a) || missingSource(node.b);
+    }
+    if (!ast || !missingSource(ast.root)) return ast;
+    var reparsed = parseAst(query);
+    return reparsed.error || !reparsed.root ? ast : reparsed;
+  }
 
   function astToText(ast) {
     var root = ast && ast.root;
     if (!root) return '';
-    function walk(node, parentOp) {
+    function precedence(node) {
+      return node.op === 'or' ? 1 : node.op === 'and' ? 2 : node.op === 'not' ? 3 : 4;
+    }
+    function walk(node, parentPrecedence) {
       if (!node) return '';
+      var result = '';
       switch (node.op) {
-        case 'and': {
-          var s = walk(node.a, 'and') + ' ' + walk(node.b, 'and');
-          return parentOp === 'or' ? '(' + s + ')' : s;
-        }
-        case 'or': return walk(node.a, 'or') + ' OR ' + walk(node.b, 'or');
-        case 'not': return 'NOT ' + walk(node.a, 'not');
-        case 'text': return /\s/.test(node.value) ? '"' + node.value + '"' : node.value;
-        case 'regex': return '/' + (node.re ? node.re.source : node.source || '') + '/';
-        case 'field': return node.field + ':"' + node.value + '"';
-        case 'cmp': return node.field + node.cmp + node.value;
-        case 'datecmp': return node.field + node.cmp + new Date(node.value).toISOString().slice(0, 10);
-        case 'flag': return 'has:' + node.name;
-        case 'missing': return 'missing:' + node.name;
-        case 'folder': return node.id ? 'folderid:' + node.id : 'folder:"' + node.value + '"';
-        case 'ann': return 'ann(' + walk(node.a, '') + ')';
-        case 'note': return 'note(' + walk(node.a, '') + ')';
-        case 'attachment': return 'attachment(' + walk(node.a, '') + ')';
-        case 'count': return node.field + node.cmp + node.value;
+        case 'and': result = walk(node.a, 2) + ' ' + walk(node.b, 2); break;
+        case 'or': result = walk(node.a, 1) + ' OR ' + walk(node.b, 1); break;
+        case 'not': result = 'NOT ' + walk(node.a, 3); break;
+        case 'text': result = /\s/.test(node.value) ? '"' + node.value + '"' : node.value; break;
+        case 'regex': result = '/' + (node.re instanceof RegExp ? node.re.source : node.source || '') + '/'; break;
+        case 'field': result = node.field + ':"' + node.value + '"'; break;
+        case 'cmp': result = node.field + node.cmp + node.value; break;
+        case 'datecmp': result = node.field + node.cmp + new Date(node.value).toISOString().slice(0, 10); break;
+        case 'flag': result = 'has:' + node.name; break;
+        case 'missing': result = 'missing:' + node.name; break;
+        case 'folder': result = node.id ? 'folderid:' + node.id : 'folder:"' + node.value + '"'; break;
+        case 'ann': result = 'ann(' + walk(node.a, 0) + ')'; break;
+        case 'note': result = 'note(' + walk(node.a, 0) + ')'; break;
+        case 'attachment': result = 'attachment(' + walk(node.a, 0) + ')'; break;
+        case 'count': result = node.field + node.cmp + node.value; break;
         default: return '';
       }
+      return precedence(node) < parentPrecedence ? '(' + result + ')' : result;
     }
-    return walk(root, '');
+    return walk(root, 0);
   }
 
   // ---------- 求值 ----------
@@ -400,13 +431,13 @@
    * 普通关键词查询 → {matched, score, field, snippet, fields}。
    * 标题 > 标签/标识 > 作者/期刊 > 摘要 > 笔记；同字段完整短语另加权。
    */
-  function rankPlainText(paper, input) {
+  function rankPlainText(paper, input, ctx) {
     var terms = plainSearchTerms(input);
     if (!terms.length) return { matched: true, score: 0, field: '', snippet: '', fields: [] };
     var values = {};
     var all = '';
     PLAIN_SEARCH_FIELDS.forEach(function (spec) {
-      var raw = plainFieldText(paper, spec.key);
+      var raw = spec.key === 'notes' ? noteSearchText(paper, ctx) : plainFieldText(paper, spec.key);
       values[spec.key] = { raw: raw, normalized: normalizeForSearch(raw), score: 0 };
       all += ' ' + values[spec.key].normalized;
     });
@@ -443,8 +474,21 @@
   }
 
   function activeNotesFor(paper, ctx) {
-    if (!paper || !ctx || !ctx.notesByPaper) return [];
-    return ctx.notesByPaper[paper.id] || [];
+    if (!paper || !ctx) return [];
+    if (ctx.notesByPaper) return ctx.notesByPaper[paper.id] || [];
+    if (Array.isArray(ctx.notes)) return ctx.notes.filter(function (note) {
+      return note && !note.deletedAt && note.paperId === paper.id;
+    });
+    return [];
+  }
+
+  function noteSearchText(paper, ctx) {
+    if (ctx && (ctx.notesByPaper || Array.isArray(ctx.notes))) {
+      return activeNotesFor(paper, ctx).map(function (note) {
+        return text(note.title) + ' ' + text(note.content);
+      }).join(' ');
+    }
+    return text(paper && paper.notes);
   }
 
   function countValue(field, paper, ctx) {
@@ -482,7 +526,8 @@
       case 'doi': return !!paper.doi;
       case 'abstract': return !!paper.abstract;
       case 'annotations': return !!(paper.pdfAnnotations && paper.pdfAnnotations.length);
-      case 'unread': case 'reading': case 'read': return paper.status === name;
+      case 'unread': case 'reading': return paper.status === name;
+      case 'read': return paper.status === 'reading' || paper.status === 'read'; // 兼容旧智能文件夹
       case 'trash': case 'trashed': case 'deleted': return !!paper.deletedAt;
       default: return false;
     }
@@ -529,13 +574,15 @@
           : TEXT_HAY_FIELDS;
         var target = paper;
         if (scope === 'paper' && ctx && ctx.notesByPaper) {
-          target = Object.assign({}, paper, { notes: activeNotesFor(paper, ctx).map(function (n) { return n.content; }).join(' ') });
+          target = Object.assign({}, paper, { notes: noteSearchText(paper, ctx) });
         }
         return haystack(target, fields, scope === 'paper').indexOf(node.value) !== -1;
       }
       case 'regex': {
         try {
-          return node.re.test(rawHaystack(paper, TEXT_HAY_FIELDS));
+          var regexTarget = scope === 'paper' && ctx && ctx.notesByPaper
+            ? Object.assign({}, paper, { notes: noteSearchText(paper, ctx) }) : paper;
+          return node.re.test(rawHaystack(regexTarget, TEXT_HAY_FIELDS));
         } catch (e) { return false; }
       }
       case 'field': {
@@ -543,7 +590,8 @@
           return (paper.tags || []).some(function (tag) { return normalizeForSearch(tag) === node.value; });
         }
         if (node.field === 'status') {
-          return normalizeForSearch(paper.status) === node.value;
+          return normalizeForSearch(paper.status) === node.value ||
+            (node.value === 'read' && paper.status === 'reading');
         }
         if (node.field === 'color') { // ann 组
           return normalizeForSearch(paper.color) === node.value;
@@ -554,7 +602,7 @@
         if (node.field === 'format') {
           return normalizeForSearch(paper.format) === node.value;
         }
-        var v = paper[node.field];
+        var v = node.field === 'notes' ? noteSearchText(paper, ctx) : paper[node.field];
         if (Array.isArray(v)) v = v.join(' ');
         return normalizeForSearch(v).indexOf(node.value) !== -1;
       }
@@ -665,18 +713,20 @@
   }
 
   /** 兼容包装：parse(query) → { matcher, error, ast } */
-  function parse(input) {
+  function parse(input, ctx) {
     var raw = String(input || '').trim();
     if (!raw) return { matcher: function () { return true; }, error: null, ast: { v: AST_VERSION, root: null } };
     var ast = parseAst(raw);
     if (ast.error || !ast.root) return { matcher: null, error: ast.error || null, ast: ast };
-    var compiled = compile(ast, null);
+    var compiled = compile(ast, ctx || null);
     return { matcher: compiled.matcher, error: compiled.error, ast: ast };
   }
 
   /** 是否为"纯裸词"查询（不需要高级语法时可走老路径） */
   function isPlainText(input) {
-    return !/[()"/!]|\bAND\b|\bOR\b|\bNOT\b|[A-Za-z]+\s*(>=|<=|>|<|=|:)/.test(String(input || ''));
+    var value = String(input || '');
+    return !(/[()"/!]|\bAND\b|\bOR\b|\bNOT\b|[A-Za-z]+\s*(>=|<=|>|<|=|:)/.test(value) ||
+      /(?:^|\s)-(?=\S)/.test(value));
   }
 
   /**
@@ -827,8 +877,10 @@
       if (!note || note.deletedAt || !note.paperId) return;
       (ctx.notesByPaper[note.paperId] = ctx.notesByPaper[note.paperId] || []).push(note);
     });
+    var parsed = typeof astOrText === 'string' ? parseAst(astOrText) : null;
+    if (parsed && parsed.error) return [];
     var root = astOrText && typeof astOrText === 'object' && astOrText.root !== undefined
-      ? reviveAst(astOrText) : (typeof astOrText === 'string' ? parseAst(astOrText).root : astOrText);
+      ? reviveAst(astOrText) : (parsed ? parsed.root : astOrText);
     var scope = String(options.scope || 'annotation').toLowerCase();
     var groupOp = scope === 'annotation' ? 'ann' : scope === 'note' ? 'note' : scope === 'attachment' ? 'attachment' : null;
     var positiveTargets = groupOp && root ? collectPositiveTargets(root, groupOp, []) : [];
@@ -878,7 +930,9 @@
 
   function searchEntities(astOrText, workspace, options) {
     options = options || {};
-    var all = entityHits(astOrText, workspace, options);
+    var parsed = typeof astOrText === 'string' ? parseAst(astOrText) : null;
+    if (parsed && parsed.error) return { total: 0, page: 0, pageSize: 0, items: [], error: parsed.error };
+    var all = entityHits(parsed || astOrText, workspace, options);
     var pageSize = Number(options.pageSize);
     pageSize = Number.isFinite(pageSize) && pageSize > 0 ? Math.trunc(pageSize) : all.length || 1;
     var page = Number(options.page);
@@ -892,6 +946,7 @@
     parseAst: parseAst,
     compile: compile,
     serializeAst: serializeAst,
+    repairLegacyRegexAst: repairLegacyRegexAst,
     astToText: astToText,
     reviveAst: reviveAst,
     normalizeForSearch: normalizeForSearch,

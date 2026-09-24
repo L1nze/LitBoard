@@ -21,7 +21,6 @@
     var applyPortableConfigRuntime = options.applyPortableConfigRuntime;
     var fillSyncForm = options.fillSyncForm;
     var setSyncIndicator = options.setSyncIndicator;
-    var setIntegrationConfig = options.setIntegrationConfig;
     var isSyncBusy = options.isSyncBusy || function () { return false; };
     var download = options.download;
     var stamp = options.stamp || function () { return new Date().toISOString().slice(0, 10); };
@@ -49,6 +48,7 @@
     var pendingRemoteResolutions = {};
     var LOCAL_EMPTY_RESET_KEY = 'plan:local-empty-reset'; // 与主进程 integrations.js 保持一致
     var remotePlanApplying = false;
+    var remotePlanStopping = false;
 
     function remotePlanId(plan) {
       return plan && (plan.planId || plan.id || plan.token) || '';
@@ -426,7 +426,6 @@
         var paperCount = info && info.counts && info.counts.papers;
         var text = T('云端库文件存在 · ') + (paperCount == null ? T('文献数未知') : (paperCount + T(' 篇'))) +
           (info && info.fileUrl ? ' · ' + info.fileUrl : '');
-        if (info && info.config && info.config.exists) text += (info.config.locked ? T(' · 配置已加密（需配置密码）') : T(' · 含可恢复配置'));
         setSyncInlineStatus('sync-remote-status', text, 'success');
       }).catch(function (error) {
         setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
@@ -439,23 +438,6 @@
       desktop.createNutstoreSyncPlan({ config: syncFormValue(), workspace: workspacePayload(), mode: mode }).then(function (plan) {
         renderRemotePlan(plan || {});
         setSyncInlineStatus('sync-remote-status', T('已生成对照，请完成选择后应用'), 'warning');
-      }).catch(function (error) {
-        setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
-      });
-    }
-
-    function pullRemoteConfig() {
-      if (!desktop || !desktop.pullNutstoreConfig) { setSyncInlineStatus('sync-remote-status', T('当前版本不支持独立配置恢复'), 'error'); return; }
-      setSyncInlineStatus('sync-remote-status', T('正在恢复云端配置…'), 'pending');
-      desktop.pullNutstoreConfig(syncFormValue()).then(function (result) {
-        if (!result || !result.found) throw new Error(T('云端没有可用的加密配置'));
-        if (result.config) setIntegrationConfig(result.config);
-        if (result.config) {
-          applyPortableConfigRuntime(result.config);
-          fillSyncForm(result.config);
-        }
-        setSyncInlineStatus('sync-remote-status', T('配置恢复完成（文献库未改变）'), 'success');
-        toast(T('云端配置恢复完成'));
       }).catch(function (error) {
         setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
       });
@@ -512,6 +494,7 @@
 
     function resetRemotePlanProgressUi() {
       setRemotePlanApplying(false);
+      remotePlanStopping = false;
       var cancelButton = $('#sync-remote-plan-cancel');
       if (cancelButton) {
         cancelButton.disabled = false;
@@ -526,6 +509,7 @@
 
     function setRemotePlanCompleted(message) {
       remotePlanApplying = false;
+      remotePlanStopping = false;
       var progress = $('#sync-remote-plan-progress');
       var list = $('#sync-remote-plan-list');
       var filterInput = $('#sync-remote-plan-filter');
@@ -564,7 +548,9 @@
       if (remotePlanApplying) return;
       var planMode = pendingRemotePlan.mode;
       var button = $('#sync-remote-plan-apply'); button.disabled = true;
-      var cancelButton = $('#sync-remote-plan-cancel'); if (cancelButton) cancelButton.disabled = true;
+      remotePlanStopping = false;
+      var cancelButton = $('#sync-remote-plan-cancel');
+      if (cancelButton) { cancelButton.disabled = false; cancelButton.textContent = T('停止同步'); }
       setRemotePlanApplying(true);
       setRemotePlanProgress({ phase: 'verify', message: T('正在校验云端版本…') });
       setSyncInlineStatus('sync-remote-status', T('正在校验云端版本并应用…'), 'pending');
@@ -592,8 +578,25 @@
         setRemotePlanCompleted(label);
         toast(label);
       }).catch(function (error) {
+        var stopped = error && (error.code === 'SYNC_CANCELLED' || String(error.message || error).indexOf('同步已停止') !== -1);
         resetRemotePlanProgressUi();
         button.disabled = false;
+        setSyncInlineStatus('sync-remote-status', stopped
+          ? T('同步已停止；已上传附件下次可续传') : error && error.message || String(error),
+        stopped ? 'warning' : 'error');
+      });
+    }
+
+    function cancelOrCloseRemotePlan() {
+      if (!remotePlanApplying) { closeRemotePlanDialog(); return; }
+      if (remotePlanStopping || !desktop || !desktop.cancelNutstoreSync) return;
+      remotePlanStopping = true;
+      var button = $('#sync-remote-plan-cancel');
+      if (button) { button.disabled = true; button.textContent = T('正在停止…'); }
+      setRemotePlanProgress({ message: T('正在停止同步…') });
+      desktop.cancelNutstoreSync().catch(function (error) {
+        remotePlanStopping = false;
+        if (button) { button.disabled = false; button.textContent = T('停止同步'); }
         setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
       });
     }
@@ -601,10 +604,9 @@
 
     function bind() {
       $('#sync-remote-inspect').addEventListener('click', api.inspect);
-      $('#sync-remote-config').addEventListener('click', api.pullConfig);
       $('#sync-remote-restore').addEventListener('click', function () { api.createPlan('restore'); });
       $('#sync-remote-merge').addEventListener('click', function () { api.createPlan('merge'); });
-      $('#sync-remote-plan-cancel').addEventListener('click', api.close);
+      $('#sync-remote-plan-cancel').addEventListener('click', cancelOrCloseRemotePlan);
       $('#sync-remote-plan-apply').addEventListener('click', api.apply);
       $('#sync-remote-choose-local').addEventListener('click', function () {
         batchSetRemotePlanChoices('local');
@@ -658,7 +660,6 @@
       createPlan: createRemotePlan,
       handleProgress: handleSyncProgress,
       inspect: inspectRemote,
-      pullConfig: pullRemoteConfig,
       show: renderRemotePlan,
       showConflicts: showSyncConflicts,
       clearRefreshFormFlag: function () { refreshSyncFormAfterSync = false; },

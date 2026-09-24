@@ -40,6 +40,19 @@ test('tool schemas cover the base read-only tools with valid shape', function ()
   });
 });
 
+test('build_graph passes its originating session to the graph panel', async function () {
+  const shown = [];
+  const graph = { meta: { nodeCount: 1, edgeCount: 0, depth: 1, maxNodes: 60, communityCount: 1 } };
+  const t = LitAgent.createTools(makeDeps({
+    includeWrite: true,
+    buildGraph: true,
+    desktop: { researchGraph: async () => graph },
+    openGraphPanel: (data, sessionId) => shown.push({ data, sessionId })
+  }));
+  await t.execute('build_graph', { workIds: ['W1'] }, { sessionId: 'session-a' });
+  assert.deepEqual(shown, [{ data: graph, sessionId: 'session-a' }]);
+});
+
 test('search_library matches multi-term AND, skips deleted, caps results', async function () {
   const t = LitAgent.createTools(makeDeps());
   const out = JSON.parse(await t.execute('search_library', { query: 'battery 2023' }));
