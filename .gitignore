@@ -80,6 +80,8 @@ Desktop.ini
 /docs/roadmap.md
 /docs/releasing.md
 /docs/limitations.md
+# 录屏原件不随演示 GIF 一起发布。
+docs/assets/gif/*.mp4
 # ---------- 一次性探针与本地调试脚本 ----------
 /scripts/one-off/
 
