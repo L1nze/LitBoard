@@ -47,12 +47,23 @@ test('setData debounced flush survives restart-by-cache-drop', async function ()
   const data = await s.read(created.id);
   data.messages.push({ role: 'user', content: 'hello' });
   await s.setData(created.id, data);
-  await sleep(60); // 防抖落盘
-  const onDisk = JSON.parse(await fs.readFile(
-    path.join(root, '会话记录', created.dir, 'session.json'), 'utf8'));
+  // 防抖落盘是异步的：全量测试并行跑时 10ms 定时器会被拖后，固定 sleep(60) 会偶发早于落盘。
+  // 改为轮询等待（有上限），超时后再断言——失败时输出的仍是真实落盘状态。
+  const sessionFile = path.join(root, '会话记录', created.dir, 'session.json');
+  const deadline = Date.now() + 5000;
+  let onDisk = null;
+  let list = [];
+  for (;;) {
+    try { onDisk = JSON.parse(await fs.readFile(sessionFile, 'utf8')); } catch (error) { onDisk = null; }
+    list = await s.list();
+    if (onDisk && Array.isArray(onDisk.messages) && onDisk.messages.length === 1 &&
+        list[0] && list[0].msgCount === 1) break;
+    if (Date.now() > deadline) break;
+    await sleep(20);
+  }
+  assert.ok(onDisk, 'session.json 应在防抖窗口后落盘');
   assert.equal(onDisk.messages.length, 1);
-  const list = await s.list();
-  assert.equal(list[0].msgCount, 1);
+  assert.equal(list[0] && list[0].msgCount, 1);
 });
 
 test('rename moves folder, keeps stable id, updates index', async function () {
