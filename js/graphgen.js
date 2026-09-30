@@ -35,19 +35,16 @@
   var LAYOUT = { seed: 42, iterations: 200, iterationsLarge: 100, k: 2, pixel: 90 };
   var HIGHLIGHT = '#1d4ed8';
 
-  /* 年份顺序色阶 / 社区辅助色 / 连线基色。节点颜色只编码年份；社区色保留给
-   * 兼容调用与后续辅助视图，社区本身仍参与线强度与详情统计。 */
+  /* 年份顺序色阶 / 连线基色。节点颜色只编码年份；社区本身仍参与线强度与详情统计。 */
   var PALETTES = {
     light: {
       yearRamp: ['#dbeafe', '#bfdbfe', '#93c5fd', '#60a5fa', '#2563eb'],
-      community: ['#1d4ed8', '#2563eb', '#3b82f6', '#60a5fa', '#1e40af', '#0ea5e9', '#38bdf8', '#7dd3fc'],
       edge: [71, 105, 157], fallback: '#7b91aa',
       border: '#93b4dc', hoverBorder: '#1d4ed8',
       label: '#1b2a30', labelStroke: 'rgba(255,255,255,0.92)', highlight: HIGHLIGHT
     },
     dark: {
       yearRamp: ['#172554', '#1e3a8a', '#1d4ed8', '#3b82f6', '#93c5fd'],
-      community: ['#93c5fd', '#60a5fa', '#3b82f6', '#bfdbfe', '#2563eb', '#7dd3fc', '#38bdf8', '#a5b4fc'],
       edge: [133, 170, 221], fallback: '#93a8c4',
       border: '#527db5', hoverBorder: '#bfdbfe',
       label: '#e4eef0', labelStroke: 'rgba(16,24,26,0.9)', highlight: '#60a5fa'
@@ -847,14 +844,6 @@
     return sizes;
   }
 
-  /** 引文社区 → 离散分类色；无社区时使用中性回退色。 */
-  function communityColor(community, paletteName) {
-    var pal = paletteOf(paletteName);
-    var index = Number(community);
-    if (!isFinite(index) || index < 0) return pal.fallback;
-    return pal.community[Math.floor(index) % pal.community.length];
-  }
-
   function edgeRgba(palette, alpha) {
     var rgb = paletteOf(palette).edge;
     return 'rgba(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ',' + alpha.toFixed(3) + ')';
@@ -1401,7 +1390,6 @@
     legendHtml: legendHtml,
     metaSummary: metaSummary,
     nodeSizes: nodeSizes,
-    communityColor: communityColor,
     rampColor: rampColor,
     yearBarCss: yearBarCss,
     edgeStrengths: edgeStrengths,

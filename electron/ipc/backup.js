@@ -37,17 +37,6 @@ function register() {
     return { backupDir: directory, backup: backup };
   });
   ctx.handle('backup:run', function () { return ctx.backupManager.createSnapshot(); });
-  ctx.handle('backup:set-keep', function (_event, value) {
-    try {
-      ctx.dataPathState = ctx.dataPathManager.stageBackupKeep(value);
-      return { ok: true, keepSnapshots: ctx.dataPathState.backupKeep };
-    } catch (error) {
-      return { ok: false, error: String(error && error.message || error) };
-    }
-  });
-  // 遗留文件清理：扫描只读，清理只删扫描列出的东西（详见 backup.js 的 scanLeftovers 注释）
-  ctx.handle('backup:scan-leftovers', function () { return ctx.backupManager.scanLeftovers(); });
-  ctx.handle('backup:clean-leftovers', function () { return ctx.backupManager.cleanLeftovers(); });
   ctx.handle('backup:restore', async function (_event, snapshotId) {
     // 手动恢复：先以当前库成功创建紧急快照，再校验所选快照、还原并重启应用
     // 紧急快照不参与本次轮换，确保用户选择的旧快照不会在恢复前被删掉。

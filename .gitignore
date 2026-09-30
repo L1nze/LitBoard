@@ -95,4 +95,5 @@ docs/assets/gif/*.mp4
 !/test/library-crud.test.js
 !/test/pdf-open-race.test.js
 !/test/paper-folder-drag.test.js
+!/test/research-fetch-page.test.js
 .zcodeignore

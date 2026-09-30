@@ -317,6 +317,7 @@ function createResearchDb(options) {
       // 重新分词，且 fulltext 列还要回读侧表（最多 40 万字符）。检索类工具一次调用会 upsert
       // 上百行（find_literature 的每条召回都过这里），这笔开销是「Agent 一调工具就卡」的主要来源之一
       const readPrevious = works.prepare('SELECT title, abstract, snippet FROM works WHERE id = ?');
+      const vecHashRead = vec ? vec.prepare('SELECT content_hash FROM vecs WHERE work_id = ?') : null;
       const extInsert = works.prepare('INSERT OR IGNORE INTO ext_ids(work_id, kind, value) VALUES(?, ?, ?)');
       const staleVecIds = [];
       list.forEach(function (row) {
@@ -339,7 +340,7 @@ function createResearchDb(options) {
           title: merged.title || '', abstract: merged.abstract || '',
           concepts: parseJsonArray(merged.concepts_json), keywords: parseJsonArray(merged.keywords_json)
         });
-        const before = vec ? vec.prepare('SELECT content_hash FROM vecs WHERE work_id = ?').get(c.id) : null;
+        const before = vecHashRead ? vecHashRead.get(c.id) : null;
         if (before && before.content_hash !== hash) staleVecIds.push(c.id);
         LitResearch.extIdsForRow({ id: c.id, doi: c.doi }).forEach(function (ext) {
           extInsert.run(c.id, ext.kind, ext.value);

@@ -16,9 +16,6 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   getBackupStatus: function () { return ipcRenderer.invoke('backup:status'); },
   chooseBackupDir: function () { return ipcRenderer.invoke('backup:choose-dir'); },
   backupNow: function () { return ipcRenderer.invoke('backup:run'); },
-  setBackupKeep: function (value) { return ipcRenderer.invoke('backup:set-keep', value); },
-  scanBackupLeftovers: function () { return ipcRenderer.invoke('backup:scan-leftovers'); },
-  cleanBackupLeftovers: function () { return ipcRenderer.invoke('backup:clean-leftovers'); },
   restoreBackup: function (snapshotId) { return ipcRenderer.invoke('backup:restore', snapshotId); },
   openBackupDir: function () { return ipcRenderer.invoke('backup:open-dir'); },
   getSetting: function (key) { return ipcRenderer.invoke('settings:get', key); },
@@ -82,7 +79,6 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   chooseFiles: function (options) { return ipcRenderer.invoke('files:choose-files', options); },
   renameFile: function (options) { return ipcRenderer.invoke('files:rename', options); },
   writePdf: function (options) { return ipcRenderer.invoke('files:write-pdf', options); },
-  saveAnnotationImage: function (options) { return ipcRenderer.invoke('files:save-annotation-image', options); },
   storeNoteImage: function (options) { return ipcRenderer.invoke('files:store-note-image', options); },
   pdfSearchMeta: function () { return ipcRenderer.invoke('pdfsearch:meta'); },
   pdfSearchPut: function (value) { return ipcRenderer.invoke('pdfsearch:put', value); },
@@ -96,12 +92,6 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   researchSearchScopus: function (input) { return ipcRenderer.invoke('research:search-scopus', input); },
   researchGetWorks: function (ids) { return ipcRenderer.invoke('research:get-works', ids); },
   researchStats: function () { return ipcRenderer.invoke('research:stats'); },
-  researchImportHarness: function () { return ipcRenderer.invoke('research:import-harness'); },
-  onResearchImportProgress: function (handler) {
-    var listener = function (_event, payload) { handler(payload); };
-    ipcRenderer.on('research:import-progress', listener);
-    return function () { ipcRenderer.removeListener('research:import-progress', listener); };
-  },
   agentChat: function (input) { return ipcRenderer.invoke('agent:chat', input); },
   agentCancel: function (sessionId) { return ipcRenderer.invoke('agent:cancel', sessionId); },
   agentTest: function (input) { return ipcRenderer.invoke('agent:test', input); },
@@ -177,7 +167,6 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
     return ipcRenderer.invoke('pdfsearch:get-pages', { paperId: paperId, attachmentId: attachmentId || '', legacyFallback: legacyFallback === true });
   },
   pdfSearchGetPageRange: function (input) { return ipcRenderer.invoke('pdfsearch:get-page-range', input); },
-  chooseSavePath: function (options) { return ipcRenderer.invoke('files:choose-save-path', options); },
   fetchCslStyle: function (styleId) { return ipcRenderer.invoke('csl:fetch-style', styleId); },
   downloadPdf: function (options) { return ipcRenderer.invoke('pdf:download', options); },
   onDownloadProgress: function (callback) {
