@@ -24,7 +24,13 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   stageDataPaths: function (value) { return ipcRenderer.invoke('data-paths:stage', value); },
   getAppVersion: function () { return ipcRenderer.invoke('app:get-version'); },
   checkAppUpdate: function () { return ipcRenderer.invoke('app:check-update'); },
-  downloadAppUpdate: function () { return ipcRenderer.invoke('app:download-update'); },
+  getAppUpdateStatus: function () { return ipcRenderer.invoke('app:update-status'); },
+  applyAppUpdate: function () { return ipcRenderer.invoke('app:apply-update'); },
+  onAppUpdateStatus: function (handler) {
+    var listener = function (_event, payload) { handler(payload); };
+    ipcRenderer.on('update:status', listener);
+    return function () { ipcRenderer.removeListener('update:status', listener); };
+  },
   relaunchApp: function () { return ipcRenderer.invoke('app:relaunch'); },
   chooseImportFiles: function () { return ipcRenderer.invoke('files:choose-import'); },
   saveFile: function (options) { return ipcRenderer.invoke('files:save', options); },

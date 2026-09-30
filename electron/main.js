@@ -1,6 +1,7 @@
 'use strict';
 
 const { app, BrowserWindow, dialog, ipcMain, net, safeStorage, shell } = require('electron');
+const { spawn } = require('node:child_process');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { createLibraryStorage } = require('./storage.js');
@@ -16,6 +17,7 @@ const { createSessions } = require('./sessions.js');
 const { createDataPathManager } = require('./data-paths.js');
 const { createBackupManager } = require('./backup.js');
 const { createWebFetchNet } = require('./webfetch-net.js');
+const { createUpdateManager } = require('./update-check.js');
 /* 界面语言：与渲染层共用 js/i18n.js + js/i18n-en.js（UMD 双出口）。
  * 键 = 中文源串；语言存 settings 表 uiLang（渲染层切换时经 settings:set 写入）。 */
 const LitI18n = require('../js/i18n.js');
@@ -387,7 +389,8 @@ function createWindow() {
               !!document.querySelector('a[href="https://dev.elsevier.com/apikey/create"]') &&
               !!document.querySelector('a[href="https://agent.tinyfish.ai/"]'),
             updateCheckPresent: !!window.litboardDesktop.checkAppUpdate &&
-              !!window.litboardDesktop.downloadAppUpdate &&
+              !!window.litboardDesktop.getAppUpdateStatus &&
+              !!window.litboardDesktop.applyAppUpdate &&
               !!document.querySelector('#settings-check-update'),
             // PDF 阅读助手（期一）：agent 的按页读取/批注工具 + 页区间 IPC
             //（阅读器「AI 解释」按钮已于 2026-09-20 整体移除，用户反馈无实际作用）
@@ -2216,6 +2219,52 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
     });
   }, 60 * 60 * 1000);
   registerAll();
+  // 应用自动更新：发现更高版本即后台预下载安装包（SHA-256 校验 + 单份缓存），
+  // 就绪后通知渲染层；点「立即更新」直接拉起 NSIS 安装界面并退出本应用。
+  ctx.updateManager = createUpdateManager({
+    getConfigDir: function () { return ctx.dataPathState.configDir; },
+    currentVersion: app.getVersion(),
+    isPackaged: app.isPackaged,
+    isPortable: !!process.env.PORTABLE_EXECUTABLE_FILE,
+    fetchRelease: async function () {
+      const response = await net.fetch('https://api.github.com/repos/L1nze/LitBoard/releases/latest', {
+        headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'LitBoard' },
+        signal: AbortSignal.timeout(10000)
+      });
+      if (response.status === 404) return null; // 尚未发布正式 Release
+      if (!response.ok) throw new Error('GitHub Release: HTTP ' + response.status);
+      return response.json();
+    },
+    fetchText: async function (url) {
+      const response = await net.fetch(url, { headers: { 'User-Agent': 'LitBoard' }, signal: AbortSignal.timeout(30000) });
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.text();
+    },
+    netFetch: function (url, init) { return net.fetch(url, init); },
+    spawnInstaller: function (file) {
+      spawn(file, [], { detached: true, stdio: 'ignore' }).unref();
+    },
+    revealPath: function (file) { shell.showItemInFolder(file); },
+    requestQuit: function () {
+      setImmediate(function () {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+        else app.quit();
+      });
+    },
+    sendStatus: function (status) {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('update:status', status);
+    },
+    log: startupLog
+  });
+  // 启动清扫（含「装完新版自动删安装包」）后静默自检一次；离线/失败只落日志不打扰
+  ctx.updateManager.init().then(function () {
+    const updateTimer = setTimeout(function () {
+      ctx.updateManager.checkNow().catch(function (error) {
+        startupLog('auto update check failed: ' + (error && error.message || error));
+      });
+    }, 8000);
+    if (updateTimer.unref) updateTimer.unref();
+  }).catch(function (error) { startupLog('update manager init failed: ' + (error && error.message || error)); });
   // 浏览器扩展桥接服务（仅 127.0.0.1）
   // 主进程网络出口：OpenAlex DOI 补全（api.openalex.org）；知网 PDF 走的浏览器会话，不直连知网。
   ctx.bridgeServer = createBridgeServer({

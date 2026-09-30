@@ -8924,24 +8924,71 @@
   }
   function closeBridgePanel() { $('#bridge-panel-mask').hidden = true; }
 
+  // 应用更新：主进程在后台预下载并校验安装包（状态机见 electron/update-check.js），
+  // 这里只把状态映射成按钮与提醒；就绪的 toast 按版本去重，重启后仍能再次提醒。
+  var appUpdateState = null;
+  var appUpdateToastKey = '';
+
+  function applyAppUpdate() {
+    if (!desktop || !desktop.applyAppUpdate) return;
+    desktop.applyAppUpdate().then(function (result) {
+      if (result && result.ok && result.mode === 'installer') {
+        toast(T('正在退出并启动安装程序…'));
+      } else if (result && result.ok && result.mode === 'reveal') {
+        toast(T('便携版已下载到本机，关闭 LitBoard 后用新文件替换旧文件即可完成更新。'), 8000);
+      } else {
+        toast(T('更新尚未就绪，请先检查更新'));
+      }
+    }).catch(function (error) {
+      toast(T('⚠ 启动安装程序失败：') + (error && error.message || error));
+    });
+  }
+
+  function describeUpdateStatus(status, manual) {
+    if (!status) return;
+    appUpdateState = status;
+    var button = $('#settings-check-update');
+    if (status.packaged === false) { if (manual) toast(T('当前已是最新版本')); return; }
+    if (status.status === 'ready') {
+      if (button) button.textContent = T('立即更新 ') + status.version;
+      var readyKey = 'ready:' + status.version;
+      if (appUpdateToastKey !== readyKey) {
+        appUpdateToastKey = readyKey;
+        toast(T('LitBoard 新版本 ') + status.version + T(' 已下载完成，点击即可更新'), 30000, {
+          label: T('立即更新'),
+          fn: applyAppUpdate
+        });
+      }
+    } else if (status.status === 'downloading') {
+      var pct = status.progress && status.progress.total
+        ? Math.floor(100 * status.progress.done / status.progress.total) + '%'
+        : '…';
+      if (button) button.textContent = T('下载新版 ') + status.version + '（' + pct + '）';
+      if (manual) toast(T('发现 LitBoard 新版本 ') + status.version + T('，正在后台下载安装包…'));
+    } else if (status.status === 'available') {
+      if (button) button.textContent = T('下载新版 ') + status.version;
+      var availKey = 'available:' + status.version;
+      if (appUpdateToastKey !== availKey) {
+        appUpdateToastKey = availKey;
+        toast(T('发现 LitBoard 新版本 ') + status.version + T('，正在后台下载安装包…'), 8000);
+      }
+    } else if (status.status === 'checking') {
+      if (button) button.textContent = T('检查更新') + '…';
+    } else if (status.status === 'up-to-date') {
+      if (button) button.textContent = T('检查更新');
+      if (manual) toast(T('当前已是最新版本'));
+    } else if (status.status === 'error') {
+      if (button) button.textContent = T('检查更新');
+      if (manual) toast(T('⚠ 检查更新失败：') + (status.error || ''));
+    }
+  }
+
   function checkForAppUpdate(manual) {
     if (!desktop || !desktop.checkAppUpdate) return;
     var button = $('#settings-check-update');
     if (manual && button) button.disabled = true;
-    desktop.checkAppUpdate().then(function (result) {
-      if (result && result.version) {
-        toast(T('发现 LitBoard 新版本 ') + result.version, 30000, {
-          label: T('下载新版'),
-          fn: function () {
-            desktop.downloadAppUpdate().catch(function (error) {
-              toast(T('⚠ 无法打开下载链接：') + (error && error.message || error));
-            });
-          }
-        });
-        if (button) button.textContent = T('下载新版 ') + result.version;
-      } else if (manual) {
-        toast(T('当前已是最新版本'));
-      }
+    desktop.checkAppUpdate().then(function (status) {
+      describeUpdateStatus(status, manual);
     }).catch(function (error) {
       if (manual) toast(T('⚠ 检查更新失败：') + (error && error.message || error));
     }).finally(function () { if (button) button.disabled = false; });
@@ -9633,12 +9680,8 @@
     });
     $('#sync-close').addEventListener('click', closeSyncSettings);
     $('#settings-check-update').addEventListener('click', function () {
-      var button = $('#settings-check-update');
-      if (button.textContent.indexOf(T('下载新版 ')) === 0) {
-        desktop.downloadAppUpdate().catch(function (error) {
-          toast(T('⚠ 无法打开下载链接：') + (error && error.message || error));
-        });
-      } else checkForAppUpdate(true);
+      if (appUpdateState && appUpdateState.status === 'ready') applyAppUpdate();
+      else checkForAppUpdate(true);
     });
     // 设置项改动即自动保存：文本输入在失焦/回车时（change），勾选与下拉即时
     ['sync-nutstore-url', 'sync-nutstore-user', 'sync-nutstore-password', 'sync-nutstore-folder',
@@ -12165,7 +12208,14 @@
       renderPdfTabs();
       reportCurrentFolder(); // 启动时同步一次当前文件夹给浏览器扩展
       window.litboardReadyAt = performance.now();
-      if (desktop && desktop.checkAppUpdate) setTimeout(function () { checkForAppUpdate(false); }, 3000);
+      // 主进程启动后 8s 自动检查并在后台预下载；这里订阅状态并取一次当前快照
+      //（覆盖「重启时安装包早已就绪」的场景——那时没有新事件，只能主动查）。
+      if (desktop && desktop.onAppUpdateStatus) {
+        desktop.onAppUpdateStatus(function (status) { describeUpdateStatus(status, false); });
+        desktop.getAppUpdateStatus().then(function (status) {
+          describeUpdateStatus(status, false);
+        }).catch(function () {});
+      }
     });
   }
   if (desktop && desktop.isSmokeTest) window.litboardSmokeImportFolder = importDroppedFolder;

@@ -36,6 +36,7 @@ const ctx = {
   agentNet: null,
   agentSessions: null,
   webFetchNet: null,
+  updateManager: null,
   // —— 跨域共享标志 ——
   forceQuitNext: false,
   syncInFlight: false,

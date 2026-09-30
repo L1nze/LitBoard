@@ -17,6 +17,7 @@ const pdfsearchDomain = require('./pdfsearch.js');
 const researchDomain = require('./research.js');
 const agentDomain = require('./agent.js');
 const apiDomain = require('./api.js');
+const updateDomain = require('./update.js');
 
 function registerAll() {
   windowDomain.register();
@@ -31,6 +32,7 @@ function registerAll() {
   researchDomain.register();
   agentDomain.register();
   apiDomain.register();
+  updateDomain.register();
 }
 
 module.exports = { registerAll: registerAll };

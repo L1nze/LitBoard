@@ -26,7 +26,10 @@ const RUNTIME_CONFIG_ENTRIES = new Set([
   // Chromium 的进程单例锁（Windows 形态就是 userData 根下的一个 0 字节 lockfile）。
   // 它每次启动重建、迁移过去只会变成死文件，删不掉也不该算清理失败——但也不能就此不管，
   // 否则旧目录会永久留一个 lockfile 小尾巴（见 runRuntimeSweep 的补偿删除）。
-  'lockfile'
+  'lockfile',
+  // 应用自动更新的安装包缓存（update-check.js）：可再下载的运行时产物——迁移不复制
+  // （上百 MB 没必要跟着搬），旧目录清扫时按运行时条目删除，不做完整性记账。
+  'update-cache'
 ]);
 // 这些名字在当前进程运行期间被自己持有：当被清理的目录正是默认目录时既不删也不记账
 // （删掉会让第二个实例误判自己独占，且它必然删不动）。
