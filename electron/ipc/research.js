@@ -4,7 +4,6 @@
  * 临时全文链、网页检索、段落找文献、引文网络（自 main.js registerIpc 平移）。
  * scheduleAutoEmbed 导出给 main.js 启动装配的 60s 空闲巡检 setInterval 用。 */
 
-const { app, dialog } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { storeFileInto } = require('../integrations.js');
@@ -362,29 +361,6 @@ function register() {
     };
   });
 
-  ctx.handle('research:import-harness', async function (event) {
-    if (!ctx.researchDb) throw new Error(ctx.T('调研库未就绪'));
-    let file = path.join(app.getPath('home'), '.AI-CACHE', 'openalex', 'library.db');
-    try { require('node:fs').accessSync(file); } catch (error) {
-      const picked = await dialog.showOpenDialog(ctx.mainWindow, {
-        title: ctx.T('选择 literature-mcp 调研库文件（library.db）'),
-        properties: ['openFile'],
-        filters: [{ name: 'SQLite', extensions: ['db', 'sqlite', 'sqlite3'] }]
-      });
-      if (picked.canceled || !picked.filePaths[0]) return { canceled: true };
-      file = picked.filePaths[0];
-    }
-    const result = await ctx.researchDb.importFromHarness(file, function (progress) {
-      if (event.sender && !event.sender.isDestroyed()) {
-        event.sender.send('research:import-progress', progress);
-      }
-    });
-    ctx.startupLog('research harness import done: ' + JSON.stringify(result));
-    // 导入后的存量清扫：历史遗留缺摘要条目（含本次导入）也进自动回填（按引用数优先，≤25/批）
-    scheduleAutoBackfill(ctx.researchDb.findWorksNeedingAbstract({ limit: 25 }));
-    return result;
-  });
-
   /* Semantic Scholar 相关度检索（R16）：结果按 DOI/s2 标识归位后入库调研库，
    * 与 OpenAlex 互补（S2 的引用数与被引语境常与 OpenAlex 不同；OA PDF 直链来自 openAccessPdf）。 */
   ctx.handle('research:search-semanticscholar', async function (_event, input) {
@@ -722,9 +698,8 @@ function register() {
     const sessionId = String(input && input.sessionId || '');
     // 续读（offset>0）只取正文片段：快照附件在首次抓取（offset=0）时创建，不重复挂载
     if (paperId && offset === 0) {
-      const state = await ctx.libraryDb.loadState();
-      const paper = (state.papers || []).filter(function (p) { return p.id === paperId && !p.deletedAt; })[0];
-      if (!paper) return { ok: false, error: ctx.T('未找到该正式库文献：') + paperId };
+      const paper = await ctx.libraryDb.getPaper(paperId);
+      if (!paper || paper.deletedAt) return { ok: false, error: ctx.T('未找到该正式库文献：') + paperId };
       const crypto = require('node:crypto');
       const attId = 'att' + crypto.randomBytes(10).toString('hex');
       const dir = path.join(itemAttachmentDir(ctx.dataPathState.configDir, paperId), attId + '.snapshot');

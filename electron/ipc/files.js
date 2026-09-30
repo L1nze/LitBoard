@@ -292,16 +292,6 @@ function register() {
     return { updated: updated, failed: failed };
   });
 
-  // 选择自动导出 .bib 的目标文件
-  ctx.handle('files:choose-save-path', async function (_event, options) {
-    const result = await dialog.showSaveDialog(ctx.mainWindow, {
-      title: options && options.title ? String(options.title) : ctx.T('选择文件'),
-      defaultPath: options && options.name ? options.name : 'library.bib',
-      filters: options && Array.isArray(options.filters) ? options.filters : undefined
-    });
-    return result.canceled || !result.filePath ? '' : result.filePath;
-  });
-
   // 在线获取 CSL 样式（缓存到配置目录/csl-styles/）
   ctx.handle('csl:fetch-style', async function (_event, styleId) {
     const id = String(styleId || '').trim().toLowerCase();
@@ -341,21 +331,6 @@ function register() {
     } catch (error) {
       return { error: String(error && error.message || error) };
     }
-  });
-
-  // 批注截图等图片附件保存到配置目录/annotation-images/
-  ctx.handle('files:save-annotation-image', async function (_event, options) {
-    try {
-      const name = String(options && options.name || '').replace(/[^A-Za-z0-9_-]/g, '');
-      const dataUrl = String(options && options.dataUrl || '');
-      const match = dataUrl.match(/^data:image\/png;base64,(.+)$/);
-      if (!name || !match) return { error: ctx.T('无效的图片数据') };
-      const dir = path.join(ctx.dataPathState.configDir, 'annotation-images');
-      await fs.mkdir(dir, { recursive: true });
-      const target = path.join(dir, name + '.png');
-      await fs.writeFile(target, Buffer.from(match[1], 'base64'));
-      return { path: target };
-    } catch (error) { return { error: String(error && error.message || error) }; }
   });
 
   // 笔记图片入库：复制/解码写入 <配置目录>/note-assets/<noteId>/（受管目录，登记过路径迁移/备份/同步）

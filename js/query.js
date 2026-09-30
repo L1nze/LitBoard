@@ -343,30 +343,77 @@
 
   // ---------- 求值 ----------
   var TEXT_HAY_FIELDS = ['key', 'title', 'authors', 'venue', 'abstract', 'notes', 'tags'];
+  /* 缓存硬约束（本节三条缓存共用）：① 键 = id+updatedAt 依赖「改内容必抬 updatedAt」不变量
+   * （lastReadAt 不进 haystack 字段，不受影响）；值内存 paper 引用，同 id 同版本的另一实例不串缓存。
+   * ② notes 非文献自身字段，按「活跃笔记引用 + 各自 updatedAt 的有序快照」校验——编辑较早笔记、
+   * 换引用、换序都会失效，重建 notesByPaper（笔记引用不变）照常命中。③ save 落库调 clearHaystackCache() 兜底清空。 */
   // 万级文献库一次全文搜索就会写满缓存：容量按规模放大，淘汰改为逐条最旧先出，
   // 不再用「超限即整表清空」——那会让同一次遍历的后半程全部 miss、下一次搜索重建一半。
   var HAY_CACHE_MAX = 20000;
-  var hayCache = new (typeof Map !== 'undefined' ? Map : Object)();
-  function haystack(paper, fields, useCache) {
-    var cacheable = !!(useCache && paper.id && paper.updatedAt != null);
-    if (cacheable) {
-      var key = paper.id + ':' + (paper.updatedAt || 0);
-      var hit = hayCache.get ? hayCache.get(key) : hayCache[key];
-      if (hit) return hit;
+  function notesSigOf(list) {
+    if (list == null) return null; // null = 无笔记上下文（区别于「有上下文但活跃笔记为空」的 []）
+    var sig = [];
+    for (var i = 0; i < list.length; i++) {
+      sig.push({ ref: list[i], updatedAt: (list[i] && list[i].updatedAt) || 0 });
     }
-    var value = normalizeForSearch(fields.map(function (f) {
-      var v = paper[f];
+    return sig;
+  }
+  function notesSigMatch(stored, list) {
+    if (stored == null && list == null) return true;   // 两边都无 notes 上下文
+    if (!stored || !list || stored.length !== list.length) return false;
+    for (var i = 0; i < stored.length; i++) {
+      var n = list[i];
+      if (!n || stored[i].ref !== n || stored[i].updatedAt !== (n.updatedAt || 0)) return false;
+    }
+    return true;
+  }
+  function cacheGet(store, key) {
+    if (store.get) {
+      var v = store.get(key);
+      return v === undefined ? null : v; // 空串是合法缓存值（全空字段），不能用真值判断
+    }
+    return Object.prototype.hasOwnProperty.call(store, key) ? store[key] : null;
+  }
+  function cachePut(store, key, value, max) {
+    if (store.set) {
+      if (store.size >= max) {
+        var oldest = store.keys().next().value;
+        if (oldest !== undefined) store.delete(oldest);
+      }
+      store.set(key, value);
+    } else store[key] = value;
+  }
+  var hayCache = new (typeof Map !== 'undefined' ? Map : Object)();
+  function buildHaystackValue(target, fields) {
+    return normalizeForSearch(fields.map(function (f) {
+      var v = target[f];
       return Array.isArray(v) ? v.join(' ') : text(v);
     }).join(' '));
-    if (cacheable) {
-      if (hayCache.set) {
-        if (hayCache.size >= HAY_CACHE_MAX) {
-          var oldest = hayCache.keys().next().value;
-          if (oldest !== undefined) hayCache.delete(oldest);
-        }
-        hayCache.set(key, value);
-      } else hayCache[key] = value;
+  }
+  function haystack(paper, fields, useCache) {
+    var cacheable = !!(useCache && paper.id && paper.updatedAt != null);
+    var key = cacheable ? paper.id + ':' + (paper.updatedAt || 0) : null;
+    if (key != null) {
+      var hit = cacheGet(hayCache, key);
+      if (hit !== null && hit.paperRef === paper) return hit.value;
     }
+    var value = buildHaystackValue(paper, fields);
+    if (key != null) cachePut(hayCache, key, { paperRef: paper, value: value }, HAY_CACHE_MAX);
+    return value;
+  }
+  /* AST text 条件的 notes 投影 haystack（ctx.notesByPaper 存在时）：
+   * 独立缓存 + notes 签名，避免每次条件求值都克隆 paper 并重拼全部笔记。 */
+  var notesHayCache = new (typeof Map !== 'undefined' ? Map : Object)();
+  function projectedHaystack(paper, ctx) {
+    var list = (ctx.notesByPaper && ctx.notesByPaper[paper.id]) || [];
+    var key = paper.id && paper.updatedAt != null
+      ? paper.id + ':' + (paper.updatedAt || 0) : null;
+    if (key != null) {
+      var hit = cacheGet(notesHayCache, key);
+      if (hit !== null && hit.paperRef === paper && notesSigMatch(hit.notesSig, list)) return hit.value;
+    }
+    var value = buildHaystackValue(Object.assign({}, paper, { notes: noteSearchText(paper, ctx) }), TEXT_HAY_FIELDS);
+    if (key != null) cachePut(notesHayCache, key, { paperRef: paper, notesSig: notesSigOf(list), value: value }, HAY_CACHE_MAX);
     return value;
   }
   /** 正则专用：原始（未规范化）小写 haystack —— 正则不做 Unicode 折叠，模式与原文字符对应 */
@@ -376,7 +423,11 @@
       return Array.isArray(v) ? v.join(' ') : text(v);
     }).join(' ').toLowerCase();
   }
-  function clearHaystackCache() { if (hayCache.clear) hayCache.clear(); else hayCache = {}; }
+  function clearHaystackCache() {
+    if (hayCache.clear) hayCache.clear(); else hayCache = {};
+    if (notesHayCache.clear) notesHayCache.clear(); else notesHayCache = {};
+    if (plainFieldCache.clear) plainFieldCache.clear(); else plainFieldCache = {};
+  }
 
   /* 普通关键词检索的相关度层：布尔命中语义仍是「所有词可分布在任意元数据字段」，
    * 这里只根据命中字段给结果排序，并返回一段可解释的上下文。高级语法不走此层。 */
@@ -391,14 +442,18 @@
   ];
 
   function plainSearchTerms(input) {
+    // 查询词纯粹由输入串决定：按「上一次输入」记忆，避免逐篇文献重复规范化查询本身
+    if (plainTermsMemo.terms && plainTermsMemo.input === input) return plainTermsMemo.terms;
     var normalized = normalizeForSearch(input).trim();
-    if (!normalized) return [];
+    if (!normalized) { plainTermsMemo = { input: input, terms: [] }; return []; }
     var seen = {};
-    return normalized.split(/\s+/).filter(function (term) {
+    var terms = normalized.split(/\s+/).filter(function (term) {
       if (!term || seen[term]) return false;
       seen[term] = true;
       return true;
     });
+    plainTermsMemo = { input: input, terms: terms };
+    return terms;
   }
 
   function plainFieldText(paper, key) {
@@ -427,6 +482,36 @@
     return (start > 0 ? '…' : '') + raw.slice(start, end) + (end < raw.length ? '…' : '');
   }
 
+  /* 普通关键词检索的逐字段规范化缓存（按篇一条记录）：键 = id+updatedAt + paper 引用，
+   * notes 另带引用快照签名（契约见上）。记录只读——score 等查询相关量不写入；raw 供命中说明取用。 */
+  var plainFieldCache = new (typeof Map !== 'undefined' ? Map : Object)();
+  var plainTermsMemo = { input: null, terms: null };
+  function plainFieldValues(paper, ctx) {
+    var hasNotesCtx = !!(ctx && (ctx.notesByPaper || Array.isArray(ctx.notes)));
+    var notesList = hasNotesCtx ? activeNotesFor(paper, ctx) : null; // null = 无笔记上下文（投影用 paper.notes）
+    var key = paper && paper.id && paper.updatedAt != null
+      ? paper.id + ':' + (paper.updatedAt || 0) : null;
+    var rec = key != null ? cacheGet(plainFieldCache, key) : null;
+    if (rec && rec.paperRef === paper && notesSigMatch(rec.notesSig, notesList)) return rec.values;
+    var samePaper = !!(rec && rec.paperRef === paper);
+    var values = samePaper ? rec.values : {};
+    PLAIN_SEARCH_FIELDS.forEach(function (spec) {
+      if (samePaper && spec.key !== 'notes') return; // 记录其余字段仍有效，只重算 notes
+      var raw = spec.key === 'notes'
+        ? (notesList
+          ? notesList.map(function (n) { return text(n.title) + ' ' + text(n.content); }).join(' ')
+          : text(paper && paper.notes))
+        : plainFieldText(paper, spec.key);
+      values[spec.key] = { raw: raw, normalized: normalizeForSearch(raw) };
+    });
+    if (samePaper) rec.notesSig = notesSigOf(notesList);
+    else if (key != null) {
+      cachePut(plainFieldCache, key,
+        { paperRef: paper, notesSig: notesSigOf(notesList), values: values }, HAY_CACHE_MAX);
+    }
+    return values;
+  }
+
   /**
    * 普通关键词查询 → {matched, score, field, snippet, fields}。
    * 标题 > 标签/标识 > 作者/期刊 > 摘要 > 笔记；同字段完整短语另加权。
@@ -434,13 +519,9 @@
   function rankPlainText(paper, input, ctx) {
     var terms = plainSearchTerms(input);
     if (!terms.length) return { matched: true, score: 0, field: '', snippet: '', fields: [] };
-    var values = {};
+    var values = plainFieldValues(paper, ctx);
     var all = '';
-    PLAIN_SEARCH_FIELDS.forEach(function (spec) {
-      var raw = spec.key === 'notes' ? noteSearchText(paper, ctx) : plainFieldText(paper, spec.key);
-      values[spec.key] = { raw: raw, normalized: normalizeForSearch(raw), score: 0 };
-      all += ' ' + values[spec.key].normalized;
-    });
+    PLAIN_SEARCH_FIELDS.forEach(function (spec) { all += ' ' + values[spec.key].normalized; });
     var matched = terms.every(function (term) { return all.indexOf(term) !== -1; });
     if (!matched) return { matched: false, score: 0, field: '', snippet: '', fields: [] };
     var phrase = terms.join(' ');
@@ -454,14 +535,14 @@
       var count = 0;
       terms.forEach(function (term) { if (value.normalized.indexOf(term) !== -1) count++; });
       if (!count) return;
-      value.score = count * spec.weight;
-      if (terms.length > 1 && value.normalized.indexOf(phrase) !== -1) value.score += spec.weight * 2;
-      total += value.score;
+      var score = count * spec.weight;
+      if (terms.length > 1 && value.normalized.indexOf(phrase) !== -1) score += spec.weight * 2;
+      total += score;
       matchedFields.push(spec.key);
-      var candidate = { key: spec.key, raw: value.raw, score: value.score };
-      if (!best || value.score > best.score) best = candidate;
-      if (count === terms.length && (!bestComplete || value.score > bestComplete.score)) bestComplete = candidate;
-      if (spec.key !== 'title' && (!bestNonTitle || value.score > bestNonTitle.score)) bestNonTitle = candidate;
+      var candidate = { key: spec.key, raw: value.raw, score: score };
+      if (!best || score > best.score) best = candidate;
+      if (count === terms.length && (!bestComplete || score > bestComplete.score)) bestComplete = candidate;
+      if (spec.key !== 'title' && (!bestNonTitle || score > bestNonTitle.score)) bestNonTitle = candidate;
     });
     var explanation = bestComplete || (matchedFields.length > 1 && best && best.key === 'title' ? bestNonTitle : best);
     return {
@@ -572,11 +653,11 @@
           : scope === 'note' ? ['title', 'content']
             : scope === 'attachment' ? ['fileName', 'path', 'kind', 'zoteroKey']
           : TEXT_HAY_FIELDS;
-        var target = paper;
         if (scope === 'paper' && ctx && ctx.notesByPaper) {
-          target = Object.assign({}, paper, { notes: noteSearchText(paper, ctx) });
+          // notes 投影走独立缓存：缓存命中时不再克隆 paper / 重拼笔记
+          return projectedHaystack(paper, ctx).indexOf(node.value) !== -1;
         }
-        return haystack(target, fields, scope === 'paper').indexOf(node.value) !== -1;
+        return haystack(paper, fields, scope === 'paper').indexOf(node.value) !== -1;
       }
       case 'regex': {
         try {

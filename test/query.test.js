@@ -428,3 +428,151 @@ test('F05 回归：EPUB 批注实体命中 target 携带 epubcfi', function () {
   assert.equal(r.items.length, 1);
   assert.equal(r.items[0].target.epubcfi, 'epubcfi(/6/4!/2)');
 });
+
+/* ---------- 检索缓存：命中/失效契约（普通关键词 + AST notes 投影） ---------- */
+
+/* 带 getter 计数的文献：title/abstract 每被读取一次计数 +1，用于观测缓存是否真的跳过了重算；
+ * __data 为可变后援存储，配合 updatedAt 抬升模拟「原地编辑」。 */
+function countingPaper(id, base, updatedAt) {
+  const counts = { abstract: 0, title: 0 };
+  const box = { title: (base && base.title) || '', abstract: (base && base.abstract) || '' };
+  const paper = Object.assign({ id: id, updatedAt: updatedAt || 100, key: '', authors: [], venue: '',
+    abstract: '', notes: '', tags: [] }, base);
+  Object.defineProperty(paper, 'title', { enumerable: true, configurable: true,
+    get: function () { counts.title++; return box.title; } });
+  Object.defineProperty(paper, 'abstract', { enumerable: true, configurable: true,
+    get: function () { counts.abstract++; return box.abstract; } });
+  paper.__reads = counts;
+  paper.__data = box;
+  return paper;
+}
+
+test('缓存：warm 重复检索不再重读字段 getter；结果与冷算完全一致', function () {
+  const paper = countingPaper('cache-warm', { title: 'Battery SOH estimation', abstract: 'state of health' });
+  const cold = LitQuery.rankPlainText(paper, 'soh estimation');
+  const readsAfterCold = paper.__reads.abstract + paper.__reads.title;
+  assert.ok(readsAfterCold > 0);
+  const warm = LitQuery.rankPlainText(paper, 'soh estimation');
+  assert.equal(paper.__reads.abstract + paper.__reads.title, readsAfterCold, 'warm 命中不应重读字段');
+  assert.deepEqual(warm, cold, 'warm 与冷算的 matched/score/field/snippet 完全一致');
+});
+
+test('缓存：同 id 同 updatedAt 的替换实例不读旧内容（alpha→beta 各自如实命中）', function () {
+  const oldPaper = countingPaper('cache-swap', { title: 'alpha', abstract: 'alpha' }, 77);
+  assert.equal(LitQuery.rankPlainText(oldPaper, 'alpha').matched, true);
+  assert.equal(LitQuery.rankPlainText(oldPaper, 'beta').matched, false);
+  const newPaper = countingPaper('cache-swap', { title: 'beta', abstract: 'beta' }, 77);
+  assert.equal(LitQuery.rankPlainText(newPaper, 'beta').matched, true, '替换实例的新内容必须可见（旧缓存是 alpha）');
+  assert.equal(LitQuery.rankPlainText(newPaper, 'alpha').matched, false, '不得读到旧实例的 alpha 缓存');
+  // 旧实例仍然如实：同键已被新实例占据，旧实例必须重算自己的内容（而不是读新实例的缓存）
+  const oldReads = oldPaper.__reads.abstract + oldPaper.__reads.title;
+  assert.equal(LitQuery.rankPlainText(oldPaper, 'alpha').matched, true);
+  assert.ok(oldPaper.__reads.abstract + oldPaper.__reads.title > oldReads, '旧实例被迫重算');
+});
+
+test('缓存：原地编辑 + updatedAt 抬升后重算；clearHaystackCache 清空后重算', function () {
+  const paper = countingPaper('cache-bump', { title: 'alpha', abstract: 'alpha' });
+  assert.equal(LitQuery.rankPlainText(paper, 'beta').matched, false);
+  assert.equal(LitQuery.rankPlainText(paper, 'beta').matched, false);
+  paper.__data.abstract = 'beta zebra';
+  paper.updatedAt = paper.updatedAt + 1;
+  const readsBefore = paper.__reads.abstract;
+  assert.equal(LitQuery.rankPlainText(paper, 'beta').matched, true, '原地编辑 + updatedAt 抬升后应重算');
+  assert.ok(paper.__reads.abstract > readsBefore);
+  assert.equal(LitQuery.rankPlainText(paper, 'beta').matched, true);
+  assert.equal(paper.__reads.abstract, readsBefore + 1, '重算一次后再次命中缓存');
+  LitQuery.clearHaystackCache();
+  const readsCleared = paper.__reads.abstract;
+  LitQuery.rankPlainText(paper, 'beta');
+  assert.ok(paper.__reads.abstract > readsCleared, 'clearHaystackCache 后应重新读字段');
+});
+
+test('缓存：笔记删除（墓碑）后旧 notes 投影失效；上下文撤除回落 paper.notes', function () {
+  const paper = countingPaper('cache-note-del', { title: 'alpha', abstract: 'alpha', notes: '' }, 500);
+  const n1 = { id: 'n1', paperId: 'cache-note-del', title: 't1', content: 'zebra body', updatedAt: 10 };
+  // notesByPaper 的既有契约：只含活跃笔记（app.js / compile / entityHits 构建时都先滤墓碑）
+  const ctxOf = function (list) { return { notesByPaper: { 'cache-note-del': list }, folders: [] }; };
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctxOf([n1])).matched, true);
+  n1.deletedAt = 99; // 墓碑：下一轮构建的活跃列表不含它
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctxOf([])).matched, false, '笔记删除后不得命中旧投影');
+  n1.deletedAt = null;
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctxOf([n1])).matched, true, '恢复后重算可见');
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', null).matched, false, '撤除上下文回落 paper.notes 投影（此处为空）');
+  paper.__data.abstract = 'zebra fallback'; // paper.notes 为空 → 用 abstract 保证语义切换本身可命中
+  paper.updatedAt = 501;
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', null).matched, true, '无上下文路径按 paper 自身字段求值');
+});
+
+test('缓存：编辑较早笔记（max updatedAt 不动）也会失效，不再命中旧 notes 投影', function () {
+  const paper = countingPaper('cache-note-edit', { title: 'alpha', abstract: 'alpha' }, 500);
+  const n1 = { id: 'n1', paperId: 'cache-note-edit', title: 't1', content: 'plain body', updatedAt: 10 };
+  const n2 = { id: 'n2', paperId: 'cache-note-edit', title: 't2', content: 'later body', updatedAt: 1000 };
+  const ctxA = { notesByPaper: { 'cache-note-edit': [n1, n2] }, folders: [] };
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctxA).matched, false);
+  // 只改较早的 n1：条数不变、max(1000) 不变——引用快照必须仍能识别变化
+  n1.updatedAt = 20;
+  n1.content = 'zebra body';
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctxA).matched, true,
+    '编辑较早笔记后不得命中旧缓存（count+max 签名会漏检这种场景）');
+});
+
+test('缓存：同条数同时间戳的不同笔记子集不共享缓存', function () {
+  const paper = countingPaper('cache-note-subset', { title: 'alpha', abstract: 'alpha' }, 500);
+  const setA = [
+    { id: 'a1', paperId: 'cache-note-subset', title: 't1', content: 'plain', updatedAt: 10 },
+    { id: 'a2', paperId: 'cache-note-subset', title: 't2', content: 'plain', updatedAt: 1000 }
+  ];
+  const setB = [
+    { id: 'b1', paperId: 'cache-note-subset', title: 't1', content: 'zebra', updatedAt: 10 },
+    { id: 'b2', paperId: 'cache-note-subset', title: 't2', content: 'plain', updatedAt: 1000 }
+  ];
+  const ctxA = { notesByPaper: { 'cache-note-subset': setA }, folders: [] };
+  const ctxB = { notesByPaper: { 'cache-note-subset': setB }, folders: [] };
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctxA).matched, false);
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctxB).matched, true, '不同笔记引用子集不得串缓存');
+});
+
+test('缓存：重建 notesByPaper（新 Map、同笔记引用）仍命中，不重读字段', function () {
+  const n1 = { id: 'n1', paperId: 'cache-rebuild', title: 't1', content: 'zebra body', updatedAt: 10 };
+  const paper = countingPaper('cache-rebuild', { title: 'alpha', abstract: 'alpha' });
+  const ctx1 = { notesByPaper: { 'cache-rebuild': [n1] }, folders: [] };
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctx1).matched, true);
+  const reads = paper.__reads.abstract + paper.__reads.title;
+  const ctx2 = { notesByPaper: { 'cache-rebuild': [n1] }, folders: [] }; // 全新 Map，笔记引用相同
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctx2).matched, true);
+  assert.equal(paper.__reads.abstract + paper.__reads.title, reads, '重建 notesByPaper 不应导致重算');
+});
+
+test('缓存：全空字段文献的空串缓存值可命中（真值判断回归，普通与 AST 两路）', function () {
+  const paper = countingPaper('cache-empty', {}, 42);
+  assert.equal(LitQuery.rankPlainText(paper, 'anything').matched, false);
+  const reads = paper.__reads.abstract;
+  assert.equal(LitQuery.rankPlainText(paper, 'anything').matched, false);
+  assert.equal(paper.__reads.abstract, reads, '空规范化串（""）也是合法缓存值');
+  // AST 无上下文路径（hayCache）：空串值同样必须命中
+  const astPaper = countingPaper('cache-empty-ast', {}, 43);
+  const matcher = LitQuery.parse('zebra').matcher;
+  assert.equal(matcher(astPaper), false);
+  const astReads = astPaper.__reads.abstract + astPaper.__reads.title;
+  assert.equal(matcher(astPaper), false);
+  assert.equal(astPaper.__reads.abstract + astPaper.__reads.title, astReads, 'AST 路径空串 haystack 也命中缓存');
+});
+
+test('缓存：AST 多词查询 warm 重复不重拼笔记（notes 投影走缓存）', function () {
+  let contentReads = 0;
+  const note = { id: 'n1', paperId: 'cache-ast', title: 'note title',
+    get content() { contentReads++; return 'alpha beta gamma body'; }, updatedAt: 10 };
+  const paper = countingPaper('cache-ast', { title: 'Battery paper', abstract: 'x' }, 300);
+  const ctx = { notesByPaper: { 'cache-ast': [note] }, folders: [] };
+  const matcher = LitQuery.parse('alpha beta gamma', ctx).matcher;
+  assert.equal(matcher(paper), true);
+  const readsAfterFirst = contentReads;
+  assert.ok(readsAfterFirst > 0, '冷算应至少读取一次笔记内容');
+  assert.equal(matcher(paper), true);
+  assert.equal(matcher(paper), true);
+  assert.equal(contentReads, readsAfterFirst, '同查询重复求值不应重拼笔记（多词也不重拼）');
+  // 笔记内容变化（updatedAt 抬升）→ 失效重算
+  note.updatedAt = 11;
+  assert.equal(matcher(paper), true);
+  assert.ok(contentReads > readsAfterFirst, '笔记 updatedAt 变化后应重拼');
+});

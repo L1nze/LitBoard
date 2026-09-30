@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createResearchDb } = require('../electron/research-db.js');
+const LitResearch = require('../js/research.js');
 
 async function makeDb() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-research-'));
@@ -402,6 +403,57 @@ test('性能回归：内容未变的 upsert 不重建 FTS 行（检索工具一�
     assert.notEqual(ridOf(after, 'W1'), ridOf(before, 'W1'), '改过的行要重建');
     assert.equal(ridOf(after, 'W2'), ridOf(before, 'W2'), '没改的行仍不重建');
     assert.equal(db.queryWorks({ q: '修订版' }).works.length, 1);
+  } finally { db.close(); }
+});
+
+test('性能回归：R13 stale 前置读取每批只 prepare 一次（不再逐行编译 content_hash SELECT）', async function () {
+  const { db, dir } = await makeDb();
+  try {
+    const rows = [];
+    for (let i = 0; i < 25; i++) {
+      rows.push({ id: 'V' + i, doi: '', title: 'Stale check row number ' + i, year: 2020 + (i % 5),
+        abstract: 'abstract for row ' + i, concepts: [], keywords: [], refs: [], authors: [] });
+    }
+    db.upsertWorks(rows);
+    // 向量先建好且 hash 与当前内容一致：整批重跑不应判任何 stale
+    db.vecPut(rows.map(function (r) {
+      return { workId: r.id, model: 'mp', dim: 4, recipe: 1,
+        hash: LitResearch.embeddingHash({ title: r.title, abstract: r.abstract, concepts: [], keywords: [] }),
+        vec: Buffer.from(new Float32Array([1, 0, 0, 0]).buffer) };
+    }));
+    assert.equal(db.stats().vectors, 25);
+
+    // 临时在原型上包一层 prepare 统计编译次数；finally 必须还原（见收尾）
+    const VEC_HASH_SQL = 'SELECT content_hash FROM vecs WHERE work_id = ?';
+    const origPrepare = DatabaseSync.prototype.prepare;
+    let prepared = 0;
+    DatabaseSync.prototype.prepare = function (sql) {
+      if (sql === VEC_HASH_SQL) prepared += 1;
+      return origPrepare.call(this, sql);
+    };
+    try {
+      // ① 内容未变整批重跑：每行照做 stale 检查，但语句只编译一次（旧实现 25 次）
+      db.upsertWorks(rows);
+      assert.equal(prepared, 1, '25 行一批只 prepare 一次 content_hash SELECT');
+      assert.equal(db.stats().vectors, 25, '内容未变不得删向量');
+      // ② 只改一行标题：语句仍只编译一次，stale 判定只命中那一行
+      prepared = 0;
+      db.upsertWorks(rows.map(function (r, i) {
+        return i === 13 ? Object.assign({}, r, { title: 'Stale check row number 13 (revised)' }) : r;
+      }));
+      assert.equal(prepared, 1, '改标题的批次同样只 prepare 一次');
+    } finally {
+      DatabaseSync.prototype.prepare = origPrepare;
+    }
+
+    // 直接读 vec.db 断言「只删了变的那行」：R13 删除精确到 stale 行，不殃及邻居
+    const raw = new DatabaseSync(path.join(dir, 'vec.db'), { readOnly: true });
+    const remaining = raw.prepare('SELECT work_id FROM vecs ORDER BY work_id').all()
+      .map(function (row) { return row.work_id; });
+    raw.close();
+    assert.equal(remaining.length, 24, '只删 stale 的那一行');
+    assert.ok(remaining.indexOf('V13') === -1, '改标题那行的向量被删（R13）');
+    assert.ok(remaining.indexOf('V12') !== -1 && remaining.indexOf('V14') !== -1, '其余向量保留');
   } finally { db.close(); }
 });
 
