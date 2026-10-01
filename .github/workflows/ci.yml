@@ -89,11 +89,15 @@ jobs:
           & node $builderCli --projectDir $env:GITHUB_WORKSPACE "--config.electronDist=$electronDist" --win nsis portable --x64
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # 逐条检查退出码：pwsh 会继续执行后续命令，漏查会把 lifecycle 失败掩盖在
+      # smoke.js 的退出码后面（两条都过才算过）。
       - name: Smoke packaged binary + lifecycle
         shell: pwsh
         run: |
           node scripts/smoke-lifecycle.js
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::smoke-lifecycle failed with $LASTEXITCODE"; exit $LASTEXITCODE }
           node scripts/smoke.js (Join-Path $env:GITHUB_WORKSPACE 'dist\win-unpacked\LitBoard.exe')
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::smoke failed with $LASTEXITCODE"; exit $LASTEXITCODE }
 
       # 2) 再走正式发布脚本（会把 win-unpacked 清理掉），验证发布路径本身。
       #    用 dist:nobump：CI 不能把版本号提交回仓库，产物版本必须与仓库一致，

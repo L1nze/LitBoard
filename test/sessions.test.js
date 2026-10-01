@@ -23,7 +23,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 test('create lays out dated folder, session.json and index entry', async function () {
   const { s, root } = await makeSessions();
   const created = await s.create({ title: '锂电池寿命预测 Review' });
-  assert.match(created.dir, /^\d{8}\\锂电池寿命预测 Review 01$/);
+  // dir 用宿主 path.sep 连接（Windows 为 \、Linux CI 为 /），两种分隔符都接受
+  assert.match(created.dir, /^\d{8}[\\/]锂电池寿命预测 Review 01$/);
   const sessionFile = path.join(root, '会话记录', created.dir, 'session.json');
   const data = JSON.parse(await fs.readFile(sessionFile, 'utf8'));
   assert.equal(data.id, created.id);
