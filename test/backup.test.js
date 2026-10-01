@@ -157,7 +157,6 @@ test('publishObject tolerates a target that is already published', async functio
     assert.equal(sha256(await fs.readFile(target)), hash, '对象内容不得被改坏');
     await assert.rejects(fs.access(tempRace), '竞态路径也要清掉临时文件');
   } finally {
-    await fs.chmod(path.join(root, 'objects'), 0o666).catch(function () {});
     await fs.rm(root, { recursive: true, force: true });
   }
 });

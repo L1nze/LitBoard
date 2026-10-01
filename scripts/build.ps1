@@ -21,7 +21,7 @@ if ($DryRun) { $bumpArgs += '--dry-run' }
 & node @bumpArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-& node $builderCli --projectDir $projectDir "--config.electronDist=$electronDist" --win nsis portable --x64
+& node $builderCli --projectDir $projectDir "--config.electronDist=$electronDist" --win nsis portable --x64 --publish never
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $distDir = [System.IO.Path]::GetFullPath((Join-Path $projectDir 'dist'))
