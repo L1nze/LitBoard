@@ -27,7 +27,7 @@
     "release-checksums": "node scripts/release-checksums.js"
   },
   "devDependencies": {
-    "electron": "44.4.3",
+    "electron": "44.4.5",
     "electron-builder": "26.15.3",
     "eslint": "^10.10.0"
   },
