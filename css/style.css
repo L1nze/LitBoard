@@ -1602,10 +1602,6 @@ body.resizing-tags { cursor: row-resize; user-select: none; }
 
 .lit-table tbody tr.detail-active { background: var(--accent-soft); }
 
-@media (max-width: 1220px) {
-  .col-venue, .col-rating,
-  .lit-table td:nth-child(7), .lit-table td:nth-child(9) { display: none; }
-}
 @media (max-width: 900px) {
   /* 下限与主网格一致（430px）；窗口最小 1080 时此断点本不会触发，仅作防御 */
   .workspace { grid-template-columns: minmax(430px, 1fr) var(--detail-column-width, var(--detail-width)) var(--rail-width); }

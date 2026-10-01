@@ -238,6 +238,7 @@ function createWindow() {
   } else if (SMOKE_TEST) {
     mainWindow.webContents.once('did-finish-load', async function () {
       try {
+        mainWindow.setContentSize(1080, 720);
         const result = await mainWindow.webContents.executeJavaScript(`(async function () {
           const pdfResourceRequests = [];
           const pdfPath = ${JSON.stringify(SMOKE_PDF)};
@@ -1433,6 +1434,7 @@ function createWindow() {
             const pdfColumnWidth = document.querySelector('#lit-table th[data-column="attachment"]').getBoundingClientRect().width;
             const yearColumnWidth = document.querySelector('#lit-table th[data-column="year"]').getBoundingClientRect().width;
             result.tableNarrowColumnsKeepWidth = Math.abs(pdfColumnWidth - 38) < 2 && Math.abs(yearColumnWidth - 64) < 2;
+            result.tableColumnWidthDiag = { viewport: innerWidth, pdf: pdfColumnWidth, year: yearColumnWidth };
             document.querySelector('#table-columns-btn').click();
             const tagsChoice = Array.from(document.querySelectorAll('#ctx-menu .menu-item'))
               .find(function (item) { return item.textContent.trim() === '标签'; });
