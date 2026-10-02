@@ -7,6 +7,34 @@
   'use strict';
 
   var THEME_KEY = 'litboard.theme';
+  var PDF_THEME_KEY = 'litboard.pdfTheme';
+  var PDF_ORIGINAL_KEY = 'litboard.pdfOriginalColors';
+  // Paper/ink endpoints from upstream palettes; the surround is slightly darker.
+  var PDF_THEMES = [
+    { id: 'original', name: '', group: 'light', paper: '#ffffff', ink: '#000000', surround: '#eaecf0' },
+    { id: 'vitesse-light-soft', name: 'Vitesse Light Soft', group: 'light', paper: '#f1f0e9', ink: '#393a34', surround: '#e3e2da' },
+    { id: 'easyread-light', name: 'EasyRead Paper', group: 'light', paper: '#f6f3ec', ink: '#23211d', surround: '#e8e3d8' },
+    { id: 'solarized-light', name: 'Solarized Light', group: 'light', paper: '#fdf6e3', ink: '#586e75', surround: '#eee8d5' },
+    { id: 'everforest-light', name: 'Everforest Light', group: 'light', paper: '#f3ead3', ink: '#5c6a72', surround: '#e5dfc5' },
+    { id: 'catppuccin-latte', name: 'Catppuccin Latte', group: 'light', paper: '#eff1f5', ink: '#4c4f69', surround: '#dce0e8' },
+    { id: 'vitesse-dark-soft', name: 'Vitesse Dark Soft', group: 'dark', paper: '#222222', ink: '#d4d0c4', surround: '#191919' },
+    { id: 'easyread-dark', name: 'EasyRead Charcoal', group: 'dark', paper: '#1a1917', ink: '#ddd7cb', surround: '#12110f' },
+    { id: 'nord', name: 'Nord', group: 'dark', paper: '#2e3440', ink: '#d8dee9', surround: '#242933' },
+    { id: 'gruvbox-dark', name: 'Gruvbox Dark Soft', group: 'dark', paper: '#32302f', ink: '#ebdbb2', surround: '#242322' }
+  ];
+
+  function pdfTheme(id) {
+    return PDF_THEMES.find(function (preset) { return preset.id === id; }) || PDF_THEMES[1];
+  }
+
+  function pdfColorTransfer(preset) {
+    return [0, 1, 2].map(function (channel) {
+      var offset = 1 + channel * 2;
+      var ink = parseInt(preset.ink.slice(offset, offset + 2), 16) / 255;
+      var paper = parseInt(preset.paper.slice(offset, offset + 2), 16) / 255;
+      return { slope: paper - ink, intercept: ink };
+    });
+  }
 
   function create(options) {
     var T = options.T;
@@ -19,6 +47,70 @@
     var showCtxMenu = options.showCtxMenu;
     var desktop = options.desktop || function () { return null; };
     var i18n = options.i18n || (typeof window !== 'undefined' ? window.LitI18n : null);
+
+    function currentPdfTheme() {
+      return pdfTheme(store.getItem(PDF_THEME_KEY)).id;
+    }
+
+    function applyPdfTheme() {
+      var overlay = $('#pdf-overlay');
+      if (!overlay) return;
+      var preset = pdfTheme(currentPdfTheme());
+      var original = store.getItem(PDF_ORIGINAL_KEY) === '1';
+      overlay.setAttribute('data-reading-theme', preset.id);
+      overlay.setAttribute('data-reading-scheme', preset.group);
+      overlay.setAttribute('data-original-colors', original ? 'true' : 'false');
+      overlay.style.setProperty('--pdf-surround', preset.surround);
+      overlay.style.setProperty('--pdf-paper', original ? '#ffffff' : preset.paper);
+      overlay.style.setProperty('--pdf-swatch', preset.paper);
+      overlay.style.setProperty('--pdf-ink', preset.ink);
+      // Compensate the dark transfer's hue inversion without changing black/white endpoints.
+      var hue = $('#pdf-tone-hue');
+      if (hue) hue.setAttribute('values', preset.group === 'dark' ? '180' : '0');
+      pdfColorTransfer(preset).forEach(function (transfer, channel) {
+        var func = $('#pdf-tone-' + channel);
+        if (!func) return;
+        func.setAttribute('slope', transfer.slope);
+        func.setAttribute('intercept', transfer.intercept);
+      });
+      var btn = $('#pdf-theme');
+      if (btn) {
+        btn.title = T('PDF 阅读主题：') + (preset.name || T('原始白纸'));
+        btn.setAttribute('aria-label', btn.title);
+      }
+      var originalBtn = $('#pdf-original-colors');
+      if (originalBtn) originalBtn.setAttribute('aria-pressed', original ? 'true' : 'false');
+    }
+
+    function setPdfTheme(id) {
+      store.setItem(PDF_THEME_KEY, pdfTheme(id).id);
+      applyPdfTheme();
+    }
+
+    function togglePdfOriginalColors() {
+      store.setItem(PDF_ORIGINAL_KEY, store.getItem(PDF_ORIGINAL_KEY) === '1' ? '0' : '1');
+      applyPdfTheme();
+    }
+
+    function showPdfMenu() {
+      var btn = $('#pdf-theme');
+      if (!btn) return;
+      var rect = btn.getBoundingClientRect();
+      var cur = currentPdfTheme();
+      var items = [];
+      ['light', 'dark'].forEach(function (group) {
+        if (items.length) items.push('sep');
+        items.push({ header: group === 'light' ? T('浅色阅读背景') : T('深色阅读背景') });
+        PDF_THEMES.filter(function (preset) { return preset.group === group; }).forEach(function (preset) {
+          items.push({
+            label: (preset.name || T('原始白纸')) + (cur === preset.id ? '  ✓' : ''),
+            dot: 'pdf-' + preset.id,
+            fn: function () { setPdfTheme(preset.id); }
+          });
+        });
+      });
+      showCtxMenu(rect.left - 120, rect.bottom + 6, items);
+    }
 
     var THEMES = [
       'auto',
@@ -116,6 +208,7 @@
       i18n.applyStatic(doc);
       if (options.renderAll) options.renderAll();
       if (options.renderPdfTabs) options.renderPdfTabs();
+      applyPdfTheme();
       var bridge = desktop();
       if (bridge && bridge.setSetting) {
         bridge.setSetting('uiLang', i18n.getLang()).catch(function () {});
@@ -221,9 +314,14 @@
       current: current,
       cycle: cycle,
       set: set,
-      showMenu: showMenu
+      showMenu: showMenu,
+      applyPdfTheme: applyPdfTheme,
+      currentPdfTheme: currentPdfTheme,
+      setPdfTheme: setPdfTheme,
+      showPdfMenu: showPdfMenu,
+      togglePdfOriginalColors: togglePdfOriginalColors
     };
   }
 
-  return { create: create, THEME_KEY: THEME_KEY };
+  return { create: create, THEME_KEY: THEME_KEY, PDF_THEMES: PDF_THEMES, pdfTheme: pdfTheme, pdfColorTransfer: pdfColorTransfer };
 });

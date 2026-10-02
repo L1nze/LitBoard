@@ -8,6 +8,12 @@
 })(typeof window !== 'undefined' ? window : null, function (register) {
   'use strict';
   register('en', {
+    "PDF 阅读主题": "PDF reading theme",
+    "PDF 阅读主题：": "PDF reading theme: ",
+    "原始白纸": "Original white paper",
+    "浅色阅读背景": "Light reading backgrounds",
+    "深色阅读背景": "Dark reading backgrounds",
+    "保留 PDF 原色": "Keep original PDF colors",
     "<div class=\"issues-empty\">没有记录</div>": "<div class=\"issues-empty\">No records</div>",
     "点击复制详情": "Click to copy details",
     "✓ 问题详情已复制到剪贴板": "✓ Issue details copied to clipboard",

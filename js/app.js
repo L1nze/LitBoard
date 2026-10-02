@@ -10921,6 +10921,8 @@
     $('#pdf-fit-width').addEventListener('click', fitPdfWidth);
     $('#pdf-rotate').addEventListener('click', rotatePdf);
     $('#pdf-layout-toggle').addEventListener('click', togglePdfLayout);
+    $('#pdf-theme').addEventListener('click', function (e) { e.stopPropagation(); if (theme) theme.showPdfMenu(); });
+    $('#pdf-original-colors').addEventListener('click', function () { if (theme) theme.togglePdfOriginalColors(); });
     $('#rail-translation').addEventListener('click', function () { openSyncSettings('translation'); });
     $('#pdf-page-prev').addEventListener('click', function () { goToPdfPage(pdfState.currentPage - 1); });
     $('#pdf-page-next').addEventListener('click', function () { goToPdfPage(pdfState.currentPage + 1); });
@@ -12094,6 +12096,7 @@
   function start() {
     initTheme();
     applyTheme(currentTheme());
+    if (theme) theme.applyPdfTheme();
     initWindowControls();
     state.collapsedFolders = readCollapsedFolders();
     state.shortcuts = readShortcutSettings();

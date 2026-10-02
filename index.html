@@ -12,6 +12,14 @@
 <!-- 统一线性图标库（stroke=currentColor，随主题变色；JS 动态处用 LitIcons.use(id) 引用） -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
   <defs>
+    <filter id="pdf-reading-tone" color-interpolation-filters="sRGB" x="0" y="0" width="100%" height="100%">
+      <feColorMatrix id="pdf-tone-hue" type="hueRotate" values="0"/>
+      <feComponentTransfer>
+        <feFuncR id="pdf-tone-0" type="linear" slope="1" intercept="0"/>
+        <feFuncG id="pdf-tone-1" type="linear" slope="1" intercept="0"/>
+        <feFuncB id="pdf-tone-2" type="linear" slope="1" intercept="0"/>
+      </feComponentTransfer>
+    </filter>
     <symbol id="lb-i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5.5v13M5.5 12h13"/></symbol>
     <symbol id="lb-i-minus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 12h13"/></symbol>
     <symbol id="lb-i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
@@ -642,6 +650,8 @@
       <span class="pdf-zoom" id="pdf-zoom">135%</span>
       <button class="btn btn-ghost btn-icon" id="pdf-zoom-in" title="放大"><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg></button>
       <button class="btn btn-ghost" id="pdf-fit-width" title="适合页面宽度">适合宽度</button>
+      <button class="btn btn-ghost btn-icon" id="pdf-theme" title="PDF 阅读主题" aria-label="PDF 阅读主题" aria-haspopup="menu"><svg class="ic" aria-hidden="true"><use href="#lb-i-theme-auto"/></svg></button>
+      <button class="btn btn-ghost btn-icon" id="pdf-original-colors" title="保留 PDF 原色" aria-label="保留 PDF 原色" aria-pressed="false"><svg class="ic" aria-hidden="true"><use href="#lb-i-doc"/></svg></button>
       <button class="btn btn-ghost btn-icon" id="pdf-rotate" title="顺时针旋转" aria-label="顺时针旋转"><svg class="ic" aria-hidden="true"><use href="#lb-i-rotate"/></svg></button>
       <button class="btn btn-ghost btn-icon" id="pdf-layout-toggle" title="切换双栏阅读" aria-pressed="false">
         <svg class="layout-icon layout-icon-single" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">

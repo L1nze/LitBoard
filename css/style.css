@@ -2822,7 +2822,7 @@ input.key-retained { border-color: var(--accent); background: var(--accent-soft)
   top: calc(var(--topbar-h) + var(--tabbar-h));
   z-index: 150;
   display: flex; flex-direction: column;
-  background: light-dark(#eaecf0, #090b0e);
+  background: var(--pdf-surround, light-dark(#eaecf0, #090b0e));
 }
 body.pdf-locked { overflow: hidden; }
 .pdf-toolbar {
@@ -2864,9 +2864,24 @@ body.pdf-locked { overflow: hidden; }
 /* 阅读画布需要更容易抓取的纵向滚动条；不改变应用其它列表的紧凑滚动条。 */
 .pdf-scroll::-webkit-scrollbar { width: 14px; }
 .pdf-scroll.pdf-layout-spread { display: grid; grid-template-columns: repeat(2, max-content); justify-content: safe center; align-content: start; gap: 16px; }
-.pdf-page-sheet { position: relative; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.22); background: #fff; border-radius: 4px; flex: 0 0 auto; overflow: hidden; }
+.pdf-page-sheet { position: relative; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.22); background: var(--pdf-paper, #fff); border-radius: 4px; flex: 0 0 auto; overflow: hidden; }
 .pdf-scroll:not(.pdf-layout-spread) .pdf-page-sheet, .pdf-loading { margin-inline: auto; }
 .pdf-page { display: block; background: #fff; border-radius: 4px; max-width: 100%; }
+/* Keep text, selection and annotation geometry outside the raster color filter. */
+.pdf-overlay[data-reading-theme]:not([data-reading-theme="original"]):not([data-original-colors="true"]) :is(.pdf-page, .pdf-thumb-canvas-wrap canvas) { filter: url(#pdf-reading-tone); }
+#pdf-theme { background: var(--pdf-swatch); color: var(--pdf-ink); border-color: var(--pdf-ink); }
+#pdf-original-colors[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); }
+.ctx-dot[class*="ctx-dot-pdf-"] { box-shadow: 0 0 0 1px var(--border-strong); }
+.ctx-dot-pdf-original { background: #fff; }
+.ctx-dot-pdf-vitesse-light-soft { background: #f1f0e9; }
+.ctx-dot-pdf-easyread-light { background: #f6f3ec; }
+.ctx-dot-pdf-solarized-light { background: #fdf6e3; }
+.ctx-dot-pdf-everforest-light { background: #f3ead3; }
+.ctx-dot-pdf-catppuccin-latte { background: #eff1f5; }
+.ctx-dot-pdf-vitesse-dark-soft { background: #222; }
+.ctx-dot-pdf-easyread-dark { background: #1a1917; }
+.ctx-dot-pdf-nord { background: #2e3440; }
+.ctx-dot-pdf-gruvbox-dark { background: #32302f; }
 
 .pdf-text-layer {
   --min-font-size: 1;
@@ -2899,6 +2914,7 @@ body.pdf-locked { overflow: hidden; }
 .pdf-search-layer { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
 .pdf-search-mark { position: absolute; display: block; border-radius: 1px; background: rgba(255, 212, 0, 0.45); mix-blend-mode: multiply; }
 .pdf-search-mark.active { background: rgba(255, 140, 0, 0.68); outline: 1px solid rgba(214, 110, 0, 0.85); }
+.pdf-overlay[data-reading-scheme="dark"][data-original-colors="false"] :is(.pdf-search-mark, .pdf-annotation-mark) { mix-blend-mode: screen; }
 .pdf-link-layer, .pdf-annotation-layer { position: absolute; inset: 0; }
 .pdf-link-layer { z-index: 2; pointer-events: none; }
 .pdf-document-link { position: absolute; display: block; padding: 0; border: 0; background: transparent; pointer-events: auto; cursor: pointer; }

@@ -1324,6 +1324,48 @@ function createWindow() {
           const smokePdfOverlay = document.querySelector('#pdf-overlay');
           smokePdfOverlay.hidden = false;
           await new Promise(function (resolve) { setTimeout(resolve, 80); });
+          result.pdfReadingThemesWork = (function () {
+            const btn = document.querySelector('#pdf-theme');
+            const originalBtn = document.querySelector('#pdf-original-colors');
+            if (!btn || !originalBtn || !window.LitTheme) return false;
+            const saved = localStorage.getItem('litboard.pdfTheme');
+            const raster = document.createElement('canvas');
+            raster.className = 'pdf-page';
+            const mark = document.createElement('i');
+            mark.className = 'pdf-search-mark';
+            smokePdfOverlay.append(raster, mark);
+            let ok = true;
+            try {
+              for (const preset of window.LitTheme.PDF_THEMES) {
+                btn.click();
+                const menu = document.querySelector('#ctx-menu');
+                const item = Array.from(menu.querySelectorAll('button')).find(function (el) {
+                  return preset.name ? el.textContent.includes(preset.name) : el.textContent.includes('原始白纸');
+                });
+                if (!item) { ok = false; break; }
+                const rect = menu.getBoundingClientRect();
+                ok = ok && rect.bottom <= innerHeight + 1 && rect.top >= 0;
+                item.click();
+                ok = ok && smokePdfOverlay.getAttribute('data-reading-theme') === preset.id &&
+                  document.querySelector('#pdf-tone-hue').getAttribute('values') === (preset.group === 'dark' ? '180' : '0') &&
+                  localStorage.getItem('litboard.pdfTheme') === preset.id &&
+                  (getComputedStyle(raster).filter !== 'none') === (preset.id !== 'original') &&
+                  getComputedStyle(mark).mixBlendMode === (preset.group === 'dark' ? 'screen' : 'multiply');
+              }
+              originalBtn.click();
+              ok = ok && originalBtn.getAttribute('aria-pressed') === 'true' && getComputedStyle(raster).filter === 'none';
+              originalBtn.click();
+              return ok && originalBtn.getAttribute('aria-pressed') === 'false' && getComputedStyle(raster).filter !== 'none';
+            } finally {
+              raster.remove(); mark.remove();
+              const menu = document.querySelector('#ctx-menu');
+              if (menu) menu.remove();
+              const api = window.LitTheme.create({ T: function (s) { return s; }, $: function (s) { return document.querySelector(s); } });
+              if (saved === null) localStorage.removeItem('litboard.pdfTheme');
+              else localStorage.setItem('litboard.pdfTheme', saved);
+              api.applyPdfTheme();
+            }
+          })();
           (function () {
             const wsEl = document.querySelector('.workspace');
             const rail = document.querySelector('.right-rail');
@@ -1808,7 +1850,7 @@ function createWindow() {
            result.autoSyncTogglePresent && result.syncNowInCloudPresent && result.syncRunUnconfiguredGuarded === true &&
           result.dataPathUiPresent && result.dataPathApiPresent && result.dataPathApiWorks && result.dataPathTypable &&
           result.inlineTestStatusPresent && result.nestedFolderUiPresent && result.folderTreeModulePresent &&
-          result.muPdfLoaded && result.pdfLayoutTogglePresent && result.translationUiPresent && result.journalRankUiPresent &&
+          result.muPdfLoaded && result.pdfLayoutTogglePresent && result.pdfReadingThemesWork && result.translationUiPresent && result.journalRankUiPresent &&
           result.searchHelpUiPresent && result.searchHelpOpens === true && result.searchHelpTryWorks === true &&
           result.wordCiteSearchUiPresent && result.wordCiteHelpOpens === true && result.wordCiteHelpTryWorks === true &&
           result.wordCiteSyntaxHintWorks === true && result.wordCiteSyntaxHintClears === true &&
