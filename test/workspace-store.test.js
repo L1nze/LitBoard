@@ -8,6 +8,58 @@ const os = require('node:os');
 const path = require('node:path');
 const LitModel = require('../js/model.js');
 const { createLibraryDb } = require('../electron/db.js');
+const LitMerge = require('../js/merge.js');
+
+for (const scenario of [{ cancelFirst: false, overlap: false }, { cancelFirst: true, overlap: false }, { cancelFirst: false, overlap: true }, { cancelFirst: false, overlap: true, choice: 'remote' }]) {
+  const { cancelFirst, overlap } = scenario;
+  const choice = scenario.choice || 'local';
+  test('保存冲突保留已确认祖先和本地修改' + (cancelFirst ? '，取消后重试仍需解决冲突' : '') + (overlap ? '，同字段修改选择' + choice : ''), async function (t) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-store-conflict-'));
+    const db = createLibraryDb(dir);
+    await db.open();
+    t.after(async function () { await db.close(); await fs.rm(dir, { recursive: true, force: true }); });
+    db.replaceState({ papers: [{ id: 'p1', title: 'base', venue: 'base venue' }, { id: 'p2', title: 'unchanged' }] });
+    const state = { papers: [], notes: [], folders: [], folderTombstones: [], savedSearches: [],
+      savedSearchTombstones: [], tagColors: {}, tagColorRecords: [] };
+    let resolutions = 0;
+    const desktop = {
+      loadLibrary: function () { return Promise.resolve(db.loadState()); },
+      saveLibrary: function (value, base) { return Promise.resolve(db.saveState(Object.assign({}, value, { baseSignatures: base }))); }
+    };
+    const store = createStore({
+      state: state, model: LitModel, uid: function () { return 'id'; }, T: function (s) { return s; },
+      toast: function () {}, desktop: function () { return desktop; }, scheduleSync: function () {}, onLoad: function () {},
+      resolveConflicts: function (conflicts, base) {
+        ++resolutions;
+        assert.equal(base.papers.p1.title, 'base');
+        if (cancelFirst && resolutions === 1) return Promise.resolve(false);
+        const merged = LitMerge.mergeEntity(base.papers.p1, state.papers[0], conflicts[0].entity, LitMerge.PAPER_SPEC);
+        assert.equal(merged.conflicts.length, overlap ? 1 : 0);
+        if (overlap) {
+          assert.equal(merged.conflicts[0].field, 'title');
+          LitMerge.applyChoice(merged.merged, merged.conflicts[0], choice);
+        }
+        state.papers[0] = merged.merged;
+        return Promise.resolve(true);
+      }
+    });
+    await store.load();
+    state.papers[0].title = 'local title';
+    state.papers[1].title = 'nonconflicting edit';
+    const external = db.loadState();
+    if (overlap) external.papers[0].title = 'external title';
+    else external.papers[0].venue = 'external venue';
+    db.saveState(external);
+    if (cancelFirst) assert.equal(await store.save(true), false);
+    assert.equal(await store.save(true), true);
+    assert.equal(resolutions, cancelFirst ? 2 : 1);
+    const expectedTitle = choice === 'remote' ? 'external title' : 'local title';
+    assert.equal(db.loadState().papers[0].title, expectedTitle);
+    assert.equal(db.loadState().papers[0].venue, overlap ? 'base venue' : 'external venue');
+    assert.equal(store.getBase().papers.p1.title, expectedTitle);
+    assert.equal(store.getBase().papers.p2.title, 'nonconflicting edit');
+  });
+}
 
 function makeModel() {
   function signatures(workspace) {

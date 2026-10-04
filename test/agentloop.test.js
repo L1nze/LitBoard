@@ -40,6 +40,38 @@ function makeRun() {
 
 const toolCall = (id, name, args) => ({ message: { content: '', tool_calls: [{ id: id, function: { name: name, arguments: JSON.stringify(args) } }] } });
 
+test('cancel during overflow recovery persistence prevents another model request', async function () {
+  const { hooks, calls } = makeHooks([
+    new Error('prompt is too long: 90000 tokens > 8192 maximum'),
+    { message: { content: 'must not request this answer' } }
+  ]);
+  hooks.context = require('../js/agentcontext.js');
+  hooks.persist = function () {
+    calls.persists++;
+    if (calls.persists === 2) runner.cancel('r1');
+  };
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  Core.appendUser(run.core, 'go');
+  assert.equal(await runner.runTurn(run), 'stopped');
+  assert.equal(calls.chat.length, 1);
+});
+
+test('cancel on the final allowed tool step takes priority over max_steps', async function () {
+  const { hooks } = makeHooks([toolCall('c1', 't', {})]);
+  hooks.executeTool = async function () {
+    runner.cancel('r1');
+    return 'late result';
+  };
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  run.core.maxSteps = 1;
+  Core.appendUser(run.core, 'go');
+  assert.equal(await runner.runTurn(run), 'stopped');
+  assert.equal(run.core.messages.filter((message) => message.role === 'tool').length, 1);
+  assert.equal(run.core.messages.some((message) => message.role === 'error'), false);
+});
+
 test('A01/A17: orchestration runs model → tools → model → final answer', async function () {
   const { hooks, calls } = makeHooks([
     toolCall('c1', 'search_openalex', { query: 'battery' }),

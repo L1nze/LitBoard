@@ -1,29 +1,29 @@
 # 下载 LitBoard
 
-LitBoard 提供 Windows x64 安装版和便携版。仓库目前保持私有，仅有权限的协作者可访问[正式发布页](https://github.com/L1nze/LitBoard/releases)和下方的直接下载链接。
+LitBoard 提供 Windows x64 安装版和便携版，可从[正式发布页](https://github.com/L1nze/LitBoard/releases)和下方的直接下载链接获取。
 
 ## 直接下载
 
-以下直接下载 1.0.1 正式版的发布附件。
+以下直接下载 1.0.3 正式版的发布附件。
 
 | 版本 | 直接下载 | 适合 |
 | --- | --- | --- |
-| Windows 安装版 | [下载 LitBoard-Setup-1.0.1-x64.exe](https://github.com/L1nze/LitBoard/releases/download/v1.0.1/LitBoard-Setup-1.0.1-x64.exe) | 常规安装，可选择安装目录 |
-| Windows 便携版 | [下载 LitBoard-Portable-1.0.1-x64.exe](https://github.com/L1nze/LitBoard/releases/download/v1.0.1/LitBoard-Portable-1.0.1-x64.exe) | 免安装运行，适合放在自选位置 |
+| Windows 安装版 | [下载 LitBoard-Setup-1.0.3-x64.exe](https://github.com/L1nze/LitBoard/releases/download/v1.0.3/LitBoard-Setup-1.0.3-x64.exe) | 常规安装，可选择安装目录 |
+| Windows 便携版 | [下载 LitBoard-Portable-1.0.3-x64.exe](https://github.com/L1nze/LitBoard/releases/download/v1.0.3/LitBoard-Portable-1.0.3-x64.exe) | 免安装运行，适合放在自选位置 |
 
-[查看 1.0.1 发布说明](https://github.com/L1nze/LitBoard/releases/tag/v1.0.1) · [下载 SHA256SUMS.txt](https://github.com/L1nze/LitBoard/releases/download/v1.0.1/SHA256SUMS.txt)
+[查看 1.0.3 发布说明](https://github.com/L1nze/LitBoard/releases/tag/v1.0.3) · [下载 SHA256SUMS.txt](https://github.com/L1nze/LitBoard/releases/download/v1.0.3/SHA256SUMS.txt)
 
-浏览器扩展可[下载 LitBoard-Extension-1.0.1.zip](https://github.com/L1nze/LitBoard/releases/download/v1.0.1/LitBoard-Extension-1.0.1.zip)。它需要连接正在运行的 LitBoard 桌面应用。
+浏览器扩展可[下载 LitBoard-Extension-1.0.3.zip](https://github.com/L1nze/LitBoard/releases/download/v1.0.3/LitBoard-Extension-1.0.3.zip)。它需要连接正在运行的 LitBoard 桌面应用。
 
 ## 校验下载文件
 
 从同一次 Release 下载 exe 与 `SHA256SUMS.txt`。在 PowerShell 中计算文件哈希：
 
 ```powershell
-Get-FileHash -LiteralPath '.\LitBoard-Setup-1.0.1-x64.exe' -Algorithm SHA256
+Get-FileHash -LiteralPath '.\LitBoard-Setup-1.0.3-x64.exe' -Algorithm SHA256
 ```
 
-便携版将命令中的文件名换为 `LitBoard-Portable-1.0.1-x64.exe`。把输出的 `Hash` 与校验文件中相应文件的 SHA-256 值逐字比较。
+便携版将命令中的文件名换为 `LitBoard-Portable-1.0.3-x64.exe`。把输出的 `Hash` 与校验文件中相应文件的 SHA-256 值逐字比较。
 
 ## 安装与数据
 

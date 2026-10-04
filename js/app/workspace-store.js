@@ -104,13 +104,24 @@
       var oldBase = persistedSignatures;
       return desktop.saveLibrary(workspace, oldBase).then(function (result) {
         if (result && result.conflicts && result.conflicts.length) {
-          persistedSignatures = result.signatures || oldBase;
-          refreshBase(workspace, oldBase);
+          // 解析前保留已确认祖先：未提交的本地内容不能成为三方合并的 base。
+          // 取消时也不推进签名，否则重试会认为库端未变并直接覆盖外部修改。
           return options.resolveConflicts(result.conflicts, baseEntities).then(function (resolved) {
             if (!resolved) {
               options.toast(options.T('⚠ 保存冲突未解决，本地修改已保留，请重试'));
               return false;
             }
+            // 本轮非冲突项已落库；冲突项的已确认内容则是库端返回的实体。
+            // 先推进这两类祖先，再重提合并结果，采用库端版本时也不会遗留旧 base。
+            refreshBase(workspace, oldBase);
+            result.conflicts.forEach(function (conflict) {
+              if (conflict.entity) {
+                baseEntities[conflict.collection][conflict.id] = JSON.parse(JSON.stringify(conflict.entity));
+              } else {
+                delete baseEntities[conflict.collection][conflict.id];
+              }
+            });
+            persistedSignatures = result.signatures || oldBase;
             return persistDesktop(skipSync, desktop);
           });
         }

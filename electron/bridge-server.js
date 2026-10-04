@@ -12,6 +12,7 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const { downloadPdfToFile, availablePdfPath } = require('./pdfdownload.js');
+const { createSafePublicHttpsFetch } = require('./safe-fetch.js');
 
 const DEFAULT_PORT = 24117;
 const MAX_PORT_ATTEMPTS = 8;
@@ -19,6 +20,19 @@ const MAX_PORT_ATTEMPTS = 8;
 function createBridgeServer(options) {
   const libraryDb = options.libraryDb;
   const netFetch = options.fetch;
+  const safeFetch = createSafePublicHttpsFetch();
+  // 页面及元数据提供的 PDF 地址不可信，使用独立的公共 HTTPS 下载出口。
+  const pdfFetch = options.pdfFetch || async function (url, init) {
+    const response = await safeFetch(url, init);
+    if (!response.ok || /text\/html/i.test(String(response.headers.get('content-type') || ''))) {
+      if (response.discard) response.discard();
+      return response;
+    }
+    return new Response(await response.arrayBuffer(), {
+      status: response.status,
+      headers: { 'Content-Type': response.headers.get('content-type') || 'application/pdf' }
+    });
+  };
   // PDF 落盘目录：主进程按条目 ID 返回独立受管目录；旧调用方的静态 downloadsDir 仍兼容。
   const resolveDownloadDir = typeof options.resolveDownloadDir === 'function'
     ? options.resolveDownloadDir
@@ -181,7 +195,7 @@ function createBridgeServer(options) {
       const dir = await resolveDownloadDir(paperId);
       await fs.mkdir(dir, { recursive: true });
       const target = await availablePdfPath(dir, 'litboard-' + paperId + '.pdf');
-      const result = await downloadPdfToFile(pdfUrl, target, { fetch: netFetch, timeoutMs: 30000 });
+      const result = await downloadPdfToFile(pdfUrl, target, { fetch: pdfFetch, timeoutMs: 30000 });
       if (result && result.error) return false;
       return attachPdfFile(paperId, result.path);
     } catch (error) {
@@ -217,6 +231,7 @@ function createBridgeServer(options) {
     let body;
     try {
       body = JSON.parse(await readBody(req));
+      if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('请求须为 JSON 对象');
     } catch (error) {
       send(res, 400, { ok: false, error: '无效 JSON' });
       return;
@@ -309,6 +324,7 @@ function createBridgeServer(options) {
     let body;
     try {
       body = JSON.parse(await readBody(req, 64 * 1024 * 1024));
+      if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('请求须为 JSON 对象');
     } catch (error) {
       send(res, 400, { ok: false, error: '请求体过大或 JSON 无效' });
       return;

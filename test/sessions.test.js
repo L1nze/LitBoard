@@ -20,6 +20,27 @@ async function makeSessions(trashed) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+test('concurrent same-name attachments keep distinct files and original bytes', async function () {
+  const { s, root } = await makeSessions();
+  const created = await s.create({ title: 'parallel attachments' });
+  const contents = ['first attachment', 'second attachment'];
+  const saved = await Promise.all(contents.map((content) => s.saveAttachment(created.id, {
+    name: 'paper.pdf', dataBase64: Buffer.from(content).toString('base64')
+  })));
+  try {
+    assert.notEqual(saved[0].file, saved[1].file);
+    for (let i = 0; i < saved.length; i++) {
+      assert.equal(await fs.readFile(saved[i].path, 'utf8'), contents[i]);
+    }
+    const disk = JSON.parse(await fs.readFile(path.join(root, '会话记录', created.dir, 'session.json'), 'utf8'));
+    assert.equal(disk.attachments.length, 2);
+    assert.equal(new Set(disk.attachments.map((attachment) => attachment.file)).size, 2);
+  } finally {
+    await s.flushAll();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('create lays out dated folder, session.json and index entry', async function () {
   const { s, root } = await makeSessions();
   const created = await s.create({ title: '锂电池寿命预测 Review' });

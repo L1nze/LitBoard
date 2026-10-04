@@ -98,4 +98,5 @@ docs/assets/gif/*.mp4
 !/test/research-fetch-page.test.js
 !/test/update.test.js
 !/test/update-check.test.js
+!/test/files-ipc.test.js
 .zcodeignore

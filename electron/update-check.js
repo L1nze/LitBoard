@@ -14,7 +14,8 @@ const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { once } = require('node:events');
+const { Readable, Transform } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const LitUpdate = require('../js/update.js');
 
 const CACHE_DIR_NAME = 'update-cache';
@@ -124,6 +125,8 @@ function createUpdateManager(deps) {
   async function checkNow() {
     if (!isPackaged) return snapshot();
     if (checkPromise) return checkPromise.then(snapshot);
+    // 下载目标在完成前保持固定，避免 pending 与已缓存文件指向不同版本。
+    if (downloadPromise) return downloadPromise.then(snapshot);
     checkPromise = (async function () {
       setStatus({ status: 'checking', error: '' });
       try {
@@ -194,21 +197,17 @@ function createUpdateManager(deps) {
     const res = await netFetch(url, { headers: { 'User-Agent': 'LitBoard' }, signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
     if (!res.ok) throw new Error('下载更新：HTTP ' + res.status);
     const total = Number(res.headers.get('content-length')) || 0;
-    const reader = res.body.getReader();
-    const out = fsSync.createWriteStream(dest);
     let done = 0;
     let lastEmit = -PROGRESS_STEP;
-    try {
-      for (;;) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        done += chunk.value.length;
-        if (!out.write(Buffer.from(chunk.value))) await once(out, 'drain');
+    const progress = new Transform({
+      transform: function (chunk, _encoding, callback) {
+        done += chunk.length;
         if (done - lastEmit >= PROGRESS_STEP) { lastEmit = done; onProgress(done, total); }
+        callback(null, chunk);
       }
-    } finally {
-      await new Promise(function (resolve) { out.end(resolve); });
-    }
+    });
+    // pipeline 全程处理读写错误，并在失败时关闭文件、取消响应流。
+    await pipeline(Readable.fromWeb(res.body), progress, fsSync.createWriteStream(dest));
     onProgress(done, total || done);
     return done;
   }

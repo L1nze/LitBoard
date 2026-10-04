@@ -159,6 +159,7 @@
           var result = null;
           var overflowRetried = false;
           while (true) {
+            if (run.cancelRequested) { result = { aborted: true }; break; }
             try {
               result = await chat({ sessionId: run.id, turnId: run.core.turnId || '', body: body });
               break;
@@ -255,6 +256,7 @@
           // 【关键事件点】工具结果落盘（含截断后的内容；截断在工具层完成，
           // 存储层不二次截断——Cline/Roo 同策略）；await 到磁盘提交（R04）
           await persist(run);
+          if (run.cancelRequested) { run.endReason = 'stopped'; break; }
           var verdict = Core.shouldContinue(run.core);
           if (!verdict.continue) {
             run.endReason = verdict.reason === 'done' ? 'done' : verdict.reason;

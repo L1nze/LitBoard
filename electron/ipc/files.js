@@ -11,6 +11,7 @@ const { storeFileInto, storeDirInto, resolveSnapshotEntry } = require('../integr
 const { itemAttachmentDir, duplicatePdfPath, storeItemAttachment } = require('../item-storage.js');
 const ctx = require('./context.js');
 const itemStores = { storeFileInto, storeDirInto };
+const pendingPdfWrites = new Map();
 
 module.exports = { register: register };
 
@@ -223,18 +224,27 @@ function register() {
         let base = String(file && file.name || '').trim();
         if (!base) base = 'paper';
         if (!/\.pdf$/i.test(base)) base += '.pdf';
+        if (/[\\/:*?"<>|\u0000-\u001f]/.test(base)) {
+          failed.push({ name: base, reason: ctx.T('无效的文件路径') });
+          continue;
+        }
         if (!path.isAbsolute(src)) { failed.push({ name: base, reason: ctx.T('无效源路径') }); continue; }
         try { await fs.access(src); } catch (error) { failed.push({ name: base, reason: ctx.T('源文件不存在') }); continue; }
         const ext = path.extname(base);
         const stem = base.slice(0, base.length - ext.length);
         let target = path.join(dir, base);
         let counter = 2;
-        while (true) {
-          try { await fs.access(target); target = path.join(dir, stem + '-' + counter + ext); counter++; }
-          catch (error) { break; }
-        }
         try {
-          await fs.copyFile(src, target);
+          while (true) {
+            try {
+              await fs.copyFile(src, target, fs.constants.COPYFILE_EXCL);
+              break;
+            } catch (error) {
+              if (error.code !== 'EEXIST') throw error;
+              target = path.join(dir, stem + '-' + counter + ext);
+              counter++;
+            }
+          }
           copied.push({ name: path.basename(target) });
         } catch (error) {
           failed.push({ name: base, reason: String(error && error.message || error) });
@@ -316,20 +326,34 @@ function register() {
     if (!path.isAbsolute(filePath) || !/\.pdf$/i.test(filePath)) return { error: ctx.T('无效的 PDF 路径') };
     const bytes = options && options.bytes;
     if (!bytes || !bytes.length) return { error: ctx.T('没有可写入的内容') };
-    try {
-      const backup = filePath + '.litbak';
+    const resolved = path.resolve(filePath);
+    const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+    const previous = pendingPdfWrites.get(key) || Promise.resolve();
+    // 同一 PDF 的写入按调用顺序执行，防止并发替换冲突和旧内容晚到覆盖。
+    const writing = previous.then(async function () {
+      const temp = filePath + '.' + crypto.randomUUID() + '.litwrite';
       try {
-        await fs.access(backup);
+        const backup = filePath + '.litbak';
+        try {
+          await fs.copyFile(filePath, backup, fs.constants.COPYFILE_EXCL); // 首次写回前留底，并发时也不覆盖
+        } catch (error) {
+          if (error.code !== 'EEXIST') throw error;
+        }
+        await fs.writeFile(temp, Buffer.from(bytes), { flag: 'wx' });
+        // 同目录 rename 原子替换；失败时原件必须仍在，不能先删除原文件。
+        await fs.rename(temp, filePath);
+        return { ok: true, backup: backup };
       } catch (error) {
-        await fs.copyFile(filePath, backup); // 首次写回前留底
+        return { error: String(error && error.message || error) };
+      } finally {
+        await fs.rm(temp, { force: true }).catch(function () {});
       }
-      const temp = filePath + '.litwrite';
-      await fs.writeFile(temp, Buffer.from(bytes));
-      await fs.rm(filePath, { force: true });
-      await fs.rename(temp, filePath);
-      return { ok: true, backup: backup };
-    } catch (error) {
-      return { error: String(error && error.message || error) };
+    });
+    pendingPdfWrites.set(key, writing);
+    try {
+      return await writing;
+    } finally {
+      if (pendingPdfWrites.get(key) === writing) pendingPdfWrites.delete(key);
     }
   });
 

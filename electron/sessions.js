@@ -361,19 +361,25 @@ function createSessions(options) {
     const ext = (path.extname(rawName).match(/\.[A-Za-z0-9]{1,10}/) || [''])[0];
     const stem = LitResearch.sanitizeFileStem(path.basename(rawName, ext), 60);
     const attDir = path.join(rootDir, entry.dir, '附件');
+    const buffer = Buffer.from(String(input && input.dataBase64 || ''), 'base64');
+    if (!buffer.length) throw new Error('附件内容为空');
     await fs.mkdir(attDir, { recursive: true });
     let target = path.join(attDir, stem + ext);
     let suffix = 1;
     while (true) {
-      try { await fs.access(target); suffix++; target = path.join(attDir, stem + ' ' + suffix + ext); }
-      catch (error) { break; }
+      try {
+        await fs.writeFile(target, buffer, { flag: 'wx' });
+        break;
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        suffix++;
+        target = path.join(attDir, stem + ' ' + suffix + ext);
+      }
     }
-    const buffer = Buffer.from(String(input && input.dataBase64 || ''), 'base64');
-    if (!buffer.length) throw new Error('附件内容为空');
-    await fs.writeFile(target, buffer);
     const rel = '附件/' + path.basename(target);
     if (!Array.isArray(entry.data.attachments)) entry.data.attachments = [];
     entry.data.attachments.push({ file: rel, label: String(input && input.label || '') });
+    entry.revision = (entry.revision || 0) + 1;
     entry.dirty = true;
     await flush(id);
     return { file: rel, path: target };

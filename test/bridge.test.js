@@ -17,6 +17,7 @@ async function makeBridge(t, fetchImpl) {
     libraryDb: db,
     downloadsDir: dir,
     fetch: fetchImpl || (async function () { throw new Error('offline'); }),
+    pdfFetch: fetchImpl || (async function () { throw new Error('offline'); }),
     onSaved: function (info) { saved.push(info); }
   });
   t.after(async function () {
@@ -76,6 +77,47 @@ test('bridge server serves ping, saves papers with token auth, dedupes by DOI', 
   assert.equal(state.papers.length, 1);
   assert.equal(state.papers[0].authors[0], 'Vaswani, Ashish');
   assert.equal(state.papers[0].citations, 90000);
+});
+
+test('bridge rejects private PDF URLs without sending them to its metadata transport', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-bridge-security-'));
+  const db = createLibraryDb(dir);
+  await db.open();
+  const calls = [];
+  const bridge = createBridgeServer({
+    libraryDb: db, downloadsDir: dir,
+    fetch: async function (url) {
+      calls.push(url);
+      return new Response(Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.alloc(2048)]));
+    }
+  });
+  t.after(async function () {
+    await bridge.stop(); await db.close(); await fs.rm(dir, { recursive: true, force: true });
+  });
+  const status = await bridge.start();
+  for (const pdfUrl of ['http://127.0.0.1/private.pdf', 'https://192.168.1.1/private.pdf']) {
+    const result = await fetch('http://127.0.0.1:' + status.port + '/save', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token },
+      body: JSON.stringify({ title: pdfUrl, pdfUrl: pdfUrl,
+        attachments: [{ url: 'http://169.254.169.254/metadata.pdf' }] })
+    }).then(r => r.json());
+    assert.equal(result.ok, true);
+    assert.equal(result.pdfAttached, false);
+  }
+  assert.deepEqual(calls, []);
+});
+
+test('bridge rejects non-object JSON on both write endpoints', async function (t) {
+  const { bridge } = await makeBridge(t);
+  const status = await bridge.start();
+  for (const endpoint of ['/save', '/attach-pdf']) {
+    for (const body of ['null', '[]', '"text"', '123']) {
+      const response = await fetch('http://127.0.0.1:' + status.port + endpoint, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token }, body: body
+      });
+      assert.equal(response.status, 400, endpoint + ': ' + body);
+    }
+  }
 });
 
 test('bridge server honors the disabled setting and offline enrichment still saves', async function (t) {
@@ -392,6 +434,11 @@ test('bridge resolves the download dir per save (mkdir included) and reports pap
   const bridge = createBridgeServer({
     libraryDb: db,
     resolveDownloadDir: async function () { return targetDir; },
+    pdfFetch: async function (url) {
+      assert.equal(url, 'https://example.org/resolver.pdf');
+      const bytes = Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.alloc(4096, 0x20)]);
+      return new Response(bytes, { status: 200, headers: { 'content-type': 'application/pdf' } });
+    },
     fetch: async function (url) {
       if (url.indexOf('api.openalex.org') !== -1) {
         return new Response(JSON.stringify({

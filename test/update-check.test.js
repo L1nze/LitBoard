@@ -15,6 +15,7 @@ const fsSync = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { spawnSync } = require('node:child_process');
 const { createUpdateManager } = require('../electron/update-check.js');
 
 const SETUP_101 = Buffer.from('fake-setup-bytes-1.0.1');
@@ -72,6 +73,7 @@ async function makeEnv(t, opts) {
     },
     netFetch: async function (url) {
       calls.downloads.push(url);
+      if (opts.netFetch) return opts.netFetch(url);
       return responseOf(url.indexOf('Portable') !== -1 ? state.bytes.portable : state.bytes.setup);
     },
     spawnInstaller: async function (file) { calls.spawned.push(file); },
@@ -87,6 +89,62 @@ function cacheFiles(configDir) {
   const dir = path.join(configDir, 'update-cache');
   try { return fsSync.readdirSync(dir).sort(); } catch (error) { return []; }
 }
+
+test('下载期间再次检查不替换正在下载版本，完成后仍可检查新版', async function (t) {
+  let releaseDownload;
+  const response = new Promise(function (resolve) { releaseDownload = resolve; });
+  let markStarted;
+  const started = new Promise(function (resolve) { markStarted = resolve; });
+  let first = true;
+  const env = await makeEnv(t, { netFetch: function () {
+    if (first) { first = false; markStarted(); return response; }
+    return Promise.resolve(responseOf(SETUP_102));
+  } });
+  await env.manager.checkNow();
+  const downloading = env.manager.downloadNow();
+  await started;
+  env.state.latest = '1.0.2';
+  env.state.bytes.setup = SETUP_102;
+  const checking = env.manager.checkNow();
+  releaseDownload(responseOf(SETUP_101));
+  await Promise.all([downloading, checking]);
+  assert.equal(env.calls.fetchRelease, 1);
+  await env.manager.checkNow();
+  const latest = await env.manager.downloadNow();
+  assert.equal(latest.status, 'ready');
+  assert.equal(latest.version, '1.0.2');
+  assert.deepEqual(cacheFiles(env.configDir), [setupName('1.0.2'), 'state.json'].sort());
+});
+
+test('安装包文件写入失败返回 error，不造成未捕获异常或挂起', async function (t) {
+  const configDir = await fs.mkdtemp(path.join(os.tmpdir(), 'lb-update-write-error-'));
+  t.after(async function () { await fs.rm(configDir, { recursive: true, force: true }); });
+  const script = `
+    const fs = require('node:fs/promises');
+    const path = require('node:path');
+    const { createUpdateManager } = require(process.argv[1]);
+    const dir = process.argv[2];
+    const name = '${setupName('1.0.1')}';
+    const manager = createUpdateManager({
+      getConfigDir: () => dir, currentVersion: '1.0.0', isPackaged: true,
+      fetchRelease: async () => (${JSON.stringify(releaseFor('1.0.1'))}),
+      fetchText: async () => '${sha(SETUP_101)}  ' + name,
+      netFetch: async () => {
+        await fs.mkdir(path.join(dir, 'update-cache', name + '.part'), { recursive: true });
+        let timer;
+        return new Response(new ReadableStream({ start(controller) {
+          timer = setTimeout(() => { controller.enqueue(new Uint8Array([1])); controller.close(); }, 30);
+        }, cancel() { clearTimeout(timer); } }));
+      }
+    });
+    (async () => { await manager.checkNow(); console.log(JSON.stringify(await manager.downloadNow())); })()
+      .catch(error => { console.error(error); process.exitCode = 1; });
+  `;
+  const result = spawnSync(process.execPath, ['-e', script, require.resolve('../electron/update-check.js'), configDir], { encoding: 'utf8', timeout: 5000 });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout.trim()).status, 'error');
+});
 
 test('首次发现新版本：后台预下载 + 校验就绪，缓存只此一份', async function (t) {
   const env = await makeEnv(t);
