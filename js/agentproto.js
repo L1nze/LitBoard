@@ -271,10 +271,10 @@
     return name.indexOf('/') >= 0 ? name.slice(name.lastIndexOf('/') + 1) : name;
   }
 
-  /** OpenAI 官方推理系模型（o 系 / gpt-5）在 chat/completions 上**拒收** `max_tokens`
+  /** OpenAI 官方推理系模型（o 系 / gpt-5 / gpt-6）在 chat/completions 上**拒收** `max_tokens`
    *  （HTTP 400 Unsupported parameter），必须改发 `max_completion_tokens`；其余模型按旧字段发
    *  （第三方兼容网关普遍只认 `max_tokens`，不能一律改名）。 */
-  var OPENAI_REASONING_MODEL = /^(o[1-9]|gpt-5|gpt5)/;
+  var OPENAI_REASONING_MODEL = /^(o[1-9]|gpt-?[56])/;
 
   /** → OpenAI Chat Completions（原样透传 + 输出上限的字段名适配） */
   function toChatBody(body) {

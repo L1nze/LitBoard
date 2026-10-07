@@ -2034,6 +2034,7 @@
     " 个失败：": " failed: ",
     "当前版本不支持批量删除": "This version does not support batch deletion",
     "Kimi（Moonshot）": "Kimi (Moonshot)",
+    "小米 MiMo": "Xiaomi MiMo",
     "智谱 AI（Zhipu AI）": "Zhipu AI",
     "智谱 GLM": "Zhipu GLM",
     "：官方以开关键制": ": official boolean switch",

@@ -279,7 +279,7 @@ test('createAccumulator: 未知协议回退 chat 形态', function () {
   assert.equal(acc.message().content, 'x');
 });
 
-test('chat 形态：输出上限随模型改写字段名（o 系/gpt-5 用 max_completion_tokens）', function () {
+test('chat 形态：输出上限随模型改写字段名（o 系/gpt-5/gpt-6 用 max_completion_tokens）', function () {
   const body = { model: 'gpt-5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 12800 };
   const out = P.toChatBody(body);
   assert.equal(out.max_completion_tokens, 12800);
@@ -288,6 +288,7 @@ test('chat 形态：输出上限随模型改写字段名（o 系/gpt-5 用 max_c
 
   // 网关惯用 vendor/model 前缀，按最后一段判家族
   assert.equal(P.toChatBody({ model: 'openai/o3-mini', max_tokens: 4096 }).max_completion_tokens, 4096);
+  assert.equal(P.toChatBody({ model: 'gpt-6-sol', max_tokens: 4096 }).max_completion_tokens, 4096);
   // 其余模型保持 max_tokens（第三方兼容网关普遍只认这个字段）
   assert.equal(P.toChatBody({ model: 'deepseek-chat', max_tokens: 12800 }).max_tokens, 12800);
   assert.equal(P.toChatBody({ model: 'gpt-4o', max_tokens: 12800 }).max_tokens, 12800);
