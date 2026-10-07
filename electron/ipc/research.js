@@ -395,9 +395,28 @@ function register() {
     const embedTarget = await ctx.embedService.resolveTarget();
     // 查询路径按需补齐（比照上游 literature-mcp 的 library_query + semantic_query）：最多 50 篇/次，
     // 让「刚检索入库、还没轮到空闲构建」的库这次就能走向量。失败标记存在时 topUp 自行跳过（不重试计费）。
+    // 2026-10 对照上游再提速两点（registry.py 的 create_task(_top_up) 路线）：
+    // ① 查询文本嵌入与 topUp 是两次独立 API 调用，向量索引已就绪时**并行发起**——查询只等
+    //    自己的向量，不再串行白等补齐批次；topUp 只增向量，先验过覆盖就不会白花这次嵌入（计费红线不动）。
+    // ② topUp 的基础设施性报错（DB 故障等）按非致命降级（上游：top-up failures stay non-fatal
+    //    for the read），检索照常按现有向量走，不再整次失败。
+    const preCoverage = embedTarget.ok
+      ? ctx.researchDb.vecCoverage({ model: embedTarget.model, recipe: LitResearch.EMBED_RECIPE })
+      : { total: 0, matched: 0 };
+    const vectorAlready = embedTarget.ok && requested !== 'keyword' &&
+      LitResearch.vectorReadiness(embedTarget, preCoverage).ready;
+    let queryEmbedPromise = null;
+    if (vectorAlready) {
+      queryEmbedPromise = ctx.embedService.embedTexts({ texts: [query] });
+      // 防御：后续判定若意外走了关键词分支，别让悬挂拒绝漏成 unhandledRejection
+      queryEmbedPromise.catch(function () {});
+    }
     let topUp = null;
     if (embedTarget.ok && requested !== 'keyword' && ctx.researchEmbedder) {
-      topUp = await ctx.researchEmbedder.topUp();
+      topUp = await ctx.researchEmbedder.topUp().catch(function (error) {
+        ctx.startupLog('semantic-search top-up error: ' + String(error && error.message || error));
+        return { skipped: 'error', error: String(error && error.message || error) };
+      });
     }
     // A-followup #4：可用性按**当前模型 + 配方**的覆盖判定（不是全库向量总数）——
     // 换过嵌入模型时旧向量还在，总数不为零，但 cosineSearch 只认同模型同配方的向量，
@@ -441,7 +460,9 @@ function register() {
         })
       };
     }
-    const result = await ctx.embedService.embedTexts({ texts: [query] });
+    // 查询向量在此收口：vectorAlready 为真时这份早已与 topUp 并行发出（见上），
+    // 否则现在才发——两种情况计费次数完全一致（只在向量路径必走时才发起）
+    const result = queryEmbedPromise ? await queryEmbedPromise : await ctx.embedService.embedTexts({ texts: [query] });
     const vec = new Float32Array(result.vectors[0]);
     // R13：检索只命中「同一嵌入模型 + 同一配方」的向量——等维不同模型的向量
     // 不是同一空间，混检会给出虚假的满分命中

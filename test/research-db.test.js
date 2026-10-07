@@ -93,6 +93,29 @@ test('updateWorkText writes provenance and invalidates vectors', async function 
   } finally { db.close(); }
 });
 
+test('updateWorkText 内容未变短路：不重建 FTS、不删向量、不造假待办', async function () {
+  const { db } = await makeDb();
+  try {
+    db.upsertWorks([{ id: 'W70', title: 'Stable title', abstract: 'stable abstract', doi: '10.1/q' }]);
+    const model = 'm1';
+    const recipe = 2;
+    const pending = db.pendingEmbeddings({ model, recipe, limit: 5 });
+    db.vecPut([{ workId: 'W70', model: model, dim: 1, recipe: recipe, hash: pending[0].hash,
+      vec: Buffer.from(new Float32Array([1]).buffer) }]);
+    // 幂等回填（同一摘要原样再写一遍）：updated 0，向量保留、不重新变成待嵌
+    const r = db.updateWorkText('W70', { abstract: 'stable abstract' }, 'crossref');
+    assert.equal(r.updated, 0);
+    assert.equal(db.stats().vectors, 1);
+    assert.equal(db.pendingEmbeddings({ model, recipe, limit: 5 }).length, 0);
+    assert.ok(db.cosineSearch(Buffer.from(new Float32Array([1]).buffer), { limit: 5, model: model, recipe: recipe })
+      .some((h) => h.workId === 'W70'), '内容没变，向量必须仍在检索结果里');
+    // 内容真的变了：照旧全链路（R13 删 vec 行 → 重新待嵌）
+    const r2 = db.updateWorkText('W70', { abstract: 'changed abstract' }, 'crossref');
+    assert.equal(r2.updated, 1);
+    assert.equal(db.pendingEmbeddings({ model, recipe, limit: 5 }).length, 1);
+  } finally { db.close(); }
+});
+
 test('importFromHarness maps and imports idempotently', async function () {
   const { db, dir } = await makeDb();
   // 构造一个最小 harness 形态的库
@@ -178,6 +201,37 @@ test('vec layer: put, pending by hash/model/recipe, cosine search with year filt
     assert.ok(!pending.some((p) => p.work.id === 'W12'));
     db.vecClear();
     assert.equal(db.stats().vectors, 0);
+  } finally { db.close(); }
+});
+
+test('pendingEmbeddings 两段式（对照上游 2026-10）：戳在即跳过，不再逐行重验 hash', async function () {
+  const { db, dir } = await makeDb();
+  try {
+    db.upsertWorks([
+      { id: 'WA', title: 'Alpha', abstract: 'a text', concepts: ['x'], keywords: ['y'] },
+      { id: 'WB', title: 'Beta', abstract: 'b text' },
+      { id: 'WC', title: '', abstract: '' }
+    ]);
+    const model = 'm1';
+    const recipe = 2;
+    let pending = db.pendingEmbeddings({ model, recipe, limit: 10 });
+    assert.deepEqual(pending.map((p) => p.work.id), ['WA', 'WB']); // 扫描序 + 空文本跳过
+    // 第二段才算 hash，且是当前内容算出的（vecPut 落库后写入路径的失真检测不受影响）
+    assert.equal(pending[0].hash, LitResearch.embeddingHash(pending[0].work));
+    db.vecPut(pending.map((p) => ({
+      workId: p.work.id, model: model, dim: 1, recipe: recipe, hash: p.hash,
+      vec: Buffer.from(new Float32Array([0.5]).buffer)
+    })));
+    assert.equal(db.pendingEmbeddings({ model, recipe, limit: 10 }).length, 0);
+    // 手工改坏 vecs.content_hash 也不再触发重嵌——已有当前模型+配方向量即视为最新
+    // （上游 embed_version 同一信任模型；应用的所有写路径都同步删 vec 行，R13）
+    const vecDb = new DatabaseSync(path.join(dir, 'vec.db'));
+    vecDb.prepare("UPDATE vecs SET content_hash = 'zzz'").run();
+    vecDb.close();
+    assert.equal(db.pendingEmbeddings({ model, recipe, limit: 10 }).length, 0);
+    // 换模型（等维不同空间）→ 全部重新待办；limit 截断按扫描序
+    assert.equal(db.pendingEmbeddings({ model: 'm2', recipe, limit: 10 }).length, 2);
+    assert.equal(db.pendingEmbeddings({ model: 'm2', recipe, limit: 1 })[0].work.id, 'WA');
   } finally { db.close(); }
 });
 

@@ -597,6 +597,15 @@ function createResearchDb(options) {
     }
     if (patch && patch.abstract) { sets.push('abstract = @abstract'); params.abstract = String(patch.abstract).slice(0, 200000); }
     if (!sets.length) return { updated: 0 };
+    // 内容未变短路（2026-10 对照上游 literature-mcp works_fts_update 触发器的 WHEN 守卫）：
+    // 相同文本再写一遍不做任何事——FTS 删插（fulltext 列要回读侧表最多 40 万字符）、
+    // vec 行删除（下次构建会把没变的内容白重新计费嵌入一遍）、provenance 重写全省掉。
+    // 幂等回填（同一摘要写两次）不再制造「删了向量又重嵌」的假待办。
+    const current = works.prepare('SELECT title, abstract FROM works WHERE id = ?').get(id);
+    if (!current) return { updated: 0 };
+    const titleUnchanged = !params.title || String(current.title || '') === params.title;
+    const abstractUnchanged = !params.abstract || String(current.abstract || '') === params.abstract;
+    if (titleUnchanged && abstractUnchanged) return { updated: 0 };
     sets.push('updated_at = @now');
     works.exec('BEGIN');
     try {
@@ -801,8 +810,17 @@ function createResearchDb(options) {
   }
 
   /**
-   * 待嵌入清单：无向量 / 内容 hash 变了 / 模型或配方版本不符 → 都视为待办。
+   * 待嵌入清单：无向量 / 模型或配方版本不符 → 待办（2026-10 对照上游 literature-mcp 的
+   * get_work_ids_missing_embeddings + get_works_for_embedding 改为两段式）。
    * 空标题且空摘要的条目没有嵌入意义，跳过。分批扫描，limit 封顶单批。
+   *
+   * 第一段只扫 id 与「有无可嵌文本」两个小信号——已有当前模型+配方向量的行**不再逐条
+   * JSON.parse + SHA-1 验 hash**：所有改 title/abstract 的写路径（upsertWorks /
+   * updateWorkText）都同步删 vec 行（R13），戳在内容就在（上游 embed_version 同一信任
+   * 模型；绕过应用直改数据库不在支持面内，vec.db 本就是可删了重建的缓存）。旧实现对
+   * 全库每行重算 hash——topUp 在每次语义检索前都要跑一遍预检，万级库已嵌满时这是白付的
+   * 大头。hash 只对真正要嵌的 ≤ limit 条在第二段算（vecPut 存的还是当前内容的 hash，
+   * 写入路径的失真检测不受影响）。
    */
   function pendingEmbeddings(options) {
     ensureOpen();
@@ -811,38 +829,55 @@ function createResearchDb(options) {
     const model = String(opts.model || '');
     const recipe = Number(opts.recipe) || 0;
     const limit = Math.max(1, Math.min(5000, Number(opts.limit) || 500));
-    const existing = new Map();
-    vec.prepare('SELECT work_id, content_hash, model, recipe FROM vecs').all()
+    const currentIds = new Set();
+    // 只取「当前模型 + 当前配方」的 work_id 集合（SQLite 侧过滤掉旧模型行，JS 侧免存整行对象）
+    vec.prepare('SELECT work_id FROM vecs WHERE model = ? AND recipe = ?').all(model, recipe)
       .forEach(function (row) {
-        existing.set(row.work_id, row);
+        currentIds.add(row.work_id);
       });
-    const out = [];
+    const picked = [];
     const CHUNK = 500;
-    let offset = 0;
-    while (out.length < limit) {
+    // keyset 分页（WHERE id > ?）：OFFSET 版每片都要重走跳过的行，万级库全扫是平方级
+    let lastId = '';
+    while (picked.length < limit) {
       const rows = works.prepare(`
-        SELECT id, title, abstract, concepts_json, keywords_json
-        FROM works ORDER BY id LIMIT ? OFFSET ?
-      `).all(CHUNK, offset);
+        SELECT id, (COALESCE(title, '') != '' OR COALESCE(abstract, '') != '') AS has_text
+        FROM works WHERE id > ? ORDER BY id LIMIT ?
+      `).all(lastId, CHUNK);
       if (!rows.length) break;
-      offset += rows.length;
+      lastId = rows[rows.length - 1].id;
       for (const row of rows) {
-        if (out.length >= limit) break;
-        const work = {
-          id: row.id,
-          title: row.title || '',
-          abstract: row.abstract || '',
-          concepts: parseJsonArray(row.concepts_json),
-          keywords: parseJsonArray(row.keywords_json)
-        };
-        if (!work.title && !work.abstract) continue;
-        const hash = LitResearch.embeddingHash(work);
-        const have = existing.get(row.id);
-        if (have && have.content_hash === hash && have.model === model && Number(have.recipe) === recipe) continue;
-        out.push({ work: work, hash: hash });
+        if (picked.length >= limit) break;
+        if (!row.has_text) continue;
+        if (currentIds.has(row.id)) continue;
+        picked.push(row.id);
       }
       if (rows.length < CHUNK) break;
     }
+    if (!picked.length) return [];
+    // 第二段：只对挑出的条目取嵌入配方需要的瘦身列，并保持第一段的扫描序
+    // （limit 截断先挑谁与旧实现一致）
+    const byId = new Map();
+    for (let start = 0; start < picked.length; start += CHUNK) {
+      const slice = picked.slice(start, start + CHUNK);
+      const placeholders = slice.map(function () { return '?'; }).join(',');
+      works.prepare(`SELECT id, title, abstract, concepts_json, keywords_json FROM works WHERE id IN (${placeholders})`)
+        .all(...slice).forEach(function (row) { byId.set(row.id, row); });
+    }
+    const out = [];
+    picked.forEach(function (id) {
+      const row = byId.get(id);
+      if (!row) return;
+      const work = {
+        id: row.id,
+        title: row.title || '',
+        abstract: row.abstract || '',
+        concepts: parseJsonArray(row.concepts_json),
+        keywords: parseJsonArray(row.keywords_json)
+      };
+      if (!work.title && !work.abstract) return;
+      out.push({ work: work, hash: LitResearch.embeddingHash(work) });
+    });
     return out;
   }
 

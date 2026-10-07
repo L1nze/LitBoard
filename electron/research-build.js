@@ -4,7 +4,9 @@
  * LitBoard 调研库向量构建器（二期）：content-hash 增量 + 库空闲调度 + 成本护栏。
  *
  * 规则（对应 roadmap B-1 语义）：
- * - 待嵌判定 = 无向量 / 内容 hash 变了 / 模型或配方版本不符（research-db.pendingEmbeddings）；
+ * - 待嵌判定 = 无向量 / 模型或配方版本不符（research-db.pendingEmbeddings，2026-10 对照上游
+ *   改两段式：内容变化在写入路径即时删 vec 行（R13），扫描按「当前模型+配方」戳判定，
+ *   不再全库逐行重验 hash）；
  * - 只在库空闲（无待保存、无进行中同步——由调用方注入 isIdle）时跑，批间复检；
  * - 失败批次不自动重试计费（R14）：整批失败写入持久 failed 标记（settings 表，
  *   由调用方注入 getSetting/setSetting）——巡检/入库触发见标记即跳过，**零新增请求**；

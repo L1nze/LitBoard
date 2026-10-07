@@ -96,6 +96,7 @@ docs/assets/gif/*.mp4
 !/test/pdf-open-race.test.js
 !/test/paper-folder-drag.test.js
 !/test/research-fetch-page.test.js
+!/test/research-semantic-search.test.js
 !/test/update.test.js
 !/test/update-check.test.js
 !/test/files-ipc.test.js
