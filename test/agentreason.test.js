@@ -49,6 +49,29 @@ test('Kimi: k2.x 用 thinking.type，k3 用 reasoning_effort，k2.7-code 不可�
   assert.deepEqual(Reason.buildBody(code, 'high'), {});
 });
 
+test('Kimi Code 订阅端点：独立模型 ID，kimi-for-coding/k3 可关可降档', function () {
+  // 订阅端点（api.kimi.com/coding）的模型 ID 与开放平台不同源：
+  // kimi-for-coding / k3 / k3-256k 走 reasoning_effort none|low|high|max（none = 关思考）
+  for (const model of ['kimi-for-coding', 'k3', 'k3-256k']) {
+    const c = cap({ baseUrl: 'https://api.kimi.com/coding/v1', model });
+    assert.equal(c.provider, 'kimi', model);
+    assert.deepEqual(c.levels, ['off', 'low', 'high', 'max'], model);
+    assert.deepEqual(Reason.buildBody(c, 'off'), { reasoning_effort: 'none' });
+    assert.deepEqual(Reason.buildBody(c, 'low'), { reasoning_effort: 'low' });
+    // 官方别名归一：medium→high、xhigh→max（未知取值官方 400，不原样下发）
+    assert.deepEqual(Reason.buildBody(c, 'medium'), { reasoning_effort: 'high' });
+    assert.deepEqual(Reason.buildBody(c, 'xhigh'), { reasoning_effort: 'max' });
+    const r = Reason.normalize(c, 'medium');
+    assert.equal(r.remapped, true);
+    assert.ok(r.note.indexOf('归一为 high') !== -1);
+  }
+  // 高速版固定思考，无任何档位
+  const hs = cap({ baseUrl: 'https://api.kimi.com/coding/v1', model: 'kimi-for-coding-highspeed' });
+  assert.deepEqual(hs.levels, []);
+  assert.deepEqual(Reason.buildBody(hs, 'off'), {});
+  assert.ok(Reason.normalize(hs, 'off').note.indexOf('固定开启思考') !== -1);
+});
+
 test('GLM: 4.5~5.1 只有 thinking 开关，5.2 有效档 off/high/max，5.3 不能关', function () {
   const g46 = cap({ baseUrl: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4.6' });
   assert.equal(g46.provider, 'glm');

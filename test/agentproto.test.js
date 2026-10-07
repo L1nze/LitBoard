@@ -314,6 +314,7 @@ test('providerLabel: 服务商展示名（OpenCode 分 Go/Zen，未知回落真�
   assert.equal(P.providerLabel('https://api.deepseek.com'), 'DeepSeek');
   assert.equal(P.providerLabel('https://api.deepseek.com/anthropic'), 'DeepSeek');
   assert.equal(P.providerLabel('https://api.moonshot.cn/v1'), 'Kimi');
+  assert.equal(P.providerLabel('https://api.kimi.com/coding/v1'), 'Kimi Code');
   assert.equal(P.providerLabel('https://open.bigmodel.cn/api/paas/v4'), '智谱 GLM');
   assert.equal(P.providerLabel('https://api.anthropic.com'), 'Anthropic');
   assert.equal(P.providerLabel('https://dashscope.aliyuncs.com/compatible-mode/v1'), 'DashScope');

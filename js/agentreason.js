@@ -15,6 +15,12 @@
  *   （含 -highspeed）始终思考、传 disabled 报错；kimi-k2.6 等用 thinking.type =
  *   enabled(默认)|disabled（thinking.keep = "all"|null 是跨轮保留思考，与档位无关，
  *   本模块不下发）。
+ * - Kimi Code 订阅（www.kimi.com/code/docs，api.kimi.com/coding）：与开放平台**不同
+ *   产品、不同模型 ID**——k3 / k3-256k / kimi-for-coding 用 reasoning_effort =
+ *   none|low|high|max（默认 k3=high、kimi-for-coding=max；none = 关闭思考，关闭后由
+ *   K2.8 Preview 无思考处理；官方别名归一 medium→high、xhigh/ultra→max，未知取值 400）；
+ *   kimi-for-coding-highspeed 固定思考不可调。官方提醒：切换 effort 会使已建立的
+ *   上下文缓存失效。
  * - 智谱 GLM（docs.bigmodel.cn）：reasoning_effort 仅 GLM-5.2 及以上支持。GLM-5.2
  *   名义上接受 none|minimal|low|medium|high|xhigh|max，但官方把 low/medium 归一为 high、
  *   xhigh 归一为 max——有效档只有 none/high/max，UI 只展示有效档（不拿「会被服务端归一」
@@ -132,8 +138,23 @@
       });
   }
 
-  /** Kimi / Moonshot：按模型细分（k3 用 effort、k2.7-code 不可关、其余用 thinking.type） */
+  /** Kimi / Moonshot：按模型细分（k3 用 effort、k2.7-code 不可关、其余用 thinking.type）。
+   *  Kimi Code 订阅端点（api.kimi.com/coding）的模型 ID 与开放平台不同源，单独成支。 */
   function kimi(model) {
+    if (/^kimi-for-coding-highspeed$/.test(model)) {
+      return alwaysThinking('kimi', 'Kimi Code（高速版）', 'kimi-for-coding-highspeed 官方固定开启思考');
+    }
+    // Kimi Code 订阅：官方别名归一 medium→high、xhigh/ultra→max，none = 关闭思考
+    if (/^kimi-for-coding$/.test(model) || /^k3(?:-256k)?$/.test(model)) {
+      return capability('kimi', 'Kimi Code', PARAM_KINDS.EFFORT,
+        ['off', 'low', 'high', 'max'],
+        { off: 'none', low: 'low', high: 'high', max: 'max' },
+        { medium: 'high', xhigh: 'max' },
+        {
+          medium: 'Kimi Code 官方把 medium 归一为 high，已按 high 下发',
+          xhigh: 'Kimi Code 官方把 xhigh 归一为 max，已按 max 下发'
+        });
+    }
     if (/k3/.test(model)) {
       return capability('kimi', 'Kimi（k3）', PARAM_KINDS.EFFORT,
         ['low', 'high', 'max'],
@@ -320,7 +341,7 @@
     var cap;
     if (/^deepseek(?:-|$)/.test(model)) cap = deepseek();
     else if (/^mimo(?:-|$)/.test(model)) cap = mimo();
-    else if (/^kimi(?:-|$)/.test(model)) cap = kimi(model);
+    else if (/^kimi(?:-|$)|^k3(?:-|$)/.test(model)) cap = kimi(model);
     else if (/^glm(?:-|$)/.test(model)) cap = glm(model);
     else if (/^(qwen|qwq)(?:[\d.-]|$)/.test(model)) cap = qwen(model);
     else if (/^claude(?:-|$)/.test(model)) cap = claude(model);

@@ -42,6 +42,8 @@
     'api.anthropic.com': 'Anthropic',
     'api.deepseek.com': 'DeepSeek',
     'api.moonshot.cn': 'Kimi',
+    'api.kimi.com': 'Kimi Code',
+    'api.kimi.ai': 'Kimi Code',
     'open.bigmodel.cn': '智谱 GLM',
     'api.z.ai': 'Z.ai',
     'dashscope.aliyuncs.com': 'DashScope',
