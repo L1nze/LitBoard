@@ -2301,14 +2301,19 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
     },
     log: startupLog
   });
-  // 启动清扫（含「装完新版自动删安装包」）后静默自检一次；离线/失败只落日志不打扰
+  // 启动清扫（含「装完新版自动删安装包」）后静默自检一次；离线/失败只落日志不打扰。
+  // 之后每 6 小时复查一次：应用常开时新发布的版本也能在会话内发现并提示（含启动时离线、
+  // 稍后才联网的场景）。checkNow 对「下载中/已就绪」自带去重不会重复下载，渲染层 toast
+  // 按版本去重，复查不会重复打扰。
   ctx.updateManager.init().then(function () {
-    const updateTimer = setTimeout(function () {
+    const silentUpdateCheck = function () {
       ctx.updateManager.checkNow().catch(function (error) {
         startupLog('auto update check failed: ' + (error && error.message || error));
       });
-    }, 8000);
+    };
+    const updateTimer = setTimeout(silentUpdateCheck, 8000);
     if (updateTimer.unref) updateTimer.unref();
+    setInterval(silentUpdateCheck, 6 * 60 * 60 * 1000);
   }).catch(function (error) { startupLog('update manager init failed: ' + (error && error.message || error)); });
   // 浏览器扩展桥接服务（仅 127.0.0.1）
   // 主进程网络出口：OpenAlex DOI 补全（api.openalex.org）；知网 PDF 走的浏览器会话，不直连知网。
