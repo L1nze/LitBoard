@@ -295,16 +295,16 @@
     <div class="bulk-bar" id="bulk-bar" hidden>
       <span class="bulk-count" id="bulk-count">已选 0 篇</span>
       <div class="bulk-actions">
-        <button class="btn btn-ghost" data-bulk="tag" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg>标签</button>
-        <button class="btn btn-ghost" data-bulk="folder" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg>文件夹</button>
-        <button class="btn btn-ghost" data-bulk="enrich" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-sparkle"/></svg>补全元数据</button>
-        <button class="btn btn-ghost" data-bulk="rename" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-pencil"/></svg>重命名 PDF</button>
-        <button class="btn btn-ghost" data-bulk="export-bib" data-normal-only>导出 BibTeX</button>
-        <button class="btn btn-ghost" data-bulk="edit-fields" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-pencil"/></svg>编辑字段</button>
-        <button class="btn btn-ghost" data-bulk="export-ris" data-normal-only>导出 RIS</button>
-        <button class="btn btn-ghost" data-bulk="restore" data-trash-only hidden><svg class="ic" aria-hidden="true"><use href="#lb-i-undo"/></svg>恢复</button>
-        <button class="btn btn-ghost danger" data-bulk="purge" data-trash-only hidden><svg class="ic" aria-hidden="true"><use href="#lb-i-x-circle"/></svg>彻底删除</button>
-        <button class="btn btn-ghost danger" data-bulk="delete" data-normal-only><svg class="ic" aria-hidden="true"><use href="#lb-i-trash"/></svg>删除</button>
+        <button class="btn btn-ghost" data-bulk="tag" data-normal-only title="标签"><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg><span class="btn-label">标签</span></button>
+        <button class="btn btn-ghost" data-bulk="folder" data-normal-only title="文件夹"><svg class="ic" aria-hidden="true"><use href="#lb-i-folder-new"/></svg><span class="btn-label">文件夹</span></button>
+        <button class="btn btn-ghost" data-bulk="enrich" data-normal-only title="补全元数据"><svg class="ic" aria-hidden="true"><use href="#lb-i-sparkle"/></svg><span class="btn-label">补全元数据</span></button>
+        <button class="btn btn-ghost" data-bulk="rename" data-normal-only title="重命名 PDF"><svg class="ic" aria-hidden="true"><use href="#lb-i-pencil"/></svg><span class="btn-label">重命名 PDF</span></button>
+        <button class="btn btn-ghost" data-bulk="export-bib" data-normal-only title="导出 BibTeX"><svg class="ic" aria-hidden="true"><use href="#lb-i-tray-up"/></svg><span class="btn-label">导出 BibTeX</span></button>
+        <button class="btn btn-ghost" data-bulk="edit-fields" data-normal-only title="编辑字段"><svg class="ic" aria-hidden="true"><use href="#lb-i-pencil"/></svg><span class="btn-label">编辑字段</span></button>
+        <button class="btn btn-ghost" data-bulk="export-ris" data-normal-only title="导出 RIS"><svg class="ic" aria-hidden="true"><use href="#lb-i-doc"/></svg><span class="btn-label">导出 RIS</span></button>
+        <button class="btn btn-ghost" data-bulk="restore" data-trash-only hidden title="恢复"><svg class="ic" aria-hidden="true"><use href="#lb-i-undo"/></svg><span class="btn-label">恢复</span></button>
+        <button class="btn btn-ghost danger" data-bulk="purge" data-trash-only hidden title="彻底删除"><svg class="ic" aria-hidden="true"><use href="#lb-i-x-circle"/></svg><span class="btn-label">彻底删除</span></button>
+        <button class="btn btn-ghost danger" data-bulk="delete" data-normal-only title="删除"><svg class="ic" aria-hidden="true"><use href="#lb-i-trash"/></svg><span class="btn-label">删除</span></button>
       </div>
       <button class="btn btn-ghost btn-icon bulk-close" id="bulk-clear-sel" title="取消选择"><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
     </div>

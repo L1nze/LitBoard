@@ -1887,8 +1887,16 @@ body.resizing-tags { cursor: row-resize; user-select: none; }
   border-radius: var(--radius);
   overflow: hidden;
   box-shadow: var(--shadow-xs);
+  /* 批量栏紧凑档的容器查询参照：卡的实际宽度随抽屉开合变化，媒体查询管不到 */
+  container-type: inline-size;
 }
-.table-card > .bulk-bar { flex: none; }
+/* 批量操作栏做成覆盖表头的浮层（不占流）：在流内会把表格行整体往下顶，
+ * 双击打开条目前首击选中触发它出现，第二击落到上一行（真机投诉的误触）。
+ * z-index 压过 sticky 表头（th z-5 / hover z-7）与空态（z-6） */
+.table-card > .bulk-bar {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 8;
+  box-shadow: var(--shadow-sm);
+}
 .table-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; }
 .table-card > .entity-hits { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 /* 空态铺满整卡：滚动挪进 .table-wrap 后，流内排版会被 flex 增长顶出可视区 */
@@ -2768,14 +2776,25 @@ input.key-retained { border-color: var(--accent); background: var(--accent-soft)
 
 /* ---------------- 批量操作栏 ---------------- */
 .bulk-bar {
-  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-  padding: 8px 14px; border-bottom: 1px solid var(--border);
-  background: var(--accent-soft);
+  display: flex; align-items: center; gap: 10px;
+  padding: 4px 14px; border-bottom: 1px solid var(--border);
+  /* 浮层必须不透明：--accent-soft 本身是 8~14% 透明色，单铺会透出底下的表头与行；
+   * 叠在 surface-1 上合成，视觉与各主题的 accent-soft 一致 */
+  background: linear-gradient(var(--accent-soft), var(--accent-soft)), var(--surface-1);
 }
-.bulk-count { font-weight: 650; font-size: 13px; white-space: nowrap; color: var(--accent-text); }
-.bulk-actions { display: flex; gap: 4px; flex-wrap: wrap; }
-.bulk-actions .btn { padding: 4px 10px; font-size: 12px; }
-.bulk-close { margin-left: auto; }
+.bulk-count { font-weight: 650; font-size: 13px; white-space: nowrap; color: var(--accent-text); flex: none; }
+/* 浮层条必须保持单行：动作区横向滚动收纳溢出（抽屉展开挤窄表格时按钮很多），
+ * 一旦 wrap 成多行会把表头和前几行全盖住；滚动条隐形以保住条高（触控板/Shift+滚轮可滚） */
+.bulk-actions { display: flex; gap: 4px; flex-wrap: nowrap; overflow-x: auto; min-width: 0; scrollbar-width: none; }
+.bulk-actions::-webkit-scrollbar { display: none; }
+.bulk-actions .btn { padding: 4px 10px; font-size: 12px; flex: none; }
+.bulk-close { margin-left: auto; flex: none; }
+/* 卡窄（抽屉展开等）时动作钮收成纯图标，保证单行内全部可见、不被滚出视野；
+ * 文案靠 title 悬停提示兜底 */
+@container (max-width: 820px) {
+  .bulk-actions .btn { padding: 4px 7px; }
+  .bulk-actions .btn .btn-label { display: none; }
+}
 
 /* 表格行多选高亮 */
 .lit-table tbody tr.selected { background: var(--accent-soft); }
