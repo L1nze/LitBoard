@@ -86,6 +86,10 @@
       </span>
       <span class="brand-name">LitBoard</span>
     </div>
+    <div class="brand-update">
+      <span class="brand-version" id="topbar-version"></span>
+      <button class="btn" id="topbar-check-update"><svg class="ic" aria-hidden="true"><use href="#lb-i-refresh"/></svg><span class="btn-label">检查更新</span></button>
+    </div>
     <div class="topbar-actions">
       <button class="btn" id="btn-import" title="导入 .bib / .ris / .pdf / .json 文件"><svg class="ic" aria-hidden="true"><use href="#lb-i-folder-import"/></svg>导入文件</button>
       <button class="btn" id="btn-add" title="按 DOI / arXiv / 标题添加，或手动录入"><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg>添加</button>
@@ -1466,8 +1470,6 @@
     <p class="sync-status" id="sync-status" aria-live="polite"></p>
     <div class="modal-actions sync-modal-actions">
       <span class="sync-auto-hint">改动即时保存，关闭窗口也会保存；需要立即同步请到「云同步」。</span>
-      <span class="settings-version" id="settings-version"></span>
-      <button type="button" class="btn btn-sm" id="settings-check-update">检查更新</button>
       <button class="btn btn-primary" id="sync-close">关闭</button>
     </div>
     <button type="button" class="modal-grip" id="sync-resize-grip" title="拖动调整设置窗口大小（双击恢复默认）" aria-label="拖动调整设置窗口大小（双击恢复默认）"><svg class="ic" aria-hidden="true"><use href="#lb-i-grip"/></svg></button>

@@ -392,7 +392,8 @@ function createWindow() {
             updateCheckPresent: !!window.litboardDesktop.checkAppUpdate &&
               !!window.litboardDesktop.getAppUpdateStatus &&
               !!window.litboardDesktop.applyAppUpdate &&
-              !!document.querySelector('#settings-check-update'),
+              !!document.querySelector('#topbar-check-update') &&
+              !!document.querySelector('#topbar-version'),
             // PDF 阅读助手（期一）：agent 的按页读取/批注工具 + 页区间 IPC
             //（阅读器「AI 解释」按钮已于 2026-09-20 整体移除，用户反馈无实际作用）
             agentReaderPresent: !!window.litboardDesktop.pdfSearchGetPageRange,

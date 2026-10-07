@@ -656,6 +656,9 @@ body, .topbar, .library-sidebar, .detail-sidebar, .drawer, .tile, .chart-card,
   letter-spacing: -0.025em;
   color: var(--text-primary);
 }
+/* 品牌区旁的版本号 + 检查更新入口；同 .brand 一样禁止收缩（防文字逐字竖排） */
+.brand-update { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.brand-version { font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
 .topbar-actions {
   display: flex; gap: 6px; align-items: center;
   /* 定高顶栏内禁止换行：换行会溢出 52px 条、盖住下方内容；
@@ -682,6 +685,7 @@ body, .topbar, .library-sidebar, .detail-sidebar, .drawer, .tile, .chart-card,
  * 窗口 minWidth 1080，最末档要保证在 1080 下也放得下 */
 @media (max-width: 1240px) {
   .brand-name { display: none; }
+  .brand-version { display: none; }
 }
 @media (max-width: 1150px) {
   .topbar { gap: 8px; padding-left: 14px; }

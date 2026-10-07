@@ -8944,13 +8944,21 @@
     });
   }
 
+  // 顶栏按钮带图标，状态文案只写 <span class="btn-label">——整按钮 textContent 会抹掉图标
+  function setUpdateButtonLabel(text) {
+    var button = $('#topbar-check-update');
+    if (!button) return;
+    var label = button.querySelector('.btn-label');
+    if (label) label.textContent = text;
+    else button.textContent = text;
+  }
+
   function describeUpdateStatus(status, manual) {
     if (!status) return;
     appUpdateState = status;
-    var button = $('#settings-check-update');
     if (status.packaged === false) { if (manual) toast(T('当前已是最新版本')); return; }
     if (status.status === 'ready') {
-      if (button) button.textContent = T('立即更新 ') + status.version;
+      setUpdateButtonLabel(T('立即更新 ') + status.version);
       var readyKey = 'ready:' + status.version;
       if (appUpdateToastKey !== readyKey) {
         appUpdateToastKey = readyKey;
@@ -8963,29 +8971,29 @@
       var pct = status.progress && status.progress.total
         ? Math.floor(100 * status.progress.done / status.progress.total) + '%'
         : '…';
-      if (button) button.textContent = T('下载新版 ') + status.version + '（' + pct + '）';
+      setUpdateButtonLabel(T('下载新版 ') + status.version + '（' + pct + '）');
       if (manual) toast(T('发现 LitBoard 新版本 ') + status.version + T('，正在后台下载安装包…'));
     } else if (status.status === 'available') {
-      if (button) button.textContent = T('下载新版 ') + status.version;
+      setUpdateButtonLabel(T('下载新版 ') + status.version);
       var availKey = 'available:' + status.version;
       if (appUpdateToastKey !== availKey) {
         appUpdateToastKey = availKey;
         toast(T('发现 LitBoard 新版本 ') + status.version + T('，正在后台下载安装包…'), 8000);
       }
     } else if (status.status === 'checking') {
-      if (button) button.textContent = T('检查更新') + '…';
+      setUpdateButtonLabel(T('检查更新') + '…');
     } else if (status.status === 'up-to-date') {
-      if (button) button.textContent = T('检查更新');
+      setUpdateButtonLabel(T('检查更新'));
       if (manual) toast(T('当前已是最新版本'));
     } else if (status.status === 'error') {
-      if (button) button.textContent = T('检查更新');
+      setUpdateButtonLabel(T('检查更新'));
       if (manual) toast(T('⚠ 检查更新失败：') + (status.error || ''));
     }
   }
 
   function checkForAppUpdate(manual) {
     if (!desktop || !desktop.checkAppUpdate) return;
-    var button = $('#settings-check-update');
+    var button = $('#topbar-check-update');
     if (manual && button) button.disabled = true;
     desktop.checkAppUpdate().then(function (status) {
       describeUpdateStatus(status, manual);
@@ -8994,16 +9002,19 @@
     }).finally(function () { if (button) button.disabled = false; });
   }
 
+  // 顶栏 logo 旁的版本号：启动时取一次；语言切换时由 LitI18n.onChange 重设
+  //（动态文案不走 applyStatic，取不到版本就留空）
+  function renderTopbarVersion() {
+    var vEl = $('#topbar-version');
+    if (!vEl || !desktop || !desktop.getAppVersion) return;
+    desktop.getAppVersion().then(function (v) {
+      if (vEl && v) vEl.textContent = T('版本') + ' ' + v;
+    }).catch(function () {});
+  }
+
   function openSyncSettings(sectionId) {
     if (!desktop || !desktop.getIntegrationConfig) { toast(T('同步功能仅在桌面版可用')); return; }
     $('#sync-mask').hidden = false;
-    // 设置弹窗版本号（index.html 的 <span id="settings-version"></span>；取不到就留空）
-    var vEl = $('#settings-version');
-    if (vEl && window.litboardDesktop && litboardDesktop.getAppVersion) {
-      litboardDesktop.getAppVersion().then(function (v) {
-        if (vEl && v) vEl.textContent = T('版本') + ' ' + v;
-      }).catch(function () {});
-    }
     applyModalSize($('.sync-modal'), readModalSizes().settings, 560, 360);
     activateSyncGroup('storage');
     $('#sync-status').classList.remove('error');
@@ -9679,7 +9690,7 @@
       if (btn) activateSyncGroup(btn.dataset.syncGroup);
     });
     $('#sync-close').addEventListener('click', closeSyncSettings);
-    $('#settings-check-update').addEventListener('click', function () {
+    $('#topbar-check-update').addEventListener('click', function () {
       if (appUpdateState && appUpdateState.status === 'ready') applyAppUpdate();
       else checkForAppUpdate(true);
     });
@@ -12211,6 +12222,15 @@
       renderPdfTabs();
       reportCurrentFolder(); // 启动时同步一次当前文件夹给浏览器扩展
       window.litboardReadyAt = performance.now();
+      renderTopbarVersion();
+      // 语言切换后重设版本号与更新按钮文案（两者都是动态写入，applyStatic 管不到；
+      // describeUpdateStatus 的 toast 按版本去重，重放最近状态不会重复提醒）
+      if (window.LitI18n && window.LitI18n.onChange) {
+        window.LitI18n.onChange(function () {
+          renderTopbarVersion();
+          if (appUpdateState) describeUpdateStatus(appUpdateState, false);
+        });
+      }
       // 主进程启动后 8s 自动检查并在后台预下载；这里订阅状态并取一次当前快照
       //（覆盖「重启时安装包早已就绪」的场景——那时没有新事件，只能主动查）。
       if (desktop && desktop.onAppUpdateStatus) {
