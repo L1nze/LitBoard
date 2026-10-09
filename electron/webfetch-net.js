@@ -74,6 +74,7 @@ function createWebFetchNet(options) {
     const data = await queue.requestJson(FETCH_URL, {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-API-Key': key },
+      signal: input && input.signal,
       body: JSON.stringify({ urls: [url], format: 'markdown', ttl: 0 })
     });
     return LitWebFetch.parseFetchResponse(data, url);

@@ -99,7 +99,7 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   researchGetWorks: function (ids) { return ipcRenderer.invoke('research:get-works', ids); },
   researchStats: function () { return ipcRenderer.invoke('research:stats'); },
   agentChat: function (input) { return ipcRenderer.invoke('agent:chat', input); },
-  agentCancel: function (sessionId) { return ipcRenderer.invoke('agent:cancel', sessionId); },
+  agentCancel: function (sessionId, turnId) { return ipcRenderer.invoke('agent:cancel', sessionId, turnId); },
   agentTest: function (input) { return ipcRenderer.invoke('agent:test', input); },
   agentListModels: function (input) { return ipcRenderer.invoke('agent:list-models', input); },
   /* 对话面板底部切换服务商 / 模型（只改选中项，不打开设置） */
@@ -110,6 +110,7 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
     return function () { ipcRenderer.removeListener('agent:event', listener); };
   },
   sessionCreate: function (input) { return ipcRenderer.invoke('session:create', input); },
+  sessionFork: function (id, input) { return ipcRenderer.invoke('session:fork', { id: id, input: input }); },
   sessionList: function () { return ipcRenderer.invoke('session:list'); },
   sessionRead: function (id) { return ipcRenderer.invoke('session:read', id); },
   sessionSetData: function (id, data) { return ipcRenderer.invoke('session:set-data', { id: id, data: data }); },
@@ -121,6 +122,10 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   sessionDeleteMany: function (ids) { return ipcRenderer.invoke('session:delete-many', ids); },
   sessionExportMarkdown: function (id) { return ipcRenderer.invoke('session:export-md', id); },
   sessionSaveAttachment: function (id, input) { return ipcRenderer.invoke('session:save-attachment', { id: id, name: input.name, label: input.label, dataBase64: input.dataBase64 }); },
+  sessionImportReference: function (id, paths) { return ipcRenderer.invoke('session:import-reference', { id: id, paths: paths }); },
+  sessionListReferences: function (id) { return ipcRenderer.invoke('session:list-references', id); },
+  sessionSearchReference: function (id, file, query, options) { return ipcRenderer.invoke('session:search-reference', { id: id, file: file, query: query, options: options }); },
+  sessionReadReference: function (id, file, offset) { return ipcRenderer.invoke('session:read-reference', { id: id, file: file, offset: offset }); },
   sessionOpenRoot: function () { return ipcRenderer.invoke('session:open-root'); },
   sessionRoot: function () { return ipcRenderer.invoke('session:root'); },
   /* 调研助手二期：语义检索 / 回填 / 向量嵌入 / PDF 两步 / 补登记 */

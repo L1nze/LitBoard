@@ -8577,7 +8577,7 @@
       /* R19 临时全文链：按路径抽取 PDF 全文文本（agent read_work_fulltext 用；临时文件
        *  抽取完主进程即删）。与全文索引同一条 LitPdf.extractText 管线（MuPDF），
        *  页数/单页长度上限与 pdfsearch.extractPages 一致；带「第 N 页」标记供引用页码 */
-      extractPdfTextByPath: function (filePath) {
+      extractPdfTextByPath: function (filePath, options) {
         if (!window.LitPdf || !LitPdf.extractText || !desktop.readFileBytes || !filePath) return Promise.resolve(null);
         return Promise.resolve(window.LitPdf.load()).then(function () {
           return desktop.readFileBytes(filePath);
@@ -8585,11 +8585,14 @@
           return LitPdf.extractText(filePath, new Uint8Array(bytes));
         }).then(function (result) {
           if (!result || !Array.isArray(result.pages)) return null;
-          return result.pages.slice(0, 400).map(function (text, idx) {
+          var pageTruncated = false;
+          var extractedText = result.pages.slice(0, 400).map(function (text, idx) {
             var page = String(text || '');
-            if (page.length > 200000) page = page.slice(0, 200000);
+            if (page.length > 200000) { pageTruncated = true; page = page.slice(0, 200000); }
             return page ? '【第 ' + (idx + 1) + ' 页】\n' + page : '';
           }).filter(Boolean).join('\n\n');
+          if (options && options.withMetadata) return { text: extractedText.slice(0, 1000000), totalPages: result.pages.length, extractionTruncated: pageTruncated || result.pages.length > 400 || extractedText.length > 1000000 };
+          return extractedText.slice(0, 1000000);
         });
       }
     });
@@ -10978,7 +10981,10 @@
         pdfSelectionFrame = 0;
         var selection = window.getSelection();
         if (!selection || !selection.rangeCount || selection.isCollapsed) {
-          pdfState.handle.clearSelection();
+          // 点翻译/批注弹框（按钮、勾选框、批注输入框）会让原生选区作为 mousedown
+          // 默认行为塌掉，但选区仍被弹框钉住：已画高亮驻留，随弹框关闭统一清理
+          var pinnedPopover = $('#pdf-translation-popover');
+          if (!pinnedPopover || pinnedPopover.hidden) pdfState.handle.clearSelection();
           return;
         }
         var range = selection.getRangeAt(0);

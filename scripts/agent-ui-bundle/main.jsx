@@ -11,6 +11,7 @@
  * - onNew({text}) / onEdit({turnId, text}) / onReload({turnId}) / onCancel()
  * - sendSuggestion(text): 空态建议点击直接发送
  * - retry(turnId): 错误卡重试
+ * - onFork({messageId}): 从指定消息创建独立会话
  * - composerSlotReady(el): 输入行宿主插槽挂载完成，宿主把模型/推理等控件移入 el
  * - T(s): i18n；openPaper(id): 来源卡跳转
  */
@@ -90,6 +91,14 @@ function ToolCard(props) {
 /** 宿主桥的模块级引用：保证 Messages 组件映射的组件身份稳定（React 增量渲染的前提） */
 let bridgeRef = null;
 
+function ForkAction({ message }) {
+  const bridge = bridgeRef;
+  const T = makeT(bridge);
+  const custom = (message.metadata && message.metadata.custom) || {};
+  if (!bridge.onFork || !Number.isInteger(custom.forkIndex)) return null;
+  return <button className="aui-act aui-fork" title={T('保留此前对话，在新会话中继续')} onClick={() => bridge.onFork({ messageId: message.id })}>{T('从此处分叉')}</button>;
+}
+
 /** 消息组件：无 props 渲染，通过 useMessage() 取消息（assistant-ui 0.11 契约） */
 function UserMessage() {
   const bridge = bridgeRef;
@@ -108,6 +117,7 @@ function UserMessage() {
         <ActionBarPrimitive.Root hideWhenRunning autohide="not-last">
           <ActionBarPrimitive.Copy className="aui-act">{makeT(bridge)('复制')}</ActionBarPrimitive.Copy>
           {!synthetic && <ActionBarPrimitive.Edit className="aui-act">{makeT(bridge)('编辑')}</ActionBarPrimitive.Edit>}
+          <ForkAction message={message} />
         </ActionBarPrimitive.Root>
       </div>
     </div>
@@ -169,6 +179,7 @@ function AssistantMessage() {
         <ActionBarPrimitive.Root hideWhenRunning autohide="not-last">
           <ActionBarPrimitive.Copy className="aui-act">{T('复制')}</ActionBarPrimitive.Copy>
           <ActionBarPrimitive.Reload className="aui-act">{T('重新生成')}</ActionBarPrimitive.Reload>
+          <ForkAction message={message} />
         </ActionBarPrimitive.Root>
       </div>
     </div>
@@ -181,8 +192,10 @@ function AssistantMessage() {
  *  行内不再显示「Enter 发送」提示（占位符里已有）；aui-host-slot 是宿主插槽——
  *  agentui 挂载后把模型/推理/状态/token 等 plain-DOM 控件移进来（发送按钮旁），
  *  React 不接管槽内节点（槽自身无 React 子节点，重渲染不会清掉外部插入的 DOM）。 */
-function ComposerArea({ bridge, isRunning }) {
+function ComposerArea({ bridge, isRunning, queuedCount }) {
   const T = makeT(bridge);
+  const [steering, setSteering] = useState('');
+  const [queueBusy, setQueueBusy] = useState(false);
   const label = isRunning ? T('停止') : T('发送');
   const slotRef = React.useRef(null);
   useEffect(() => {
@@ -213,6 +226,19 @@ function ComposerArea({ bridge, isRunning }) {
           )}
         </div>
       </ComposerPrimitive.Root>
+      {isRunning && <form className="aui-steering" onSubmit={async (e) => {
+        e.preventDefault();
+        if (!steering.trim() || queueBusy) return;
+        setQueueBusy(true);
+        try { if (await bridge.queueMessage(steering)) setSteering(''); } finally { setQueueBusy(false); }
+      }}>
+        <textarea className="aui-input" rows={1} maxLength={10000} value={steering} onChange={(e) => setSteering(e.target.value)} placeholder={T('补充要求（当前操作完成后处理）')} aria-label={T('补充要求')} />
+        <button className="aui-send" type="submit" disabled={queueBusy || !steering.trim()}>{T('加入队列')}</button>
+      </form>}
+      {queuedCount > 0 && <div className="aui-queued">
+        {T('已排队 {n} 条；停止后保留，下次继续处理').replace('{n}', String(queuedCount))}
+        <button type="button" className="aui-act" onClick={() => bridge.clearQueue()}>{T('清空队列')}</button>
+      </div>}
     </div>
   );
 }
@@ -273,7 +299,7 @@ function App({ bridge }) {
             }} />
             <ThreadPrimitive.ScrollToBottom className="aui-jump">{T('↓ 回到底部')}</ThreadPrimitive.ScrollToBottom>
           </ThreadPrimitive.Viewport>
-          <ComposerArea bridge={bridge} isRunning={snap.isRunning} />
+          <ComposerArea key={snap.sessionId} bridge={bridge} isRunning={snap.isRunning} queuedCount={snap.queuedCount} />
         </ThreadPrimitive.Root>
       </div>
     </AssistantRuntimeProvider>

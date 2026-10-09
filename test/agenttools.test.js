@@ -23,9 +23,47 @@ function makeDeps(overrides) {
   }, overrides);
 }
 
+test('research plans validate progress and follow successful history, including compacted records', async () => {
+  const t = LitAgent.createTools(makeDeps());
+  const plan = { goal: 'review', steps: [{ content: 'read', status: 'in_progress', note: 'W1 page 3' }] };
+  const saved = await t.execute('update_research_plan', plan, { messages: [] });
+  const messages = [{ role: 'tool', name: 'update_research_plan', content: saved, compacted: true },
+    { role: 'tool', name: 'update_research_plan', content: '{"bad":true}', error: true }];
+  assert.deepEqual(JSON.parse(await t.execute('read_research_plan', {}, { messages })), JSON.parse(saved));
+  assert.equal(LitAgent.getResearchPlan([]), null);
+  assert.throws(() => LitAgent.validateResearchPlan({ goal: 'x', steps: [plan.steps[0], plan.steps[0]] }));
+  assert.throws(() => LitAgent.validateResearchPlan({ goal: '\u0000'.repeat(300), steps: Array.from({ length: 12 }, () => ({ content: '\u0000'.repeat(180), status: 'pending', note: '\u0000'.repeat(300) })) }));
+});
+
+test('read_session_file preserves JSON and exact cursor for escape-heavy text', async () => {
+  const t = LitAgent.createTools(makeDeps({ desktop: { sessionReadReference: async () => ({ status: 'ready', offset: 9, totalChars: 30000, text: '\u0000'.repeat(6000) }) } }));
+  const raw = await t.execute('read_session_file', { file: '附件/a.txt', fromChar: 9 }, { sessionId: 's' });
+  const result = JSON.parse(raw);
+  assert.ok(raw.length <= 10000);
+  assert.equal(result.nextFromChar, 9 + result.text.length);
+});
+
+test('read_session_file revalidates PDF registry on cached reads and gates images by frozen vision', async () => {
+  let reads = 0, extracts = 0;
+  const t = LitAgent.createTools(makeDeps({ desktop: { sessionReadReference: async (_id, file) => {
+    reads++;
+    return file.endsWith('.png') ? { status: 'vision' } : { status: 'requires_pdf_extraction', path: '/authorized/a.pdf' };
+  } }, extractPdfText: async () => { extracts++; return '【第 1 页】\n' + 'text'.repeat(5000); } }));
+  const first = JSON.parse(await t.execute('read_session_file', { file: '附件/a.pdf' }, { sessionId: 's' }));
+  const second = JSON.parse(await t.execute('read_session_file', { file: '附件/a.pdf', fromChar: first.nextFromChar }, { sessionId: 's' }));
+  assert.equal(extracts, 1);
+  assert.equal(reads, 2);
+  assert.equal(second.offset, first.nextFromChar);
+  assert.match(first.note, /400/);
+  const image = JSON.parse(await t.execute('read_session_file', { file: '附件/a.png' }, { sessionId: 's', vision: false }));
+  assert.ok(image.error);
+  const visual = await t.execute('read_session_file', { file: '附件/a.png' }, { sessionId: 's', vision: true });
+  assert.equal(visual.images[0].ref, 'session:s|附件/a.png');
+});
+
 test('tool schemas cover the base read-only tools with valid shape', function () {
   const t = LitAgent.createTools(makeDeps());
-  assert.equal(t.tools.length, 15); // 整篇梳理作为独立工具注册
+  assert.equal(t.tools.length, 20); // 计划读写与会话参考读取常驻
   const names = t.tools.map((x) => x.function.name);
   ['search_library', 'search_research', 'search_openalex', 'get_research_work', 'get_paper', 'fulltext_search', 'read_pdf_pages', 'summarize_paper', 'list_pdf_annotations',
     'find_literature',
@@ -878,4 +916,61 @@ test('A-followup #6: collect_papers 同样在确认边界复核取消', async fu
   const out2 = await t.execute('collect_papers', { workIds: ['W1'] }, { sessionId: 's1', cancelRequested: () => true });
   assert.ok(String(out2).indexOf('已停止') !== -1);
   assert.equal(called, 0);
+});
+
+
+test('reference file search feeds precise read cursors and restores real reading coverage', async () => {
+  const text = 'intro\nneedle evidence\nend', file = '附件/report.pdf';
+  const desktop = {
+    sessionListReferences: async () => ({ files: [{ file, kind: 'pdf' }] }),
+    sessionReadReference: async () => ({ status: 'requires_pdf_extraction', path: 'registered.pdf' }),
+    sessionSearchReference: async () => ({ status: 'requires_pdf_extraction', path: 'registered.pdf' })
+  };
+  let extracted = 0;
+  const tools = LitAgent.createTools({ desktop, extractPdfText: async () => { extracted++; return text; } });
+  const ctx = { sessionId: 's', messages: [] };
+  const hits = JSON.parse(await tools.execute('search_session_file', { file, query: 'needle' }, ctx));
+  assert.equal(hits.matches[0].matchOffset, 6); assert.equal(hits.coverage.readChars, 0);
+  const read = JSON.parse(await tools.execute('read_session_file', { file, fromChar: hits.matches[0].matchOffset }, ctx));
+  ctx.messages.push({ role: 'tool', name: 'read_session_file', content: JSON.stringify(read), compacted: true });
+  const list = JSON.parse(await tools.execute('list_session_files', {}, ctx));
+  assert.equal(list.files[0].coverage.readChars, text.length - 6); assert.equal(list.files[0].coverage.textComplete, false); assert.equal(extracted, 1);
+});
+
+test('uploaded PDF visual reading gates frozen vision and attaches only successful physical pages', async () => {
+  const saved = [], file = '附件/scanned.pdf';
+  const tools = LitAgent.createTools({ includeVisionRender: true, renderPageImage: async () => null,
+    renderPagesImage: async input => { assert.deepEqual(input.pages, [1, 3, 4]); return [{ page: 1, dataUrl: 'data:image/png;base64,YQ==' }, { page: 3, error: 'bad page' }]; },
+    desktop: { sessionReadReference: async () => ({ status: 'requires_pdf_extraction', path: 'registered.pdf' }), sessionSaveAttachment: async (_id, data) => { saved.push(data); return { file: '附件/page1.png' }; } } });
+  assert.ok(tools.tools.some(t => t.function.name === 'render_session_pdf_pages'));
+  const args = { file, pages: [1, 3, 4, 5] };
+  assert.match(await tools.execute('render_session_pdf_pages', args, { sessionId: 's', vision: false }), /不支持图片/);
+  const result = await tools.execute('render_session_pdf_pages', args, { sessionId: 's', vision: true });
+  assert.deepEqual(JSON.parse(result.text).renderedPages, [1]); assert.equal(result.images[0].ref, 'session:s|附件/page1.png'); assert.equal(saved.length, 1);
+});
+
+
+test('reference lists and escape-heavy search preserve valid JSON and continuation under tool caps', async () => {
+  const FileContext = require('../js/agentfilecontext.js');
+  const files = Array.from({ length: 80 }, (_, i) => ({ file: '附件/' + i + '-'.repeat(180) + '.txt', name: 'file', kind: 'text' }));
+  const text = ('"\\\n'.repeat(100) + 'needle').repeat(12);
+  const tools = LitAgent.createTools({ desktop: { sessionListReferences: async () => ({ files }), sessionSearchReference: async (_id, file, query, opts) => Object.assign({ file, status: 'ready' }, FileContext.searchTextWindows(text, query, opts)) } });
+  const list = JSON.parse(await tools.execute('list_session_files', {}, { sessionId: 's' }));
+  assert.ok(list.nextFromIndex > 0 && list.nextFromIndex < files.length); assert.ok(JSON.stringify(list).length < 12000);
+  const first = JSON.parse(await tools.execute('search_session_file', { file: '附件/f.txt', query: 'needle', limit: 10 }, { sessionId: 's' }));
+  assert.ok(JSON.stringify(first).length < 12000); assert.ok(first.nextOffset > 0);
+  const next = JSON.parse(await tools.execute('search_session_file', { file: '附件/f.txt', query: 'needle', fromChar: first.nextOffset, limit: 10 }, { sessionId: 's' }));
+  assert.equal(next.matches[0].matchOffset, first.nextOffset);
+});
+
+
+test('plan tool verifies actual successful execution and registered artifacts before completion', async () => {
+  const tools = LitAgent.createTools({ desktop: { sessionListReferences: async () => ({ files: [{ file: '附件/result.md' }] }) } });
+  const messages = [{ role: 'assistant', tool_calls: [{ id: 'read-ok', function: { name: 'search_library' } }] }, { role: 'tool', name: 'search_library', tool_call_id: 'read-ok', content: '{"papers":[]}' }];
+  const plan = { goal: 'review', steps: [{ id: 'find', content: 'find source', status: 'completed', evidenceCallIds: ['read-ok'] }, { id: 'report', content: 'write report', status: 'in_progress', dependsOn: ['find'] }] };
+  const saved = JSON.parse(await tools.execute('update_research_plan', plan, { sessionId: 's', messages }));
+  assert.equal(saved.steps[0].id, 'find');
+  await assert.rejects(tools.execute('update_research_plan', { goal: 'review', steps: [{ content: 'claim done', status: 'completed' }] }, { messages }), /需要成功工具证据/);
+  await assert.rejects(tools.execute('update_research_plan', { goal: 'review', steps: [{ content: 'claim done', status: 'completed', artifacts: ['附件/missing.md'] }] }, { sessionId: 's', messages }), /尚未登记/);
+  assert.equal(LitAgent.isParallelTool('search_library'), true); assert.equal(LitAgent.isParallelTool('search_openalex'), false); assert.equal(LitAgent.isParallelTool('collect_papers'), false);
 });

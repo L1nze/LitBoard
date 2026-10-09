@@ -20,6 +20,58 @@ async function makeSessions(trashed) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+test('fork copies registered attachments and survives source deletion independently', async function () {
+  const { s, root } = await makeSessions();
+  try {
+    const source = await s.create({ title: 'source' });
+    const attachment = await s.saveAttachment(source.id, { name: 'image.png', dataBase64: Buffer.from('image bytes').toString('base64') });
+    const data = await s.read(source.id);
+    data.messages = [{ role: 'user', content: 'hi', images: [{ type: 'image', ref: 'session:' + source.id + '|' + attachment.file }] }];
+    await s.commit(source.id, data);
+    const branchTitle = 'A conversation with a long title（分支）';
+    const branch = await s.fork(source.id, { title: branchTitle });
+    assert.equal(branch.data.title, branchTitle, '长标题也保留分支后缀');
+    assert.notEqual(branch.id, source.id);
+    assert.equal((await s.list()).length, 2);
+    assert.equal(await fs.readFile(await s.attachmentPath(branch.id, attachment.file), 'utf8'), 'image bytes');
+    assert.equal(branch.data.messages[0].images[0].ref, 'session:' + branch.id + '|' + attachment.file);
+    assert.deepEqual(await s.read(source.id), data);
+    await fs.rm(path.join(root, '会话记录', source.dir), { recursive: true });
+    const restarted = createSessions({ rootDir: path.join(root, '会话记录') });
+    assert.equal((await restarted.read(branch.id)).title, branchTitle);
+    assert.equal(await fs.readFile(await restarted.attachmentPath(branch.id, attachment.file), 'utf8'), 'image bytes');
+    await restarted.flushAll();
+  } finally {
+    await s.flushAll();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('fork failure on missing or unsafe attachment creates no indexed branch', async function () {
+  const { s, root } = await makeSessions();
+  try {
+    const source = await s.create({ title: 'source' });
+    const data = await s.read(source.id);
+    data.attachments = [{ file: '附件/missing.png' }];
+    await s.commit(source.id, data);
+    await assert.rejects(() => s.fork(source.id, { title: 'branch' }));
+    assert.equal((await s.list()).length, 1);
+    assert.deepEqual(await fs.readdir(path.join(root, '会话记录', source.dir.split(path.sep)[0])), [path.basename(source.dir)]);
+    const second = await s.create({ title: 'unsafe' });
+    const unsafe = await s.read(second.id);
+    unsafe.attachments = [{ file: '../session.json' }];
+    await s.commit(second.id, unsafe);
+    await assert.rejects(() => s.fork(second.id), /Invalid attachment/);
+    assert.equal((await s.list()).length, 2);
+    data.streaming = true;
+    await s.commit(source.id, data);
+    await assert.rejects(() => s.fork(source.id), /busy/);
+  } finally {
+    await s.flushAll();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('concurrent same-name attachments keep distinct files and original bytes', async function () {
   const { s, root } = await makeSessions();
   const created = await s.create({ title: 'parallel attachments' });

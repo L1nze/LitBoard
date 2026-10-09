@@ -74,7 +74,8 @@ test('planCompaction：跳过已压缩消息（二次压缩只看活历史，并
   const second = Ctx.planCompaction(state.messages, { estimate: est, thresholdTokens: 5000, preserveRecentTokens: 2000 });
   assert.ok(second, '二次压缩应可行');
   assert.equal(second.previousSummaryText, '第一份摘要内容', '上一份摘要文本被带回供合并');
-  assert.ok(second.headMessages.every((m) => m.kind !== 'compaction' || true));
+  assert.ok(second.headMessages.some((m) => m.kind === 'compaction'));
+  assert.ok(second.headMessages.every((m) => m.compacted !== true));
 });
 
 test('applyCompaction：头部打标记、摘要消息落在边界、消息总数不变', () => {
@@ -115,7 +116,7 @@ test('buildRequestBody 联动：压缩后旧历史不进请求、摘要消息进
   assert.ok(texts.indexOf('已压缩的结论') !== -1, '摘要进入模型上下文');
   // 第一轮（c0，已被压缩）的 tool 结果不再发送，只剩后两轮
   const toolIds = body.messages.filter((m) => m.role === 'tool').map((m) => m.tool_call_id);
-  assert.deepEqual(toolIds, ['c1', 'c2']);
+  assert.deepEqual(toolIds, ['c2']);
   assert.notEqual(body.messages[0].role, 'tool', '窗口不从孤儿 tool 开始');
   // serialize 往返：compacted 标记与 lastInputTokens 持久化
   const restored = Core.deserialize(JSON.parse(JSON.stringify(Core.serialize(state))));
@@ -133,7 +134,7 @@ test('serializeForSummary：工具结果按字符封顶、超总预算时最旧�
   assert.ok(text.length < 6000);
   // 单条 tool 结果封顶
   const t = Ctx.serializeForSummary([{ role: 'tool', name: 'search', content: big(10000) }], {});
-  assert.ok(t.indexOf('【工具结果 search】') === 0 && t.length < 1000);
+  assert.ok(t.indexOf('【工具结果 search】') === 0 && t.length < 2100);
 });
 
 test('summarizerBody：system+user 双消息、无工具、max_tokens 夹在 1024-2048', () => {
@@ -233,4 +234,215 @@ test('normalizeSelectionContext：EPUB 形态（cfi/章节/进度），无页码
   const bare = Ctx.normalizeSelectionContext({ kind: 'epub', text: '句', cfi: 'epubcfi(/6/2)' });
   assert.equal(bare.chapter, '');
   assert.equal(bare.progress, null);
+});
+
+test('planCompaction：两轮即可压缩第一轮，估算器接收消息对象且只序列化一次', () => {
+  const state = buildConversation();
+  state.messages.splice(8);
+  const estimate = (message) => {
+    assert.equal(typeof message, 'object');
+    return est(message);
+  };
+  const plan = Ctx.planCompaction(state.messages, { estimate, thresholdTokens: 1, preserveRecentTokens: 2000 });
+  assert.ok(plan);
+  assert.equal(plan.boundaryIndex, 4);
+  assert.deepEqual(plan.headMessages, state.messages.slice(0, 4));
+  assert.equal(plan.totalLiveTokens, state.messages.reduce((sum, message) => sum + est(message), 0));
+});
+
+test('planCompaction：synthetic 图像消息不能成为边界，工具配对和最新用户轮完整保留', () => {
+  const state = buildConversation();
+  state.messages.splice(8);
+  const image = { role: 'user', synthetic: true, content: '第 3 页截图', images: [{ type: 'image', ref: 'session:abc|page3.png' }] };
+  state.messages.splice(7, 0, image);
+  state.messages[8].content = big(9000);
+  const plan = Ctx.planCompaction(state.messages, { estimate: est, thresholdTokens: 1, preserveRecentTokens: 2000 });
+  assert.equal(plan.boundaryIndex, 4);
+  const tail = state.messages.slice(plan.boundaryIndex);
+  const lastTurnId = tail[0].turnId;
+  const info = Ctx.applyCompaction(state, plan, '保留第一轮文献检索结论', { estimate: est });
+  assert.ok(info);
+  assert.deepEqual(state.messages.slice(plan.boundaryIndex + 1), tail);
+  assert.equal(state.messages[plan.boundaryIndex + 1].turnId, lastTurnId);
+  const body = Core.buildRequestBody(state, {});
+  assert.equal(body.messages.find((m) => m.role === 'tool').tool_call_id, 'c1');
+  assert.equal(body.messages.find((m) => m.tool_calls).tool_calls[0].id, 'c1');
+});
+
+test('planCompaction：手动 force 忽略触发阈值，仍保护只有一轮的长任务', () => {
+  const state = buildConversation();
+  const plan = Ctx.planCompaction(state.messages, { estimate: est, force: true, thresholdTokens: 999999, preserveRecentTokens: 2000 });
+  assert.ok(plan);
+  state.messages.splice(4);
+  state.messages.push({ role: 'user', synthetic: true, content: big(20000) });
+  state.messages.push({ role: 'assistant', content: big(20000) });
+  assert.equal(Ctx.planCompaction(state.messages, { estimate: est, force: true, preserveRecentTokens: 1000 }), null);
+});
+
+test('serializeForSummary：硬字符预算包含省略说明和截断标记，正文尾部 ID 可恢复', () => {
+  const messages = [
+    { role: 'user', content: '旧请求'.repeat(1000) },
+    { role: 'tool', name: 'read_file', tool_call_id: 'read-42', content: '正文'.repeat(2000) + ' attachmentId=A42 nextOffset=9000' }
+  ];
+  for (const cap of [1, 4, 6, 100, 2000]) {
+    const text = Ctx.serializeForSummary(messages, { charCap: cap });
+    assert.ok(text.length <= cap, '所有标记计入预算 ' + cap);
+  }
+  const text = Ctx.serializeForSummary(messages, { charCap: 2100 });
+  assert.ok(text.includes('id=read-42'));
+  assert.ok(text.includes('attachmentId=A42 nextOffset=9000'));
+  assert.ok(text.includes('截断'));
+});
+
+test('serializeForSummary：工具调用 ID 和参数尾部保留，上一份摘要只由独立字段提供', () => {
+  const text = Ctx.serializeForSummary([
+    { role: 'user', kind: 'compaction', synthetic: true, content: '不可重复的旧摘要' },
+    { role: 'assistant', tool_calls: [{ id: 'call-8', function: { name: 'read_reference_file', arguments: 'x'.repeat(3000) + '"attachmentId":"A8"}' } }] }
+  ]);
+  assert.ok(text.includes('id=call-8'));
+  assert.ok(text.includes('"attachmentId":"A8"}'));
+  assert.ok(!text.includes('不可重复的旧摘要'));
+  const body = Ctx.summarizerBody({ historyText: text, previousSummary: '不可重复的旧摘要' });
+  assert.equal(body.messages[1].content.split('不可重复的旧摘要').length - 1, 1);
+});
+
+test('summarizerBody：小上下文包含输出预留，超大上下文仍受历史硬封顶', () => {
+  for (const contextTokens of [512, 1024, 2048, 4096, 8192]) {
+    const body = Ctx.summarizerBody({
+      contextTokens, historyText: big(100000, true), previousSummary: big(10000, true), tailText: big(5000, true)
+    });
+    const tokens = Core.estimateTokens(JSON.stringify(body.messages)) + body.max_tokens;
+    assert.ok(tokens <= contextTokens, '摘要输入和输出预留不能超过 ' + contextTokens);
+    assert.ok(body.max_tokens > 0);
+  }
+  const body = Ctx.summarizerBody({ contextTokens: 1000000, historyText: big(100000), previousSummary: big(10000), tailText: big(5000) });
+  assert.ok(body.messages[1].content.length <= Ctx.HISTORY_CHAR_CAP);
+});
+
+test('applyCompaction：拒绝边界移位和头部原地编辑后的过期计划，不污染历史', () => {
+  for (const edit of [
+    (state) => state.messages.unshift({ role: 'user', content: '插入新问题' }),
+    (state) => { state.messages[0].content = '编辑后的真实意图'; },
+    (state) => { state.messages[0].compacted = true; }
+  ]) {
+    const state = buildConversation();
+    state.lastInputTokens = 99000;
+    const plan = Ctx.planCompaction(state.messages, { estimate: est, thresholdTokens: 1, preserveRecentTokens: 2000 });
+    edit(state);
+    const before = JSON.stringify(state);
+    assert.equal(Ctx.applyCompaction(state, plan, '原问题的摘要', { estimate: est }), null);
+    assert.equal(JSON.stringify(state), before);
+  }
+});
+
+test('applyCompaction：摘要变大或加上 header 后无节约时拒绝，成功后重置旧用量', () => {
+  const state = buildConversation();
+  const plan = Ctx.planCompaction(state.messages, { estimate: est, thresholdTokens: 1, preserveRecentTokens: 2000 });
+  const before = JSON.stringify(state);
+  const estimate = (message) => message.kind === 'compaction' ? plan.headTokens : 1;
+  assert.equal(Ctx.applyCompaction(state, plan, '短文本但 header 后没有节约', { estimate }), null);
+  assert.equal(JSON.stringify(state), before);
+  assert.equal(Ctx.applyCompaction(state, plan, big(8000, true), { estimate: () => plan.headTokens + 1 }), null);
+  assert.equal(JSON.stringify(state), before);
+  state.lastInputTokens = 99000;
+  const info = Ctx.applyCompaction(state, plan, '压缩后的结论', { estimate: est });
+  assert.ok(info.summaryTokens < info.freedTokens);
+  assert.equal(state.lastInputTokens, 0);
+});
+
+function microConversation(contents) {
+  return [
+    { role: 'user', turnId: 'latest', content: '查清证据；不要自动收藏或重复写入。' },
+    { role: 'assistant', content: '', tool_calls: contents.map((_, i) => ({ id: 't' + i, function: { name: 'read_session_file', arguments: '{"file":"附件/evidence.txt"}' } })) },
+    ...contents.map((content, i) => ({ role: 'tool', name: 'read_session_file', tool_call_id: 't' + i, content, error: i === 0 }))
+  ];
+}
+
+test('compactToolView：单长轮仅缩短工具结果，保留首尾引用和最新用户要求且不写存档', () => {
+  const messages = microConversation(['正文起点 ' + big(10000, true) + ' attachmentId=A42 nextOffset=9000']);
+  const snapshot = JSON.stringify(messages);
+  assert.equal(Ctx.planCompaction(messages, { estimate: est, thresholdTokens: 1, preserveRecentTokens: 100 }), null);
+  const view = Ctx.compactToolView(messages, { estimate: est, budgetTokens: 1000 });
+  assert.ok(view.reduce((sum, m) => sum + est(m), 0) <= 1000);
+  assert.equal(view[0], messages[0], '不截用户问题与授权要求');
+  assert.equal(view[1], messages[1], '不改工具调用');
+  assert.equal(view[2].tool_call_id, 't0');
+  assert.equal(view[2].name, 'read_session_file');
+  assert.equal(view[2].error, true);
+  assert.ok(view[2].content.includes('已缩短'));
+  assert.ok(view[2].content.includes('正文起点'));
+  assert.ok(view[2].content.includes('attachmentId=A42 nextOffset=9000'));
+  assert.equal(JSON.stringify(messages), snapshot);
+  const body = Core.buildRequestBody({ messages: view, historyMessageCap: 100 }, {});
+  assert.equal(body.messages.find((m) => m.tool_calls).tool_calls[0].id, 't0');
+  assert.equal(body.messages.find((m) => m.role === 'tool').tool_call_id, 't0');
+});
+
+test('compactToolView：预算足时保留全部正文，超预算先缩旧结果并保留最近三条', () => {
+  const messages = microConversation([big(10000), big(10000), 'recent one', 'recent two', 'recent three']);
+  assert.equal(Ctx.compactToolView(messages, { estimate: est, budgetTokens: 99999 }), messages);
+  const view = Ctx.compactToolView(messages, { estimate: est, budgetTokens: 1700 });
+  assert.ok(view.reduce((sum, m) => sum + est(m), 0) <= 1700);
+  assert.notEqual(view[2], messages[2]);
+  for (let i = 4; i < view.length; i++) assert.equal(view[i], messages[i]);
+  assert.deepEqual(view.filter((m) => m.role === 'tool').map((m) => m.tool_call_id), ['t0', 't1', 't2', 't3', 't4']);
+});
+
+test('compactToolView：预算紧时可清正文但不删配对，短结果和计划不扩大或掩掉', () => {
+  const messages = microConversation(Array.from({ length: 8 }, () => big(5000)));
+  const plan = { role: 'tool', name: 'update_research_plan', tool_call_id: 'plan-1', content: '{"goal":"核查","steps":[]}' };
+  messages.push(plan);
+  const snapshot = JSON.stringify(messages);
+  const view = Ctx.compactToolView(messages, { estimate: est, budgetTokens: 850, keepRecentTools: 3 });
+  assert.ok(view.reduce((sum, m) => sum + est(m), 0) <= 850);
+  assert.ok(view.some((m) => m.content && m.content.includes('已清除')));
+  assert.equal(view.at(-1), plan, '结构化计划仍原样保留');
+  assert.equal(view.length, messages.length);
+  assert.equal(JSON.stringify(messages), snapshot);
+  const short = microConversation(['OK']);
+  const tight = Ctx.compactToolView(short, { estimate: est, budgetTokens: 1 });
+  assert.equal(tight[2], short[2], '短工具正文不能换成更长的掩码');
+  assert.equal(tight[0], short[0], '不可满足的预算也不改真人指令');
+});
+
+test('compactToolView：旧工具清正文已够预算时，不提前缩短最近结果', () => {
+  const messages = microConversation([big(10000), big(10000), big(1000), big(1000), big(1000)]);
+  const clearedOld = messages.map((m, index) => index === 2 || index === 3 ? Object.assign({}, m, { content: Ctx.maskToolMessage(m.content) }) : m);
+  const budget = clearedOld.reduce((sum, m) => sum + est(m), 0);
+  const view = Ctx.compactToolView(messages, { estimate: est, budgetTokens: budget });
+  assert.ok(view.reduce((sum, m) => sum + est(m), 0) <= budget);
+  for (let i = 4; i < view.length; i++) assert.equal(view[i], messages[i]);
+});
+
+test('微压缩和掩码完整保留写入/下载/收藏回执，缺失内容只指导只读核对', () => {
+  const names = ['collect_papers', 'download_pdfs', 'add_pdfs_to_folder', 'fetch_page', 'update_research_plan'];
+  const protectedMessages = names.map((name, i) => ({ role: 'tool', name, tool_call_id: 'written-' + i, content: '已成功完成，勿重复 ' + big(2000), error: false }));
+  const read = { role: 'tool', name: 'read_session_file', tool_call_id: 'read', content: big(20000) };
+  const messages = [...protectedMessages, read];
+  const before = JSON.stringify(messages);
+  const view = Ctx.compactToolView(messages, { estimate: est, budgetTokens: 4000 });
+  names.forEach((name, i) => {
+    assert.equal(view[i], protectedMessages[i], name + ' 回执不能丢失');
+    assert.equal(Ctx.maskToolMessage(protectedMessages[i].content, protectedMessages[i]), protectedMessages[i].content);
+  });
+  const masked = Ctx.maskOldToolResults([...protectedMessages, read, { role: 'user', content: '继续' }], 1);
+  names.forEach((name, i) => assert.equal(masked[i].content, protectedMessages[i].content, name));
+  for (const content of [view.at(-1).content, masked[5].content, Ctx.maskToolMessage('以前的读取结果')]) {
+    assert.match(content, /只读/);
+    assert.match(content, /不得因此重复写入、下载或收藏/);
+    assert.ok(!content.includes('请重新调用工具获取'));
+  }
+  assert.equal(JSON.stringify(messages), before);
+  const custom = { role: 'tool', name: 'export_evidence', content: big(10000) };
+  assert.equal(Ctx.compactToolView([custom], { estimate: est, budgetTokens: 1, protectedToolNames: ['export_evidence'] })[0], custom);
+});
+
+
+test('provider calibrated liveTokens triggers compaction even below the text-only threshold', () => {
+  const messages = [{ role: 'user', content: 'a'.repeat(12000) }, { role: 'assistant', content: 'b'.repeat(12000) }, { role: 'user', content: 'latest'.repeat(100) }];
+  const estimate = Core.estimateMessageTokens;
+  const plan = Ctx.planCompaction(messages, { estimate, thresholdTokens: 100000, preserveRecentTokens: 10, liveTokens: 110000 });
+  assert.ok(plan); const state = { messages, inputUsageBaseline: { tokens: 110000, estimate: 6000 } };
+  assert.ok(Ctx.applyCompaction(state, plan, 'short summary', { estimate }));
+  assert.equal(state.inputUsageBaseline, null);
 });

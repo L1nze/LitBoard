@@ -12,7 +12,7 @@
  * - A06 崩溃恢复（2026-09-20 按业界实践重做）：流式增量**只进内存**，不落盘；
  *   落盘只在四个事件点——轮开始（写运行标记）、**执行工具前**（assistant 消息必须先落盘）、
  *   工具结果、轮收尾。事件点一律 await persist（R04：persist 返回「磁盘已提交」的
- *   Promise，缓存 1 秒防抖只覆盖高频 delta；等待失败不中断对话，由 persist 自行报告）；
+ *   Promise，缓存 1 秒防抖只覆盖高频 delta；保存失败停止本轮，副作用不得跨过失败检查点）；
  *   硬崩溃丢当前未完成的半截（业界一致取舍），运行标记留真时按
  *   LibreChat 式「unfinished 行」在下次打开时恢复为「已中断」+ 手动重试；
  * - A13 按轮重试：错误卡绑定 turnId；retry/edit 都定位到具体 user 消息截断重跑，
@@ -30,6 +30,7 @@
     var opts = options || {};
     var Core = opts.core; // LitAgentCore
     var Context = opts.context || null; // LitAgentContext（压缩/溢出判定；未注入则跳过相关能力）
+    var Dispatch = opts.dispatch || (typeof module === 'object' && module.exports ? require('./agentdispatch.js') : window.LitAgentDispatch);
     var chat = opts.chat;
     var executeTool = opts.executeTool;
     var buildBody = opts.buildBody;
@@ -38,14 +39,50 @@
     var maybeCompact = typeof opts.maybeCompact === 'function' ? opts.maybeCompact : null;
     var runners = new Map(); // runId → run
 
+    async function checkpoint(run) {
+      var saved = await persist(run);
+      if (saved === null || saved === false) throw new Error('会话检查点保存失败，本轮已停止');
+      return saved;
+    }
+
     function register(run) { runners.set(run.id, run); }
 
     function cancel(runId) {
       var run = runners.get(String(runId || ''));
       if (!run || !run.streaming) return false;
       run.cancelRequested = true;
-      if (typeof opts.cancelChat === 'function') opts.cancelChat(run.id);
+      if (typeof opts.cancelChat === 'function') opts.cancelChat(run.id, run.core.turnId);
       return true;
+    }
+
+    async function enqueue(runId, text) {
+      var run = runners.get(String(runId || '')), value = String(text || '').trim();
+      if (!run || !run.streaming || !value) return false;
+      if (value.length > 10000) throw new Error('补充要求过长（最多 10000 字符）');
+      var queue = run.doc.queuedInputs || (run.doc.queuedInputs = []);
+      if (queue.length >= 10) throw new Error('补充要求队列已满（最多 10 条）');
+      queue.push({ text: value, queuedAt: new Date().toISOString() });
+      try { await checkpoint(run); } catch (error) { run.persistenceFailed = true; throw error; }
+      emit(run.id, { type: 'queue_changed', count: queue.length });
+      return true;
+    }
+
+    async function clearQueue(runId) {
+      var run = runners.get(String(runId || ''));
+      if (!run) return false;
+      run.doc.queuedInputs = [];
+      await checkpoint(run);
+      emit(run.id, { type: 'queue_changed', count: 0 });
+      return true;
+    }
+
+    async function drainQueue(run) {
+      var queue = run.doc.queuedInputs || [];
+      if (!queue.length) return;
+      queue.splice(0).forEach(function (input) {
+        run.core.messages.push({ role: 'user', content: '[补充要求]\n' + input.text, synthetic: true, kind: 'steering', turnId: run.core.turnId, ts: input.queuedAt });
+      });
+      await checkpoint(run);
     }
 
     function isStreaming(runId) {
@@ -87,6 +124,26 @@
       doc.streamReasoning = '';
       if (!wasRunning) return false;
       var messages = run.core.messages || [];
+      // 崩溃时工具可能已产生副作用，但结果尚未提交：标为未知，绝不自动重放。
+      // 已提交的结果保留；只补齐最后一批未配对调用，保证恢复后协议完整。
+      var lastAssistant = -1;
+      for (var a = messages.length - 1; a >= 0; a--) {
+        if (messages[a].role === 'assistant') { lastAssistant = a; break; }
+        if (messages[a].role === 'user' && !messages[a].synthetic) break;
+      }
+      if (lastAssistant >= 0) {
+        var finished = new Set(messages.slice(lastAssistant + 1).filter(function (m) { return m.role === 'tool'; }).map(function (m) { return m.tool_call_id; }));
+        var missing = (messages[lastAssistant].tool_calls || []).filter(function (call) { return !finished.has(call.id); });
+        Core.appendToolResults(run.core, missing.map(function (call) {
+          return { callId: call.id, name: call.function && call.function.name,
+            result: '执行被中断，结果未确认。先核对现有数据；不要自动重复收藏、下载或写入。', error: true };
+        }));
+      }
+      var recoveredImages = [];
+      messages.forEach(function (msg) {
+        if (msg.pendingImages) { recoveredImages.push(msg.pendingImages); delete msg.pendingImages; }
+      });
+      recoveredImages.forEach(function (msg) { messages.push(msg); });
       if (text) {
         // 防御：缓冲内容若已作为最近一条助手消息落账，就不再重复追加
         var duplicated = false;
@@ -117,6 +174,7 @@
         turnId: run.core.turnId || '',
         retry: true
       });
+      run.doc.requestResume = { turnId: run.core.turnId || '', partial: true };
       return true;
     }
 
@@ -134,6 +192,7 @@
       var normalMaxSteps = run.core.maxSteps;
       run.streaming = true;
       run.cancelRequested = false;
+      run.persistenceFailed = false;
       run.phase = 'waiting';
       run.streamText = '';
       run.streamReasoning = '';
@@ -141,10 +200,12 @@
       run.endReason = '';
       run.doc.streaming = true;   // 运行中标记：异常退出后据此判定「中断」（不能只看缓冲非空）
       run.forceContextTokens = 0; // 溢出减半预算只在本轮内生效，新一轮恢复用户设置的预算
-      await persist(run);
       try {
+        await checkpoint(run);
         while (true) {
+          if (run.persistenceFailed) throw new Error('会话检查点保存失败，本轮已停止');
           if (run.cancelRequested) { run.endReason = 'stopped'; break; }
+          await drainQueue(run);
           run.phase = 'waiting';
           // 上下文压缩钩子（R17）：发送前检查——活历史超阈值时先把旧对话摘要成一条
           // （agentui 注入：读设置、发 quiet 摘要请求、落盘；失败则本轮改走裁剪，不阻塞）
@@ -173,7 +234,7 @@
                   content: '上下文超出模型限制，已裁剪最旧历史并重试一次；若仍失败，请在设置里调小「模型上下文（tokens）」。',
                   turnId: run.core.turnId || ''
                 });
-                await persist(run);
+                await checkpoint(run);
                 body = buildBody(run);
                 continue;
               }
@@ -186,21 +247,25 @@
           run.streamReasoning = '';
           if (run.cancelRequested || (result && result.aborted)) {
             // 用户停止：保留已生成的半截内容（若有），保证 tool_calls/tool 配对不被破坏
-            if (result && result.message && result.message.content) {
-              Core.appendAssistant(run.core, result.message, null);
+            if (result && result.message && (result.message.content || result.message.reasoning_content || (result.message.tool_calls || []).length)) {
+              Core.appendAssistant(run.core, result.message, result.usage);
+              Core.appendToolResults(run.core, Core.pendingToolCalls(run.core).map(function (call) { return { callId: call.callId, name: call.name, result: '（已停止，未执行）', error: true }; }));
             }
             run.endReason = 'stopped';
             break;
           }
           if (result && result.partial) {
             // A05：截断 / 空闲超时 / 流中断——部分内容保留 + 错误卡（手动重试，不自动重发）
-            Core.appendAssistant(run.core, result.message, null);
+            Core.appendAssistant(run.core, result.message, result.usage);
             run.core.messages.push({
               role: 'error',
               content: result.errorText || '回复可能被截断',
               turnId: run.core.turnId || '',
               retry: true
             });
+            var partialCalls = (result.message.tool_calls || []).map(function (call) { return { callId: call.id, name: call.function.name }; });
+            Core.appendToolResults(run.core, partialCalls.map(function (call) { return { callId: call.callId, name: call.name, result: '回复中断，工具未执行；请继续核对。', error: true }; }));
+            run.doc.requestResume = { turnId: run.core.turnId, partial: true };
             run.endReason = 'failed';
             break;
           }
@@ -208,54 +273,63 @@
           // 用量回喂（R17）：端点回报的 prompt_tokens 是「下一次请求规模」最可信的地板值，
           // 压缩触发的估算偏差靠它纠正（估算值只会在没有真实值时兜底）
           var reportedIn = result && result.usage && Number(result.usage.prompt_tokens);
-          if (isFinite(reportedIn) && reportedIn > 0) run.core.lastInputTokens = reportedIn;
+          if (isFinite(reportedIn) && reportedIn > 0) Core.recordInputUsage(run.core, result.usage, body);
           var pending = Core.pendingToolCalls(run.core);
-          if (!pending.length) { run.endReason = 'done'; break; }
+          if (!pending.length) {
+            if ((run.doc.queuedInputs || []).length) continue;
+            run.endReason = 'done'; break;
+          }
           Core.decorateToolCalls(run.core, pending.map(function (call) {
             return { callId: call.callId, name: call.name, args: call.args };
           }));
           // 【关键事件点】执行工具之前先把 assistant 消息落盘：
           // 用户随时可能退出/崩溃，此刻不写就会连同已生成的回复一起丢
           // （Cline/Roo 源码注释里点名的同一条纪律）。R04：await 到磁盘提交
-          await persist(run);
+          await checkpoint(run);
           // 工具执行阶段（A03：每个工具前检查取消）
           run.phase = 'tools';
           var results = [];
-          var turnImages = [];   // R11：工具渲染的页面截图引用（合成 user 消息注入）
-          var cancelledMidway = false;
-          for (var i = 0; i < pending.length; i++) {
-            if (run.cancelRequested) { cancelledMidway = true; break; }
-            var call = pending[i];
-            // 整篇梳理需要多次续读；仅本轮放宽步数，收尾恢复原上限。
-            if (call.name === 'summarize_paper') run.core.maxSteps = Math.max(run.core.maxSteps, 48);
-            try {
-              var out = await executeTool(call.name, call.args, run);
+          var imageMessages = [];
+
+          var startedCallIds = new Set();
+          await Dispatch.dispatchBatch(pending, {
+            maxConcurrency: 3,
+            canParallel: function (call) { return typeof opts.canParallel === 'function' && opts.canParallel(call, run); },
+            isCancelled: function () { return run.cancelRequested || run.persistenceFailed; },
+            cancelActive: function () { if (opts.cancelTools) return opts.cancelTools(run.id, run.core.turnId); },
+            execute: async function (call) {
+              startedCallIds.add(call.callId);
+              if (call.name === 'summarize_paper') run.core.maxSteps = Math.max(run.core.maxSteps, 48);
+              var out = await executeTool(call.name, call.args, run), record = { callId: call.callId, name: call.name };
               if (out && typeof out === 'object' && !Array.isArray(out) && (out.text != null || Array.isArray(out.images))) {
-                // 结构化工具结果：文本进 tool 消息，图像引用收集待注入（R11）
-                if (Array.isArray(out.images)) turnImages = turnImages.concat(out.images);
-                results.push({ callId: call.callId, name: call.name, result: out.text });
-              } else {
-                results.push({ callId: call.callId, name: call.name, result: out });
+                record.result = out.text; record.images = out.images || [];
+              } else record.result = out;
+              return record;
+            },
+            commit: async function (record, index) {
+              results[index] = record;
+              Core.appendToolResults(run.core, [record]);
+              if (record.images && record.images.length) {
+                var imageMessage = appendSyntheticImages(run, record.images);
+                if (imageMessage) {
+                  imageMessages.push(run.core.messages.pop());
+                  run.core.messages[run.core.messages.length - 1].pendingImages = imageMessages[imageMessages.length - 1];
+                }
               }
-            } catch (error) {
-              results.push({
-                callId: call.callId, name: call.name,
-                result: '工具执行失败：' + String(error && error.message || error), error: true
-              });
+              await checkpoint(run);
+            }
+          });
+          for (var j = 0; j < pending.length; j++) {
+            if (!results[j]) {
+              Core.appendToolResults(run.core, [{ callId: pending[j].callId, name: pending[j].name, result: '（已停止，未执行）', error: true }]);
             }
           }
-          if (cancelledMidway) {
-            // 未执行的工具补占位结果：消息配对完整，模型下次能看到全部调用都有结果
-            for (var j = results.length; j < pending.length; j++) {
-              results.push({ callId: pending[j].callId, name: pending[j].name, result: '（已停止，未执行）', error: true });
-            }
-          }
-          Core.appendToolResults(run.core, results);
           // R11：工具渲染的页面截图以合成 user 消息注入本轮（vision 模型下一请求可见）
-          if (turnImages.length) appendSyntheticImages(run, turnImages);
+          run.core.messages.forEach(function (msg) { if (msg.pendingImages) delete msg.pendingImages; });
+          imageMessages.forEach(function (msg) { run.core.messages.push(msg); });
           // 【关键事件点】工具结果落盘（含截断后的内容；截断在工具层完成，
           // 存储层不二次截断——Cline/Roo 同策略）；await 到磁盘提交（R04）
-          await persist(run);
+          await checkpoint(run);
           if (run.cancelRequested) { run.endReason = 'stopped'; break; }
           var verdict = Core.shouldContinue(run.core);
           if (!verdict.continue) {
@@ -265,6 +339,15 @@
         }
       } catch (error) {
         run.endReason = 'failed';
+        run.doc.requestResume = { turnId: run.core.turnId, partial: false };
+        var completedIds = new Set(run.core.messages.filter(function (msg) { return msg.role === 'tool'; }).map(function (msg) { return msg.tool_call_id; }));
+        var unpaired = (pending || []).filter(function (call) { return !completedIds.has(call.callId); });
+        Core.appendToolResults(run.core, unpaired.map(function (call) {
+          return { callId: call.callId, name: call.name, result: startedCallIds && startedCallIds.has(call.callId) ? '执行结果未保存，先核对现有数据；不要自动重复写入。' : '检查点保存失败或请求中断，工具未执行。', error: true };
+        }));
+        var savedImages = [];
+        run.core.messages.forEach(function (msg) { if (msg.pendingImages) { savedImages.push(msg.pendingImages); delete msg.pendingImages; } });
+        savedImages.forEach(function (msg) { run.core.messages.push(msg); });
         run.core.messages.push({
           role: 'error',
           content: '请求失败：' + String(error && error.message || error),
@@ -272,6 +355,7 @@
           retry: true
         });
       } finally {
+        if (run.endReason === 'done') delete run.doc.requestResume;
         run.core.maxSteps = normalMaxSteps;
         run.streaming = false;
         run.doc.streaming = false;
@@ -284,10 +368,24 @@
         run.doc.streamText = '';
         run.doc.streamReasoning = '';
         // 轮收尾也是事件点：终态（endReason / 运行标记清除）必须先落盘再报 run_end（R04）
-        await persist(run);
+        try { await checkpoint(run); } catch (saveError) {
+          run.endReason = 'failed';
+          run.core.endReason = 'failed';
+          run.core.messages.push({ role: 'error', content: String(saveError.message || saveError), turnId: run.core.turnId || '', retry: true });
+        }
         emit(run.id, { type: 'run_end', endReason: run.endReason });
       }
       return run.endReason;
+    }
+
+    function retryTurn(run, turnId) {
+      var resume = run.doc.requestResume;
+      if (run.streaming) return Promise.resolve('busy');
+      if (!resume || resume.turnId !== turnId || run.core.turnId !== turnId) return rerunTurn(run, turnId);
+      run.core.messages = run.core.messages.filter(function (msg) { return !(msg.role === 'error' && msg.turnId === turnId); });
+      if (resume.partial) run.core.messages.push({ role: 'user', content: '[上一回复中断，请从已保存的内容继续。已完成的工具结果仍有效，不要重复执行收藏、下载或写入。]', synthetic: true, kind: 'continuation', turnId: turnId });
+      delete run.doc.requestResume;
+      return runTurn(run);
     }
 
     /** 按轮重试 / 重新生成 / 编辑重发：定位 user 消息 → 截断 → 以新文本重跑（A13）。
@@ -311,6 +409,8 @@
         ? String(newText)
         : { text: String(original.content || ''), images: original.images };
       stashEditHistory(run, turnId, messages.slice(idx));
+      run.doc.queuedInputs = [];
+      delete run.doc.requestResume;
       // 修回复核：若目标轮已经被压缩，截断会同时移除位于它后面的摘要，而目标之前的
       // 原始消息仍带 compacted 标记，最终请求只剩当前问题。恢复目标之前的原始历史，
       // 并继续屏蔽旧摘要，避免「原文 + 摘要」重复进入模型上下文。
@@ -320,6 +420,8 @@
           else if (messages[r]) delete messages[r].compacted;
         }
       }
+      run.core.inputUsageBaseline = null;
+      run.core.lastInputTokens = 0;
       messages.length = idx; // 截掉该轮与其后所有内容（含历史错误卡）
       Core.appendUser(run.core, input);
       // R03：重试/编辑沿用原轮冻结上下文（模型/思考档/文献/选区）——重启后重试 PDF
@@ -368,6 +470,7 @@
         turnId: run.core.turnId || '',
         ts: new Date().toISOString()
       });
+      return run.core.messages[run.core.messages.length - 1];
     }
 
     /** 最近一轮重试（错误卡「重试」按钮的缺省行为） */
@@ -378,7 +481,7 @@
       for (var i = messages.length - 1; i >= 0; i--) {
         if (messages[i].role === 'user' && messages[i].synthetic !== true) { turnId = messages[i].turnId; break; }
       }
-      return turnId ? rerunTurn(run, turnId) : Promise.resolve('not_found');
+      return turnId ? retryTurn(run, turnId) : Promise.resolve('not_found');
     }
 
     /** R08：等待某会话当前轮收尾（先 cancel 后用）；超时返回 false——调用方如实决定是否继续。
@@ -404,6 +507,10 @@
       handleStreamEvent: handleStreamEvent,
       restoreInterrupted: restoreInterrupted,
       rerunTurn: rerunTurn,
+      retryTurn: retryTurn,
+      enqueue: enqueue,
+      clearQueue: clearQueue,
+      flushQueue: drainQueue,
       retryLast: retryLast
     };
   }

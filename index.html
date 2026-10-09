@@ -471,11 +471,14 @@
       <div class="agent-not-ready" id="agent-not-ready" hidden></div>
     </div>
     <div class="agent-composer">
+      <div id="agent-plan" class="agent-plan" hidden></div>
+      <div id="agent-pending-references" class="agent-chips" hidden></div>
       <div class="agent-attachments" id="agent-attachments" hidden></div>
       <div class="agent-chips" id="agent-chips" hidden></div>
       <!-- 模型/推理/状态/token 的预备行：bundle 输入行挂载后由 agentui 把它们移进输入行插槽（发送按钮旁），
            此行只是 bundle 未加载时的兜底位置，移空即移除 -->
       <div class="agent-composer-row">
+        <button type="button" class="btn btn-ghost btn-icon" id="agent-upload-btn" title="上传参考文件（文本、PDF、Office、图片；单文件最多 20 MiB，图片 8 MiB）" aria-label="上传参考文件">📎</button>
         <button type="button" class="btn btn-ghost btn-icon agent-compact-btn" id="agent-compact-btn" title="压缩上下文：把较旧对话摘要成一条，腾出上下文空间（原文仍在会话存档）" aria-label="压缩上下文"><svg class="ic" aria-hidden="true"><use href="#lb-i-layers"/></svg></button>
         <span class="agent-status" id="agent-status" role="status" aria-live="polite"></span>
         <div class="agent-model-control" id="agent-model-control">
@@ -1679,9 +1682,12 @@
 <script src="js/agentcontext.js"></script>
 <script src="js/embedcfg.js"></script>
 <script src="js/agentreason.js"></script>
+<script src="js/agentdispatch.js"></script>
 <script src="js/agentloop.js"></script>
 <script src="js/webfetch.js"></script>
 <script src="js/litsearch.js"></script>
+<script src="js/agentfilecontext.js"></script>
+<script src="js/agentplan.js"></script>
 <script src="js/agenttools.js"></script>
 <script src="vendor/vis-network/vis-network.min.js"></script>
 <script src="js/graphgen.js"></script>

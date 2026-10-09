@@ -530,3 +530,21 @@ test('H3: 同会话两个并发请求，先结束者不得删掉后者的控制�
   const r2 = await second;
   assert.equal(r2.aborted, true, '第二个请求被取消（而非正常完成）');
 });
+
+
+test('transient HTTP rejection honors Retry-After with bounded retries and no tool replay', async () => {
+  let calls = 0; const waits = [];
+  const net = createAgentNet({ getConfig: async () => ({ agentBaseUrl: 'https://api.test', agentApiKey: 'K', agentModel: 'm' }), sleep: async ms => waits.push(ms),
+    fetch: async () => { calls++; return { ok: false, status: 429, headers: { get: () => '2' }, text: async () => 'rate limited' }; } });
+  await assert.rejects(net.chatStream({ sessionId: 'retry-s', turnId: 't', body: { messages: [{ role: 'user', content: 'go' }] } }), /HTTP 429/);
+  assert.equal(calls, 3); assert.deepEqual(waits, [2000, 2000]);
+});
+
+test('ambiguous connection failures and reasoning-only partial streams never auto retry', async () => {
+  let calls = 0;
+  const net = createAgentNet({ getConfig: async () => ({ agentBaseUrl: 'https://api.test', agentApiKey: 'K', agentModel: 'm' }), fetch: async () => { calls++; throw new Error('socket reset after request'); } });
+  await assert.rejects(net.chatStream({ sessionId: 'no-blind-retry', body: { messages: [] } }), /socket reset/); assert.equal(calls, 1);
+  const streamNet = createAgentNet({ getConfig: async () => ({ agentBaseUrl: 'https://api.test', agentApiKey: 'K', agentModel: 'm' }), fetch: async () => ({ ok: true, body: { getReader: () => ({ read: async () => { if (calls++ === 1) return { value: new TextEncoder().encode('data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n') }; throw new Error('lost'); } }) } }) });
+  const result = await streamNet.chatStream({ sessionId: 'reasoning-partial', body: { messages: [] } });
+  assert.equal(result.partial, true); assert.equal(result.message.reasoning_content, 'thinking');
+});

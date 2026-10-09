@@ -152,8 +152,13 @@
 
   /** 工具执行结果落账：每条对应一个 tool_call（OpenAI 的 role:'tool' 形态） */
   function appendToolResults(state, results) {
-    var last = state.messages[state.messages.length - 1];
-    var calls = last && Array.isArray(last.toolCalls) ? last.toolCalls : [];
+    var calls = [];
+    // 每个工具独立落盘时，最后一条可能已经是同批的 tool 结果。
+    for (var i = state.messages.length - 1; i >= 0; i--) {
+      var previous = state.messages[i];
+      if (previous.role === 'assistant') { calls = previous.toolCalls || []; break; }
+      if (previous.role === 'user' && !previous.synthetic) break;
+    }
     (Array.isArray(results) ? results : []).forEach(function (item) {
       var call = item || {};
       var content = truncateOutput(
@@ -281,13 +286,14 @@
    */
   function buildRequestBody(state, options) {
     var opts = options || {};
+    var requestEstimate = function (msg) { return estimateMessageTokens(msg, opts); };
     var messages = [];
     if (opts.system) messages.push({ role: 'system', content: String(opts.system) });
     var budget = Number(opts.maxContextTokens) > 0 ? Number(opts.maxContextTokens) : 0;
     if (budget > 0) {
       var overhead = estimateTokens(opts.system || '');
       if (Array.isArray(opts.tools) && opts.tools.length) overhead += estimateTokens(JSON.stringify(opts.tools));
-      budget = Math.max(1000, budget - overhead); // 下限兜底：预算再小也留得住最新一轮
+      budget = Math.max(1, budget - overhead - (Number(opts.maxOutputTokens) || 0));
     }
     // 上下文压缩（js/agentcontext）：compacted 标记的消息已被摘要替代，不进请求窗口；
     // maskToolResults（条数）+ maskToolMessage（占位串构造器，由调用方注入）：
@@ -295,15 +301,26 @@
     var source = (Array.isArray(state.messages) ? state.messages : []).filter(function (msg) {
       return !(msg && msg.compacted === true);
     });
-    var window_ = trimWindowToBudget(source, budget);
-    window_ = window_.slice(-(Number(opts.historyMessageCap) > 0 ? Number(opts.historyMessageCap) : state.historyMessageCap));
+    if (budget > 0 && typeof opts.compactToolView === 'function') {
+      source = opts.compactToolView(source, { budgetTokens: budget, estimate: requestEstimate });
+    }
+    var window_ = trimWindowToBudget(source, budget, requestEstimate);
+    var messageCap = Number(opts.historyMessageCap) > 0 ? Number(opts.historyMessageCap) : state.historyMessageCap;
+    if (messageCap > 0 && window_.length > messageCap) {
+      var starts = [];
+      window_.forEach(function (msg, index) { if (msg.role === 'user' && !msg.synthetic) starts.push(index); });
+      var cutoff = starts.find(function (index) { return index >= window_.length - messageCap; });
+      // 条数限制也按完整轮裁剪；最新轮过长时保留真人问题。
+      if (cutoff == null && starts.length) cutoff = starts[starts.length - 1];
+      window_ = window_.slice(cutoff || 0);
+    }
     // 头部孤儿 tool 消息：其先行 assistant 调用已被截掉，直接丢弃（顺序保证孤儿只出现在头部）
     while (window_.length && window_[0].role === 'tool') window_.shift();
     var maskKeep = Number(opts.maskToolResults) || 0;
     if (maskKeep > 0 && typeof opts.maskToolMessage === 'function') {
       window_ = window_.map(function (msg, index) {
         if (!msg || msg.role !== 'tool' || index >= window_.length - maskKeep) return msg;
-        return Object.assign({}, msg, { content: opts.maskToolMessage(msg.content) });
+        return Object.assign({}, msg, { content: opts.maskToolMessage(msg.content, msg) });
       });
     }
     // 尾部轮边界（R11 图像成本闸）：图像只从「最后一个真人 user 消息」起发送——
@@ -365,22 +382,24 @@
 
   /** 按完整对话组裁剪：估算 token 总量 > 预算时，从最旧的「user 起头组」整组丢弃
    *  （A04/A11 的上下文预算；0 = 不按预算裁剪） */
-  function trimWindowToBudget(messages, maxTokens) {
+  function trimWindowToBudget(messages, maxTokens, estimator) {
     var list = Array.isArray(messages) ? messages.slice() : [];
     var cap = Number(maxTokens) || 0;
+    var estimate = typeof estimator === 'function' ? estimator : estimateMessageTokens;
     if (cap <= 0) return list;
     var groupStarts = [];
     for (var i = 0; i < list.length; i++) {
-      if (list[i].role === 'user') groupStarts.push(i);
+      if (list[i].role === 'user' && list[i].synthetic !== true) groupStarts.push(i);
     }
     if (!groupStarts.length) return list;
     var total = 0;
-    for (var j = 0; j < list.length; j++) total += estimateTokens(JSON.stringify(list[j] || {}));
+    for (var j = 0; j < list.length; j++) total += estimate(list[j]);
     var cut = 0;
     while (groupStarts.length > 1 && total > cap) {
-      cut = groupStarts[1]; // 保留至少一组：丢到第二个 user 为止
+      var previousCut = cut;
+      cut = groupStarts[1]; // 保留至少一组：丢到第二个真人 user 为止
       var dropped = 0;
-      for (var k = 0; k < cut; k++) dropped += estimateTokens(JSON.stringify(list[k] || {}));
+      for (var k = previousCut; k < cut; k++) dropped += estimate(list[k]);
       total -= dropped;
       groupStarts.shift();
     }
@@ -392,6 +411,47 @@
     var s = String(text == null ? '' : text);
     var cjk = (s.match(/[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff]/g) || []).length;
     return Math.ceil(cjk + (s.length - cjk) / 4);
+  }
+
+  // 请求预算只计算协议字段，排除工具卡复制的 result 与持久化元数据。
+  function estimateMessageTokens(msg, options) {
+    var m = msg || {}, opts = options || {};
+    if (m.role === 'error') return 0;
+    var wire = { role: m.role, content: m.content || '' }, images = 0;
+    if (Array.isArray(wire.content)) {
+      wire.content = wire.content.filter(function (part) {
+        if (part && (part.type === 'image' || part.type === 'image_url')) { images++; return false; }
+        return true;
+      });
+    }
+    if (m.role === 'tool') wire.tool_call_id = m.tool_call_id;
+    if (m.role === 'assistant' && m.tool_calls) wire.tool_calls = m.tool_calls;
+    if (m.role === 'assistant' && opts.replayReasoning && (m.reasoning || m.reasoning_content)) wire.reasoning_content = m.reasoning || m.reasoning_content;
+    if (m.role === 'user' && opts.sendImages && m.images) images += m.images.length;
+    // Image token accounting depends on model/resolution; use a nominal per-image estimate (not a provider upper bound)
+    // rather than counting the tiny local reference (or the entire base64 string).
+    return estimateTokens(JSON.stringify(wire)) + images * 1600;
+  }
+
+  function estimateRequestTokens(body) {
+    var request = body || {}, total = 0;
+    (request.messages || []).forEach(function (msg) { total += estimateMessageTokens(msg, { replayReasoning: true, sendImages: true }); });
+    if (request.tools && request.tools.length) total += estimateTokens(JSON.stringify(request.tools));
+    return total;
+  }
+
+  function recordInputUsage(state, usage, body) {
+    var tokens = Number(usage && usage.prompt_tokens);
+    if (!(tokens > 0) || usage.estimated === true) return;
+    state.lastInputTokens = tokens;
+    state.inputUsageBaseline = { tokens: tokens, estimate: estimateRequestTokens(body) };
+  }
+
+  function currentInputTokens(state, body) {
+    var estimated = estimateRequestTokens(body), baseline = state.inputUsageBaseline;
+    // Provider usage calibrates the previous request; add newly appended content.
+    // A successful compaction invalidates the baseline, so stale usage cannot pin it.
+    return baseline && baseline.tokens > 0 ? Math.max(estimated, baseline.tokens + estimated - baseline.estimate) : estimated;
   }
 
   function addTokens(state, usage) {
@@ -415,7 +475,8 @@
       turnId: state.turnId || '',
       recentToolSignatures: state.recentToolSignatures,
       // 最近一次端点回报的输入 token（压缩触发的可信地板值；估算偏差靠它纠正）
-      lastInputTokens: Number(state.lastInputTokens) || 0
+      lastInputTokens: Number(state.lastInputTokens) || 0,
+      inputUsageBaseline: state.inputUsageBaseline || null
     }));
   }
 
@@ -431,6 +492,7 @@
       state.turnId = String(data.turnId || '');
       state.recentToolSignatures = Array.isArray(data.recentToolSignatures) ? data.recentToolSignatures : [];
       state.lastInputTokens = Number(data.lastInputTokens) || 0;
+      state.inputUsageBaseline = data.inputUsageBaseline || null;
     }
     return state;
   }
@@ -456,6 +518,10 @@
     buildRequestBody: buildRequestBody,
     normalizeImageRefs: normalizeImageRefs,
     estimateTokens: estimateTokens,
+    estimateMessageTokens: estimateMessageTokens,
+    estimateRequestTokens: estimateRequestTokens,
+    recordInputUsage: recordInputUsage,
+    currentInputTokens: currentInputTokens,
     addTokens: addTokens,
     trimWindowToBudget: trimWindowToBudget,
     historyCapFor: historyCapFor,

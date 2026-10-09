@@ -17,7 +17,9 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { constants } = require('node:fs');
 const LitResearch = require('../js/research.js');
+const LitAgentFork = require('../js/agentfork.js');
 
 const FLUSH_DELAY_MS = 1000;
 // 聚合索引的写盘防抖（真相源即时写、聚合数据防抖——Roo Code TaskHistoryStore 同策略）。
@@ -203,6 +205,65 @@ function createSessions(options) {
 
   function entryOf(id) {
     return cache.get(String(id || ''));
+  }
+
+  /** 分支的附件与文档全部准备成功后才登记索引，源会话保持原样。 */
+  async function fork(id, input) {
+    const entry = await loadEntry(id);
+    if (!entry) throw new Error('Session does not exist');
+    const opts = input || {};
+    const newId = 's' + crypto.randomBytes(8).toString('hex');
+    // 分支后缀应保留；首条消息的 20 字符标题截断规则不适用于已命名的分支。
+    const title = Array.from(String(opts.title || entry.data.title || '新会话').replace(/\s+/g, ' ').trim()).slice(0, 80).join('');
+    const data = LitAgentFork.forkDocument(entry.data, {
+      id: newId, title: title, messageIndex: opts.messageIndex
+    });
+    const sourceDir = path.resolve(rootDir, entry.dir);
+    const root = path.resolve(rootDir);
+    const sourceRelative = path.relative(root, sourceDir);
+    if (!sourceRelative || sourceRelative.startsWith('..') || path.isAbsolute(sourceRelative)) throw new Error('Invalid session directory');
+    const dateDir = dateFolderName(data.createdAt);
+    await fs.mkdir(path.join(root, dateDir), { recursive: true });
+    const dirName = await freeDirName(dateDir, title);
+    const dir = dateDir + path.sep + dirName;
+    const targetDir = path.resolve(root, dir);
+    const targetRelative = path.relative(root, targetDir);
+    if (!targetRelative || targetRelative.startsWith('..') || path.isAbsolute(targetRelative)) throw new Error('Invalid fork directory');
+    // mkdir 不使用 recursive；只有本次成功创建的目录才允许在失败时清理。
+    await fs.mkdir(targetDir);
+    try {
+      const sourceReal = await fs.realpath(sourceDir);
+      const rootReal = await fs.realpath(root);
+      const realRelative = path.relative(rootReal, sourceReal);
+      if (!realRelative || realRelative.startsWith('..') || path.isAbsolute(realRelative)) throw new Error('Invalid session directory');
+      const attachmentRoot = path.join(sourceReal, '附件');
+      for (const attachment of data.attachments || []) {
+        const file = String(attachment && attachment.file || '');
+        if (!/^附件[/\\][^/\\]+$/.test(file) || file.includes('..')) throw new Error('Invalid attachment path');
+        const from = path.join(sourceDir, file);
+        const fromReal = await fs.realpath(from);
+        const relative = path.relative(attachmentRoot, fromReal);
+        if (relative.startsWith('..') || path.isAbsolute(relative) || !(await fs.stat(fromReal)).isFile()) throw new Error('Invalid attachment path');
+        const to = path.join(targetDir, file);
+        await fs.mkdir(path.dirname(to), { recursive: true });
+        await fs.copyFile(fromReal, to, constants.COPYFILE_EXCL);
+      }
+      await atomicWrite(sessionPath(dir), JSON.stringify(LitResearch.sanitizeSessionForDisk(data), null, 2));
+      await upsertIndexEntry({
+        id: newId, title: title, dir: dir,
+        createdAt: data.createdAt, updatedAt: data.updatedAt, msgCount: data.messages.length
+      }, true);
+      cache.set(newId, { data: data, dir: dir, timer: null, dirty: false });
+      return { id: newId, dir: dir, data: JSON.parse(JSON.stringify(data)) };
+    } catch (error) {
+      if (indexCache) {
+        indexCache.sessions = indexCache.sessions.filter(function (item) { return item.id !== newId; });
+        indexDirty = true;
+        await flushIndex(true).catch(function (indexError) { log('fork rollback index failed: ' + indexError); });
+      }
+      await fs.rm(targetDir, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   async function loadEntry(id) {
@@ -428,6 +489,7 @@ function createSessions(options) {
 
   return {
     create: create,
+    fork: fork,
     list: list,
     read: read,
     setData: setData,

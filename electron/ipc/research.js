@@ -17,6 +17,7 @@ const litgraph = require('../litgraph.js');
 const ctx = require('./context.js');
 const { createSafePublicHttpsFetch } = require('../safe-fetch.js');
 
+const operations = require('../agent-operations.js');
 const safePublicFetch = createSafePublicHttpsFetch();
 
 module.exports = { register: register, scheduleAutoEmbed: scheduleAutoEmbed };
@@ -526,6 +527,7 @@ function register() {
    * 第一步：OpenAlex oaUrl → 下载进当前会话附件目录并登记附件↔身份映射；
    * 第二步：会话附件复制进受管目录（storeFileInto），返回存储路径供渲染层建条目挂附件。 */
   ctx.handle('research:download-pdfs', async function (_event, input) {
+    return operations.run(input, async function (signal) {
     if (!ctx.researchDb || !ctx.agentSessions) throw new Error(ctx.T('会话存储未就绪'));
     const sessionId = String(input && input.sessionId || '');
     const workIds = (Array.isArray(input && input.workIds) ? input.workIds : []).map(String).slice(0, 20);
@@ -538,18 +540,21 @@ function register() {
     let saveChain = Promise.resolve();
     const runDownload = async function () {
       while (cursor < works.length) {
+        if (signal.aborted) break;
         const i = cursor++;
         const work = works[i];
         if (!work.oaUrl) { out[i] = { workId: work.id, file: '', error: ctx.T('无开放获取链接') }; continue; }
         try {
           const response = await safePublicFetch(work.oaUrl, {
-            headers: { Accept: 'application/pdf,*/*' }, maxBytes: 80 * 1024 * 1024
+            signal: signal, headers: { Accept: 'application/pdf,*/*' }, maxBytes: 80 * 1024 * 1024
           });
           if (!response.ok) { out[i] = { workId: work.id, file: '', error: ctx.T('下载失败（HTTP ') + response.status + '）' }; continue; }
           const bytes = Buffer.from(await response.arrayBuffer());
+          operations.check(signal);
           if (bytes.length < 1000 || bytes[0] !== 0x25) { out[i] = { workId: work.id, file: '', error: ctx.T('返回内容不是 PDF') }; continue; }
           const name = LitResearch.sanitizeFileStem(work.title || work.id, 60) + '.pdf';
           const saved = await (saveChain = saveChain.then(function () {
+            operations.check(signal);
             return ctx.agentSessions.saveAttachment(sessionId, {
               name: name, label: work.title || work.id, dataBase64: bytes.toString('base64')
             });
@@ -561,9 +566,12 @@ function register() {
       }
     };
     await Promise.all([runDownload(), runDownload(), runDownload(), runDownload()]);
-    return { results: out };
+    for (let i = 0; i < works.length; i++) if (!out[i]) out[i] = { workId: works[i].id, file: '', error: '该轮已停止，未下载' };
+    return { results: out, stopped: signal.aborted };
+    });
   });
   ctx.handle('research:stage-pdfs', async function (_event, input) {
+    return operations.run(input, async function (signal) {
     if (!ctx.researchDb || !ctx.agentSessions) throw new Error(ctx.T('会话存储未就绪'));
     const sessionId = String(input && input.sessionId || '');
     const files = (Array.isArray(input && input.files) ? input.files : []).slice(0, 20);
@@ -574,12 +582,14 @@ function register() {
     let stageCursor = 0;
     const runStage = async function () {
       while (stageCursor < files.length) {
+        if (signal.aborted) break;
         const i = stageCursor++;
         const item = files[i];
         try {
           // R06：attachmentPath 是 async（读索引解析目录），必须 await——
           // 旧代码把 Promise 直接传给 storeFileInto，报「paths[0] must be string」
           const abs = await ctx.agentSessions.attachmentPath(sessionId, String(item.file || ''));
+          operations.check(signal);
           const stored = await storeFileInto(attachmentsDir, abs, '.pdf');
           out[i] = { workId: String(item.workId || ''), fileName: stored.name, path: stored.path };
         } catch (error) {
@@ -588,7 +598,9 @@ function register() {
       }
     };
     await Promise.all([runStage(), runStage(), runStage(), runStage()]);
-    return { results: out };
+    for (let i = 0; i < files.length; i++) if (!out[i]) out[i] = { workId: String(files[i].workId || ''), error: '该轮已停止，未暂存' };
+    return { results: out, stopped: signal.aborted };
+    });
   });
   /* R19 临时全文链（对照 literature-mcp 的 fetch_fulltext，按用户决定走「仅文本参考」路线）：
    * agent 要方法学/实验细节时，下载 OA PDF 到临时目录 → 渲染层抽取文本 → 文本入调研库
@@ -596,6 +608,7 @@ function register() {
    * 与 download_pdfs（保留 PDF 本体、写类确认门）互补：仅参考不留文件、不经确认门。 */
   const FULLTEXT_TMP = 'tmp-fulltext';
   ctx.handle('research:fulltext-read', async function (_event, input) {
+    return operations.run(input, async function (signal) {
     if (!ctx.researchDb) throw new Error(ctx.T('调研库未就绪'));
     const workId = String((input && input.workId) || '');
     if (!workId) throw new Error(ctx.T('缺少 workId'));
@@ -609,18 +622,22 @@ function register() {
       return { cached: false, error: '该文献没有开放获取链接（oaUrl 为空），无法拉取全文；请改用摘要证据或让用户以其他途径获取原文' };
     }
     const response = await safePublicFetch(work.oaUrl, {
-      headers: { Accept: 'application/pdf,*/*' }, maxBytes: 80 * 1024 * 1024
+      signal: signal, headers: { Accept: 'application/pdf,*/*' }, maxBytes: 80 * 1024 * 1024
     });
     if (!response.ok) return { cached: false, error: '全文下载失败（HTTP ' + response.status + '）' };
     const bytes = Buffer.from(await response.arrayBuffer());
+    operations.check(signal);
     if (bytes.length > 80 * 1024 * 1024) return { cached: false, error: 'PDF 过大（>80MB），已跳过' };
     if (bytes.length < 1000 || bytes[0] !== 0x25) return { cached: false, error: '返回内容不是 PDF（OA 链接可能指向落地页）' };
     const dir = path.join(ctx.dataPathState.configDir, FULLTEXT_TMP);
     await fs.mkdir(dir, { recursive: true });
     const safeId = workId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 40);
     const tempPath = path.join(dir, safeId + '-' + Date.now() + '-' + require('node:crypto').randomBytes(4).toString('hex') + '.pdf');
+    operations.check(signal);
     await fs.writeFile(tempPath, bytes);
+    if (signal.aborted) { await fs.rm(tempPath, { force: true }); operations.check(signal); }
     return { cached: false, tempPath: tempPath, workId: workId, title: work.title || '' };
+    });
   });
   ctx.handle('research:fulltext-store', async function (_event, input) {
     if (!ctx.researchDb) throw new Error(ctx.T('调研库未就绪'));
@@ -688,6 +705,7 @@ function register() {
   /* 抓取：仅学术域；markdown → 已收藏条目落 snapshot 目录附件并入 pdf_fts（消掉「快照不可全文检索」），
    * 未收藏条目落当前会话附件目录；final_url 越域在解析层已丢弃。 */
   ctx.handle('research:fetch-page', async function (_event, input) {
+    return operations.run(input, async function (signal) {
     if (!ctx.webFetchNet) throw new Error(ctx.T('调研库未就绪'));
     if (!(await webSearchGateOk())) throw new Error(ctx.T('科研网页检索未开启（含出境告知确认）'));
     const url = String(input && input.url || '');
@@ -699,7 +717,9 @@ function register() {
       parsed = fetchedPageCache.get(url);
       markdown = parsed.markdown;
     } else {
-      parsed = await ctx.webFetchNet.fetchPage({ url: url });
+      operations.check(signal);
+      parsed = await ctx.webFetchNet.fetchPage({ url: url, signal: signal });
+      operations.check(signal);
       if (!parsed.ok) {
         return { ok: false, partial: !!parsed.partial, error: parsed.error };
       }
@@ -720,11 +740,14 @@ function register() {
     // 续读（offset>0）只取正文片段：快照附件在首次抓取（offset=0）时创建，不重复挂载
     if (paperId && offset === 0) {
       const paper = await ctx.libraryDb.getPaper(paperId);
+      operations.check(signal);
       if (!paper || paper.deletedAt) return { ok: false, error: ctx.T('未找到该正式库文献：') + paperId };
       const crypto = require('node:crypto');
       const attId = 'att' + crypto.randomBytes(10).toString('hex');
       const dir = path.join(itemAttachmentDir(ctx.dataPathState.configDir, paperId), attId + '.snapshot');
+      operations.check(signal);
       await fs.mkdir(dir, { recursive: true });
+      operations.check(signal);
       const titleText = String(parsed.title || '网页快照').replace(/[&<>"']/g, function (c) {
         return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
       });
@@ -732,8 +755,10 @@ function register() {
         '<style>body{max-width:860px;margin:24px auto;padding:0 16px;font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;}' +
         'img{max-width:100%}pre{overflow-x:auto;background:#f6f7f9;padding:10px;border-radius:6px;}</style></head><body>' +
         LitMarkdown.render(markdown) + '</body></html>';
-      await fs.writeFile(path.join(dir, 'index.html'), html, 'utf8');
-      await fs.writeFile(path.join(dir, 'page.md'), markdown, 'utf8');
+      await fs.writeFile(path.join(dir, 'index.html'), html, { encoding: 'utf8', signal: signal });
+      operations.check(signal);
+      await fs.writeFile(path.join(dir, 'page.md'), markdown, { encoding: 'utf8', signal: signal });
+      operations.check(signal);
       const fingerprint = crypto.createHash('sha256').update(markdown, 'utf8').digest('hex');
       // R07：必须 await 索引写入完成——渲染层挂载附件后不再清索引，这里的写入就是最终态
       await ctx.libraryDb.pdfTextPut({
@@ -746,6 +771,7 @@ function register() {
         path: dir, fingerprint: fingerprint
       };
     } else if (sessionId && offset === 0) {
+      operations.check(signal);
       const saved = await ctx.agentSessions.saveAttachment(sessionId, {
         name: (parsed.title || '网页正文').slice(0, 60) + '.md',
         label: parsed.title || String(input && input.url || ''),
@@ -754,6 +780,7 @@ function register() {
       result.file = saved && saved.file || '';
     }
     return result;
+    });
   });
   /* ===== R16 段落找文献（大模型 tool 的服务端实现） =====
    * 契约：给定一段话（或模型拆好的论点），多路召回 → 合并去重 → 逐论点做摘要级证据归因。

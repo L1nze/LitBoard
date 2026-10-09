@@ -86,6 +86,11 @@ docs/assets/gif/*.mp4
 /scripts/one-off/
 
 /test/*
+!/test/agent-files.test.js
+!/test/agent-reference.test.js
+!/test/agent-reference-ui.test.js
+!/test/agentfork.test.js
+!/test/agent-fork-ui.test.js
 !/test/attachment-multipdf.test.js
 !/test/folder-delete.test.js
 !/test/folder-import-flow.test.js
@@ -101,3 +106,14 @@ docs/assets/gif/*.mp4
 !/test/update-check.test.js
 !/test/files-ipc.test.js
 .zcodeignore
+
+!test/agent-operations.test.js
+
+!test/agent-context-ui.test.js
+
+!test/agentfilecontext.test.js
+!test/agentplan.test.js
+
+!test/agentdispatch.test.js
+
+!test/agent-tool-cancel.test.js

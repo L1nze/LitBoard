@@ -321,7 +321,7 @@ function createWindow() {
               !!document.querySelector('#sync-agent-session-root'),
             agentApiPresent: !!window.litboardDesktop.agentChat && !!window.litboardDesktop.agentCancel &&
               !!window.litboardDesktop.researchQuery && !!window.litboardDesktop.researchSearchOpenalex &&
-              !!window.litboardDesktop.sessionList && !!window.litboardDesktop.onAgentEvent,
+              !!window.litboardDesktop.sessionList && !!window.litboardDesktop.sessionFork && !!window.litboardDesktop.onAgentEvent,
             // M9 二期：向量嵌入区 / Elsevier 凭据 / 回填 / 补登记 / 语义检索与 PDF 两步 IPC 面
             agentPhase2Present: !!document.querySelector('#sync-embed-model') && !!document.querySelector('#sync-embed-build') &&
               !!document.querySelector('#sync-embed-provider') && !!document.querySelector('#sync-embed-base-url') &&
@@ -414,6 +414,16 @@ function createWindow() {
               window.LitAgentCore.buildRequestBody({ messages: [] }, { maxOutputTokens: 4321 }).max_tokens === 4321,
             // R17/R18：上下文压缩 + 文献检索能力补齐——设置/按钮 UI、纯函数层、
             // buildRequestBody 真的跳过已压缩消息，新工具（get_work 等）已注册
+            agentExecutablePlanPresent: !!window.LitAgentPlan && !!window.LitAgentDispatch &&
+              window.LitAgentPlan.validateProposal({ goal: 'x', steps: [{ content: 'read', status: 'completed' }] }, {}).ok === false,
+            agentSteeringPresent: typeof window.LitAgentLoop.createRunner({ core: window.LitAgentCore }).enqueue === 'function' &&
+              !!window.LitAgentChat && !!document.querySelector('.aui-composer-wrap'),
+            agentReferenceSearchPresent: !!window.LitAgentFileContext &&
+              !!window.litboardDesktop.sessionListReferences && !!window.litboardDesktop.sessionSearchReference &&
+              window.LitAgent.createTools({ desktop: {} }).tools.some(function (t) { return t.function.name === 'search_session_file'; }),
+            agentContextUsagePresent: !!document.querySelector('#agent-tokens') &&
+              typeof window.LitAgentCore.currentInputTokens === 'function' &&
+              window.LitAgentCore.currentInputTokens({ tokens: { in: 700000, out: 14000 } }, { messages: [{ role: 'user', content: 'hello' }] }) < 100,
             agentContextMgmtPresent: !!document.querySelector('#agent-compact-btn') &&
               !!document.querySelector('#sync-agent-autocompact') &&
               !!window.LitAgentContext && window.LitAgentContext.isContextOverflowError('context_length_exceeded') &&
@@ -426,7 +436,7 @@ function createWindow() {
                   { role: 'user', content: '最新问题' },
                   { role: 'assistant', content: 'z'.repeat(20000) }
                 ];
-                const est = window.LitAgentCore.estimateTokens;
+                const est = function (msg) { return window.LitAgentCore.estimateTokens(JSON.stringify(msg || {})); };
                 const plan = window.LitAgentContext.planCompaction(msgs, { estimate: est, thresholdTokens: 1000, preserveRecentTokens: 500 });
                 if (!plan) return false;
                 window.LitAgentContext.applyCompaction({ messages: msgs, turnId: 't' }, plan, '摘要', { estimate: est });
@@ -434,7 +444,17 @@ function createWindow() {
                 return msgs.some(function (m) { return m.compacted === true; }) &&
                   body.messages.some(function (m) { return String(m.content || '').indexOf('摘要') !== -1; });
               })(),
-            agentLitSearchToolsPresent: ['get_work', 'autocomplete_entity', 'backfill_abstracts', 'graph_neighbors', 'read_work_fulltext'].every(function (name) {
+            agentReferenceUiPresent: !!document.querySelector('#agent-upload-btn') &&
+              !!document.querySelector('#agent-pending-references') && !!window.litboardDesktop.sessionReadReference &&
+              (function () {
+                const holder = document.querySelector('#agent-plan');
+                const run = { core: { messages: [{ role: 'tool', name: 'update_research_plan', content: JSON.stringify({ goal: '<img src=x onerror=alert(1)>', steps: [{ content: '<script>x</script>', status: 'pending', note: 'file=附件/test.txt' }] }) }] }, streaming: false };
+                window.LitAgentUi.renderPlan(run);
+                const safe = !holder.hidden && holder.textContent.includes('<script>x</script>') && !holder.querySelector('img, script') && !!holder.querySelector('button');
+                window.LitAgentUi.renderPlan(null);
+                return safe;
+              })(),
+            agentLitSearchToolsPresent: ['read_research_plan', 'update_research_plan', 'read_session_file', 'get_work', 'autocomplete_entity', 'backfill_abstracts', 'graph_neighbors', 'read_work_fulltext'].every(function (name) {
               return window.LitAgent.createTools({ desktop: {} }).tools.some(function (t) { return t.function.name === name; });
             }) && !!window.litboardDesktop.researchGetWork &&
               !!window.litboardDesktop.researchAutocomplete && !!window.litboardDesktop.researchGraphNeighbors &&
@@ -517,7 +537,7 @@ function createWindow() {
                   {
                     id: 't1:u1', role: 'user',
                     content: [{ type: 'text', text: '找电池文献' }],
-                    metadata: { custom: { turnId: 't1' } }
+                    metadata: { custom: { turnId: 't1', forkIndex: 0 } }
                   },
                   {
                     // H1 回归：同轮第二条 user 消息（工具注入的截图形态）——快照 id 必须唯一，
@@ -533,9 +553,10 @@ function createWindow() {
                       { type: 'text', text: '**结果**如下' },
                       { type: 'tool-call', toolCallId: 'c1', toolName: 'search_openalex', args: { query: 'x' }, argsText: '{"query":"x"}', result: '{"works":[]}' }
                     ],
-                    metadata: { custom: { turnId: 't1' } }
+                    metadata: { custom: { turnId: 't1', forkIndex: 2 } }
                   }
                 ];
+                const forkedMessages = [];
                 window.LitAgentChat.mount(probe, {
                   getSnapshot: function () { return { messages: messages, isRunning: false }; },
                   subscribe: function (cb) {
@@ -544,6 +565,7 @@ function createWindow() {
                   },
                   T: function (s) { return s; },
                   sendSuggestion: function () {}, retry: function () {},
+                  onFork: function (input) { forkedMessages.push(input.messageId); },
                   onCancel: function () {}, onNew: function () {}, onEdit: function () {}, onReload: function () {}
                 });
                 await new Promise(function (resolve) { setTimeout(resolve, 500); });
@@ -567,6 +589,12 @@ function createWindow() {
                   const editBtn = Array.prototype.slice.call(probe.querySelectorAll('.aui-msg.user .aui-act'))
                     .find(function (btn) { return btn.textContent === '编辑'; });
                   ok = !!editBtn;                                  // 真人消息悬停后有编辑钮
+                  if (ok) {
+                    const buttons = Array.from(probe.querySelectorAll('.aui-fork'));
+                    buttons.forEach(function (button) { button.click(); });
+                    ok = buttons.length === 2 && forkedMessages.join(',') === 't1:u1,t1:a1' &&
+                      buttons.every(function (button) { return button.textContent === '从此处分叉'; });
+                  }
                   if (ok) {
                     editBtn.click();
                     await new Promise(function (resolve) { setTimeout(resolve, 400); });

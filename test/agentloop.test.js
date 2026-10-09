@@ -40,6 +40,35 @@ function makeRun() {
 
 const toolCall = (id, name, args) => ({ message: { content: '', tool_calls: [{ id: id, function: { name: name, arguments: JSON.stringify(args) } }] } });
 
+test('each tool result commits before the next side effect and recovers pending image refs', async () => {
+  const snapshots = [];
+  const { hooks } = makeHooks([{ message: { content: '', tool_calls: [toolCall('a', 't', {}).message.tool_calls[0], toolCall('b', 't2', {}).message.tool_calls[0]] } }, { message: { content: 'done' } }]);
+  hooks.persist = (run) => snapshots.push(JSON.parse(JSON.stringify({ messages: run.core.messages, streaming: run.doc.streaming, turnId: run.core.turnId })));
+  hooks.executeTool = async (name) => {
+    if (name === 't2') assert.ok(snapshots.at(-1).messages.some((m) => m.tool_call_id === 'a' && m.pendingImages));
+    return name === 't' ? { text: 'saved', images: [{ type: 'image', ref: 'session:r1|附件/a.png' }] } : 'second';
+  };
+  const runner = Loop.createRunner(hooks), run = makeRun();
+  Core.appendUser(run.core, 'go');
+  await runner.runTurn(run);
+  const interrupted = snapshots.find((snap) => snap.messages.some((m) => m.pendingImages));
+  const restored = { id: 'r1', doc: interrupted, core: Core.deserialize(interrupted) };
+  assert.equal(runner.restoreInterrupted(restored), true);
+  assert.equal(restored.core.messages.filter((m) => m.tool_call_id === 'a').length, 1);
+  assert.match(restored.core.messages.find((m) => m.tool_call_id === 'b').content, /未确认/);
+  assert.equal(restored.core.messages.filter((m) => m.images).length, 1);
+  assert.equal(restored.core.messages.some((m) => m.pendingImages), false);
+});
+
+test('invalid tool image refs never remove their committed result', async () => {
+  const { hooks } = makeHooks([toolCall('a', 't', {}), { message: { content: 'done' } }]);
+  hooks.executeTool = async () => ({ text: 'keep this', images: [{ type: 'image', ref: 'data:bad' }] });
+  const run = makeRun();
+  Core.appendUser(run.core, 'go');
+  await Loop.createRunner(hooks).runTurn(run);
+  assert.equal(run.core.messages.find((m) => m.tool_call_id === 'a').content, 'keep this');
+});
+
 test('cancel during overflow recovery persistence prevents another model request', async function () {
   const { hooks, calls } = makeHooks([
     new Error('prompt is too long: 90000 tokens > 8192 maximum'),
@@ -647,4 +676,130 @@ test('修回复核: 重试已压缩旧轮时恢复该轮之前的原始上下文
   assert.match(sent, /Q1 IMPORTANT CONTEXT/, '目标轮之前的原始背景重新进入请求');
   assert.match(sent, /Q2 DEPENDS ON Q1/, '重试目标仍是原问题');
   assert.doesNotMatch(sent, /SUMMARY OF Q1 AND Q2/, '覆盖目标轮的旧摘要不重复进入请求');
+});
+
+
+test('failed start checkpoint stops before requesting and always clears streaming', async () => {
+  const { hooks, calls } = makeHooks([{ message: { content: 'no' } }], { persist: async () => null });
+  const run = makeRun(); Core.appendUser(run.core, 'go');
+  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed');
+  assert.equal(calls.chat.length, 0); assert.equal(run.streaming, false); assert.equal(run.doc.streaming, false);
+  assert.equal(calls.events.at(-1).endReason, 'failed');
+});
+
+test('failed tool checkpoint prevents every side effect and pairs unexecuted calls', async () => {
+  let saves = 0;
+  const { hooks, calls } = makeHooks([toolCall('a', 'write', {})], { persist: async () => ++saves === 2 ? null : true });
+  const run = makeRun(); Core.appendUser(run.core, 'go');
+  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed');
+  assert.equal(calls.tools.length, 0); assert.match(run.core.messages.find(m => m.tool_call_id === 'a').content, /未执行/);
+});
+
+test('failed result checkpoint stops the next tool and keeps completed result', async () => {
+  let saves = 0;
+  const response = { message: { content: '', tool_calls: [toolCall('a', 'write', {}).message.tool_calls[0], toolCall('b', 'write2', {}).message.tool_calls[0]] } };
+  const { hooks, calls } = makeHooks([response], { persist: async () => ++saves === 3 ? null : true });
+  const run = makeRun(); Core.appendUser(run.core, 'go');
+  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed');
+  assert.equal(calls.tools.length, 1); assert.equal(run.core.messages.filter(m => m.tool_call_id === 'a').length, 1);
+  assert.match(run.core.messages.find(m => m.tool_call_id === 'b').content, /未执行/);
+});
+
+test('failed final checkpoint cannot report done', async () => {
+  let saves = 0;
+  const { hooks, calls } = makeHooks([{ message: { content: 'answer' } }], { persist: async () => { if (++saves === 2) throw new Error('disk full'); return true; } });
+  const run = makeRun(); Core.appendUser(run.core, 'go');
+  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed'); assert.equal(calls.events.at(-1).endReason, 'failed');
+});
+
+
+test('request retry resumes after saved tools without replaying side effects, including reloaded sessions', async () => {
+  const { hooks, calls } = makeHooks([toolCall('a', 'write', {}), new Error('HTTP 503'), { message: { content: 'continued' } }]);
+  const runner = Loop.createRunner(hooks), run = makeRun(); Core.appendUser(run.core, 'go');
+  const turnId = run.core.turnId;
+  assert.equal(await runner.runTurn(run), 'failed');
+  const restored = { id: run.id, doc: structuredClone(run.doc), core: Core.deserialize(Core.serialize(run.core)), streaming: false };
+  restored.doc.requestResume = structuredClone(run.doc.requestResume);
+  assert.equal(await runner.retryTurn(restored, turnId), 'done'); assert.equal(calls.tools.length, 1);
+  assert.equal(restored.core.messages.filter(m => m.role === 'user' && !m.synthetic).length, 1);
+  assert.equal(restored.core.messages.filter(m => m.tool_call_id === 'a').length, 1);
+});
+
+test('partial request retry keeps prior tools and pairs partial calls as unexecuted', async () => {
+  const { hooks, calls } = makeHooks([toolCall('a', 'write', {}), { partial: true, message: { content: 'partial', tool_calls: toolCall('b', 'write2', {}).message.tool_calls }, errorText: 'network lost' }, { message: { content: 'continue' } }]);
+  const runner = Loop.createRunner(hooks), run = makeRun(); Core.appendUser(run.core, 'go');
+  assert.equal(await runner.runTurn(run), 'failed');
+  assert.match(run.core.messages.find(m => m.tool_call_id === 'b').content, /未执行/);
+  assert.equal(await runner.retryLast(run), 'done'); assert.equal(calls.tools.length, 1);
+  assert.ok(calls.chat.at(-1).messages.some(m => String(m.content).includes('已完成的工具结果仍有效')));
+});
+
+test('queued steering persists and enters the request only after all tools are paired', async () => {
+  const { hooks, calls } = makeHooks([{ message: { content: '', tool_calls: [toolCall('a', 't', {}).message.tool_calls[0], toolCall('b', 't2', {}).message.tool_calls[0]] } }, { message: { content: 'done' } }]);
+  let runner; const run = makeRun(); Core.appendUser(run.core, 'go');
+  hooks.executeTool = async name => { if (name === 't') await runner.enqueue(run.id, 'focus on 2024'); return name; };
+  runner = Loop.createRunner(hooks);
+  assert.equal(await runner.runTurn(run), 'done');
+  const steering = run.core.messages.findIndex(m => m.kind === 'steering');
+  assert.ok(steering > run.core.messages.findIndex(m => m.tool_call_id === 'b'));
+  assert.ok(calls.chat.at(-1).messages.some(m => String(m.content).includes('focus on 2024')));
+  assert.equal(run.doc.queuedInputs.length, 0);
+});
+
+test('queue submitted during a final response is consumed before the run finishes', async () => {
+  const { hooks, calls } = makeHooks([async () => { await runner.enqueue('r1', 'also include caveats'); return { message: { content: 'first answer' } }; }, { message: { content: 'caveats' } }]);
+  const runner = Loop.createRunner(hooks), run = makeRun(); Core.appendUser(run.core, 'go');
+  assert.equal(await runner.runTurn(run), 'done'); assert.equal(calls.chat.length, 2);
+  assert.equal(run.core.messages.filter(m => m.kind === 'steering').length, 1);
+});
+
+
+test('parallel local readers commit the fast result while slow reader is still active', async () => {
+  const calls = ['slow', 'fast', 'last'].map((name, i) => toolCall('parallel-' + i, name, {}).message.tool_calls[0]);
+  const snapshots = []; let releaseSlow, fastSaved;
+  const slowGate = new Promise(resolve => { releaseSlow = resolve; }), fastCheckpoint = new Promise(resolve => { fastSaved = resolve; });
+  const { hooks } = makeHooks([{ message: { content: '', tool_calls: calls } }, { message: { content: 'done' } }]);
+  hooks.canParallel = () => true;
+  hooks.executeTool = async name => { if (name === 'slow') await slowGate; return name; };
+  hooks.persist = async run => { snapshots.push(structuredClone(run.core.messages)); if (run.core.messages.some(m => m.tool_call_id === 'parallel-1')) fastSaved(); return true; };
+  const run = makeRun(); Core.appendUser(run.core, 'go'); const runner = Loop.createRunner(hooks), running = runner.runTurn(run);
+  await fastCheckpoint;
+  assert.equal(run.streaming, true); assert.equal(snapshots.at(-1).some(m => m.tool_call_id === 'parallel-0'), false);
+  releaseSlow(); assert.equal(await running, 'done');
+  for (const call of calls) assert.equal(run.core.messages.filter(m => m.tool_call_id === call.id).length, 1);
+});
+
+test('parallel persistence failure prevents further local reads and every write barrier', async () => {
+  const toolCalls = ['read1', 'read2', 'read3', 'read4', 'write'].map((name, i) => toolCall('failure-' + i, name, {}).message.tool_calls[0]);
+  const started = []; let saveCount = 0, cancellations = 0;
+  const { hooks } = makeHooks([{ message: { content: '', tool_calls: toolCalls } }]);
+  hooks.canParallel = call => call.name !== 'write'; hooks.cancelTools = async () => { cancellations++; };
+  hooks.executeTool = async name => { started.push(name); return name; };
+  hooks.persist = async () => ++saveCount === 3 ? null : true;
+  const run = makeRun(); Core.appendUser(run.core, 'go');
+  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed');
+  assert.equal(started.includes('write'), false); assert.equal(started.includes('read4'), false); assert.equal(cancellations, 1);
+  for (const call of toolCalls) assert.equal(run.core.messages.filter(m => m.tool_call_id === call.id).length, 1);
+});
+
+
+test('image result checkpoint failure followed by successful final save retains images for resumed requests', async () => {
+  let saves = 0;
+  const { hooks, calls } = makeHooks([toolCall('image', 'image_reader', {}), { message: { content: 'continued' } }]);
+  hooks.executeTool = async () => ({ text: 'page attached', images: [{ type: 'image', ref: 'session:r1|附件/page.png' }] });
+  hooks.persist = async () => ++saves === 3 ? null : true;
+  hooks.buildBody = run => Core.buildRequestBody(run.core, { sendImages: true });
+  const runner = Loop.createRunner(hooks), run = makeRun(); Core.appendUser(run.core, 'go');
+  assert.equal(await runner.runTurn(run), 'failed');
+  assert.equal(run.core.messages.some(m => m.pendingImages), false); assert.equal(run.core.messages.filter(m => m.images).length, 1);
+  const restored = { id: run.id, doc: structuredClone(run.doc), core: Core.deserialize(Core.serialize(run.core)), streaming: false };
+  assert.equal(await runner.retryLast(restored), 'done');
+  assert.ok(calls.chat.at(-1).messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image')));
+});
+
+test('canceled model result retains complete unexecuted tool pairing', async () => {
+  const { hooks } = makeHooks([{ aborted: true, message: { content: 'partial text', tool_calls: toolCall('not-run', 'write', {}).message.tool_calls } }]);
+  const run = makeRun(); Core.appendUser(run.core, 'go');
+  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'stopped');
+  assert.match(run.core.messages.find(m => m.tool_call_id === 'not-run').content, /未执行/);
 });

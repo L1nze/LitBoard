@@ -11,7 +11,7 @@
  * - Base URL 校验：https 必须；仅 localhost / 127.0.0.1 / [::1] 豁免 http（给 ollama）；
  * - 流式 delta 经 notify('agent:event') 增量推送，最终消息作为 invoke 返回值；
  * - AbortController 按 sessionId 记账，渲染层可随时停止；
- * - 失败不自动重试（计费红线）：错误一次性上抛，由 UI 提供手动重试。
+ * - 只对明确 HTTP 暂态拒绝或连接建立前失败有限重试；已流出内容绝不自动重发。
  */
 const LitAgentCore = require('../js/agentcore.js');
 const LitAgentProto = require('../js/agentproto.js');
@@ -124,7 +124,9 @@ function createAgentNet(options) {
     const requestBody = Object.assign({}, body);
     if (model) requestBody.model = model;
     try {
-      const response = await fetchImpl(LitAgentProto.endpointFor(base, dialect), {
+      let response;
+      for (let attempt = 0; ; attempt++) {
+        try { response = await fetchImpl(LitAgentProto.endpointFor(base, dialect), {
         method: 'POST',
         headers: LitAgentProto.buildHeaders({
           dialect: dialect,
@@ -135,7 +137,22 @@ function createAgentNet(options) {
         }),
         body: JSON.stringify(LitAgentProto.convertBody(requestBody, dialect)),
         signal: controller.signal
-      });
+        }); } catch (connectError) {
+          const code = connectError && (connectError.code || connectError.cause && connectError.cause.code);
+          if (attempt >= 2 || !['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED'].includes(code) || controller.signal.aborted) throw connectError;
+          await retryDelay(500 * Math.pow(2, attempt), controller.signal);
+          continue;
+        }
+        if (response.ok || attempt >= 2 || ![429, 502, 503, 504].includes(response.status)) break;
+        const retryAfter = response.headers && response.headers.get ? response.headers.get('retry-after') : '';
+        const afterMs = retryAfter ? (/^\d+(?:\.\d+)?$/.test(retryAfter) ? Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - Date.now())) : 0;
+        // Large server delays are not shortened: surface the error for a later continuation.
+        if (afterMs > 10000) break;
+        await Promise.resolve(response.text()).catch(function () {});
+        const delay = Math.max(500 * Math.pow(2, attempt), Number.isFinite(afterMs) ? afterMs : 0);
+        pushEvent(sessionId, { type: 'retry_wait', attempt: attempt + 1, delayMs: delay });
+        await retryDelay(delay, controller.signal);
+      }
       if (!response.ok) {
         const text = await Promise.resolve(response.text()).catch(function () { return ''; });
         const snippet = String(text || '').slice(0, 300);
@@ -197,7 +214,7 @@ function createAgentNet(options) {
       }
       if (idleTimedOut) {
         pushEvent(sessionId, { type: 'error', errorText: '流空闲超时（120 秒无数据）' });
-        return { partial: true, message: message, errorText: '流空闲超时（120 秒无数据）', finishReason: finishReason };
+        return { partial: true, message: message, usage: acc.getUsage() || estimateUsage(body, message), errorText: '流空闲超时（120 秒无数据）', finishReason: finishReason };
       }
       const incomplete = !closed || finishReason === 'length';
       if (incomplete) {
@@ -207,7 +224,7 @@ function createAgentNet(options) {
           ? '模型输出达到长度上限，回复被截断'
           : '连接在回复结束前中断';
         pushEvent(sessionId, { type: 'stream_incomplete', errorText: reason });
-        return { partial: true, message: message, errorText: reason, finishReason: finishReason };
+        return { partial: true, message: message, usage: acc.getUsage() || estimateUsage(body, message), errorText: reason, finishReason: finishReason };
       }
       pushEvent(sessionId, { type: 'done', finishReason: finishReason });
       return { message: message, usage: acc.getUsage() || estimateUsage(body, message), finishReason: finishReason };
@@ -219,10 +236,10 @@ function createAgentNet(options) {
       }
       // 普通网络异常：若已经流出部分内容，一并带回（A05：不让已显示的文字消失）
       const partialMessage = acc.message();
-      if (partialMessage.content || (partialMessage.tool_calls && partialMessage.tool_calls.length)) {
+      if (partialMessage.content || partialMessage.reasoning_content || (partialMessage.tool_calls && partialMessage.tool_calls.length)) {
         const errorText = String(error && error.message || error);
         pushEvent(sessionId, { type: 'error', errorText: errorText });
-        return { partial: true, message: partialMessage, errorText: errorText };
+        return { partial: true, message: partialMessage, usage: acc.getUsage() || estimateUsage(body, partialMessage), errorText: errorText };
       }
       throw error;
     } finally {
@@ -231,20 +248,24 @@ function createAgentNet(options) {
     }
   }
 
+  function retryDelay(ms, signal) {
+    if (opts.sleep) return opts.sleep(ms, signal);
+    return new Promise(function (resolve, reject) {
+      if (signal.aborted) { const error = new Error('已停止'); error.name = 'AbortError'; reject(error); return; }
+      const timer = setTimeout(function () { signal.removeEventListener('abort', stopped); resolve(); }, ms);
+      function stopped() { clearTimeout(timer); const error = new Error('已停止'); error.name = 'AbortError'; reject(error); }
+      signal.addEventListener('abort', stopped, { once: true });
+    });
+  }
+
   /** 端点用量未知时的粗估（有 usage 时优先用真实值）。A14 修复：
    * 旧实现对「字符数这个数字的字符串」做估算；现在对完整请求文本估算，
    * 并计入工具 schema 与系统提示的开销，estimated:true 标注非端点实测值。 */
   function estimateUsage(body, message) {
-    let inText = '';
-    (body.messages || []).forEach(function (msg) {
-      inText += String(msg.content || '');
-      if (msg.tool_calls) inText += JSON.stringify(msg.tool_calls);
-    });
-    if (Array.isArray(body.tools) && body.tools.length) inText += JSON.stringify(body.tools);
     const outText = String(message && message.content || '') +
       (message && message.tool_calls ? JSON.stringify(message.tool_calls) : '');
     return {
-      prompt_tokens: LitAgentCore.estimateTokens(inText),
+      prompt_tokens: LitAgentCore.estimateRequestTokens(body),
       completion_tokens: LitAgentCore.estimateTokens(outText),
       estimated: true
     };

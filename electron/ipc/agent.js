@@ -7,6 +7,8 @@ const { app, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const ctx = require('./context.js');
+const operations = require('../agent-operations.js');
+const references = require('../agent-reference.js').createReferences(function () { return ctx.agentSessions; });
 
 module.exports = { register: register, agentSessionsRoot: agentSessionsRoot };
 
@@ -35,7 +37,7 @@ async function resolveImageRef(ref) {
     if (raw.indexOf('session:') === 0 && ctx.agentSessions) {
       const rest = raw.slice('session:'.length);
       const split = rest.indexOf('|');
-      if (split > 0) file = await ctx.agentSessions.attachmentPath(rest.slice(0, split), rest.slice(split + 1));
+      if (split > 0) file = await references.registeredPath(rest.slice(0, split), rest.slice(split + 1));
     } else if (raw.indexOf('config:') === 0) {
       const rel = path.normalize(decodeURIComponent(raw.slice('config:'.length)));
       const abs = path.resolve(ctx.dataPathState.configDir, rel);
@@ -80,7 +82,8 @@ function register() {
     await resolveBodyImages(input && input.body);
     return ctx.agentNet.chatStream(input);
   });
-  ctx.handle('agent:cancel', function (_event, sessionId) {
+  ctx.handle('agent:cancel', function (_event, sessionId, turnId) {
+    operations.cancel(sessionId, turnId);
     return ctx.agentNet ? ctx.agentNet.cancel(sessionId) : false;
   });
   ctx.handle('agent:test', function (_event, input) {
@@ -104,6 +107,10 @@ function register() {
   });
   ctx.handle('session:list', function () {
     return ctx.agentSessions ? ctx.agentSessions.list() : [];
+  });
+  ctx.handle('session:fork', function (_event, payload) {
+    if (!ctx.agentSessions) throw new Error(ctx.T('会话存储未就绪'));
+    return ctx.agentSessions.fork(payload && payload.id, payload && payload.input);
   });
   ctx.handle('session:read', function (_event, id) {
     return ctx.agentSessions ? ctx.agentSessions.read(id) : null;
@@ -143,6 +150,22 @@ function register() {
   ctx.handle('session:save-attachment', function (_event, payload) {
     if (!ctx.agentSessions) throw new Error(ctx.T('会话存储未就绪'));
     return ctx.agentSessions.saveAttachment(payload && payload.id, payload || {});
+  });
+  ctx.handle('session:import-reference', function (_event, payload) {
+    if (!ctx.agentSessions) throw new Error(ctx.T('会话存储未就绪'));
+    return references.importFiles(payload && payload.id, payload && payload.paths);
+  });
+  ctx.handle('session:list-references', function (_event, id) {
+    if (!ctx.agentSessions) throw new Error(ctx.T('会话存储未就绪'));
+    return references.listFiles(id);
+  });
+  ctx.handle('session:search-reference', function (_event, payload) {
+    if (!ctx.agentSessions) throw new Error(ctx.T('会话存储未就绪'));
+    return references.searchFile(payload.id, payload.file, payload.query, payload.options);
+  });
+  ctx.handle('session:read-reference', function (_event, payload) {
+    if (!ctx.agentSessions) throw new Error(ctx.T('会话存储未就绪'));
+    return references.readFile(payload && payload.id, payload && payload.file, payload && payload.offset);
   });
   ctx.handle('session:open-root', async function () {
     const root = agentSessionsRoot();

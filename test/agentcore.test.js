@@ -2,6 +2,52 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+
+test('budget trimming subtracts each group once and preserves the latest real question with images', () => {
+  const messages = Array.from({ length: 5 }, (_, index) => ({ role: 'user', content: 'x'.repeat(3000), turnId: 't' + index }));
+  messages.push({ role: 'user', content: 'screenshot', synthetic: true });
+  const kept = Core.trimWindowToBudget(messages, 1000);
+  assert.equal(kept.length, 2);
+  assert.equal(kept[0].turnId, 't4');
+  const state = Core.initState();
+  state.messages = messages;
+  const body = Core.buildRequestBody(state, { maxContextTokens: 4500, maxOutputTokens: 3500 });
+  assert.equal(body.messages.filter((m) => m.role === 'user').length, 2);
+});
+
+test('message count cap never splits the latest long tool turn or drops its real user question', () => {
+  const state = Core.initState();
+  Core.appendUser(state, 'old');
+  Core.appendAssistant(state, { content: 'old answer' });
+  Core.appendUser(state, 'latest real question');
+  for (let i = 0; i < 45; i++) {
+    Core.appendAssistant(state, { tool_calls: [{ id: 'c' + i, function: { name: 'read', arguments: '{}' } }] });
+    Core.appendToolResults(state, [{ callId: 'c' + i, result: 'evidence' }]);
+  }
+  state.messages.push({ role: 'user', content: 'screenshot', synthetic: true });
+  const body = Core.buildRequestBody(state, { historyMessageCap: 40 });
+  assert.equal(body.messages[0].content, 'latest real question');
+  assert.equal(body.messages.length, 92);
+  assert.equal(body.messages.filter((m) => m.role === 'tool').length, 45);
+});
+
+test('request micro compaction budgets actual protocol fields even with duplicated tool card results', () => {
+  const Context = require('../js/agentcontext.js');
+  const state = Core.initState();
+  Core.appendUser(state, 'latest question');
+  Core.appendAssistant(state, { tool_calls: [{ id: 'c', function: { name: 'read_pdf_pages', arguments: '{}' } }] });
+  Core.decorateToolCalls(state, [{ callId: 'c', name: 'read_pdf_pages' }]);
+  Core.appendToolResults(state, [{ callId: 'c', name: 'read_pdf_pages', result: '正文'.repeat(5000) }]);
+  const stored = JSON.stringify(state.messages);
+  assert.ok(state.messages[1].toolCalls[0].result.length > 9000);
+  assert.ok(Core.estimateMessageTokens(state.messages[1]) < 100);
+  const body = Core.buildRequestBody(state, { maxContextTokens: 1500, maxOutputTokens: 300, compactToolView: Context.compactToolView });
+  assert.equal(body.messages[0].content, 'latest question');
+  assert.equal(body.messages[2].tool_call_id, 'c');
+  assert.ok(body.messages[2].content.length < 5000);
+  assert.ok(body.messages.reduce((sum, msg) => sum + Core.estimateMessageTokens(msg), 0) <= 1200);
+  assert.equal(JSON.stringify(state.messages), stored);
+});
 const Core = require('../js/agentcore.js');
 
 test('parseToolArgs handles plain, double-encoded and broken JSON', function () {
@@ -337,4 +383,22 @@ test('historyMessageCap 选项按次生效（不改 state，供按设置换算�
   Core.appendAssistant(state, { content: 'a2' });
   assert.equal(Core.buildRequestBody(state, {}).messages.length, 2);
   assert.equal(Core.buildRequestBody(state, { historyMessageCap: 4 }).messages.length, 4);
+});
+
+
+test('current context uses request schemas, reasoning and images, not cumulative billing', () => {
+  const state = Core.initState(); state.tokens = { in: 700000, out: 14000 };
+  const plain = { messages: [{ role: 'system', content: 'system' }, { role: 'user', content: 'hello' }], tools: [{ type: 'function', function: { name: 'a', description: 'x'.repeat(2000) } }] };
+  const full = structuredClone(plain); full.messages.push({ role: 'assistant', content: 'answer', reasoning_content: 'r'.repeat(4000) }, { role: 'user', content: [{ type: 'text', text: 'page' }, { type: 'image', ref: 'session:s|附件/a.png' }] });
+  assert.ok(Core.currentInputTokens(state, full) > Core.currentInputTokens(state, plain) + 2500);
+  assert.ok(Core.currentInputTokens(state, full) < 10000);
+  Core.recordInputUsage(state, { prompt_tokens: 4000 }, plain);
+  const growth = Core.estimateRequestTokens(full) - Core.estimateRequestTokens(plain);
+  assert.equal(Core.currentInputTokens(state, full), 4000 + growth);
+  assert.deepEqual(Core.deserialize(Core.serialize(state)).inputUsageBaseline, state.inputUsageBaseline);
+});
+
+test('estimated endpoint usage cannot masquerade as a provider calibration', () => {
+  const state = Core.initState(); Core.recordInputUsage(state, { prompt_tokens: 9000, estimated: true }, { messages: [] });
+  assert.equal(Core.currentInputTokens(state, { messages: [] }), 0);
 });
