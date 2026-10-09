@@ -32,7 +32,7 @@ function makeNode(tag) {
   };
 }
 
-function makeHarness(planOverride) {
+function makeHarness(planOverride, inspection) {
   const els = {};
   const ids = [
     '#sync-conflict-list', '#sync-conflict-mask', '#sync-remote-plan-mask', '#sync-remote-plan-list',
@@ -74,7 +74,7 @@ function makeHarness(planOverride) {
       return {
         createNutstoreSyncPlan: function (input) { calls.created = input; return Promise.resolve(PLAN); },
         applyNutstoreSyncPlan: function (input) { calls.applied = input; return Promise.resolve({ workspace: { papers: [] }, assets: { failures: [] } }); },
-        inspectNutstoreRemote: function () { return Promise.resolve({ exists: true, counts: { papers: 5 } }); },
+        inspectNutstoreRemote: function (input) { calls.inspected = input; return inspection ? inspection() : Promise.resolve({ exists: true, counts: { papers: 5 } }); },
         getIntegrationConfig: function () { return Promise.resolve({ autoWriteBack: false }); }
       };
     },
@@ -206,5 +206,41 @@ test('对照：inspect 对账展示「附件登记/云端实有/缺失」', asyn
   // inspectNutstoreRemote 在 harness 桩内固定返回；这里断言 status 展示链路
   h.els['#sync-remote-inspect'].click();
   await flush();
-  assert.ok(h.calls.statuses.some(function (s) { return s.id === 'sync-remote-status' && s.text.indexOf('云端库文件存在') !== -1; }));
+  assert.ok(h.calls.statuses.some(function (s) { return s.id === 'sync-remote-status' && s.text.indexOf('云端有效文献：') !== -1; }));
+});
+
+test('检查只显示有效文献和被引用附件，核验未知不显示成功', async () => {
+  const h = makeHarness(null, () => Promise.resolve({ exists: true, checkedAt: Date.now(),
+    counts: { papers: 0, attachments: 4, pdfs: 3, webSnapshots: 1 },
+    assetCheck: { registered: 3, existing: 2, missing: 1, unregistered: 1 } }));
+  await h.api.inspect();
+  assert.equal(h.calls.inspected.verifyAssets, true);
+  assert.deepEqual(h.calls.inspected.config, { user: 'u' });
+  const status = h.calls.statuses.at(-1);
+  assert.match(status.text, /本机有效文献：0 篇.*云端有效文献：0 篇/);
+  assert.match(status.text, /云端库附件：4（PDF 3 · 网页快照：1 · 其他：0）/);
+  assert.match(status.text, /已核验存在：2\/3 · 缺失文件：1/);
+  assert.match(status.text, /未登记云端文件：1/);
+  assert.equal(status.kind, 'warning');
+  const unknown = makeHarness();
+  await unknown.api.inspect();
+  assert.match(unknown.calls.statuses.at(-1).text, /附件文件尚未核验/);
+  assert.equal(unknown.calls.statuses.at(-1).kind, 'warning');
+});
+
+test('过期检查不能覆盖新检查或同步中的状态', async () => {
+  const pending = [];
+  const h = makeHarness(null, () => new Promise(resolve => pending.push(resolve)));
+  const first = h.api.inspect();
+  const second = h.api.inspect();
+  pending[1]({ exists: true, counts: { papers: 2 } });
+  await second;
+  pending[0]({ exists: true, counts: { papers: 9 } });
+  await first;
+  assert.match(h.calls.statuses.at(-1).text, /云端有效文献：2 篇/);
+  const third = h.api.inspect();
+  h.api.invalidateInspection();
+  pending[2]({ exists: true, counts: { papers: 9 } });
+  await third;
+  assert.equal(h.calls.statuses.at(-1).text, '云端状态待刷新');
 });

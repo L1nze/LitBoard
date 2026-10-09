@@ -1284,7 +1284,20 @@ function createIntegrations(options) {
   const PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>';
   const PROPFIND_PAGE_SIZE = 750; // 坚果云单次列目录上限，超出需按 Range: rows=a-b 翻页
 
-  function parsePropfindNames(body, attachmentsUrl) {
+  function parsePropfindNames(body, attachmentsUrl, verifyListing) {
+    if (verifyListing) {
+      // A DAV href alone is not proof of existence: a multistatus can contain failed entries.
+      const entries = body.match(/<(?:[A-Za-z_][\w.-]*:)?response\b[^>]*>[\s\S]*?<\/(?:[A-Za-z_][\w.-]*:)?response>/gi);
+      if (!entries) return null;
+      const confirmed = [];
+      for (const entry of entries) {
+        const statuses = Array.from(entry.matchAll(/<(?:[A-Za-z_][\w.-]*:)?status\b[^>]*>\s*HTTP\/[^ ]+\s+(\d{3})/gi), function (match) { return Number(match[1]); });
+        if (statuses.some(function (status) { return status >= 200 && status < 300; })) confirmed.push(entry);
+        else if (!statuses.length || statuses.some(function (status) { return status !== 404; })) return null;
+      }
+      body = confirmed.join('');
+    }
+
     const baseUrl = new URL(attachmentsUrl.replace(/\/+$/, '') + '/');
     const basePath = baseUrl.pathname;
     const names = new Set();
@@ -1305,7 +1318,7 @@ function createIntegrations(options) {
 
   /** 真实列出云端 attachments/ 下的对象名（分页）。返回：
    *  Set —— 实际清单；null —— 服务器不支持该 PROPFIND（403/405/501）。 */
-  async function listRemoteAssetNames(remoteOptions) {
+  async function listRemoteAssetNames(remoteOptions, verifyListing) {
     const names = new Set();
     for (let page = 0; page < 40; page++) {
       const start = page * PROPFIND_PAGE_SIZE;
@@ -1322,7 +1335,8 @@ function createIntegrations(options) {
       // 部分 WebDAV 服务不支持 Depth:infinity；此时回退到库 JSON 登记名（见调用方）。
       if (response.status === 403 || response.status === 405 || response.status === 501) return null;
       if (!response.ok) throw new Error('坚果云附件清单读取失败（' + response.status + '）');
-      const pageNames = parsePropfindNames(await response.text(), remoteOptions.attachmentsUrl);
+      const pageNames = parsePropfindNames(await response.text(), remoteOptions.attachmentsUrl, verifyListing);
+      if (pageNames === null) return null;
       let fresh = 0;
       pageNames.forEach(function (name) { if (!names.has(name)) { names.add(name); fresh++; } });
       // 不足一页 = 最后一页；fresh=0 = 服务器忽略 Range 一次性给全（或分页停滞）
@@ -2188,13 +2202,15 @@ function createIntegrations(options) {
 
   async function inspectNutstoreRemote(input) {
     const remoteOptions = await resolveNutstoreOptions(input);
+    if (input && input.verifyAssets) remoteOptions.headers['Cache-Control'] = 'no-cache';
     const library = input && input._library ? input._library : await readRemoteLibrary(remoteOptions);
     const configPassword = remoteOptions.configPassword;
     const remoteConfig = configPassword
       ? await readRemoteConfig(remoteOptions.folderUrl, remoteOptions.headers, configPassword, { publicOnly: true })
       : { exists: false, locked: false, etag: '', value: null, pathConflict: false };
     const remote = library.remote || { papers: [], folders: [] };
-    const papers = Array.isArray(remote.papers) ? remote.papers : [];
+    const papers = (Array.isArray(remote.papers) ? remote.papers : []).filter(function (paper) { return paper && !paper.deletedAt; });
+    const attachments = papers.flatMap(function (paper) { return (Array.isArray(paper.attachments) ? paper.attachments : []).filter(Boolean); });
     const assets = [];
     papers.forEach(function (paper) {
       (Array.isArray(paper.attachments) ? paper.attachments : []).forEach(function (asset) {
@@ -2207,7 +2223,7 @@ function createIntegrations(options) {
       });
     });
     (Array.isArray(remote.notes) ? remote.notes : []).forEach(function (note) {
-      if (!note) return;
+      if (!note || note.deletedAt || (note.paperId && !papers.some(function (paper) { return paper.id === note.paperId; }))) return;
       (Array.isArray(note.assets) ? note.assets : []).forEach(function (asset) {
         if (asset && asset.cloudName) assets.push({ type: 'noteAsset', paperId: note.paperId || '', id: note.id,
           cloudName: asset.cloudName, hash: asset.cloudHash || '', size: asset.cloudSize == null ? null : Number(asset.cloudSize) });
@@ -2216,12 +2232,17 @@ function createIntegrations(options) {
     // 对账（_skipAudit 的调用方——同步计划流程——稍后会自行列清单，跳过以免重复）：
     // 真实 PROPFIND 云端对象 vs 库 JSON 登记。「词条声称有附件但云端没有对象」
     // 正是历史事故里 210 篇 PDF「看起来已同步、实际从未上传」的缺口，必须可见。
+    const names = new Set(assets.filter(function (asset) { return asset.type === 'attachment'; }).map(function (asset) { return asset.cloudName; }));
+    const assetCheck = { registered: names.size, existing: null, missing: null,
+      unregistered: attachments.filter(function (asset) { return !asset.cloudName; }).length };
     let audit = null;
     if (!input || !input._skipAudit) {
       const claimed = new Set(assets.map(function (item) { return item.cloudName; }));
       let actual = null;
-      try { actual = await listRemoteAssetNames(remoteOptions); } catch (error) {}
+      try { actual = await listRemoteAssetNames(remoteOptions, !!(input && input.verifyAssets)); } catch (error) {}
       if (actual) {
+        assetCheck.existing = Array.from(names).filter(function (name) { return actual.has(name); }).length;
+        assetCheck.missing = names.size - assetCheck.existing;
         const missing = [];
         const orphans = [];
         claimed.forEach(function (name) { if (!actual.has(name)) missing.push(name); });
@@ -2241,6 +2262,8 @@ function createIntegrations(options) {
     }
     return {
       ok: true,
+      checkedAt: Date.now(),
+      assetCheck: assetCheck,
       exists: library.exists,
       status: library.status,
       folder: remoteOptions.folderName,
@@ -2252,9 +2275,11 @@ function createIntegrations(options) {
         value: portableConfigView(remoteConfig.value), pathConflict: !!remoteConfig.pathConflict },
       counts: {
         papers: papers.length,
-        folders: Array.isArray(remote.folders) ? remote.folders.length : 0,
-        savedSearches: Array.isArray(remote.savedSearches) ? remote.savedSearches.length : 0,
-        attachments: assets.filter(function (item) { return item.type === 'attachment'; }).length,
+        folders: (Array.isArray(remote.folders) ? remote.folders : []).filter(function (item) { return item && !item.deletedAt; }).length,
+        savedSearches: (Array.isArray(remote.savedSearches) ? remote.savedSearches : []).filter(function (item) { return item && !item.deletedAt; }).length,
+        attachments: attachments.length,
+        pdfs: attachments.filter(function (item) { return item.kind === 'pdf'; }).length,
+        webSnapshots: attachments.filter(function (item) { return item.kind === 'snapshot'; }).length,
         snapshots: assets.filter(function (item) { return item.type === 'snapshot'; }).length
       },
       assets: assets,
@@ -2285,7 +2310,8 @@ function createIntegrations(options) {
     if (base && base.remoteKey && base.remoteKey !== baseKey) base = null;
     const basePaperCount = base && base.workspace && Array.isArray(base.workspace.papers) ? base.workspace.papers.length : 0;
     const localPaperCount = Array.isArray(localValue && localValue.papers) ? localValue.papers.length : 0;
-    const remotePaperCount = inspected.counts && inspected.counts.papers || 0;
+    // Reset protection compares raw sync records, including tombstones, on all three sides.
+    const remotePaperCount = inspected.remote && Array.isArray(inspected.remote.papers) ? inspected.remote.papers.length : 0;
     // 正常删除走墓碑，不会表现为整库消失。整库「凭空变空」只有两种来源：
     // 远端被清空（本机仍有数据），或本机突然读不到数据（读取失败/数据目录被
     // 切换）。两种都按疑似重置暂停自动写入，人工确认后才写远端——否则

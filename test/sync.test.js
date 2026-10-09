@@ -2174,3 +2174,57 @@ test('both empty sides can recover metadata from a non-empty sync base', async f
   assert.equal(recovered.workspace.papers[0].title, '基线可恢复');
   assert.equal(JSON.parse(remoteBody).papers.length, 1);
 });
+
+
+test('remote inspection excludes tombstones and checks only current attachment references', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-live-counts-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const remote = { papers: [
+    { id: 'live', attachments: [
+      { id: 'a', kind: 'pdf', cloudName: 'present.pdf' },
+      { id: 'b', kind: 'pdf', cloudName: 'missing.pdf' },
+      { id: 'c', kind: 'snapshot', cloudName: 'page.zip' },
+      { id: 'd', kind: 'pdf' }
+    ] },
+    { id: 'gone', deletedAt: 123, attachments: [{ id: 'e', kind: 'pdf', cloudName: 'gone.pdf' }],
+      pdfAnnotations: [{ id: 'ann', type: 'snapshot', cloudName: 'gone.png' }] }
+  ], folders: [{ id: 'f1' }, { id: 'f2', deletedAt: 123 }], savedSearches: [] };
+  let listStatus = 207, entryStatus = 200;
+  const methods = [];
+  const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(),
+    fetch: async function (url, init) {
+      methods.push(init.method);
+      if (init.method === 'GET') return new Response('', { status: 404 });
+      assert.equal(init.method, 'PROPFIND');
+      return new Response('<d:multistatus xmlns:d="DAV:">' + ['present.pdf', 'page.zip', 'gone.pdf', 'orphan.pdf', 'missing.pdf'].map(function (name) {
+        return '<d:response><d:href>/dav/LitBoard/attachments/' + name + '</d:href><d:status>HTTP/1.1 ' + (name === 'missing.pdf' ? 404 : entryStatus) + ' Status</d:status></d:response>';
+      }).join('') + '</d:multistatus>', { status: listStatus });
+    }
+  });
+  const input = { nutstoreUser: 'u', nutstorePassword: 'p', verifyAssets: true,
+    _library: { exists: true, status: 200, remote: remote } };
+  const result = await integrations.inspectNutstoreRemote(input);
+  assert.equal(result.counts.papers, 1);
+  assert.equal(result.counts.folders, 1);
+  assert.equal(result.counts.attachments, 4);
+  assert.equal(result.counts.pdfs, 3);
+  assert.equal(result.counts.webSnapshots, 1);
+  assert.equal(result.counts.snapshots, 0);
+  assert.equal(result.remote.papers.length, 2, 'preserve tombstones in sync payload');
+  assert.deepEqual(result.assets.map(function (a) { return a.id; }), ['a', 'b', 'c']);
+  assert.deepEqual(result.assetCheck, { registered: 3, existing: 2, missing: 1, unregistered: 1 });
+  assert.ok(result.checkedAt);
+  entryStatus = 403;
+  const denied = await integrations.inspectNutstoreRemote(input);
+  assert.equal(denied.assetCheck.existing, null, 'failed DAV entries must not count as existing files');
+  listStatus = 405;
+  const unsupported = await integrations.inspectNutstoreRemote(input);
+  assert.equal(unsupported.assetCheck.existing, null, 'unknown is not zero');
+  assert.equal(unsupported.assetCheck.missing, null);
+  assert.ok(methods.every(function (m) { return m === 'GET' || m === 'PROPFIND'; }));
+  await fs.writeFile(path.join(dir, 'sync-base.json'), JSON.stringify({ workspace: { papers: [{ id: 'live' }] } }));
+  remote.papers[0].deletedAt = 456;
+  const plan = await integrations.createNutstoreSyncPlan(Object.assign({}, input, { verifyAssets: false, workspace: remote }));
+  assert.equal(plan.remoteCount, 0, 'no deleted papers in the comparison summary');
+  assert.equal(plan.remoteResetSuspected, false, 'tombstones are not an unexpectedly cleared remote library');
+});

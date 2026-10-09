@@ -9056,6 +9056,7 @@
     Promise.all([desktop.getIntegrationConfig(), dataPathsPromise]).then(function (values) {
       fillSyncForm(values[0]);
       fillDataPathForm(values[1]);
+      if (remotePlan && !syncBusy && values[0].nutstoreUser && values[0].hasNutstorePassword) remotePlan.inspect();
       if (window.LitAgentUi) LitAgentUi.onSettingsOpen();
       refreshPdfIndexStats();
       refreshBackupStatus();
@@ -9548,6 +9549,7 @@
       return Promise.resolve(false);
     }
     syncBusy = true;
+    if (remotePlan) remotePlan.invalidateInspection();
     $('#sync-stop').hidden = false;
     $('#sync-stop').disabled = false;
     setSyncIndicator('syncing');
@@ -9598,6 +9600,7 @@
             applyPortableConfigRuntime(freshConfig);
           }).catch(function () {});
         }
+        if (remotePlan && !$('#sync-mask').hidden) remotePlan.inspect();
         var assetState = result && result.assets || {};
         var assetFailures = assetState.failures || [];
         var pendingUpload = Number(assetState.pendingUpload) || 0;

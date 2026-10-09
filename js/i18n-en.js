@@ -2285,5 +2285,16 @@
     "请等待生成或压缩结束后再分叉": "Wait for generation or compaction to finish before forking",
     "会话保存失败，未创建分支": "Failed to save the conversation; no branch was created",
     "分叉失败：": "Failed to fork: ",
+    "本机有效文献：": "Local active papers: ",
+    "云端有效文献：": "Cloud active papers: ",
+    "云端库附件：": "Cloud library attachments: ",
+    "网页快照：": "Web snapshots: ",
+    "其他：": "Other: ",
+    "已核验存在：": "Verified present: ",
+    "缺失文件：": "Missing files: ",
+    "附件文件尚未核验": "Attachment files have not been verified",
+    "未登记云端文件：": "Without a cloud file reference: ",
+    "核验时间：": "Checked at: ",
+    "云端状态待刷新": "Cloud status needs refreshing",
   });
 });

@@ -450,38 +450,55 @@
       $('#sync-remote-plan-mask').hidden = false;
     }
 
+    var inspectionRevision = 0;
+
     function inspectRemote() {
       if (!desktop || !desktop.inspectNutstoreRemote) { setSyncInlineStatus('sync-remote-status', T('当前版本不支持云端检查'), 'error'); return; }
+      var revision = ++inspectionRevision;
+      var config = syncFormValue();
+      var configKey = JSON.stringify(config);
       setSyncInlineStatus('sync-remote-status', T('正在只读检查云端…'), 'pending');
-      desktop.inspectNutstoreRemote(syncFormValue()).then(function (info) {
+      return desktop.inspectNutstoreRemote({ config: config, verifyAssets: true }).then(function (info) {
+        if (revision !== inspectionRevision || JSON.stringify(syncFormValue()) !== configKey) return;
         if (info && info.exists === false) {
           var missing = T('未找到云端库文件 · ') + (info.fileUrl || 'litboard-library.json') +
             (info.status ? ' · HTTP ' + info.status : '');
           setSyncInlineStatus('sync-remote-status', missing, 'warning');
           return;
         }
-        var paperCount = info && info.counts && info.counts.papers;
-        var text = T('云端库文件存在 · ') + (paperCount == null ? T('文献数未知') : (paperCount + T(' 篇'))) +
-          (info && info.fileUrl ? ' · ' + info.fileUrl : '');
-        // 对账：词条登记的附件 vs 云端实际对象。「声称有但云端没有」就是
-        // 「词条在、PDF 不在」的缺口，必须直接可见。
-        var audit = info && info.audit;
-        if (audit && audit.supported) {
-          text += T(' · 附件登记 ') + audit.claimedCount + T(' / 云端实有 ') + audit.actualCount;
-          if (audit.missingCount > 0) {
-            text += ' · ⚠ ' + audit.missingCount + T(' 个附件云端缺失（需在有原文件的设备上点「立即同步」补传）');
-            setSyncInlineStatus('sync-remote-status', text, 'warning');
-            return;
-          }
-          if (audit.orphanCount > 0) text += ' · ' + audit.orphanCount + T(' 个云端对象未被词条引用');
+        var counts = info && info.counts || {};
+        var localCount = (workspacePayload().papers || []).filter(function (paper) { return paper && !paper.deletedAt; }).length;
+        var text = T('本机有效文献：') + localCount + T(' 篇') + ' · ' + T('云端有效文献：') +
+          (counts.papers == null ? T('文献数未知') : counts.papers + T(' 篇'));
+        var warning = counts.papers == null || counts.papers !== localCount;
+        if (counts.attachments != null) {
+          text += ' · ' + T('云端库附件：') + counts.attachments;
+          if (counts.pdfs != null) text += '（PDF ' + counts.pdfs + ' · ' + T('网页快照：') + (counts.webSnapshots || 0) +
+            ' · ' + T('其他：') + (counts.attachments - counts.pdfs - (counts.webSnapshots || 0)) + '）';
         }
-        setSyncInlineStatus('sync-remote-status', text, 'success');
+        var check = info && info.assetCheck;
+        if (check && check.existing != null) {
+          text += ' · ' + T('已核验存在：') + check.existing + '/' + check.registered +
+            ' · ' + T('缺失文件：') + check.missing;
+          warning = warning || check.missing > 0;
+        } else {
+          text += ' · ' + T('附件文件尚未核验');
+          warning = true;
+        }
+        if (check && check.unregistered) {
+          text += ' · ' + T('未登记云端文件：') + check.unregistered;
+          warning = true;
+        }
+        if (info && info.checkedAt) text += ' · ' + T('核验时间：') + new Date(info.checkedAt).toLocaleTimeString();
+        setSyncInlineStatus('sync-remote-status', text, warning ? 'warning' : 'success');
       }).catch(function (error) {
+        if (revision !== inspectionRevision || JSON.stringify(syncFormValue()) !== configKey) return;
         setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
       });
     }
 
     function createRemotePlan(mode) {
+      inspectionRevision++;
       if (!desktop || !desktop.createNutstoreSyncPlan) { setSyncInlineStatus('sync-remote-status', T('当前版本不支持云端恢复计划'), 'error'); return; }
       setSyncInlineStatus('sync-remote-status', T('正在读取云端并生成对照…'), 'pending');
       desktop.createNutstoreSyncPlan({ config: syncFormValue(), workspace: workspacePayload(), mode: mode }).then(function (plan) {
@@ -593,6 +610,7 @@
     }
 
     function applyRemotePlan() {
+      inspectionRevision++;
       if (!pendingRemotePlan || !desktop || !desktop.applyNutstoreSyncPlan) return;
       if (remotePlanApplying) return;
       // 首传确认选了「取消」：云端本来就没有库文件，直接关弹窗即可，无需调后端
@@ -645,6 +663,7 @@
         setSyncInlineStatus('sync-remote-status', label, applyAssetFailures ? 'warning' : 'success');
         setRemotePlanCompleted(label);
         toast(label);
+        inspectRemote();
       }).catch(function (error) {
         var stopped = error && (error.code === 'SYNC_CANCELLED' || String(error.message || error).indexOf('同步已停止') !== -1);
         resetRemotePlanProgressUi();
@@ -728,6 +747,10 @@
       createPlan: createRemotePlan,
       handleProgress: handleSyncProgress,
       inspect: inspectRemote,
+      invalidateInspection: function () {
+        inspectionRevision++;
+        setSyncInlineStatus('sync-remote-status', T('云端状态待刷新'), 'pending');
+      },
       show: renderRemotePlan,
       showConflicts: showSyncConflicts,
       clearRefreshFormFlag: function () { refreshSyncFormAfterSync = false; },
