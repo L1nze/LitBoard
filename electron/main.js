@@ -2165,6 +2165,8 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
     homeDir: app.getPath('home'),
     appDataDir: app.getPath('appData'),
     safeStorage: safeStorage,
+    // 坚果云 WebDAV 限流节流（免费/专业档位由设置页 nutstorePacing 控制）
+    pacing: true,
     fetch: function (url, init) { return net.fetch(url, init); },
     notify: function (channel, payload) {
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);

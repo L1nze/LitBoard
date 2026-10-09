@@ -117,3 +117,7 @@ docs/assets/gif/*.mp4
 !test/agentdispatch.test.js
 
 !test/agent-tool-cancel.test.js
+
+# 坚果云同步重构（对象先行/节流/断路器/备份链）的回归测试
+!test/sync-refactor.test.js
+!test/webdav-pacer.test.js

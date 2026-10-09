@@ -162,3 +162,49 @@ test('对照：handleProgress 在应用期路由到进度条；完成后可关�
   assert.strictEqual(h.api.stateForTest().plan, null, '关闭即清空计划');
   assert.deepStrictEqual(h.api.stateForTest().resolutions, {});
 });
+
+/* ---------- 防覆盖断路器与首传确认：强制确认项的渲染与门槛 ---------- */
+
+test('对照：大批移除云端词条时出现强制确认项，未选不得应用', async () => {
+  const h = makeHarness({
+    mode: 'merge', remoteCount: 210, remoteExists: true,
+    massDropSuspected: true, massDropCount: 206, remoteActiveCount: 210,
+    conflicts: [], localOnly: []
+  });
+  h.els['#sync-remote-merge'].click();
+  await flush();
+  const st = h.api.stateForTest();
+  assert.strictEqual(st.model.requiredKeys.has('plan:mass-drop-reset'), true, 'mass-drop 为必选');
+  assert.strictEqual(st.model.items.length, 1);
+  assert.strictEqual(h.els['#sync-remote-plan-apply'].disabled, true, '未确认不得应用');
+  assert.ok(h.els['#sync-remote-plan-summary'].textContent.indexOf('206') !== -1, '摘要说明移除规模');
+});
+
+test('对照：首传确认项渲染，选「取消」不调后端直接关弹窗', async () => {
+  const h = makeHarness({
+    mode: 'merge', remoteExists: false, firstUploadSuspected: true, localPaperCount: 4,
+    conflicts: [], localOnly: []
+  });
+  h.els['#sync-remote-merge'].click();
+  await flush();
+  const st = h.api.stateForTest();
+  assert.strictEqual(st.model.requiredKeys.has('plan:first-upload'), true);
+  assert.strictEqual(h.els['#sync-remote-plan-apply'].disabled, true);
+  // 模拟用户选「取消上传」（remote 侧）
+  st.resolutions['plan:first-upload'] = 'remote';
+  st.model.resolvedKeys.add('plan:first-upload');
+  h.els['#sync-remote-plan-apply'].disabled = false;
+  h.els['#sync-remote-plan-apply'].click();
+  await flush();
+  assert.strictEqual(h.calls.applied, null, '取消首传：不应调用 applyNutstoreSyncPlan');
+  assert.strictEqual(h.els['#sync-remote-plan-mask'].hidden, true, '直接关闭弹窗');
+  assert.ok(h.calls.statuses.some(function (s) { return s.id === 'sync-remote-status' && s.text.indexOf('已取消首次上传') !== -1; }));
+});
+
+test('对照：inspect 对账展示「附件登记/云端实有/缺失」', async () => {
+  const h = makeHarness();
+  // inspectNutstoreRemote 在 harness 桩内固定返回；这里断言 status 展示链路
+  h.els['#sync-remote-inspect'].click();
+  await flush();
+  assert.ok(h.calls.statuses.some(function (s) { return s.id === 'sync-remote-status' && s.text.indexOf('云端库文件存在') !== -1; }));
+});

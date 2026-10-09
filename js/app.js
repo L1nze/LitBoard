@@ -3692,6 +3692,7 @@
       fillSyncForm: fillSyncForm,
       setSyncIndicator: setSyncIndicator,
       isSyncBusy: function () { return syncBusy; },
+      scheduleSyncResume: scheduleSyncResume,
       download: download,
       stamp: stamp
     });
@@ -7464,6 +7465,23 @@
     }, 1200);
   }
 
+  var syncResumeTimer = null;
+  /** 限流暂停后的到点续传（一次性）：属于完成被打断的同步，不受自动同步开关限制；
+   *  应用重启后由 15 分钟周期同步兜底。上限 35 分钟防时钟漂移导致的长期定时器。 */
+  function scheduleSyncResume(resumeAt) {
+    if (!desktop || !desktop.getIntegrationConfig) return;
+    clearTimeout(syncResumeTimer);
+    var delay = Math.max(5000, Math.min(Number(resumeAt) - Date.now() + 5000, 35 * 60 * 1000));
+    syncResumeTimer = setTimeout(function () {
+      syncResumeTimer = null;
+      if (syncBusy) { scheduleSyncResume(resumeAt + 60000); return; }
+      desktop.getIntegrationConfig().then(function (config) {
+        integrationConfig = config;
+        return performSync(config, true);
+      }).catch(function () {});
+    }, delay);
+  }
+
   /* 设置表单是否已按配置装载过（fillSyncForm 收尾置位）。未装载时表单里只有 HTML 默认值
      ——下拉首项、空输入框、默认勾选态；把这些提交上去等于用默认值覆盖已存配置
      （打开设置页时读配置失败就停在这种状态，见 openSyncSettings 的错误分支）。
@@ -7477,6 +7495,7 @@
       nutstoreUser: $('#sync-nutstore-user').value.trim(),
       nutstorePassword: $('#sync-nutstore-password').value,
       nutstoreFolder: $('#sync-nutstore-folder').value.trim(),
+      nutstorePacing: $('#sync-nutstore-pacing') ? $('#sync-nutstore-pacing').value : '',
       zoteroWebDavFolder: $('#sync-zotero-webdav-folder').value.trim(),
       zoteroDataDir: $('#sync-zotero-dir').value.trim(),
       translatorProvider: $('#sync-translator-provider').value,
@@ -7637,6 +7656,7 @@
     $('#sync-nutstore-user').value = config.nutstoreUser || '';
     $('#sync-nutstore-password').value = '';
     $('#sync-nutstore-folder').value = config.nutstoreFolder || 'LitBoard';
+    if ($('#sync-nutstore-pacing')) $('#sync-nutstore-pacing').value = config.nutstorePacing === 'pro' ? 'pro' : 'free';
     $('#sync-zotero-webdav-folder').value = config.zoteroWebDavFolder || 'zotero';
     $('#sync-zotero-dir').value = config.zoteroDataDir || '';
     $('#sync-translator-provider').value = config.translatorProvider || 'volc';
@@ -9537,6 +9557,22 @@
     var chain = Promise.resolve(current);
     if (useNutstore) chain = chain.then(function (workspace) { return desktop.syncNutstore(workspace); });
     return chain.then(function (result) {
+      if (result && result.paused) {
+        // 限流软暂停：firstWrite 的合并结果随结果带回（云端已是这份内容），
+        // 本地先落库对齐，再到点自动续传——不落库会让恢复同步产生伪冲突
+        var resumeAt = Number(result.resumeAt) || (Date.now() + 15 * 60 * 1000);
+        var resumeText = new Date(resumeAt).toLocaleTimeString();
+        var pausedMsg = T('坚果云限流额度用尽，同步已暂停，') + resumeText + T(' 自动续传（可保持应用开着）');
+        var pausedApply = result.workspace && result.workspace.papers && result.workspace !== current
+          ? applySyncedWorkspace(result.workspace, true).catch(function () {})
+          : Promise.resolve();
+        return pausedApply.then(function () {
+          setSyncIndicator('error', pausedMsg);
+          if (!silent) $('#sync-status').textContent = pausedMsg;
+          scheduleSyncResume(resumeAt);
+          return true;
+        });
+      }
       if (result && (result.pendingPlan || result.plan)) {
         showRemotePlan(result.pendingPlan || result.plan);
         setSyncInlineStatus('sync-remote-status', T('后台同步发现冲突，云端写入已暂停'), 'warning');
@@ -9562,10 +9598,19 @@
             applyPortableConfigRuntime(freshConfig);
           }).catch(function () {});
         }
-        var assetFailures = result && result.assets && result.assets.failures || [];
-        if (assetFailures.length) {
-          // 附件失败不再阻断文献库写入；明确提示，进度已记台账、下次同步自动续传
-          var afMsg = T('文献库已同步，') + assetFailures.length + T(' 个附件暂时失败（下次同步自动续传）');
+        var assetState = result && result.assets || {};
+        var assetFailures = assetState.failures || [];
+        var pendingUpload = Number(assetState.pendingUpload) || 0;
+        var missingOnCloud = Number(assetState.missingOnCloud) || 0;
+        if (assetFailures.length || pendingUpload || missingOnCloud) {
+          // 附件失败不阻断词条同步，但状态必须说清三种情况：
+          // 待上传（本机有文件，限流窗口自动续传）/ 云端缺失（需在有原文件的设备上补传）/ 其他暂时失败
+          var afParts = [];
+          if (pendingUpload) afParts.push(pendingUpload + T(' 个附件待上传（限流窗口自动续传）'));
+          if (missingOnCloud) afParts.push(missingOnCloud + T(' 个附件云端缺失（需在有原文件的设备上点「立即同步」补传）'));
+          var otherFailures = assetFailures.length - pendingUpload - missingOnCloud;
+          if (otherFailures > 0) afParts.push(otherFailures + T(' 个附件暂时失败（下次同步自动重试）'));
+          var afMsg = T('文献库已同步；') + afParts.join(T('，'));
           setSyncIndicator('error', afMsg);
           if (!silent) $('#sync-status').textContent = afMsg;
           toast('⚠ ' + afMsg);
@@ -9703,6 +9748,7 @@
     });
     // 设置项改动即自动保存：文本输入在失焦/回车时（change），勾选与下拉即时
     ['sync-nutstore-url', 'sync-nutstore-user', 'sync-nutstore-password', 'sync-nutstore-folder',
+      'sync-nutstore-pacing',
       'sync-zotero-webdav-folder', 'sync-translator-provider', 'sync-translator-target',
       'sync-translator-model', 'sync-translator-api-key', 'sync-rank-provider',
       'sync-scigreat-api-key', 'sync-easyscholar-api-key', 'sync-auto-sync',
@@ -9968,8 +10014,22 @@
         return desktop.migrateZoteroCloudAttachments(workspace);
       }).then(function (result) {
         $('#sync-status').textContent = T('已下载 ') + result.downloaded + T(' 个 PDF，正在写入 LitBoard 坚果云目录…');
-        return desktop.syncNutstore(result.workspace).then(function (workspace) {
-          return { workspace: workspace, stats: result };
+        return desktop.syncNutstore(result.workspace).then(function (synced) {
+          if (synced && synced.paused) {
+            // 限流软暂停：迁移内容在本机已就位，续传由限流调度器接管
+            var pauseError = new Error(synced.message || T('迁移已暂停，等待续传'));
+            pauseError.softPause = true;
+            pauseError.resumeAt = synced.resumeAt;
+            throw pauseError;
+          }
+          if (synced && synced.pendingPlan) {
+            // 首传确认/冲突对照：内容已在合并计划里，弹对照让用户确认后应用
+            showRemotePlan(synced.pendingPlan);
+            var planError = new Error(T('迁移内容已并入云端对照，请在弹窗中完成确认'));
+            planError.softPause = true;
+            throw planError;
+          }
+          return { workspace: synced, stats: result };
         });
       }).then(function (result) {
         return applySyncedWorkspace(result.workspace).then(function () {
@@ -9978,8 +10038,15 @@
           toast(T('Zotero 云附件迁移完成'));
         });
       }).catch(function (error) {
-        $('#sync-status').classList.add('error');
-        $('#sync-status').textContent = error && error.message || String(error);
+        $('#sync-status').classList.remove('error');
+        if (error && error.softPause) {
+          // 软暂停不是失败：已迁移内容留在本机，限流续传或对照确认后自然落云
+          if (error.resumeAt) scheduleSyncResume(error.resumeAt);
+          $('#sync-status').textContent = error.message || T('迁移已暂停，等待续传');
+        } else {
+          $('#sync-status').classList.add('error');
+          $('#sync-status').textContent = error && error.message || String(error);
+        }
       }).finally(function () {
         syncBusy = false;
         $('#sync-migrate-zotero-cloud').disabled = false;

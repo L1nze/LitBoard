@@ -1203,6 +1203,12 @@
           <label>账号<input type="text" id="sync-nutstore-user" autocomplete="username"></label>
           <label>应用密码<input type="password" id="sync-nutstore-password" autocomplete="new-password" placeholder="留空则保持原密码"></label>
           <label class="span-2">LitBoard 同步目录<input type="text" id="sync-nutstore-folder" value="LitBoard" placeholder="例如 LitBoard 或 Research/LitBoard"></label>
+          <label class="span-2">账号限流档位
+            <select id="sync-nutstore-pacing">
+              <option value="free">免费版（每 30 分钟约 600 次请求）</option>
+              <option value="pro">专业版（每 30 分钟约 1500 次请求）</option>
+            </select>
+          </label>
           <div class="span-2 sync-inline-actions">
             <button type="button" class="btn" id="sync-test-nutstore">测试登录</button>
             <span class="sync-inline-status" id="sync-nutstore-test-status" role="status" aria-live="polite"></span>

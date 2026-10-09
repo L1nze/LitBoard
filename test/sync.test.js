@@ -316,6 +316,12 @@ test('remote restore downloads and verifies attachment and snapshot assets atomi
     baseDir: dir, homeDir: dir, safeStorage: safeStorage,
     fetch: async function (url, init) {
       if (init.method === 'GET' && url.endsWith('litboard-library.json')) return new Response(JSON.stringify(remote), { status: 200, headers: { ETag: '"v1"' } });
+      if (init.method === 'PROPFIND') {
+        return new Response('<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">' +
+          '<d:response><d:href>/dav/LitBoard/attachments/p1.pdf</d:href></d:response>' +
+          '<d:response><d:href>/dav/LitBoard/attachments/snapshots/p1/n1.png</d:href></d:response>' +
+          '</d:multistatus>', { status: 207 });
+      }
       if (init.method === 'GET' && url.endsWith('/attachments/p1.pdf')) return new Response(pdf, { status: 200 });
       if (init.method === 'GET' && url.endsWith('/attachments/snapshots/p1/n1.png')) return new Response(image, { status: 200 });
       if (init.method === 'GET') return new Response('', { status: 404 });
@@ -408,7 +414,13 @@ test('nutstore sync initializes the LitBoard directory when first read returns 4
   await integrations.saveConfig({
     nutstoreUser: 'user@example.com', nutstorePassword: 'secret', nutstoreFolder: 'Research/LitBoard'
   });
-  const result = await integrations.nutstoreSync({ papers: [{ id: 'p1', title: 'Local Paper' }], folders: [] });
+  const pending = await integrations.nutstoreSync({ papers: [{ id: 'p1', title: 'Local Paper' }], folders: [] });
+  // 云端无库文件 + 本机非空：先出首传确认，不直接建库
+  assert.equal(pending.pendingPlan.firstUploadSuspected, true);
+  const result = await integrations.applyNutstoreSyncPlan({
+    planId: pending.pendingPlan.planId,
+    resolutions: { 'plan:first-upload': 'local' }
+  });
   assert.equal(result.workspace.papers.length, 1);
   assert.ok(createdFolders.includes('https://dav.jianguoyun.com/dav/Research'));
   assert.ok(createdFolders.includes('https://dav.jianguoyun.com/dav/Research/LitBoard'));
@@ -443,7 +455,13 @@ test('nutstore sync skips the upload when the merged content is identical to rem
   });
   await integrations.saveConfig({ nutstoreUser: 'u@x.com', nutstorePassword: 'p', nutstoreFolder: 'LitBoard' });
   const papers = [{ id: 'p1', title: 'Paper', updatedAt: 1000 }];
-  const first = await integrations.nutstoreSync({ papers: papers, folders: [] });
+  const pending = await integrations.nutstoreSync({ papers: papers, folders: [] });
+  // 首传确认：云端无库文件时不直接写入，显式确认后应用计划完成首传
+  assert.equal(pending.pendingPlan.firstUploadSuspected, true);
+  const first = await integrations.applyNutstoreSyncPlan({
+    planId: pending.pendingPlan.planId,
+    resolutions: { 'plan:first-upload': 'local' }
+  });
   assert.equal(first.uploaded, true);
   const second = await integrations.nutstoreSync({ papers: first.workspace.papers, folders: [] });
   assert.equal(second.uploaded, false); // 内容一致：增量跳过
@@ -512,10 +530,15 @@ test('nutstore sync excludes local paths and ignores path-only differences', asy
     pdfAnnotations: [{ id: 'snap1', type: 'snapshot', imagePath: 'C:\\Users\\Alice\\snapshot.png',
       position: { pageIndex: 0, rects: [[1, 2, 3, 4]] }, createdAt: 1, updatedAt: 1 }] };
   const first = await integrations.nutstoreSync({ papers: [base], folders: [] });
-  assert.equal(first.uploaded, true);
+  assert.equal(first.pendingPlan.firstUploadSuspected, true);
+  const applied = await integrations.applyNutstoreSyncPlan({
+    planId: first.pendingPlan.planId,
+    resolutions: { 'plan:first-upload': 'local' }
+  });
+  assert.equal(applied.uploaded, true);
   const remoteText = Array.from(cloud.entries()).find(function (entry) { return entry[0].endsWith('litboard-library.json'); })[1];
   assert.doesNotMatch(remoteText, /Alice|paper\.pdf"\s*,\s*"path|imagePath/);
-  const changedPath = JSON.parse(JSON.stringify(first.workspace.papers[0]));
+  const changedPath = JSON.parse(JSON.stringify(applied.workspace.papers[0]));
   changedPath.attachments[0].path = 'D:\\Users\\Bob\\paper.pdf';
   changedPath.pdfPath = changedPath.attachments[0].path;
   changedPath.pdfAnnotations[0].imagePath = 'D:\\Users\\Bob\\snapshot.png';
@@ -1398,10 +1421,15 @@ test('stopping sync keeps the cloud library uploaded before attachments and pres
     }
   });
   await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
-  const running = integrations.nutstoreSync({ papers: [{ id: 'p1', title: 'Paper', attachments: [
+  const pending = await integrations.nutstoreSync({ papers: [{ id: 'p1', title: 'Paper', attachments: [
     { id: 'a1', kind: 'pdf', fileName: 'first.pdf', path: firstPath },
     { id: 'a2', kind: 'pdf', fileName: 'second.pdf', path: secondPath }
   ] }], folders: [] });
+  assert.equal(pending.pendingPlan.firstUploadSuspected, true);
+  const running = integrations.applyNutstoreSyncPlan({
+    planId: pending.pendingPlan.planId,
+    resolutions: { 'plan:first-upload': 'local' }
+  });
   await secondStarted;
   assert.equal(integrations.cancelNutstoreSync(), true);
   await assert.rejects(running, function (error) { return error.code === 'SYNC_CANCELLED'; });
@@ -1448,8 +1476,13 @@ test('new cloud library is written before PDF upload and finalized with its clou
     }
   });
   await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
-  const result = await integrations.nutstoreSync({ papers: [{ id: 'p1', title: 'Paper',
+  const pending = await integrations.nutstoreSync({ papers: [{ id: 'p1', title: 'Paper',
     attachments: [{ id: 'a1', kind: 'pdf', path: pdfPath, fileName: 'paper.pdf' }] }], folders: [] });
+  assert.equal(pending.pendingPlan.firstUploadSuspected, true);
+  const result = await integrations.applyNutstoreSyncPlan({
+    planId: pending.pendingPlan.planId,
+    resolutions: { 'plan:first-upload': 'local' }
+  });
   assert.deepEqual(writes, ['library', 'attachment', 'library']);
   const cloudAsset = JSON.parse(cloudLibrary).papers[0].attachments[0];
   assert.equal(cloudAsset.cloudName, 'p1.pdf');
@@ -1606,7 +1639,7 @@ test('an asset upload failure is recorded without blocking the library JSON writ
   assert.equal(assetGets, 0, '上传失败不应被误报成下载重试');
 });
 
-test('WebDAV rate limiting stops the asset loop immediately', async function (t) {
+test('WebDAV rate limiting pauses the sync with a resume time instead of failing', async function (t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-sync-rate-limit-'));
   t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
   const firstPath = path.join(dir, 'first.pdf');
@@ -1634,13 +1667,17 @@ test('WebDAV rate limiting stops the asset loop immediately', async function (t)
   };
   const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: fetch });
   await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
-  await assert.rejects(integrations.nutstoreSync({
+  const result = await integrations.nutstoreSync({
     papers: [{ id: 'p1', title: '限流测试', attachments: [
       { id: 'a1', kind: 'pdf', path: firstPath, fileName: 'first.pdf' },
       { id: 'a2', kind: 'supp', path: secondPath, fileName: 'second.pdf' }
     ] }],
     folders: []
-  }), /访问频率限制/);
+  });
+  // 限流不再整轮报错：软暂停 + 恢复时刻，渲染层据此调度自动续传
+  assert.equal(result.paused, true);
+  assert.ok(result.resumeAt > Date.now(), 'resumeAt 尊重 Retry-After（60s）');
+  assert.match(result.message, /限流|频率/);
   assert.equal(assetPuts, 1);
 });
 
@@ -1964,7 +2001,12 @@ test('snapshot dirs and note assets sync over WebDAV end to end', async function
     folders: []
   };
   await A.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
-  const up = await A.nutstoreSync(workspaceA);
+  const upPending = await A.nutstoreSync(workspaceA);
+  assert.equal(upPending.pendingPlan.firstUploadSuspected, true);
+  const up = await A.applyNutstoreSyncPlan({
+    planId: upPending.pendingPlan.planId,
+    resolutions: { 'plan:first-upload': 'local' }
+  });
   assert.ok(up.assets.uploaded >= 2); // 快照 zip + 笔记图片
   const syncedAttachment = up.workspace.papers[0].attachments[0];
   assert.equal(syncedAttachment.cloudName, 'p1/a1.zip');

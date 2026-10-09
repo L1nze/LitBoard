@@ -1,0 +1,124 @@
+# LitBoard 坚果云同步设计
+
+> 本文是同步子系统的权威设计说明（2026-10 重构后）。重构动机：附件上传在限流中断后
+> 产生"词条声称已同步、云端对象从未上传"的假状态，且防覆盖闸门存在"本地少量覆盖云端
+> 大库"的静默路径。重构参考了 Zotero（对象先行 + 上传确认）、Joplin（大变动 failsafe）、
+> Syncthing（版本化备份）与坚果云官方限流文档。
+
+## 云端布局（坚果云 WebDAV）
+
+```
+LitBoard/                          ← 同步目录（设置页可改，大小写敏感）
+├── litboard-library.json          ← 全部词条 + 附件元数据（单个大 JSON，SYNC_VERSION=6）
+├── litboard-config.enc            ← 加密的便携配置
+├── attachments/                   ← 附件对象
+│   ├── <paperId>.pdf              ← 主 PDF
+│   ├── <paperId>/<attachmentId>.<ext>  ← 其他附件
+│   ├── snapshots/<paperId>/<id>.zip    ← 网页快照（确定性 stored-ZIP）
+│   └── notes/<noteId>/<fileName>       ← 笔记资产
+└── backups/                       ← 库 JSON 覆盖前的云端备份链（保留最近 5 份）
+    └── library-<ISO时间戳>.json
+```
+
+本地数据目录下与同步相关的文件：
+
+| 文件 | 作用 |
+|---|---|
+| `sync-base.json` | 三方合并基线（上次达成一致的云端形态）+ pins |
+| `sync-asset-ledger.json` | 附件上传台账（断点续传）+ `pacing` 限流窗口状态 |
+| `sync-history/` | 每次读到的云端库内容留档（内容寻址，保留 20 份） |
+| `synced-attachments/` | 下载的附件缓存 |
+
+## 核心不变式
+
+### 1. 对象先行（上传诚实化）
+
+**附件元数据（`cloudName/cloudHash/cloudSize`）只在 PUT 返回 2xx 之后写入词条。**
+
+上传失败、限流中断的附件，云端库 JSON 里不留下任何"已上传"痕迹（`sanitizeCloudAssets`
+在每次写云端前再兜底剥离一次：只有本会话核实成功或真实清单确认存在的登记才放行）。
+这杜绝了"云端词条带着附件登记、attachments/ 里却没有对象"的悬空状态。
+
+下载侧同理：本机没有文件且云端无登记的附件计入 `missingOnCloud`（等源设备补传），
+而不是静默跳过。
+
+### 2. 存在性只认真实清单
+
+判断"云端有没有某对象"的唯一证据是 attachments/ 的真实 PROPFIND（支持坚果云
+750 条/页的 Range 分页）。**库 JSON 里的 cloudName 登记不能自证对象存在**——
+包括空清单：真实对账后一个对象都没有，就是都不在，台账也不再采信
+（`assetLedgerProof` 只有拿不到清单时才作为断点续传依据）。对象被用户在云端
+手动删除后，下一次同步会自动重传。
+
+### 3. 覆盖云端前必须留档
+
+覆盖 `litboard-library.json` 之前：本地 `sync-history/` 写入当前内容（内容寻址，
+必须成功否则中止写入）；云端 COPY 到 `backups/library-<时间戳>.json`（尽力而为，
+COPY 不支持时 GET+PUT 兜底），超过 8 份时裁剪到 5 份。
+
+### 4. 大变动必须人工确认（断路器）
+
+- **mass-drop**：合并结果会使远端有效词条减少 ≥ max(3, 10%) 时，同步暂停并弹
+  云端对照，用户选"确认删除"或"放弃删除"（后者把云端词条恢复回来）。不依赖
+  基线——数据目录切换、部分读取失败等造成的本地整批缺失在这里被拦下。
+- **首传确认**：云端没有库文件而本机非空时，需确认后才新建云端库（防账号/
+  目录名大小写填错建出第二个空库）。
+- 既有闸门保留：`remoteResetSuspected`（一侧突然为 0）、`localEmptyReset`、
+  `libraryLoadFailed`。
+
+### 5. 限流是常态，暂停不是失败
+
+坚果云免费版每 30 分钟 ≤600 次请求（专业版 ≤1500）。同步会话内所有 WebDAV
+请求经过 `RequestPacer`（`electron/webdav-pacer.js`）：
+
+- 最小间隔：free ≈3.1s/请求、pro ≈1.25s/请求；
+- 30 分钟滚动窗口预算，将尽时保留尾部配额（库终写/校验/配置同步）并**主动暂停**；
+- 服务端 429 → 消费 `Retry-After`，恢复时刻持久化到台账 `pacing.resumeAt`；
+- 暂停以**软结果**返回（`{paused: true, resumeAt, message, workspace}`），渲染层
+  落库带回的工作区、显示恢复时刻并到点自动续传（15 分钟周期同步兜底重启场景）。
+
+档位在设置页「账号限流档位」选择，默认按免费版保守处理。
+
+## 同步流程（nutstoreSyncOnce / applyNutstoreSyncPlan）
+
+1. 读云端库（留档 sync-history）→ 生成只读合并计划；断路器/冲突 → 返回
+   `pendingPlan` 弹云端对照，不写任何东西。
+2. 真实 PROPFIND 清单 → **净化后 firstWrite**（词条先落云端，悬空登记从第一
+   笔起就不写）。
+3. 附件循环（上传/下载/核实，对象先行；失败不阻断词条同步，进台账续传）。
+4. 配置同步 → **净化后 finalWrite**（只有本会话核实的附件元数据进云端）。
+5. writeSyncBase + 渲染层落库（云端形态做基线、合并形态做本地应用，pins 的
+   两侧分叉语义保持）。
+
+限流中断恢复：firstWrite 已完成时，暂停路径同样落基线并把合并结果带回本地
+落库，两侧从同一份内容继续，不会因缺基线把 normalize 时间戳差异误判为冲突。
+
+## 对账与诊断
+
+「查看云端内容」（`inspectNutstoreRemote`）做真实 PROPFIND 对账，报告：
+
+- `claimedCount`：词条登记的附件数
+- `actualCount`：云端实际对象数
+- `missing`：词条声称有、云端没有（**"词条在、PDF 不在"缺口的直接可见化**）
+- `orphans`：云端有、词条未引用
+
+同步状态行区分三种附件状态：待上传（限流窗口自动续传）/ 云端缺失（需在有
+原文件的设备上点「立即同步」补传）/ 暂时失败（下次自动重试）。
+
+## 常见事故排查
+
+| 症状 | 判断 | 处理 |
+|---|---|---|
+| 新机器词条同步了、PDF 没有 | inspect 看 `missing` 数 | 源机器点「立即同步」补传（可切专业版档位加速），台账断点续传 |
+| 同步提示"限流暂停" | 正常现象 | 保持应用开着等自动续传，或 15 分钟周期兜底 |
+| 云端对照弹出"将移除 N 篇" | mass-drop 断路器 | 真删了选"确认删除"；不是就选"放弃删除"并检查本机数据目录 |
+| 想找回被覆盖的云端库 | backups/ 或本地 sync-history/ | 从任一份历史 JSON 恢复（云端恢复=把该文件内容存回 litboard-library.json） |
+| 怀疑两台机器没同步到同一个库 | 检查设置页目录名（大小写敏感）与账号 | 统一目录名；inspect 确认词条数 |
+
+## 相关测试
+
+- `test/sync.test.js`：合并算法、ETag 竞态、附件原子下载、首传确认、限流暂停等端到端
+- `test/sync-refactor.test.js`：对象先行不变式、真实对账重传、断路器、备份链、节流暂停续传、PROPFIND 分页
+- `test/webdav-pacer.test.js`：节流器单元（虚拟时钟）
+- `test/asset-ledger.test.js` / `test/asset-signature.test.js`：台账与签名缓存
+- `test/remote-plan.test.js`：对照弹窗渲染（含 mass-drop / 首传确认项）

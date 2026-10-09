@@ -14,6 +14,7 @@ const LitEmbedCfg = require('../js/embedcfg.js');
 const LitAgentCfg = require('../js/agentcfg.js');
 const { itemAttachmentDir } = require('./item-storage.js');
 const { availablePdfPath } = require('./pdfdownload.js');
+const { createRequestPacer, loadPacingValue } = require('./webdav-pacer.js');
 
 /** 快照入口解析：目录 → 内部 index.html / 首个 .html；文件 → 原样返回（Zotero 快照是目录型附件，F12） */
 async function resolveSnapshotEntry(filePath) {
@@ -198,7 +199,10 @@ function createIntegrations(options) {
   }
   const configuredTimeout = Number(options.requestTimeoutMs);
   const REQUEST_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 30000;
-  const request = function (url, init) {
+  // 同步会话期间非空的节流器：所有 WebDAV 请求经它排队（坚果云 30 分钟窗口预算），
+  // 并在响应 429 时记下暂停时刻。仅在 runSyncTask 串行保护的同步会话内赋值。
+  let activePacer = null;
+  const dispatchRequest = function (url, init) {
     return new Promise(function (resolve, reject) {
       let settled = false;
       const controller = typeof AbortController === 'function' ? new AbortController() : null;
@@ -239,6 +243,17 @@ function createIntegrations(options) {
         reject(error);
       });
     });
+  };
+  const request = async function (url, init) {
+    if (activePacer) await activePacer.acquire();
+    const response = await dispatchRequest(url, init);
+    if (activePacer && response && response.status === 429) {
+      // 交由节流器记账（消费 Retry-After、持久化恢复时刻）并转为暂停；
+      // 未启用节流的调用方仍由各请求点的 throwIfWebDavRateLimited 兜底。
+      const retryAfter = response.headers && response.headers.get ? String(response.headers.get('retry-after') || '').trim() : '';
+      throw activePacer.noteRateLimited(retryAfter);
+    }
+    return response;
   };
   const safeStorage = options.safeStorage;
   // AI 助手接口协议（与 js/agentproto.js 的 DIALECTS 对应；空串 = 自动判定）
@@ -432,6 +447,8 @@ function createIntegrations(options) {
       nutstoreUser: raw.nutstoreUser || '',
       hasNutstorePassword: !!raw.nutstorePassword,
       nutstoreFolder: normalizeWebDavFolder(raw.nutstoreFolder, 'LitBoard'),
+      // 坚果云限流档位：免费版 600 次/30 分钟（默认，按最差情况），专业版 1500
+      nutstorePacing: raw.nutstorePacing === 'pro' ? 'pro' : 'free',
       zoteroWebDavFolder: raw.zoteroWebDavFolder || 'zotero',
       zoteroDataDir: raw.zoteroDataDir || '',
       translatorProvider: translators[raw.translatorProvider] ? raw.translatorProvider : DEFAULT_TRANSLATOR,
@@ -488,6 +505,9 @@ function createIntegrations(options) {
       nutstoreUser: String(input.nutstoreUser != null ? input.nutstoreUser : current.nutstoreUser || '').trim(),
       nutstorePassword: input.nutstorePassword ? encrypt(String(input.nutstorePassword)) : current.nutstorePassword || '',
       nutstoreFolder: normalizeWebDavFolder(input.nutstoreFolder != null ? input.nutstoreFolder : current.nutstoreFolder, 'LitBoard'),
+      nutstorePacing: input.nutstorePacing === 'pro' || input.nutstorePacing === 'free'
+        ? input.nutstorePacing
+        : (current.nutstorePacing === 'pro' ? 'pro' : 'free'),
       zoteroWebDavFolder: String(input.zoteroWebDavFolder != null ? input.zoteroWebDavFolder : current.zoteroWebDavFolder || 'zotero')
         .trim().replace(/^\/+|\/+$/g, '') || 'zotero',
       zoteroDataDir: String(input.zoteroDataDir != null ? input.zoteroDataDir : current.zoteroDataDir || '').trim(),
@@ -1182,8 +1202,48 @@ function createIntegrations(options) {
 
   const pendingSyncPlans = new Map();
   const SYNC_BASE_FILE = path.join(options.baseDir, 'sync-base.json');
+  const SYNC_HISTORY_DIR = path.join(options.baseDir, 'sync-history');
   /** 对照弹窗里「本机为空疑似重置」总体决议的键（渲染层同名常量保持一致） */
   const LOCAL_EMPTY_RESET_KEY = 'plan:local-empty-reset';
+  /** 「合并会大批移除云端词条」与「云端无库将首次上传」两个强制确认项的键 */
+  const MASS_DROP_RESET_KEY = 'plan:mass-drop-reset';
+  const FIRST_UPLOAD_KEY = 'plan:first-upload';
+
+  /** 一次同步会话的全部状态：附件台账（含限流 pacing 持久化）、本会话已核实
+   *  的云端对象名集合、云端备份链的会话级去重。nutstoreSyncOnce 与
+   *  applyNutstoreSyncPlan 各建一个，贯穿库写入与附件同步。 */
+  async function createSyncSession(remoteOptions) {
+    const ledger = await loadAssetLedger(remoteOptions);
+    const session = {
+      ledger: ledger,
+      verifiedNames: new Set(),
+      backupsDone: new Set(),
+      madeBackupDirs: new Set(),
+      pacer: null
+    };
+    if (options.pacing) {
+      const inject = typeof options.pacing === 'object' ? options.pacing : {};
+      session.pacer = createRequestPacer(Object.assign({
+        profile: remoteOptions.pacing,
+        loadState: async function () { return ledger.pacing; },
+        saveState: async function (value) {
+          ledger.pacing = value;
+          try { await saveAssetLedger(ledger); } catch (error) {}
+        }
+      }, inject));
+    }
+    return session;
+  }
+
+  /** 限流暂停 → 软结果：不当作同步失败抛给渲染层，而是带上恢复时刻与说明，
+   *  由渲染层展示状态并调度自动续传。 */
+  function pausedSyncResult(error, workspace) {
+    const retryAfter = Number(error && error.retryAfter) || 0;
+    const resumeAt = Number(error && error.resumeAt) ||
+      Date.now() + (retryAfter > 0 ? retryAfter * 1000 : 30 * 60 * 1000);
+    return { paused: true, resumeAt: resumeAt, message: error && error.message || '同步已因限流暂停',
+      workspace: workspace || null, uploaded: false };
+  }
 
   /** 同步进度上报（渲染层经 integrations:sync-progress 接收） */
   function emitSyncProgress(payload) {
@@ -1221,19 +1281,11 @@ function createIntegrations(options) {
       .replace(/&apos;/g, "'").replace(/&amp;/g, '&');
   }
 
-  async function listRemoteAssetNames(remoteOptions) {
-    const response = await request(remoteOptions.attachmentsUrl, {
-      method: 'PROPFIND',
-      headers: Object.assign({ Depth: 'infinity', 'Content-Type': 'application/xml; charset=utf-8' }, remoteOptions.headers),
-      body: '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
-    });
-    throwIfWebDavRateLimited(response);
-    if (response.status === 404 || response.status === 409) return new Set();
-    // 部分 WebDAV 服务不支持 Depth: infinity；此时回退到正常逐文件上传。
-    if (response.status === 403 || response.status === 405 || response.status === 501) return null;
-    if (!response.ok) throw new Error('坚果云附件清单读取失败（' + response.status + '）');
-    const body = await response.text();
-    const baseUrl = new URL(remoteOptions.attachmentsUrl.replace(/\/+$/, '') + '/');
+  const PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>';
+  const PROPFIND_PAGE_SIZE = 750; // 坚果云单次列目录上限，超出需按 Range: rows=a-b 翻页
+
+  function parsePropfindNames(body, attachmentsUrl) {
+    const baseUrl = new URL(attachmentsUrl.replace(/\/+$/, '') + '/');
     const basePath = baseUrl.pathname;
     const names = new Set();
     const hrefPattern = /<(?:[A-Za-z_][\w.-]*:)?href\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?href>/gi;
@@ -1251,12 +1303,44 @@ function createIntegrations(options) {
     return names;
   }
 
+  /** 真实列出云端 attachments/ 下的对象名（分页）。返回：
+   *  Set —— 实际清单；null —— 服务器不支持该 PROPFIND（403/405/501）。 */
+  async function listRemoteAssetNames(remoteOptions) {
+    const names = new Set();
+    for (let page = 0; page < 40; page++) {
+      const start = page * PROPFIND_PAGE_SIZE;
+      const response = await request(remoteOptions.attachmentsUrl, {
+        method: 'PROPFIND',
+        headers: Object.assign({
+          Depth: 'infinity', 'Content-Type': 'application/xml; charset=utf-8',
+          Range: 'rows=' + start + '-' + (start + PROPFIND_PAGE_SIZE - 1)
+        }, remoteOptions.headers),
+        body: PROPFIND_BODY
+      });
+      throwIfWebDavRateLimited(response);
+      if (response.status === 404 || response.status === 409) return names;
+      // 部分 WebDAV 服务不支持 Depth:infinity；此时回退到库 JSON 登记名（见调用方）。
+      if (response.status === 403 || response.status === 405 || response.status === 501) return null;
+      if (!response.ok) throw new Error('坚果云附件清单读取失败（' + response.status + '）');
+      const pageNames = parsePropfindNames(await response.text(), remoteOptions.attachmentsUrl);
+      let fresh = 0;
+      pageNames.forEach(function (name) { if (!names.has(name)) { names.add(name); fresh++; } });
+      // 不足一页 = 最后一页；fresh=0 = 服务器忽略 Range 一次性给全（或分页停滞）
+      if (pageNames.size < PROPFIND_PAGE_SIZE || fresh === 0) break;
+    }
+    return names;
+  }
+
+  /** 本会话的云端对象存在性证据。库 JSON 里的 cloudName 登记绝不能当存在性
+   *  证明使用（正是「假元数据自证已上传、永不重传」事故的根源）：只要两侧
+   *  出现任何登记名就做一次真实 PROPFIND。服务器不支持清单时退回登记名集合
+   *  （此时不做写前净化，见 sanitizeCloudAssets）。 */
   async function resolveRemoteAssetNames(remoteWorkspace, localWorkspace, remoteOptions, onScan) {
     const names = remoteAssetNames(remoteWorkspace);
-    if (names.size || !remoteAssetNames(localWorkspace).size) return names;
+    if (!names.size && !remoteAssetNames(localWorkspace).size) return new Set();
     if (onScan) onScan();
     const listed = await listRemoteAssetNames(remoteOptions);
-    return listed || names;
+    return listed === null ? names : listed;
   }
 
   function cloneJson(value) {
@@ -1289,7 +1373,8 @@ function createIntegrations(options) {
       headers: { Authorization: basicAuth(user, password) },
       folderUrl: folderUrl,
       fileUrl: joinUrl(folderUrl, 'litboard-library.json'),
-      attachmentsUrl: joinUrl(folderUrl, 'attachments')
+      attachmentsUrl: joinUrl(folderUrl, 'attachments'),
+      pacing: (supplied.nutstorePacing != null ? supplied.nutstorePacing : raw.nutstorePacing) === 'pro' ? 'pro' : 'free'
     };
   }
 
@@ -1310,6 +1395,7 @@ function createIntegrations(options) {
     }
     result.exists = true;
     result.remote = remote;
+    await archiveLocalLibrary(remote);
     return result;
   }
 
@@ -1332,7 +1418,110 @@ function createIntegrations(options) {
     throw error;
   }
 
-  async function writeCloudLibrary(remoteOptions, workspace, baseline, reportProgress) {
+  /** 本地留档：每次读到的云端库内容按内容寻址存进 sync-history/（同内容只存
+   *  一份，写后校验的重复读取零成本），保留最近 20 份。覆盖云端前的最后一道
+   *  保险——事故后可从数据目录直接取回任意历史版本的库 JSON。 */
+  async function archiveLocalLibrary(remoteValue) {
+    if (!remoteValue || typeof remoteValue !== 'object') return true;
+    try {
+      await fs.mkdir(SYNC_HISTORY_DIR, { recursive: true });
+      const digest = crypto.createHash('sha256').update(JSON.stringify(remoteValue)).digest('hex').slice(0, 16);
+      const file = path.join(SYNC_HISTORY_DIR, 'library-' + digest + '.json');
+      try { await fs.access(file); } catch (error) {
+        await fs.writeFile(file, JSON.stringify(remoteValue, null, 2), 'utf8');
+      }
+      const entries = await fs.readdir(SYNC_HISTORY_DIR);
+      const archives = [];
+      for (const name of entries) {
+        if (!/^library-[0-9a-f]{16}\.json$/.test(name)) continue;
+        try { archives.push({ name: name, mtimeMs: (await fs.stat(path.join(SYNC_HISTORY_DIR, name))).mtimeMs }); } catch (error) {}
+      }
+      archives.sort(function (a, b) { return b.mtimeMs - a.mtimeMs; });
+      for (let i = 20; i < archives.length; i++) {
+        await fs.rm(path.join(SYNC_HISTORY_DIR, archives[i].name), { force: true }).catch(function () {});
+      }
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  const REMOTE_BACKUP_KEEP = 5;
+  const REMOTE_BACKUP_PRUNE_AT = 8;
+
+  /** 云端备份链：覆盖 litboard-library.json 之前，把现有内容 COPY 到
+   *  backups/library-{时间戳}.json（WebDAV COPY 不可用时 GET+PUT 兜底），保留
+   *  最近 5 份、超过 8 份才清理（DELETE 也消耗请求配额，不必每次都删）。
+   *  云端备份尽力而为（失败不阻断同步），但本地 sync-history 留档必须成功。 */
+  async function backupCloudLibrary(remoteOptions, baseline, session) {
+    if (!(await archiveLocalLibrary(baseline.remote))) {
+      throw new Error('无法在本地留存云端库备份（sync-history 写入失败），已中止覆盖写入');
+    }
+    const backupsUrl = joinUrl(remoteOptions.folderUrl, 'backups');
+    try {
+      if (!session.madeBackupDirs.has(backupsUrl)) {
+        const mkcol = await request(backupsUrl, { method: 'MKCOL', headers: remoteOptions.headers });
+        throwIfWebDavRateLimited(mkcol);
+        if (!mkcol.ok && mkcol.status !== 405) throw new Error('HTTP ' + mkcol.status);
+        session.madeBackupDirs.add(backupsUrl);
+      }
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const backupName = 'library-' + stamp + '.json';
+      const destination = new URL(joinUrl(backupsUrl, backupName));
+      const copy = await request(remoteOptions.fileUrl, {
+        method: 'COPY',
+        headers: Object.assign({ Destination: destination.href, Overwrite: 'T' }, remoteOptions.headers)
+      });
+      throwIfWebDavRateLimited(copy);
+      if (!copy.ok && copy.status !== 404) {
+        // 服务器不支持 COPY：GET+PUT 兜底复制一份
+        const current = await readRemoteLibrary(remoteOptions);
+        if (current.exists) {
+          const put = await request(joinUrl(backupsUrl, backupName), {
+            method: 'PUT',
+            headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, remoteOptions.headers),
+            body: JSON.stringify(current.remote, null, 2)
+          });
+          throwIfWebDavRateLimited(put);
+          if (!put.ok) throw new Error('HTTP ' + put.status);
+        }
+      }
+      await pruneRemoteBackups(remoteOptions, backupsUrl);
+    } catch (error) {
+      if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED' || error.code === 'SYNC_RATE_PAUSED')) throw error;
+      // 云端备份失败不阻断同步：本地 sync-history 已有同一份内容的留档。
+    }
+  }
+
+  async function pruneRemoteBackups(remoteOptions, backupsUrl) {
+    const response = await request(backupsUrl, {
+      method: 'PROPFIND',
+      headers: Object.assign({ Depth: '1', 'Content-Type': 'application/xml; charset=utf-8' }, remoteOptions.headers),
+      body: PROPFIND_BODY
+    });
+    throwIfWebDavRateLimited(response);
+    if (!response.ok) return; // 看不见清单就不删，宁可多留
+    const body = await response.text();
+    const baseUrl = new URL(backupsUrl.replace(/\/+$/, '') + '/');
+    const names = [];
+    const hrefPattern = /<(?:[A-Za-z_][\w.-]*:)?href\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?href>/gi;
+    let match;
+    while ((match = hrefPattern.exec(body))) {
+      let target;
+      try { target = new URL(xmlText(match[1]).trim(), baseUrl); } catch (error) { continue; }
+      const name = decodeURIComponent(target.pathname.slice(baseUrl.pathname.length));
+      if (/^library-\d{4}-\d{2}-\d{2}T[\w-]+\.json$/.test(name)) names.push(name);
+    }
+    if (names.length <= REMOTE_BACKUP_PRUNE_AT) return;
+    names.sort().reverse(); // 时间戳命名：字典序倒序 = 新在前
+    for (let i = REMOTE_BACKUP_KEEP; i < names.length; i++) {
+      const del = await request(joinUrl(backupsUrl, names[i]), { method: 'DELETE', headers: remoteOptions.headers });
+      throwIfWebDavRateLimited(del);
+      if (!del.ok && del.status !== 404) return; // 删除异常就停，下次再清
+    }
+  }
+
+  async function writeCloudLibrary(remoteOptions, workspace, baseline, reportProgress, session) {
     const sameContent = hashWorkspace(workspace) === hashWorkspace(baseline.remote);
     const currentVersion = Number(baseline.remote && baseline.remote.syncVersion) >= LitSync.SYNC_VERSION;
     if (baseline.exists && sameContent && currentVersion) return { current: baseline, uploaded: false };
@@ -1343,6 +1532,14 @@ function createIntegrations(options) {
       }
     }
     throwIfSyncCancelled();
+    // 覆盖已有云端库之前先留档（同一会话同一份内容只备份一次）：
+    if (baseline.exists && session) {
+      const contentKey = hashWorkspace(baseline.remote);
+      if (!session.backupsDone.has(contentKey)) {
+        await backupCloudLibrary(remoteOptions, baseline, session);
+        session.backupsDone.add(contentKey);
+      }
+    }
     reportProgress('upload', '正在写入云端库…');
     const payload = LitSync.createSyncEnvelope(workspace);
     await conditionalPut(remoteOptions.fileUrl, JSON.stringify(payload, null, 2), remoteOptions.headers,
@@ -1464,17 +1661,22 @@ function createIntegrations(options) {
     const made = {};
     const downloadDir = path.join(options.baseDir, 'synced-attachments');
     const knownRemoteAssets = config.remoteAssets instanceof Set ? config.remoteAssets : null;
+    // 本会话「上传成功 / 下载核实 / 签名免读核实」的云端对象名：写云端库 JSON 时
+    // 只有这些（或真实清单确认存在）的附件元数据才允许保留（sanitizeCloudAssets）。
+    const verifiedNames = config.verifiedNames instanceof Set ? config.verifiedNames : new Set();
     const missingRemotely = function (cloudName) {
       return !!knownRemoteAssets && !knownRemoteAssets.has(cloudName);
     };
     await fs.mkdir(downloadDir, { recursive: true });
-    // 附件上传台账：记住哪些云端对象已成功 PUT 过，同步中断后下一轮续传
-    const assetLedger = await loadAssetLedger(remoteOptions);
+    // 附件上传台账：记住哪些云端对象已成功 PUT 过，同步中断后下一轮续传。
+    // 会话已带台账（限流 pacing 状态也在里面）时直接复用，避免重复读盘。
+    const assetLedger = config.ledger || await loadAssetLedger(remoteOptions);
     const noteLedger = async function (cloudName, hash, size) {
       recordAssetLedger(assetLedger, cloudName, hash, size);
       try { await saveAssetLedger(assetLedger); } catch (error) {}
     };
     let uploaded = 0, downloaded = 0, verified = 0;
+    let pendingUpload = 0, missingOnCloud = 0;
     // body/hash 由调用方传入（processAsset 已读过并算过哈希），避免大附件双倍读盘
     const uploadAsset = async function (asset, body, actualHash, cloudName, item) {
       try {
@@ -1485,11 +1687,16 @@ function createIntegrations(options) {
         throwIfWebDavRateLimited(response);
         if (!response.ok) throw new Error('HTTP ' + response.status);
       } catch (error) {
-        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
+        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED' || error.code === 'SYNC_RATE_PAUSED')) throw error;
         throw assetError('附件上传失败：' + (error && error.message || error), item, error);
       }
+      // 对象先行不变式：PUT 返回 2xx 之后才把 cloudName/hash/size 写进词条。
+      // 失败时云端库 JSON 不留下任何「已上传」的假元数据（旧实现先写名字，
+      // 失败后悬空，其他设备只能 404）。
+      asset.cloudName = cloudName;
       asset.cloudHash = actualHash;
       asset.cloudSize = body.length;
+      verifiedNames.add(cloudName);
       await noteLedger(cloudName, actualHash, body.length);
       uploaded++;
       return { hash: actualHash, size: body.length };
@@ -1505,6 +1712,7 @@ function createIntegrations(options) {
           // 稳态快捷路径：cloudName 已定且 cloudHash+size+mtime 与上次核对一致 → 免读盘重哈希
           if (!isSnapshot && cloudName &&
               assetSignatureUnchanged(asset, assetLocalSignature(stat, asset.cloudHash), cloudName, knownRemoteAssets, stat.size)) {
+            verifiedNames.add(cloudName);
             verified++;
             return;
           }
@@ -1513,23 +1721,25 @@ function createIntegrations(options) {
           cloudName = cloudName || (isSnapshot ? 'snapshots/' + paper.id + '/' + asset.id + '.png' :
             (asset.id === primaryId ? paper.id + '.pdf' : paper.id + '/' + asset.id + assetExtension(asset.fileName, '.pdf')));
           if (!cloudName) throw new Error('云端文件名无效');
-          asset.cloudName = cloudName;
           const expectedHash = String(asset.cloudHash || '').toLowerCase();
           const expectedSize = asset.cloudSize == null ? null : Number(asset.cloudSize);
           if ((missingRemotely(cloudName) || !expectedHash || expectedHash !== actualHash || expectedSize != null && expectedSize !== body.length) &&
               !assetLedgerProof(assetLedger, cloudName, actualHash, body.length, knownRemoteAssets)) {
             await uploadAsset(asset, body, actualHash, cloudName, item);
           } else {
+            asset.cloudName = cloudName;
             asset.cloudHash = actualHash;
             asset.cloudSize = body.length;
+            verifiedNames.add(cloudName);
             verified++;
           }
           if (!isSnapshot) asset.syncSignature = assetLocalSignature(stat, asset.cloudHash);
           return;
         } catch (error) {
-          if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
+          if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED' || error.code === 'SYNC_RATE_PAUSED')) throw error;
           if (error && error.item) {
             failures.push(error);
+            pendingUpload++;
             return;
           }
           // A stale local path is equivalent to a missing local file; if a
@@ -1542,7 +1752,12 @@ function createIntegrations(options) {
         }
       }
       cloudName = cloudName || safeCloudName(asset.cloudName);
-      if (!cloudName) return;
+      if (!cloudName) {
+        // 本机没有文件、云端也没有登记：源设备的上传还没成功过，计入「云端缺失」
+        // 报告而不是静默跳过——这正是「词条在、PDF 不在」假象的可见化。
+        missingOnCloud++;
+        return;
+      }
       asset.cloudName = cloudName;
       const target = assetTarget(paper, asset, isSnapshot);
       const expectedHash = String(asset.cloudHash || '').toLowerCase();
@@ -1558,6 +1773,7 @@ function createIntegrations(options) {
         if (isSnapshot) asset.imagePath = target;
         else { asset.path = target; asset.syncSignature = assetLocalSignature(stat, asset.cloudHash); }
         if (!asset.fileName && !isSnapshot) asset.fileName = path.posix.basename(cloudName);
+        verifiedNames.add(cloudName);
         verified++;
         return;
       } catch (error) {
@@ -1580,12 +1796,14 @@ function createIntegrations(options) {
         }
         asset.cloudHash = result.hash;
         asset.cloudSize = result.size;
+        verifiedNames.add(cloudName);
         await noteLedger(cloudName, result.hash, result.size);
         if (!asset.fileName && !isSnapshot) asset.fileName = path.posix.basename(cloudName);
         downloaded++;
       } catch (error) {
-        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
+        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED' || error.code === 'SYNC_RATE_PAUSED')) throw error;
         failures.push(error && error.item ? error : assetError(error.message || '附件下载失败', item, error));
+        missingOnCloud++;
       }
     };
     /** 递归枚举目录文件（同步资产用）：[{rel, abs, size, mtimeMs}]，超限额抛错 */
@@ -1625,11 +1843,14 @@ function createIntegrations(options) {
         throwIfWebDavRateLimited(response);
         if (!response.ok) throw new Error('HTTP ' + response.status);
       } catch (error) {
-        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
+        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED' || error.code === 'SYNC_RATE_PAUSED')) throw error;
         throw assetError('附件上传失败：' + (error && error.message || error), item, error);
       }
+      // 对象先行：PUT 2xx 之后才写 cloudName/hash/size（与 uploadAsset 同款不变式）
+      asset.cloudName = cloudName;
       asset.cloudHash = actualHash;
       asset.cloudSize = body.length;
+      verifiedNames.add(cloudName);
       await noteLedger(cloudName, actualHash, body.length);
       uploaded++;
     }
@@ -1647,6 +1868,7 @@ function createIntegrations(options) {
           const listingSig = dirSignature(files);
           // 清单（路径+大小+mtime）+ 记录时 cloudHash 与上次核对一致 → 免重读全部文件重新打 ZIP 哈希
           if (assetSignatureUnchanged(asset, listingSig + ':' + String(asset.cloudHash || '').toLowerCase(), cloudName, knownRemoteAssets, null)) {
+            verifiedNames.add(cloudName);
             verified++;
             return;
           }
@@ -1663,22 +1885,24 @@ function createIntegrations(options) {
             readWorker(), readWorker(), readWorker(), readWorker()]);
           const zip = await zipStoreEntries(entries);
           const actualHash = await hashBuffer(zip);
-          asset.cloudName = cloudName;
           if ((missingRemotely(cloudName) || String(asset.cloudHash || '').toLowerCase() !== actualHash ||
               (asset.cloudSize != null && Number(asset.cloudSize) !== zip.length)) &&
               !assetLedgerProof(assetLedger, cloudName, actualHash, zip.length, knownRemoteAssets)) {
             await uploadBuffer(asset, zip, cloudName, item);
           } else {
+            asset.cloudName = cloudName;
             asset.cloudHash = actualHash;
             asset.cloudSize = zip.length;
+            verifiedNames.add(cloudName);
             verified++;
           }
           asset.syncSignature = listingSig + ':' + String(asset.cloudHash || '').toLowerCase();
           return;
         } catch (error) {
-          if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
+          if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED' || error.code === 'SYNC_RATE_PAUSED')) throw error;
           if (error && error.item) {
             failures.push(error);
+            pendingUpload++;
             return;
           }
           if (!asset.cloudName) return; // 本机路径失效且无云端对象：保留元数据不误报
@@ -1692,7 +1916,7 @@ function createIntegrations(options) {
       const targetDir = path.join(itemAttachmentDir(options.baseDir, paperId), assetId + '.snapshot');
       try {
         const stat = await fs.stat(targetDir);
-        if (stat.isDirectory() && asset.cloudHash) { asset.path = targetDir; verified++; return; }
+        if (stat.isDirectory() && asset.cloudHash) { asset.path = targetDir; verifiedNames.add(cloudName); verified++; return; }
       } catch (error) {}
       try {
         const response = await request(joinUrl(remoteOptions.attachmentsUrl, cloudName), { method: 'GET', headers: remoteOptions.headers });
@@ -1732,11 +1956,13 @@ function createIntegrations(options) {
         asset.cloudHash = snapshotHash;
         asset.cloudSize = body.length;
         asset.syncSignature = '';
+        verifiedNames.add(cloudName);
         await noteLedger(cloudName, snapshotHash, body.length);
         downloaded++;
       } catch (error) {
-        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
+        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED' || error.code === 'SYNC_RATE_PAUSED')) throw error;
         failures.push(error && error.item ? error : assetError(error.message || '快照下载失败', item, error));
+        missingOnCloud++;
       }
     }
 
@@ -1752,28 +1978,33 @@ function createIntegrations(options) {
           if (!stat.isFile()) throw new Error('不是文件');
           const body = await fs.readFile(localPath);
           const actualHash = await hashBuffer(body);
-          asset.cloudName = cloudName;
           if ((missingRemotely(cloudName) || String(asset.cloudHash || '').toLowerCase() !== actualHash ||
               (asset.cloudSize != null && Number(asset.cloudSize) !== body.length)) &&
               !assetLedgerProof(assetLedger, cloudName, actualHash, body.length, knownRemoteAssets)) {
             await uploadBuffer(asset, body, cloudName, item);
           } else {
+            asset.cloudName = cloudName;
             asset.cloudHash = actualHash;
             asset.cloudSize = body.length;
+            verifiedNames.add(cloudName);
             verified++;
           }
           return;
         } catch (error) {
-          if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
+          if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED' || error.code === 'SYNC_RATE_PAUSED')) throw error;
           if (error && error.item) {
             failures.push(error);
+            pendingUpload++;
             return;
           }
           if (!asset.cloudName) return;
         }
       }
       cloudName = cloudName || safeCloudName(asset.cloudName);
-      if (!cloudName) return;
+      if (!cloudName) {
+        missingOnCloud++;
+        return;
+      }
       asset.cloudName = cloudName;
       const target = path.join(noteAssetsDir, note.id, safeName);
       const expectedHash = String(asset.cloudHash || '').toLowerCase();
@@ -1783,6 +2014,7 @@ function createIntegrations(options) {
         if (expectedHash && (await hashBuffer(body)) === expectedHash &&
             (expectedSize == null || body.length === expectedSize)) {
           asset.path = target;
+          verifiedNames.add(cloudName);
           verified++;
           return;
         }
@@ -1793,11 +2025,13 @@ function createIntegrations(options) {
         asset.path = target;
         asset.cloudHash = result.hash;
         asset.cloudSize = result.size;
+        verifiedNames.add(cloudName);
         await noteLedger(cloudName, result.hash, result.size);
         downloaded++;
       } catch (error) {
-        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED')) throw error;
+        if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_CANCELLED' || error.code === 'SYNC_RATE_PAUSED')) throw error;
         failures.push(error && error.item ? error : assetError(error.message || '笔记资产下载失败', item, error));
+        missingOnCloud++;
       }
     }
 
@@ -1876,7 +2110,45 @@ function createIntegrations(options) {
       try { await saveAssetLedger(assetLedger); } catch (error) {}
     }
     if (failures.length && config.strict !== false) throw new AssetSyncError(failures);
-    return { uploaded: uploaded, downloaded: downloaded, verified: verified, failures: failures };
+    return {
+      uploaded: uploaded, downloaded: downloaded, verified: verified, failures: failures,
+      // 面向 UI 的诚实状态：待上传（本机有文件但没传上去，续传队列）与
+      // 云端缺失（登记悬空或源设备尚未传成，本机无从下载）分开计数。
+      pendingUpload: pendingUpload, missingOnCloud: missingOnCloud, verifiedNames: verifiedNames
+    };
+  }
+
+  /** 云端写入前的附件元数据净化（对象先行不变式的写侧执行）：
+   *  verifiedNames（本会话上传/核实成功）∪ 真实远端清单之外的 cloudName 一律
+   *  剥离，云端库 JSON 不留下「词条声称有附件但对象不存在」的悬空登记。
+   *  返回净化后的深拷贝（绝不原地改动合并结果）；knownRemoteAssets 为 null
+   *  （服务器不支持清单）时不净化，维持旧语义。 */
+  function sanitizeCloudAssets(workspace, verifiedNames, knownRemoteAssets) {
+    if (!knownRemoteAssets) return { workspace: workspace, stripped: 0 };
+    const out = cloneJson(workspace);
+    const verified = verifiedNames instanceof Set ? verifiedNames : new Set();
+    let stripped = 0;
+    const visit = function (asset) {
+      if (!asset) return;
+      const name = safeCloudName(asset.cloudName);
+      if (name && !verified.has(name) && !knownRemoteAssets.has(name)) {
+        delete asset.cloudName;
+        delete asset.cloudHash;
+        delete asset.cloudSize;
+        stripped++;
+      }
+    };
+    (Array.isArray(out.papers) ? out.papers : []).forEach(function (paper) {
+      if (!paper) return;
+      (Array.isArray(paper.attachments) ? paper.attachments : []).forEach(visit);
+      (Array.isArray(paper.pdfAnnotations) ? paper.pdfAnnotations : []).forEach(function (annotation) {
+        if (annotation && annotation.type === 'snapshot') visit(annotation);
+      });
+    });
+    (Array.isArray(out.notes) ? out.notes : []).forEach(function (note) {
+      if (note) (Array.isArray(note.assets) ? note.assets : []).forEach(visit);
+    });
+    return { workspace: out, stripped: stripped };
   }
 
   async function writeSyncBase(value) {
@@ -1934,6 +2206,39 @@ function createIntegrations(options) {
           id: annotation.id, cloudName: annotation.cloudName, hash: annotation.cloudHash || '', size: annotation.cloudSize == null ? null : Number(annotation.cloudSize) });
       });
     });
+    (Array.isArray(remote.notes) ? remote.notes : []).forEach(function (note) {
+      if (!note) return;
+      (Array.isArray(note.assets) ? note.assets : []).forEach(function (asset) {
+        if (asset && asset.cloudName) assets.push({ type: 'noteAsset', paperId: note.paperId || '', id: note.id,
+          cloudName: asset.cloudName, hash: asset.cloudHash || '', size: asset.cloudSize == null ? null : Number(asset.cloudSize) });
+      });
+    });
+    // 对账（_skipAudit 的调用方——同步计划流程——稍后会自行列清单，跳过以免重复）：
+    // 真实 PROPFIND 云端对象 vs 库 JSON 登记。「词条声称有附件但云端没有对象」
+    // 正是历史事故里 210 篇 PDF「看起来已同步、实际从未上传」的缺口，必须可见。
+    let audit = null;
+    if (!input || !input._skipAudit) {
+      const claimed = new Set(assets.map(function (item) { return item.cloudName; }));
+      let actual = null;
+      try { actual = await listRemoteAssetNames(remoteOptions); } catch (error) {}
+      if (actual) {
+        const missing = [];
+        const orphans = [];
+        claimed.forEach(function (name) { if (!actual.has(name)) missing.push(name); });
+        actual.forEach(function (name) { if (!claimed.has(name)) orphans.push(name); });
+        audit = {
+          supported: true,
+          claimedCount: claimed.size,
+          actualCount: actual.size,
+          missingCount: missing.length,
+          orphanCount: orphans.length,
+          missing: missing.slice(0, 50),
+          orphans: orphans.slice(0, 50)
+        };
+      } else {
+        audit = { supported: false };
+      }
+    }
     return {
       ok: true,
       exists: library.exists,
@@ -1953,6 +2258,7 @@ function createIntegrations(options) {
         snapshots: assets.filter(function (item) { return item.type === 'snapshot'; }).length
       },
       assets: assets,
+      audit: audit,
       syncVersion: Number(remote.syncVersion) || 0,
       configVersion: remoteConfig.value ? Number(remoteConfig.value.version) || 1 : null
     };
@@ -1965,7 +2271,9 @@ function createIntegrations(options) {
   async function createNutstoreSyncPlan(input) {
     const value = input && typeof input === 'object' ? input : {};
     const remoteOptions = await resolveNutstoreOptions(value);
-    const inspected = await inspectNutstoreRemote(value);
+    // 计划流程随后会自行做真实 PROPFIND（resolveRemoteAssetNames），这里跳过
+    // inspect 的对账扫描，避免一次会话列两遍附件清单。
+    const inspected = await inspectNutstoreRemote(Object.assign({}, value, { _skipAudit: true }));
     const localValue = value.workspace || value.localValue || (value.papers ? value : { papers: [], folders: [] });
     const mode = value.mode === 'restore' || value.mode === 'pull' || value.mode === 'remote' ? 'restore' : 'merge';
     if (mode === 'restore' && !inspected.exists) {
@@ -1998,6 +2306,27 @@ function createIntegrations(options) {
     // 双方都有同 ID 修改则列为待选择冲突，而不是猜测时间戳胜负。
     if (base && base.workspace) planInput.baseWorkspace = base.workspace;
     const corePlan = LitSync.createSyncPlan(planInput);
+    // 防覆盖断路器（比例版，不依赖基线）：三方合并会把远端「有效词条」大批移除。
+    // 正常的单篇删除不会触发；触发的是「本机整批实体缺失」被当成删除传播——
+    // 数据目录切换/部分读取失败，或用户真删了一批。无论哪种，达到阈值就暂停
+    // 自动写入、强制人工确认，杜绝「本地 4 篇覆盖云端 210 篇」这类静默事故。
+    const remoteActiveIds = new Set();
+    ((inspected.remote && inspected.remote.papers) || []).forEach(function (paper) {
+      if (paper && !paper.deletedAt) remoteActiveIds.add(String(paper.id));
+    });
+    const mergedActiveIds = new Set();
+    ((((corePlan.preview || {}).workspace || {}).papers) || []).forEach(function (paper) {
+      if (paper && !paper.deletedAt) mergedActiveIds.add(String(paper.id));
+    });
+    let droppedRemoteCount = 0;
+    remoteActiveIds.forEach(function (id) {
+      if (!mergedActiveIds.has(id)) droppedRemoteCount++;
+    });
+    const massDropSuspected = mode === 'merge' && inspected.exists && remoteActiveIds.size > 0 &&
+      droppedRemoteCount >= Math.max(3, Math.ceil(remoteActiveIds.size * 0.1));
+    // 首传确认：云端没有库文件而本机非空。多数是正常的新库初始化，但也可能是
+    // 账号/同步目录名填错（大小写不同即另一个目录）。写之前让用户看一眼。
+    const firstUploadSuspected = mode === 'merge' && !inspected.exists && !base && localPaperCount > 0;
     const conflicts = (corePlan.conflicts || []).map(function (conflict) {
       return Object.assign({}, conflict, { choice: null });
     });
@@ -2049,12 +2378,18 @@ function createIntegrations(options) {
       localEmptyReset: localEmptyReset,
       baseRecoveryAvailable: baseRecoveryAvailable,
       baseRecoveryCount: baseRecoveryAvailable ? basePaperCount : 0,
+      massDropSuspected: massDropSuspected,
+      massDropCount: massDropSuspected ? droppedRemoteCount : 0,
+      remoteActiveCount: remoteActiveIds.size,
+      firstUploadSuspected: firstUploadSuspected,
+      localPaperCount: localPaperCount,
       corePlan: corePlan,
       config: inspected.config,
       assets: inspected.assets,
       remoteKey: baseKey,
       portableSettings: cloneJson(value.portableSettings || {}),
-      requiresConfirmation: mode === 'restore' || conflicts.length > 0 || remoteResetSuspected,
+      requiresConfirmation: mode === 'restore' || conflicts.length > 0 || remoteResetSuspected ||
+        massDropSuspected || firstUploadSuspected,
       _options: remoteOptions,
       _remoteConfig: inspected.config && inspected.config.value ? null : null
     };
@@ -2072,13 +2407,17 @@ function createIntegrations(options) {
 
   /** 「本机为空疑似重置」的总体决议：对照弹窗以 plan:local-empty-reset 为键
    * 提交 'remote'（把远端拉回本机）或 'local'（确认清空远端）；未选择返回 ''。 */
-  function localEmptyResetChoice(resolutions) {
+  function planKeyChoice(resolutions, key) {
     let value = Array.isArray(resolutions)
-      ? (resolutions.find(function (item) { return item && (item.conflictId === LOCAL_EMPTY_RESET_KEY || item.key === LOCAL_EMPTY_RESET_KEY); }) || {}).choice
-      : resolutions && resolutions[LOCAL_EMPTY_RESET_KEY];
+      ? (resolutions.find(function (item) { return item && (item.conflictId === key || item.key === key || item.id === key); }) || {}).choice
+      : resolutions && resolutions[key];
     if (value && typeof value === 'object') value = value.choice || value.resolution || value.value;
     value = String(value || '').toLowerCase();
     return value === 'remote' ? 'remote' : (value === 'local' ? 'local' : '');
+  }
+
+  function localEmptyResetChoice(resolutions) {
+    return planKeyChoice(resolutions, LOCAL_EMPTY_RESET_KEY);
   }
 
   function resolutionValue(resolutions, conflict) {
@@ -2254,6 +2593,23 @@ function createIntegrations(options) {
         throw new Error('本机工作区为空而同步基线仍有内容：请先在对照中选择「采用云端版本」（把云端拉回本机）或「采用本机版本」（确认清空云端）');
       }
     }
+    // 断路器决议：合并会大批移除云端词条时，'local'=确认删除照常应用，
+    // 'remote'=放弃删除、把云端被移除的词条恢复回来；未选择不得应用。
+    if (plan.massDropSuspected) {
+      const dropChoice = planKeyChoice(value.resolutions, MASS_DROP_RESET_KEY);
+      if (dropChoice === 'remote') {
+        workspace = LitSync.adoptRemoteEntities(workspace, plan.remote);
+      }
+      else if (dropChoice !== 'local') {
+        throw new Error('本次同步会把云端 ' + plan.massDropCount + ' 篇文献从合并结果中移除：请先在对照顶部选择「确认删除」或「放弃删除」');
+      }
+    }
+    // 首传确认：云端没有库文件时，必须显式选择「确认上传」才新建云端库。
+    if (plan.firstUploadSuspected) {
+      if (planKeyChoice(value.resolutions, FIRST_UPLOAD_KEY) !== 'local') {
+        throw new Error('云端还没有文献库文件：如确认以本机内容新建云端库，请在对照顶部选择「确认上传」；否则请检查账号与同步目录名是否正确');
+      }
+    }
     // 云端保留结果：普通同步里用户选「采用本机版本」的实体在云端保持远端
     // 值（本机只保留自己的，不上传覆盖远端），两侧快照登记进 sync base；
     // 任一侧之后发生变化即解除登记、回到正常合并。恢复模式远端权威，不登记。
@@ -2266,112 +2622,187 @@ function createIntegrations(options) {
     }
     workspace = applyLocalOnlyResolutions(workspace, plan, value.resolutions || {});
     cloudWorkspace = LitSync.applyPinsToWorkspace(workspace, pins);
-    if (!current.exists) {
-      const folderStatus = await ensureWebDavFolder(plan._options.url, plan._options.folderName, plan._options.headers);
-      if (current.pathConflict && folderStatus === 405) {
-        throw new Error('坚果云路径冲突：请确认“' + plan._options.folderName + '”是文件夹而非普通文件');
+    const session = await createSyncSession(plan._options);
+    const previousPacer = activePacer;
+    activePacer = session.pacer;
+    // 暂停恢复语义与 nutstoreSyncOnce 一致：firstWrite 已完成则落基线，避免
+    // 恢复同步因缺基线产生伪冲突；已决议工作区随暂停结果带回渲染层落库。
+    let pausedBaseWorkspace = workspace;
+    let firstWriteForPause = null;
+    try {
+      if (!current.exists) {
+        const folderStatus = await ensureWebDavFolder(plan._options.url, plan._options.folderName, plan._options.headers);
+        if (current.pathConflict && folderStatus === 405) {
+          throw new Error('坚果云路径冲突：请确认“' + plan._options.folderName + '”是文件夹而非普通文件');
+        }
       }
-    }
-    const firstWrite = await writeCloudLibrary(plan._options, cloudWorkspace, current, function (phase, message) {
-      reportProgress(phase, { message: message });
-    });
-    const knownRemoteAssets = await resolveRemoteAssetNames(current.remote, workspace, plan._options, function () {
-      reportProgress('scan-assets', { message: '正在读取云端附件清单，避免重复上传…' });
-    });
-    const assetResult = await syncWorkspaceAssets(workspace, plan._options, {
-      // 附件失败不阻断文献库 JSON 写入：附件靠台账续传，先把文献元数据救回来
-      strict: false,
-      skip: pinSkipSet(pins),
-      remoteAssets: knownRemoteAssets,
-      onProgress: function (progress) {
-        const current = progress.current ? ' · ' + progress.current : '';
-        reportProgress('assets', { done: progress.done, total: progress.total, current: progress.current || '',
-          message: progress.total > 0 ? '正在同步附件与快照（' + progress.done + '/' + progress.total + '）' + current + '…' : '正在核对附件…' });
+      const knownRemoteAssets = await resolveRemoteAssetNames(current.remote, workspace, plan._options, function () {
+        reportProgress('scan-assets', { message: '正在读取云端附件清单，避免重复上传…' });
+      });
+      const firstPass = sanitizeCloudAssets(cloudWorkspace, null, knownRemoteAssets);
+      const firstWrite = await writeCloudLibrary(plan._options, firstPass.workspace, current, function (phase, message) {
+        reportProgress(phase, { message: message });
+      }, session);
+      firstWriteForPause = firstWrite;
+      const assetResult = await syncWorkspaceAssets(workspace, plan._options, {
+        // 附件失败不阻断文献库 JSON 写入：附件靠台账续传，先把文献元数据救回来
+        strict: false,
+        skip: pinSkipSet(pins),
+        remoteAssets: knownRemoteAssets,
+        ledger: session.ledger,
+        verifiedNames: session.verifiedNames,
+        onProgress: function (progress) {
+          const current = progress.current ? ' · ' + progress.current : '';
+          reportProgress('assets', { done: progress.done, total: progress.total, current: progress.current || '',
+            message: progress.total > 0 ? '正在同步附件与快照（' + progress.done + '/' + progress.total + '）' + current + '…' : '正在核对附件…' });
+        }
+      });
+      throwIfSyncCancelled();
+      const finalPass = sanitizeCloudAssets(cloudWorkspace, session.verifiedNames, knownRemoteAssets);
+      const finalLocal = sanitizeCloudAssets(workspace, session.verifiedNames, knownRemoteAssets);
+      const finalWrite = await writeCloudLibrary(plan._options, finalPass.workspace, firstWrite.current, function (phase, message) {
+        reportProgress(phase, { message: message });
+      }, session);
+      const uploaded = firstWrite.uploaded || finalWrite.uploaded;
+      reportProgress('config', { message: '正在同步配置…' });
+      if (plan.mode === 'restore' && plan._remoteConfig) {
+        await applySyncedConfig(await loadRawConfig(), plan._remoteConfig, { portableSettings: plan.portableSettings });
       }
-    });
-    throwIfSyncCancelled();
-    const finalWrite = await writeCloudLibrary(plan._options, cloudWorkspace, firstWrite.current, function (phase, message) {
-      reportProgress(phase, { message: message });
-    });
-    const uploaded = firstWrite.uploaded || finalWrite.uploaded;
-    reportProgress('config', { message: '正在同步配置…' });
-    if (plan.mode === 'restore' && plan._remoteConfig) {
-      await applySyncedConfig(await loadRawConfig(), plan._remoteConfig, { portableSettings: plan.portableSettings });
+      await syncEncryptedConfig(plan._options.folderUrl, plan._options.headers, await loadRawConfig(), {
+        passwordOverride: plan._options.configPassword,
+        portableSettings: plan.portableSettings
+      });
+      const etag = finalWrite.current.etag || '';
+      throwIfSyncCancelled();
+      await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: plan.remoteKey, etag: etag,
+        workspace: LitSync.syncWorkspace(finalPass.workspace), pins: pins });
+      pendingSyncPlans.delete(plan.planId);
+      reportProgress('done', { message: '同步完成', uploaded: uploaded, pinned: Object.keys(pins).length });
+      return { workspace: finalLocal.workspace, conflicts: plan.conflicts || [], uploaded: uploaded, assets: assetResult,
+        pinned: Object.keys(pins).length, config: await getConfig() };
+    } catch (error) {
+      // 限流软暂停：已决议的工作区照常带回渲染层落库（决议不丢），附件在台账
+      // 里，恢复续传由「立即同步」按普通合并完成。
+      if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_RATE_PAUSED')) {
+        if (session.pacer && session.pacer.flush) await session.pacer.flush();
+        if (firstWriteForPause) {
+          try {
+            await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: plan.remoteKey, etag: firstWriteForPause.current.etag || '',
+              workspace: LitSync.syncWorkspace(pausedBaseWorkspace), pins: pins });
+          } catch (baseError) {}
+        }
+        return pausedSyncResult(error, workspace);
+      }
+      throw error;
+    } finally {
+      if (activePacer === session.pacer) activePacer = previousPacer;
     }
-    await syncEncryptedConfig(plan._options.folderUrl, plan._options.headers, await loadRawConfig(), {
-      passwordOverride: plan._options.configPassword,
-      portableSettings: plan.portableSettings
-    });
-    const etag = finalWrite.current.etag || '';
-    throwIfSyncCancelled();
-    await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: plan.remoteKey, etag: etag,
-      workspace: LitSync.syncWorkspace(cloudWorkspace), pins: pins });
-    pendingSyncPlans.delete(plan.planId);
-    reportProgress('done', { message: '同步完成', uploaded: uploaded, pinned: Object.keys(pins).length });
-    return { workspace: workspace, conflicts: plan.conflicts || [], uploaded: uploaded, assets: assetResult,
-      pinned: Object.keys(pins).length, config: await getConfig() };
   }
 
   async function nutstoreSyncOnce(localValue, remoteOptions) {
-    const library = await readRemoteLibrary(remoteOptions);
-    const plan = await createNutstoreSyncPlan({
-      workspace: localValue, mode: 'merge', _library: library,
-      portableSettings: localValue && localValue.portableSettings
-    });
-    if (plan.conflicts && plan.conflicts.length || plan.remoteResetSuspected) {
-      return { pendingPlan: plan, workspace: plan.workspace, conflicts: plan.conflicts, uploaded: false };
-    }
-    pendingSyncPlans.delete(plan.planId);
-    if (!library.exists) {
-      const folderStatus = await ensureWebDavFolder(remoteOptions.url, remoteOptions.folderName, remoteOptions.headers);
-      if (library.pathConflict && folderStatus === 405) {
-        throw new Error('坚果云路径冲突：请确认“' + remoteOptions.folderName + '”是文件夹而非普通文件');
+    const session = await createSyncSession(remoteOptions);
+    const previousPacer = activePacer;
+    activePacer = session.pacer;
+    // 暂停时需要知道「云端已写到哪一步」：firstWrite 已完成则把合并结果落成
+    // 基线（云端已是这份内容），恢复同步不会因缺基线把 normalize 时间戳差异
+    // 当成冲突。
+    let mergedForPause = null;
+    let firstWriteForPause = null;
+    let pinsForPause = {};
+    try {
+      const library = await readRemoteLibrary(remoteOptions);
+      const plan = await createNutstoreSyncPlan({
+        workspace: localValue, mode: 'merge', _library: library,
+        portableSettings: localValue && localValue.portableSettings
+      });
+      if (plan.conflicts && plan.conflicts.length || plan.remoteResetSuspected ||
+          plan.massDropSuspected || plan.firstUploadSuspected) {
+        return { pendingPlan: plan, workspace: plan.workspace, conflicts: plan.conflicts, uploaded: false };
       }
-    }
-    const remote = library.remote || { papers: [], folders: [] };
-    const merged = plan.workspace;
-    const conflicts = [];
-    const pins = plan.pins || {};
-    const cloudWorkspace = LitSync.applyPinsToWorkspace(merged, pins);
-    const firstWrite = await writeCloudLibrary(remoteOptions, cloudWorkspace, library, function (phase, message) {
-      emitSyncProgress({ scope: 'sync', phase: phase, message: message });
-    });
-    const knownRemoteAssets = await resolveRemoteAssetNames(remote, merged, remoteOptions, function () {
-      emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取云端附件清单，避免重复上传…' });
-    });
-    const assetResult = await syncWorkspaceAssets(merged, remoteOptions, {
-      // 附件失败不阻断文献库 JSON 写入：附件靠台账续传，先把文献元数据救回来
-      strict: false,
-      skip: pinSkipSet(pins),
-      remoteAssets: knownRemoteAssets,
-      onProgress: function (progress) {
-        const current = progress.current ? ' · ' + progress.current : '';
-        emitSyncProgress({ scope: 'sync', phase: 'assets', done: progress.done, total: progress.total, current: progress.current || '',
-          message: progress.total > 0 ? '正在同步附件与快照（' + progress.done + '/' + progress.total + '）' + current + '…' : '正在核对附件…' });
+      pendingSyncPlans.delete(plan.planId);
+      if (!library.exists) {
+        const folderStatus = await ensureWebDavFolder(remoteOptions.url, remoteOptions.folderName, remoteOptions.headers);
+        if (library.pathConflict && folderStatus === 405) {
+          throw new Error('坚果云路径冲突：请确认“' + remoteOptions.folderName + '”是文件夹而非普通文件');
+        }
       }
-    });
-    throwIfSyncCancelled();
-    emitSyncProgress({ scope: 'sync', phase: 'config', message: '正在同步配置…' });
-    await syncEncryptedConfig(remoteOptions.folderUrl, remoteOptions.headers, remoteOptions.raw, {
-      portableSettings: localValue && localValue.portableSettings
-    });
-    const finalWrite = await writeCloudLibrary(remoteOptions, cloudWorkspace, firstWrite.current, function (phase, message) {
-      emitSyncProgress({ scope: 'sync', phase: phase, message: message });
-    });
-    const uploaded = firstWrite.uploaded || finalWrite.uploaded;
-    if (conflicts.length) {
-      const lines = conflicts.map(function (c) {
-        return JSON.stringify({ at: new Date().toISOString(), id: c.id, title: c.title, direction: c.direction, overwritten: c.overwritten });
-      }).join('\n') + '\n';
-      await fs.appendFile(path.join(options.baseDir, 'sync-conflicts.jsonl'), lines, 'utf8').catch(function () {});
+      const remote = library.remote || { papers: [], folders: [] };
+      const merged = plan.workspace;
+      const conflicts = [];
+      const pins = plan.pins || {};
+      mergedForPause = merged;
+      pinsForPause = pins;
+      const cloudWorkspace = LitSync.applyPinsToWorkspace(merged, pins);
+      // 真实清单先行：firstWrite 之前就知道哪些登记是悬空的，写入云端的词条
+      // 从第一笔起就不带假元数据。
+      const knownRemoteAssets = await resolveRemoteAssetNames(remote, merged, remoteOptions, function () {
+        emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取云端附件清单，避免重复上传…' });
+      });
+      const firstPass = sanitizeCloudAssets(cloudWorkspace, null, knownRemoteAssets);
+      const firstWrite = await writeCloudLibrary(remoteOptions, firstPass.workspace, library, function (phase, message) {
+        emitSyncProgress({ scope: 'sync', phase: phase, message: message });
+      }, session);
+      firstWriteForPause = firstWrite;
+      const assetResult = await syncWorkspaceAssets(merged, remoteOptions, {
+        // 附件失败不阻断文献库 JSON 写入：附件靠台账续传，先把文献元数据救回来
+        strict: false,
+        skip: pinSkipSet(pins),
+        remoteAssets: knownRemoteAssets,
+        ledger: session.ledger,
+        verifiedNames: session.verifiedNames,
+        onProgress: function (progress) {
+          const current = progress.current ? ' · ' + progress.current : '';
+          emitSyncProgress({ scope: 'sync', phase: 'assets', done: progress.done, total: progress.total, current: progress.current || '',
+            message: progress.total > 0 ? '正在同步附件与快照（' + progress.done + '/' + progress.total + '）' + current + '…' : '正在核对附件…' });
+        }
+      });
+      throwIfSyncCancelled();
+      emitSyncProgress({ scope: 'sync', phase: 'config', message: '正在同步配置…' });
+      await syncEncryptedConfig(remoteOptions.folderUrl, remoteOptions.headers, remoteOptions.raw, {
+        portableSettings: localValue && localValue.portableSettings
+      });
+      // 终写净化：只有本会话核实（上传/下载/签名）或真实清单确认存在的附件
+      // 元数据才进云端 JSON；悬空登记剥离。云端写/基线用净化后的 cloud 形态，
+      // 本地应用用净化后的合并结果（保持 pins 的两侧分叉语义）。
+      const finalPass = sanitizeCloudAssets(cloudWorkspace, session.verifiedNames, knownRemoteAssets);
+      const finalLocal = sanitizeCloudAssets(merged, session.verifiedNames, knownRemoteAssets);
+      const finalWrite = await writeCloudLibrary(remoteOptions, finalPass.workspace, firstWrite.current, function (phase, message) {
+        emitSyncProgress({ scope: 'sync', phase: phase, message: message });
+      }, session);
+      const uploaded = firstWrite.uploaded || finalWrite.uploaded;
+      if (conflicts.length) {
+        const lines = conflicts.map(function (c) {
+          return JSON.stringify({ at: new Date().toISOString(), id: c.id, title: c.title, direction: c.direction, overwritten: c.overwritten });
+        }).join('\n') + '\n';
+        await fs.appendFile(path.join(options.baseDir, 'sync-conflicts.jsonl'), lines, 'utf8').catch(function () {});
+      }
+      throwIfSyncCancelled();
+      await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: remoteOptions.user + '\n' + remoteOptions.fileUrl,
+        etag: finalWrite.current.etag || '',
+        workspace: LitSync.syncWorkspace(finalPass.workspace), pins: pins });
+      emitSyncProgress({ scope: 'sync', phase: 'done', message: '同步完成', uploaded: uploaded, pinned: Object.keys(pins).length });
+      return { workspace: finalLocal.workspace, conflicts: conflicts, uploaded: uploaded, assets: assetResult,
+        pinned: Object.keys(pins).length, config: await getConfig() };
+    } catch (error) {
+      // 限流不是失败：软暂停 + 恢复时刻。已上传的附件在台账里，下一轮免重传。
+      // firstWrite 已完成时，云端已是合并结果——把它同时落成基线并随结果带回
+      // 本地落库，两侧从同一份内容继续，恢复同步不会产生伪冲突。
+      if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_RATE_PAUSED')) {
+        if (session.pacer && session.pacer.flush) await session.pacer.flush();
+        if (mergedForPause && firstWriteForPause) {
+          try {
+            await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: remoteOptions.user + '\n' + remoteOptions.fileUrl,
+              etag: firstWriteForPause.current.etag || '',
+              workspace: LitSync.syncWorkspace(mergedForPause), pins: pinsForPause });
+          } catch (baseError) {}
+          return pausedSyncResult(error, mergedForPause);
+        }
+        return pausedSyncResult(error, localValue);
+      }
+      throw error;
+    } finally {
+      if (activePacer === session.pacer) activePacer = previousPacer;
     }
-    throwIfSyncCancelled();
-    await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: remoteOptions.user + '\n' + remoteOptions.fileUrl,
-      etag: finalWrite.current.etag || '',
-      workspace: LitSync.syncWorkspace(cloudWorkspace), pins: pins });
-    emitSyncProgress({ scope: 'sync', phase: 'done', message: '同步完成', uploaded: uploaded, pinned: Object.keys(pins).length });
-    return { workspace: merged, conflicts: conflicts, uploaded: uploaded, assets: assetResult,
-      pinned: Object.keys(pins).length, config: await getConfig() };
   }
 
   async function nutstoreSync(localValue) {
@@ -3029,7 +3460,7 @@ function assetLedgerRemoteKey(remoteOptions) {
 
 /** 解析台账文件内容；结构无效或 remoteKey 不符（换账号/换远端目录）时返回空台账 */
 function loadAssetLedgerValue(value, remoteKey) {
-  const fresh = { version: 1, remoteKey: remoteKey, assets: {} };
+  const fresh = { version: 1, remoteKey: remoteKey, assets: {}, pacing: loadPacingValue(value && value.pacing) };
   if (!value || typeof value !== 'object' || !value.assets || typeof value.assets !== 'object') return fresh;
   if (value.remoteKey !== remoteKey) return fresh;
   const assets = {};
@@ -3040,16 +3471,17 @@ function loadAssetLedgerValue(value, remoteKey) {
     if (size != null && (!isFinite(size) || size < 0)) return;
     assets[String(cloudName)] = { hash: String(entry.hash).toLowerCase(), size: size == null ? null : Math.trunc(size) };
   });
-  return { version: 1, remoteKey: remoteKey, assets: assets };
+  return { version: 1, remoteKey: remoteKey, assets: assets, pacing: loadPacingValue(value.pacing) };
 }
 
-/** 台账能否证明该对象已在远端（同一字节流成功 PUT 过）。远端清单非空且
- * 明确不含该对象时不采信台账，照常上传。 */
+/** 台账能否证明该对象已在远端（同一字节流成功 PUT 过）。只要有真实/派生的
+ * 远端清单且其中没有该对象，一律不采信台账、照常上传——包括清单为空的
+ * 情况（对象确实都不在了）。只有拿不到清单（null）时才退回台账断点续传。 */
 function assetLedgerProof(ledger, cloudName, hash, size, knownRemoteAssets) {
   const entry = ledger && ledger.assets && ledger.assets[String(cloudName || '')];
   if (!entry || entry.hash !== String(hash || '').toLowerCase()) return false;
   if (entry.size != null && size != null && entry.size !== size) return false;
-  if (knownRemoteAssets && knownRemoteAssets.size > 0 && !knownRemoteAssets.has(cloudName)) return false;
+  if (knownRemoteAssets && !knownRemoteAssets.has(cloudName)) return false;
   return true;
 }
 

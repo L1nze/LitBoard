@@ -70,7 +70,9 @@ test('assetLedgerProof defers to a populated remote listing that lacks the name'
   assert.equal(assetLedgerProof(ledger, 'p1.pdf', HASH, 100, remote), false, '远端清单明确不含该对象时应照常上传');
   remote.add('p1.pdf');
   assert.equal(assetLedgerProof(ledger, 'p1.pdf', HASH, 100, remote), true);
-  assert.equal(assetLedgerProof(ledger, 'p1.pdf', HASH, 100, new Set()), true, '空清单（PROPFIND 不支持/远端 JSON 为空）视为未知，采信台账');
+  // 空清单 = 真实对账后云端一个对象都没有（对象确实不在了），不再视作
+  // 「未知」采信台账——否则对象被外部删除后永远不会再重传（A2 事故）。
+  assert.equal(assetLedgerProof(ledger, 'p1.pdf', HASH, 100, new Set()), false, '空真实清单：台账不得自证对象存在');
 });
 
 test('pruneAssetLedger keeps only names still referenced by the workspace', function () {

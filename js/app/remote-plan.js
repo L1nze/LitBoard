@@ -47,6 +47,8 @@
     var pendingRemotePlan = null;
     var pendingRemoteResolutions = {};
     var LOCAL_EMPTY_RESET_KEY = 'plan:local-empty-reset'; // 与主进程 integrations.js 保持一致
+    var MASS_DROP_RESET_KEY = 'plan:mass-drop-reset';     // 合并将大批移除云端词条的强制确认
+    var FIRST_UPLOAD_KEY = 'plan:first-upload';           // 云端无库、本机非空的首传确认
     var remotePlanApplying = false;
     var remotePlanStopping = false;
 
@@ -134,7 +136,9 @@
         T('采用本机＝本机保留；云端无此条目时会重新上传，云端已有另一版本时保持云端副本不变。') +
         T('采用云端＝本机改用云端内容。') +
         (pendingRemotePlan.localEmptyReset ? T('检测到本机文献为 0 而同步基线仍有内容（常见于本机读取失败或切换过数据目录），已暂停自动同步，请先选择处理方式。') :
-          (pendingRemotePlan.remoteResetSuspected ? T('检测到云端库从非空突然变为 0 篇，已暂停自动同步，请确认保留本机。') : '')) +
+          (pendingRemotePlan.remoteResetSuspected ? T('检测到云端库从非空突然变为 0 篇，已暂停自动同步，请确认保留本机。') :
+            (pendingRemotePlan.massDropSuspected ? T('检测到本次合并会把云端 ') + pendingRemotePlan.massDropCount + T(' 篇文献移除（常见于本机数据目录切换或整批丢失），已暂停自动写入，请先在顶部确认。') : ''))) +
+        (pendingRemotePlan.firstUploadSuspected ? T('云端还没有文献库文件，将把本机 ') + (pendingRemotePlan.localPaperCount == null ? '' : pendingRemotePlan.localPaperCount) + T(' 篇上传为新云端库；如非预期请检查账号与同步目录名。') : '') +
         (pendingRemotePlan.remoteEtag ? T('云端内容在应用前会再次核对。') : '');
       $('#sync-remote-plan-summary').textContent = summary;
     }
@@ -361,6 +365,39 @@
         });
       }
 
+      // 「合并会大批移除云端词条」断路器：本地整批缺失被当成删除传播时强制确认，
+      // 杜绝「本地 4 篇覆盖云端 210 篇」式静默事故。
+      if (plan.massDropSuspected) {
+        remotePlanModel.requiredKeys.add(MASS_DROP_RESET_KEY);
+        remotePlanModel.items.push({
+          key: MASS_DROP_RESET_KEY,
+          kind: 'conflict',
+          label: T('⚠ 本次同步会把云端 ') + plan.massDropCount + T(' 篇文献移除'),
+          hint: T('常见原因：本机切换过数据目录或部分数据读取失败。真删了这么多也在这里确认。'),
+          localVal: T('确认删除：合并结果将移除云端这些词条（不可撤销，云端备份链保留最近 5 份）'),
+          remoteVal: T('放弃删除：把云端被移除的 ') + plan.massDropCount + T(' 篇恢复回来'),
+          localText: T('确认删除'),
+          remoteText: T('放弃删除'),
+          isRequired: true
+        });
+      }
+
+      // 「云端无库 + 本机非空」首传确认：防账号/目录填错建出第二个空库。
+      if (plan.firstUploadSuspected) {
+        remotePlanModel.requiredKeys.add(FIRST_UPLOAD_KEY);
+        remotePlanModel.items.push({
+          key: FIRST_UPLOAD_KEY,
+          kind: 'conflict',
+          label: T('⚠ 云端还没有文献库文件'),
+          hint: T('将把本机内容上传为新云端库；账号或同步目录名填错（大小写不同即另一个目录）会建出第二个库'),
+          localVal: T('确认上传：以本机 ') + (plan.localPaperCount == null ? '' : plan.localPaperCount) + T(' 篇新建云端库'),
+          remoteVal: T('取消：先检查账号与同步目录名是否正确'),
+          localText: T('确认上传'),
+          remoteText: T('取消上传'),
+          isRequired: true
+        });
+      }
+
       conflicts.forEach(function (conflict, index) {
         var key = remoteConflictKey(conflict, index);
         remotePlanModel.requiredKeys.add(key);
@@ -426,6 +463,18 @@
         var paperCount = info && info.counts && info.counts.papers;
         var text = T('云端库文件存在 · ') + (paperCount == null ? T('文献数未知') : (paperCount + T(' 篇'))) +
           (info && info.fileUrl ? ' · ' + info.fileUrl : '');
+        // 对账：词条登记的附件 vs 云端实际对象。「声称有但云端没有」就是
+        // 「词条在、PDF 不在」的缺口，必须直接可见。
+        var audit = info && info.audit;
+        if (audit && audit.supported) {
+          text += T(' · 附件登记 ') + audit.claimedCount + T(' / 云端实有 ') + audit.actualCount;
+          if (audit.missingCount > 0) {
+            text += ' · ⚠ ' + audit.missingCount + T(' 个附件云端缺失（需在有原文件的设备上点「立即同步」补传）');
+            setSyncInlineStatus('sync-remote-status', text, 'warning');
+            return;
+          }
+          if (audit.orphanCount > 0) text += ' · ' + audit.orphanCount + T(' 个云端对象未被词条引用');
+        }
         setSyncInlineStatus('sync-remote-status', text, 'success');
       }).catch(function (error) {
         setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
@@ -546,6 +595,13 @@
     function applyRemotePlan() {
       if (!pendingRemotePlan || !desktop || !desktop.applyNutstoreSyncPlan) return;
       if (remotePlanApplying) return;
+      // 首传确认选了「取消」：云端本来就没有库文件，直接关弹窗即可，无需调后端
+      if (pendingRemotePlan.firstUploadSuspected &&
+          String(pendingRemoteResolutions[FIRST_UPLOAD_KEY]).toLowerCase() === 'remote') {
+        closeRemotePlanDialog();
+        setSyncInlineStatus('sync-remote-status', T('已取消首次上传：云端未做任何修改'), 'warning');
+        return;
+      }
       var planMode = pendingRemotePlan.mode;
       var button = $('#sync-remote-plan-apply'); button.disabled = true;
       remotePlanStopping = false;
@@ -555,10 +611,14 @@
       setRemotePlanProgress({ phase: 'verify', message: T('正在校验云端版本…') });
       setSyncInlineStatus('sync-remote-status', T('正在校验云端版本并应用…'), 'pending');
       var applyAssetFailures = 0;
+      var applyPaused = null;
       desktop.applyNutstoreSyncPlan({ planId: remotePlanId(pendingRemotePlan), resolutions: pendingRemoteResolutions }).then(function (result) {
         var workspace = result && result.workspace ? result.workspace : result;
-        applyAssetFailures = result && result.assets && result.assets.failures ? result.assets.failures.length : 0;
+        var assets = result && result.assets || {};
+        applyAssetFailures = (assets.failures || []).length;
+        if (result && result.paused) applyPaused = result;
         if (workspace && workspace.papers) {
+          // 暂停时也落库：用户已经做出的决议不能丢，附件续传交给限流调度
           return applySyncedWorkspace(workspace, true).then(function () {
             setSyncIndicator('ok');
             if (desktop.getIntegrationConfig) return desktop.getIntegrationConfig().catch(function () { return null; });
@@ -572,8 +632,16 @@
           applyPortableConfigRuntime(config);
           fillSyncForm(config);
         }
+        if (applyPaused) {
+          var pausedLabel = applyPaused.message || T('同步已因限流暂停');
+          if (options.scheduleSyncResume) options.scheduleSyncResume(applyPaused.resumeAt);
+          setSyncInlineStatus('sync-remote-status', pausedLabel, 'warning');
+          setRemotePlanCompleted(pausedLabel);
+          toast('⚠ ' + pausedLabel);
+          return;
+        }
         var label = planMode === 'merge' ? T('同步对照已应用') : T('云端恢复完成');
-        if (applyAssetFailures) label += '（' + applyAssetFailures + T(' 个附件失败，下次同步自动续传）');
+        if (applyAssetFailures) label += '（' + applyAssetFailures + T(' 个附件未完成，下次同步自动续传）');
         setSyncInlineStatus('sync-remote-status', label, applyAssetFailures ? 'warning' : 'success');
         setRemotePlanCompleted(label);
         toast(label);
