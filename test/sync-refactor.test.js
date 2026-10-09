@@ -164,16 +164,17 @@ test('对象先行（既有悬空登记）：清单缺对象且重传失败时�
   const pdf = Buffer.from('%PDF-dangling');
   const pdfPath = path.join(dir, 'paper.pdf');
   await fs.writeFile(pdfPath, pdf);
+  // 固定两侧附件时间，避免分别 normalize 时 Date.now() 漂移触发无关冲突。
   // 云端库带着悬空登记（历史事故形态）：词条声称有附件，attachments/ 里没有对象
   dav.state.files.set(dav.state.libraryUrl, JSON.stringify({ syncVersion: 6, papers: [{
-    id: 'p1', title: '悬空', updatedAt: 2000, attachments: [{ id: 'a1', kind: 'pdf', fileName: 'paper.pdf',
+    id: 'p1', title: '悬空', updatedAt: 2000, attachments: [{ id: 'a1', addedAt: 1000, kind: 'pdf', fileName: 'paper.pdf',
       cloudName: 'p1.pdf', cloudHash: sha256(pdf), cloudSize: pdf.length }]
   }], folders: [] }));
   const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: dav.fetch });
   await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
   dav.state.failAttachmentPuts = 1; // 重传也失败
   const result = await integrations.nutstoreSync({
-    papers: [{ id: 'p1', title: '悬空', updatedAt: 2000, attachments: [{ id: 'a1', kind: 'pdf', fileName: 'paper.pdf', path: pdfPath,
+    papers: [{ id: 'p1', title: '悬空', updatedAt: 2000, attachments: [{ id: 'a1', addedAt: 1000, kind: 'pdf', fileName: 'paper.pdf', path: pdfPath,
       cloudName: 'p1.pdf', cloudHash: sha256(pdf), cloudSize: pdf.length }] }],
     folders: []
   });
