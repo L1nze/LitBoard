@@ -7,7 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const P = require('../js/agentproto.js');
 
-test('detectDialect: URL 尾段、域名与 opencode 模型系列分流', function () {
+test('detectDialect/endpointFor/modelsEndpointFor: URL 尾段与域名分流、三种协议补全路径、models 收敛', function () {
   // URL 尾段优先
   assert.equal(P.detectDialect('https://opencode.ai/zen/go/v1'), 'chat');
   assert.equal(P.detectDialect('https://opencode.ai/zen/go/v1/messages'), 'messages');
@@ -32,9 +32,7 @@ test('detectDialect: URL 尾段、域名与 opencode 模型系列分流', functi
   assert.equal(P.detectDialect('https://opencode.ai/zen/go/v1/messages', { dialect: 'chat' }), 'chat');
   assert.equal(P.detectDialect('https://api.deepseek.com', { dialect: 'responses', model: 'x' }), 'responses');
   assert.equal(P.detectDialect('https://api.deepseek.com', { dialect: 'auto' }), 'chat');
-});
-
-test('endpointFor: 三种协议补全路径，已含尾段时原样保留', function () {
+  // endpointFor：三种协议补全路径，已含尾段时原样保留
   assert.equal(P.endpointFor('https://api.deepseek.com/', 'chat'), 'https://api.deepseek.com/chat/completions');
   assert.equal(P.endpointFor('https://x/v1/chat/completions', 'chat'), 'https://x/v1/chat/completions');
   // messages：base 自带 /v1 时只接 /messages（opencode / anthropic 系惯例）
@@ -46,9 +44,7 @@ test('endpointFor: 三种协议补全路径，已含尾段时原样保留', func
   assert.equal(P.endpointFor('https://opencode.ai/zen/go/v1', 'responses'), 'https://opencode.ai/zen/go/v1/responses');
   assert.equal(P.endpointFor('https://api.openai.com/v1', 'responses'), 'https://api.openai.com/v1/responses');
   assert.equal(P.endpointFor('https://x/v1/responses', 'responses'), 'https://x/v1/responses');
-});
-
-test('modelsEndpointFor: 三种协议都收敛到 {prefix}/models', function () {
+  // modelsEndpointFor：三种协议都收敛到 {prefix}/models
   assert.equal(P.modelsEndpointFor('https://api.moonshot.cn/v1', 'chat'), 'https://api.moonshot.cn/v1/models');
   assert.equal(P.modelsEndpointFor('https://x/v1/chat/completions', 'chat'), 'https://x/v1/models');
   assert.equal(P.modelsEndpointFor('https://opencode.ai/zen/go/v1', 'chat'), 'https://opencode.ai/zen/go/v1/models');
@@ -114,7 +110,7 @@ test('toResponsesBody: system→instructions、工具扁平化、图像转 input
   assert.equal(body.messages, undefined);
 });
 
-test('toMessagesBody: system 提顶层、max_tokens 必填、工具结果并进 user、相邻同角色合并', function () {
+test('toMessagesBody: system 提顶层、工具结果并进 user、图像转 source、推理参数按侧透传；convertBody: chat 原样返回', function () {
   const body = P.toMessagesBody({
     model: 'claude',
     messages: [
@@ -146,10 +142,8 @@ test('toMessagesBody: system 提顶层、max_tokens 必填、工具结果并进 
   assert.deepEqual(body.messages[2].content[1], { type: 'tool_result', tool_use_id: 't2', content: '结果B' });
   assert.deepEqual(body.messages[2].content[2], { type: 'text', text: '追问' });
   assert.deepEqual(body.tools, [{ name: 'a', input_schema: { type: 'object', properties: {} }, description: 'da' }]);
-});
-
-test('toMessagesBody: 图像走 base64/url source，不支持的媒体类型丢弃；OpenAI 侧推理参数不透传', function () {
-  const body = P.toMessagesBody({
+  // 图像走 base64/url source，不支持的媒体类型丢弃；OpenAI 侧推理参数不透传
+  const body2 = P.toMessagesBody({
     model: 'm',
     max_tokens: 100,
     reasoning_effort: 'high',
@@ -164,10 +158,10 @@ test('toMessagesBody: 图像走 base64/url source，不支持的媒体类型丢�
       ]
     }]
   });
-  assert.equal(body.reasoning_effort, undefined);
-  assert.equal(body.thinking, undefined); // {type:'disabled'} 是 OpenAI 侧形态，发过去只会 400
-  assert.equal(body.max_tokens, 100);
-  assert.deepEqual(body.messages[0].content, [
+  assert.equal(body2.reasoning_effort, undefined);
+  assert.equal(body2.thinking, undefined); // {type:'disabled'} 是 OpenAI 侧形态，发过去只会 400
+  assert.equal(body2.max_tokens, 100);
+  assert.deepEqual(body2.messages[0].content, [
     { type: 'text', text: '看图' },
     { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'QUJD' } },
     { type: 'image', source: { type: 'url', url: 'https://x.test/a.png' } }
@@ -177,14 +171,12 @@ test('toMessagesBody: 图像走 base64/url source，不支持的媒体类型丢�
   assert.deepEqual(thinking.thinking, { type: 'enabled', budget_tokens: 2048 });
   const claude = P.toMessagesBody({ model: 'claude-opus-4-7', reasoning_effort: 'xhigh', messages: [{ role: 'user', content: 'q' }] });
   assert.deepEqual(claude.output_config, { effort: 'xhigh' });
-});
-
-test('convertBody: chat 原样返回', function () {
+  // convertBody：chat 原样返回
   const src = { model: 'm', messages: [{ role: 'user', content: 'q' }], tools: [{ type: 'function', function: { name: 't' } }] };
   assert.deepEqual(P.convertBody(src, 'chat'), src);
 });
 
-test('responses 累积器：文本 / 推理 / 函数调用分片 / completed 收尾与用量', function () {
+test('responses 累积器：文本/推理/工具分片/completed 用量；incomplete 归一截断、failed/error 抛出', function () {
   const acc = P.createResponsesAccumulator();
   const events = [];
   [
@@ -208,13 +200,11 @@ test('responses 累积器：文本 / 推理 / 函数调用分片 / completed 收
   assert.equal(acc.getFinishReason(), 'tool_calls');
   assert.equal(acc.sawDone(), true);
   assert.deepEqual(acc.getUsage(), { prompt_tokens: 31, completion_tokens: 7, total_tokens: 38 });
-});
-
-test('responses 累积器：incomplete 归一为截断，failed 抛出上游错误', function () {
-  const acc = P.createResponsesAccumulator();
-  const events = acc.pushLine('data: {"type":"response.incomplete","response":{"usage":{"input_tokens":1,"output_tokens":2}}}');
-  assert.equal(acc.getFinishReason(), 'length');
-  assert.ok(events.some(function (e) { return e.type === '_closed'; }));
+  // incomplete 归一为截断，failed 抛出上游错误
+  const acc2 = P.createResponsesAccumulator();
+  const events2 = acc2.pushLine('data: {"type":"response.incomplete","response":{"usage":{"input_tokens":1,"output_tokens":2}}}');
+  assert.equal(acc2.getFinishReason(), 'length');
+  assert.ok(events2.some(function (e) { return e.type === '_closed'; }));
 
   const bad = P.createResponsesAccumulator();
   assert.throws(function () {
@@ -226,7 +216,7 @@ test('responses 累积器：incomplete 归一为截断，failed 抛出上游错�
   }, /overloaded/);
 });
 
-test('messages 累积器：文本 / 思考 / 工具调用分片 / stop_reason 映射', function () {
+test('messages 累积器：文本/思考/工具分片/stop_reason 映射；max_tokens→length、error 抛出；createAccumulator 未知协议回退 chat', function () {
   const acc = P.createMessagesAccumulator();
   const events = [];
   [
@@ -255,13 +245,11 @@ test('messages 累积器：文本 / 思考 / 工具调用分片 / stop_reason �
   assert.equal(acc.sawDone(), true);
   assert.equal(acc.getUsage().prompt_tokens, 12);
   assert.equal(acc.getUsage().completion_tokens, 9);
-});
-
-test('messages 累积器：max_tokens → length（截断），error 事件抛出', function () {
-  const acc = P.createMessagesAccumulator();
-  acc.pushLine('data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}');
-  acc.pushLine('data: {"type":"message_stop"}');
-  assert.equal(acc.getFinishReason(), 'length');
+  // max_tokens → length（截断），error 事件抛出
+  const acc2 = P.createMessagesAccumulator();
+  acc2.pushLine('data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}');
+  acc2.pushLine('data: {"type":"message_stop"}');
+  assert.equal(acc2.getFinishReason(), 'length');
 
   const plain = P.createMessagesAccumulator();
   plain.pushLine('data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}');
@@ -271,15 +259,13 @@ test('messages 累积器：max_tokens → length（截断），error 事件抛�
   assert.throws(function () {
     bad.pushLine('data: {"type":"error","error":{"type":"overloaded_error","message":"服务过载"}}');
   }, /服务过载/);
+  // createAccumulator：未知协议回退 chat 形态
+  const acc3 = P.createAccumulator('nonsense');
+  acc3.pushLine('data: {"choices":[{"delta":{"content":"x"}}]}');
+  assert.equal(acc3.message().content, 'x');
 });
 
-test('createAccumulator: 未知协议回退 chat 形态', function () {
-  const acc = P.createAccumulator('nonsense');
-  acc.pushLine('data: {"choices":[{"delta":{"content":"x"}}]}');
-  assert.equal(acc.message().content, 'x');
-});
-
-test('chat 形态：输出上限随模型改写字段名（o 系/gpt-5/gpt-6 用 max_completion_tokens）', function () {
+test('chat 形态输出上限：toChatBody 按模型改写字段名；convertBody 各协议映射 max_tokens 字段', function () {
   const body = { model: 'gpt-5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 12800 };
   const out = P.toChatBody(body);
   assert.equal(out.max_completion_tokens, 12800);
@@ -295,9 +281,7 @@ test('chat 形态：输出上限随模型改写字段名（o 系/gpt-5/gpt-6 用
   assert.equal(P.toChatBody({ model: 'gpt-4o', max_tokens: 12800 }).max_completion_tokens, undefined);
   // 没有输出上限时原样透传
   assert.deepEqual(P.toChatBody({ model: 'gpt-5', messages: [] }), { model: 'gpt-5', messages: [] });
-});
-
-test('convertBody: chat 形态带 max_tokens，responses/messages 各自映射字段', function () {
+  // convertBody：chat 形态带 max_tokens，responses/messages 各自映射字段
   const base = { model: 'm', messages: [{ role: 'user', content: 'hi' }], max_tokens: 12800 };
   assert.equal(P.convertBody(base, 'chat').max_tokens, 12800);
   assert.equal(P.convertBody(base, 'responses').max_output_tokens, 12800);

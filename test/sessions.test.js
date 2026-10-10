@@ -20,55 +20,57 @@ async function makeSessions(trashed) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-test('fork copies registered attachments and survives source deletion independently', async function () {
-  const { s, root } = await makeSessions();
-  try {
-    const source = await s.create({ title: 'source' });
-    const attachment = await s.saveAttachment(source.id, { name: 'image.png', dataBase64: Buffer.from('image bytes').toString('base64') });
-    const data = await s.read(source.id);
-    data.messages = [{ role: 'user', content: 'hi', images: [{ type: 'image', ref: 'session:' + source.id + '|' + attachment.file }] }];
-    await s.commit(source.id, data);
-    const branchTitle = 'A conversation with a long title（分支）';
-    const branch = await s.fork(source.id, { title: branchTitle });
-    assert.equal(branch.data.title, branchTitle, '长标题也保留分支后缀');
-    assert.notEqual(branch.id, source.id);
-    assert.equal((await s.list()).length, 2);
-    assert.equal(await fs.readFile(await s.attachmentPath(branch.id, attachment.file), 'utf8'), 'image bytes');
-    assert.equal(branch.data.messages[0].images[0].ref, 'session:' + branch.id + '|' + attachment.file);
-    assert.deepEqual(await s.read(source.id), data);
-    await fs.rm(path.join(root, '会话记录', source.dir), { recursive: true });
-    const restarted = createSessions({ rootDir: path.join(root, '会话记录') });
-    assert.equal((await restarted.read(branch.id)).title, branchTitle);
-    assert.equal(await fs.readFile(await restarted.attachmentPath(branch.id, attachment.file), 'utf8'), 'image bytes');
-    await restarted.flushAll();
-  } finally {
-    await s.flushAll();
-    await fs.rm(root, { recursive: true, force: true });
+test('fork copies registered attachments and survives source deletion; missing/unsafe attachment or busy source fails without an indexed branch', async function () {
+  {
+    const { s, root } = await makeSessions();
+    try {
+      const source = await s.create({ title: 'source' });
+      const attachment = await s.saveAttachment(source.id, { name: 'image.png', dataBase64: Buffer.from('image bytes').toString('base64') });
+      const data = await s.read(source.id);
+      data.messages = [{ role: 'user', content: 'hi', images: [{ type: 'image', ref: 'session:' + source.id + '|' + attachment.file }] }];
+      await s.commit(source.id, data);
+      const branchTitle = 'A conversation with a long title（分支）';
+      const branch = await s.fork(source.id, { title: branchTitle });
+      assert.equal(branch.data.title, branchTitle, '长标题也保留分支后缀');
+      assert.notEqual(branch.id, source.id);
+      assert.equal((await s.list()).length, 2);
+      assert.equal(await fs.readFile(await s.attachmentPath(branch.id, attachment.file), 'utf8'), 'image bytes');
+      assert.equal(branch.data.messages[0].images[0].ref, 'session:' + branch.id + '|' + attachment.file);
+      assert.deepEqual(await s.read(source.id), data);
+      await fs.rm(path.join(root, '会话记录', source.dir), { recursive: true });
+      const restarted = createSessions({ rootDir: path.join(root, '会话记录') });
+      assert.equal((await restarted.read(branch.id)).title, branchTitle);
+      assert.equal(await fs.readFile(await restarted.attachmentPath(branch.id, attachment.file), 'utf8'), 'image bytes');
+      await restarted.flushAll();
+    } finally {
+      await s.flushAll();
+      await fs.rm(root, { recursive: true, force: true });
+    }
   }
-});
 
-test('fork failure on missing or unsafe attachment creates no indexed branch', async function () {
-  const { s, root } = await makeSessions();
-  try {
-    const source = await s.create({ title: 'source' });
-    const data = await s.read(source.id);
-    data.attachments = [{ file: '附件/missing.png' }];
-    await s.commit(source.id, data);
-    await assert.rejects(() => s.fork(source.id, { title: 'branch' }));
-    assert.equal((await s.list()).length, 1);
-    assert.deepEqual(await fs.readdir(path.join(root, '会话记录', source.dir.split(path.sep)[0])), [path.basename(source.dir)]);
-    const second = await s.create({ title: 'unsafe' });
-    const unsafe = await s.read(second.id);
-    unsafe.attachments = [{ file: '../session.json' }];
-    await s.commit(second.id, unsafe);
-    await assert.rejects(() => s.fork(second.id), /Invalid attachment/);
-    assert.equal((await s.list()).length, 2);
-    data.streaming = true;
-    await s.commit(source.id, data);
-    await assert.rejects(() => s.fork(source.id), /busy/);
-  } finally {
-    await s.flushAll();
-    await fs.rm(root, { recursive: true, force: true });
+  {
+    const { s, root } = await makeSessions();
+    try {
+      const source = await s.create({ title: 'source' });
+      const data = await s.read(source.id);
+      data.attachments = [{ file: '附件/missing.png' }];
+      await s.commit(source.id, data);
+      await assert.rejects(() => s.fork(source.id, { title: 'branch' }));
+      assert.equal((await s.list()).length, 1);
+      assert.deepEqual(await fs.readdir(path.join(root, '会话记录', source.dir.split(path.sep)[0])), [path.basename(source.dir)]);
+      const second = await s.create({ title: 'unsafe' });
+      const unsafe = await s.read(second.id);
+      unsafe.attachments = [{ file: '../session.json' }];
+      await s.commit(second.id, unsafe);
+      await assert.rejects(() => s.fork(second.id), /Invalid attachment/);
+      assert.equal((await s.list()).length, 2);
+      data.streaming = true;
+      await s.commit(source.id, data);
+      await assert.rejects(() => s.fork(source.id), /busy/);
+    } finally {
+      await s.flushAll();
+      await fs.rm(root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -93,7 +95,7 @@ test('concurrent same-name attachments keep distinct files and original bytes', 
   }
 });
 
-test('create lays out dated folder, session.json and index entry', async function () {
+test('create lays out dated folder, session.json and index entry; same-title collisions get numbered dirs', async function () {
   const { s, root } = await makeSessions();
   const created = await s.create({ title: '锂电池寿命预测 Review' });
   // dir 用宿主 path.sep 连接（Windows 为 \、Linux CI 为 /），两种分隔符都接受
@@ -105,14 +107,14 @@ test('create lays out dated folder, session.json and index entry', async functio
   const list = await s.list();
   assert.equal(list.length, 1);
   assert.equal(list[0].id, created.id);
-});
 
-test('collision numbering across same-title sessions', async function () {
-  const { s } = await makeSessions();
-  const a = await s.create({ title: '同名会话' });
-  const b = await s.create({ title: '同名会话' });
-  assert.notEqual(a.dir, b.dir);
-  assert.ok(b.dir.indexOf('同名会话 02') !== -1);
+  {
+    const { s } = await makeSessions();
+    const a = await s.create({ title: '同名会话' });
+    const b = await s.create({ title: '同名会话' });
+    assert.notEqual(a.dir, b.dir);
+    assert.ok(b.dir.indexOf('同名会话 02') !== -1);
+  }
 });
 
 test('setData debounced flush survives restart-by-cache-drop', async function () {
@@ -140,7 +142,7 @@ test('setData debounced flush survives restart-by-cache-drop', async function ()
   assert.equal(list[0] && list[0].msgCount, 1);
 });
 
-test('rename moves folder, keeps stable id, updates index', async function () {
+test('rename moves folder keeping stable id and updating index; remove sends folder to recycle bin and drops index entry; attachments sanitize names, dedupe, and register in session data', async function () {
   const { s, root } = await makeSessions();
   const created = await s.create({ title: '旧标题' });
   await s.rename(created.id, '新标题');
@@ -153,27 +155,27 @@ test('rename moves folder, keeps stable id, updates index', async function () {
   assert.equal(data.title, '新标题');
   // 旧目录不复存在
   await assert.rejects(() => fs.access(path.join(root, '会话记录', created.dir)));
-});
 
-test('remove sends folder to recycle bin and drops index entry', async function () {
-  const { s, trashedDirs } = await makeSessions();
-  const created = await s.create({ title: '要删的' });
-  await s.remove(created.id);
-  assert.equal(trashedDirs.length, 1);
-  assert.equal((await s.list()).length, 0);
-  assert.equal(await s.read(created.id), null);
-});
+  {
+    const { s, trashedDirs } = await makeSessions();
+    const created = await s.create({ title: '要删的' });
+    await s.remove(created.id);
+    assert.equal(trashedDirs.length, 1);
+    assert.equal((await s.list()).length, 0);
+    assert.equal(await s.read(created.id), null);
+  }
 
-test('attachments sanitize names, dedupe, and register in session data', async function () {
-  const { s } = await makeSessions();
-  const created = await s.create({ title: 't' });
-  const r1 = await s.saveAttachment(created.id, { name: '报告<1>.pdf', label: 'x', dataBase64: Buffer.from('abc').toString('base64') });
-  const r2 = await s.saveAttachment(created.id, { name: '报告<1>.pdf', dataBase64: Buffer.from('def').toString('base64') });
-  assert.equal(r1.file, '附件/报告 1.pdf');
-  assert.ok(r2.file.indexOf(' 2.pdf') !== -1);
-  const data = await s.read(created.id);
-  assert.equal(data.attachments.length, 2);
-  assert.equal(data.attachments[0].label, 'x');
+  {
+    const { s } = await makeSessions();
+    const created = await s.create({ title: 't' });
+    const r1 = await s.saveAttachment(created.id, { name: '报告<1>.pdf', label: 'x', dataBase64: Buffer.from('abc').toString('base64') });
+    const r2 = await s.saveAttachment(created.id, { name: '报告<1>.pdf', dataBase64: Buffer.from('def').toString('base64') });
+    assert.equal(r1.file, '附件/报告 1.pdf');
+    assert.ok(r2.file.indexOf(' 2.pdf') !== -1);
+    const data = await s.read(created.id);
+    assert.equal(data.attachments.length, 2);
+    assert.equal(data.attachments[0].label, 'x');
+  }
 });
 
 test('exportMarkdown writes readable transcript next to session.json', async function () {
@@ -191,7 +193,7 @@ test('exportMarkdown writes readable transcript next to session.json', async fun
   assert.ok(md.indexOf('openalex') !== -1);
 });
 
-test('index corruption triggers rescan and recovery', async function () {
+test('index.json corruption triggers rescan and recovery; removeMany trashes each session and reports failures; caps batch size and tolerates empty input', async function () {
   const { s, root } = await makeSessions();
   const a = await s.create({ title: 'A' });
   const b = await s.create({ title: 'B' });
@@ -203,30 +205,30 @@ test('index corruption triggers rescan and recovery', async function () {
   // 读会话仍能命中磁盘
   const data = await s.read(a.id);
   assert.equal(data.id, a.id);
-});
 
-test('removeMany trashes each session, reports failures without aborting the rest', async function () {
-  const { s, trashedDirs } = await makeSessions();
-  const a = await s.create({ title: 'A' });
-  const b = await s.create({ title: 'B' });
-  const c = await s.create({ title: 'C' });
-  const result = await s.removeMany([a.id, 'nonexistent-id', b.id]);
-  assert.deepEqual(result.deleted, [a.id, b.id]);
-  assert.equal(result.failed.length, 1);
-  assert.equal(result.failed[0].id, 'nonexistent-id');
-  assert.equal(trashedDirs.length, 2);          // 两个成功项都进了回收站
-  assert.deepEqual(result.sessions.map((x) => x.id), [c.id]); // 返回刷新后的索引
-  assert.equal((await s.list()).length, 1);
-});
+  {
+    const { s, trashedDirs } = await makeSessions();
+    const a = await s.create({ title: 'A' });
+    const b = await s.create({ title: 'B' });
+    const c = await s.create({ title: 'C' });
+    const result = await s.removeMany([a.id, 'nonexistent-id', b.id]);
+    assert.deepEqual(result.deleted, [a.id, b.id]);
+    assert.equal(result.failed.length, 1);
+    assert.equal(result.failed[0].id, 'nonexistent-id');
+    assert.equal(trashedDirs.length, 2);          // 两个成功项都进了回收站
+    assert.deepEqual(result.sessions.map((x) => x.id), [c.id]); // 返回刷新后的索引
+    assert.equal((await s.list()).length, 1);
+  }
 
-test('removeMany caps batch size and tolerates empty input', async function () {
-  const { s } = await makeSessions();
-  assert.deepEqual((await s.removeMany([])).deleted, []);
-  assert.deepEqual((await s.removeMany(null)).deleted, []);
-  const created = await s.create({ title: 'X' });
-  const result = await s.removeMany([created.id, '', null]);
-  assert.deepEqual(result.deleted, [created.id]);
-  assert.deepEqual(result.failed, []);
+  {
+    const { s } = await makeSessions();
+    assert.deepEqual((await s.removeMany([])).deleted, []);
+    assert.deepEqual((await s.removeMany(null)).deleted, []);
+    const created = await s.create({ title: 'X' });
+    const result = await s.removeMany([created.id, '', null]);
+    assert.deepEqual(result.deleted, [created.id]);
+    assert.deepEqual(result.failed, []);
+  }
 });
 
 test('index.json writes are debounced for message flushes but forced on structural changes', async function () {
@@ -265,40 +267,42 @@ test('index.json writes are debounced for message flushes but forced on structur
   assert.equal(JSON.parse(await fs.readFile(idxPath, 'utf8')).sessions[0].title, '改名后');
 });
 
-test('R04: commit 立即写盘并等待完成（不等防抖），链住未落盘的防抖修改', async function () {
-  const { s, root } = await makeSessions();
-  const created = await s.create({ title: 't' });
-  // 先走防抖路径写入第一条（模拟流式中的普通 persist）
-  const data = await s.read(created.id);
-  data.messages.push({ role: 'user', content: 'first' });
-  await s.setData(created.id, data);
-  // 立即 checkpoint：防抖 timer 被清，最新数据（含第一条）直接落盘
-  const data2 = await s.read(created.id);
-  data2.messages.push({ role: 'user', content: 'second' });
-  const r = await s.commit(created.id, data2);
-  assert.equal(r.ok, true);
-  const onDisk = JSON.parse(await fs.readFile(
-    path.join(root, '会话记录', created.dir, 'session.json'), 'utf8'));
-  assert.deepEqual(onDisk.messages.map((m) => m.content), ['first', 'second'],
-    'commit 返回时磁盘必须已有全部已提交内容');
-});
+test('R04: commit 立即写盘并等待完成（不等防抖），链住未落盘的防抖修改；R05: 渲染层旧快照不覆盖主进程登记的附件，commit 回传当前登记', async function () {
+  {
+    const { s, root } = await makeSessions();
+    const created = await s.create({ title: 't' });
+    // 先走防抖路径写入第一条（模拟流式中的普通 persist）
+    const data = await s.read(created.id);
+    data.messages.push({ role: 'user', content: 'first' });
+    await s.setData(created.id, data);
+    // 立即 checkpoint：防抖 timer 被清，最新数据（含第一条）直接落盘
+    const data2 = await s.read(created.id);
+    data2.messages.push({ role: 'user', content: 'second' });
+    const r = await s.commit(created.id, data2);
+    assert.equal(r.ok, true);
+    const onDisk = JSON.parse(await fs.readFile(
+      path.join(root, '会话记录', created.dir, 'session.json'), 'utf8'));
+    assert.deepEqual(onDisk.messages.map((m) => m.content), ['first', 'second'],
+      'commit 返回时磁盘必须已有全部已提交内容');
+  }
 
-test('R05: 渲染层旧快照不覆盖主进程登记的附件；commit 回传当前登记', async function () {
-  const { s } = await makeSessions();
-  const created = await s.create({ title: 't' });
-  await s.saveAttachment(created.id, { name: 'a.pdf', label: 'L', dataBase64: Buffer.from('x').toString('base64') });
-  // 模拟渲染层 IPC 深拷贝提交：本地 doc 的 attachments 还是旧的空数组
-  const stale = await s.read(created.id);
-  stale.attachments = [];
-  stale.messages.push({ role: 'user', content: 'hi' });
-  const r = await s.commit(created.id, JSON.parse(JSON.stringify(stale)));
-  assert.equal(r.attachments.length, 1, '主进程登记的附件必须保留并回传');
-  assert.equal(r.attachments[0].label, 'L');
-  const after = await s.read(created.id);
-  assert.equal(after.attachments.length, 1);
-  assert.equal(after.messages.length, 1);
-  // flushAll（退出路径）后仍在
-  await s.flushAll();
-  const final = await s.read(created.id);
-  assert.equal(final.attachments.length, 1);
+  {
+    const { s } = await makeSessions();
+    const created = await s.create({ title: 't' });
+    await s.saveAttachment(created.id, { name: 'a.pdf', label: 'L', dataBase64: Buffer.from('x').toString('base64') });
+    // 模拟渲染层 IPC 深拷贝提交：本地 doc 的 attachments 还是旧的空数组
+    const stale = await s.read(created.id);
+    stale.attachments = [];
+    stale.messages.push({ role: 'user', content: 'hi' });
+    const r = await s.commit(created.id, JSON.parse(JSON.stringify(stale)));
+    assert.equal(r.attachments.length, 1, '主进程登记的附件必须保留并回传');
+    assert.equal(r.attachments[0].label, 'L');
+    const after = await s.read(created.id);
+    assert.equal(after.attachments.length, 1);
+    assert.equal(after.messages.length, 1);
+    // flushAll（退出路径）后仍在
+    await s.flushAll();
+    const final = await s.read(created.id);
+    assert.equal(final.attachments.length, 1);
+  }
 });

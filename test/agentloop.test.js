@@ -40,7 +40,7 @@ function makeRun() {
 
 const toolCall = (id, name, args) => ({ message: { content: '', tool_calls: [{ id: id, function: { name: name, arguments: JSON.stringify(args) } }] } });
 
-test('each tool result commits before the next side effect and recovers pending image refs', async () => {
+test('each tool result commits before the next side effect and recovers pending image refs; invalid tool image refs never remove their committed result', async () => {
   const snapshots = [];
   const { hooks } = makeHooks([{ message: { content: '', tool_calls: [toolCall('a', 't', {}).message.tool_calls[0], toolCall('b', 't2', {}).message.tool_calls[0]] } }, { message: { content: 'done' } }]);
   hooks.persist = (run) => snapshots.push(JSON.parse(JSON.stringify({ messages: run.core.messages, streaming: run.doc.streaming, turnId: run.core.turnId })));
@@ -58,18 +58,16 @@ test('each tool result commits before the next side effect and recovers pending 
   assert.match(restored.core.messages.find((m) => m.tool_call_id === 'b').content, /未确认/);
   assert.equal(restored.core.messages.filter((m) => m.images).length, 1);
   assert.equal(restored.core.messages.some((m) => m.pendingImages), false);
+  // invalid tool image refs never remove their committed result
+  const { hooks: hooks2 } = makeHooks([toolCall('a', 't', {}), { message: { content: 'done' } }]);
+  hooks2.executeTool = async () => ({ text: 'keep this', images: [{ type: 'image', ref: 'data:bad' }] });
+  const run2 = makeRun();
+  Core.appendUser(run2.core, 'go');
+  await Loop.createRunner(hooks2).runTurn(run2);
+  assert.equal(run2.core.messages.find((m) => m.tool_call_id === 'a').content, 'keep this');
 });
 
-test('invalid tool image refs never remove their committed result', async () => {
-  const { hooks } = makeHooks([toolCall('a', 't', {}), { message: { content: 'done' } }]);
-  hooks.executeTool = async () => ({ text: 'keep this', images: [{ type: 'image', ref: 'data:bad' }] });
-  const run = makeRun();
-  Core.appendUser(run.core, 'go');
-  await Loop.createRunner(hooks).runTurn(run);
-  assert.equal(run.core.messages.find((m) => m.tool_call_id === 'a').content, 'keep this');
-});
-
-test('cancel during overflow recovery persistence prevents another model request', async function () {
+test('cancel during overflow recovery persistence prevents another model request; cancel on the final allowed tool step takes priority over max_steps', async function () {
   const { hooks, calls } = makeHooks([
     new Error('prompt is too long: 90000 tokens > 8192 maximum'),
     { message: { content: 'must not request this answer' } }
@@ -84,24 +82,22 @@ test('cancel during overflow recovery persistence prevents another model request
   Core.appendUser(run.core, 'go');
   assert.equal(await runner.runTurn(run), 'stopped');
   assert.equal(calls.chat.length, 1);
-});
-
-test('cancel on the final allowed tool step takes priority over max_steps', async function () {
-  const { hooks } = makeHooks([toolCall('c1', 't', {})]);
-  hooks.executeTool = async function () {
-    runner.cancel('r1');
+  // cancel on the final allowed tool step takes priority over max_steps
+  const { hooks: hooks2 } = makeHooks([toolCall('c1', 't', {})]);
+  hooks2.executeTool = async function () {
+    runner2.cancel('r1');
     return 'late result';
   };
-  const runner = Loop.createRunner(hooks);
-  const run = makeRun();
-  run.core.maxSteps = 1;
-  Core.appendUser(run.core, 'go');
-  assert.equal(await runner.runTurn(run), 'stopped');
-  assert.equal(run.core.messages.filter((message) => message.role === 'tool').length, 1);
-  assert.equal(run.core.messages.some((message) => message.role === 'error'), false);
+  const runner2 = Loop.createRunner(hooks2);
+  const run2 = makeRun();
+  run2.core.maxSteps = 1;
+  Core.appendUser(run2.core, 'go');
+  assert.equal(await runner2.runTurn(run2), 'stopped');
+  assert.equal(run2.core.messages.filter((message) => message.role === 'tool').length, 1);
+  assert.equal(run2.core.messages.some((message) => message.role === 'error'), false);
 });
 
-test('A01/A17: orchestration runs model → tools → model → final answer', async function () {
+test('A01/A17: orchestration runs model → tools → model → final answer; A03: cancel during tool wait stops the loop and pads tool results', async function () {
   const { hooks, calls } = makeHooks([
     toolCall('c1', 'search_openalex', { query: 'battery' }),
     toolCall('c2', 'get_research_work', { workId: 'W1' }),
@@ -118,31 +114,29 @@ test('A01/A17: orchestration runs model → tools → model → final answer', a
   // 最后一条 assistant 消息带展示元数据（工具步骤）
   const lastToolCall = run.core.messages[3].toolCalls;
   assert.equal(lastToolCall[0].status, 'ok');
-});
-
-test('A03: cancel during tool wait stops the loop and pads tool results', async function () {
-  const { hooks, calls } = makeHooks([
+  // A03：工具等待期取消——停止循环并补占位工具结果
+  const { hooks: hooks2, calls: calls2 } = makeHooks([
     toolCall('c1', 'slow_tool', {}),
     { message: { content: 'should not be reached' } }
   ]);
   // 工具执行期间触发取消
-  hooks.executeTool = async function () {
-    runner.cancel('r1');
+  hooks2.executeTool = async function () {
+    runner2.cancel('r1');
     return 'late result';
   };
-  const runner = Loop.createRunner(hooks);
-  const run = makeRun();
-  Core.appendUser(run.core, 'go');
-  const endReason = await runner.runTurn(run);
-  assert.equal(endReason, 'stopped');
-  assert.equal(calls.chat.length, 1); // 取消后不再发起下一次模型请求
+  const runner2 = Loop.createRunner(hooks2);
+  const run2 = makeRun();
+  Core.appendUser(run2.core, 'go');
+  const endReason2 = await runner2.runTurn(run2);
+  assert.equal(endReason2, 'stopped');
+  assert.equal(calls2.chat.length, 1); // 取消后不再发起下一次模型请求
   // tool_calls 与 tool 消息仍配对（占位结果已补）
-  const toolMsgs = run.core.messages.filter(function (m) { return m.role === 'tool'; });
+  const toolMsgs = run2.core.messages.filter(function (m) { return m.role === 'tool'; });
   assert.equal(toolMsgs.length, 1);
   assert.ok(toolMsgs[0].content.indexOf('已停止') !== -1 || toolMsgs[0].content === 'late result');
 });
 
-test('A03: cancel while waiting for the model keeps partial output and marks stopped', async function () {
+test('A03: cancel while waiting for the model keeps partial output and marks stopped; A05: partial (truncated stream) lands message plus retryable error card', async function () {
   let releaseChat = null;
   const { hooks, calls } = makeHooks([
     function () {
@@ -164,31 +158,29 @@ test('A03: cancel while waiting for the model keeps partial output and marks sto
   assert.equal(calls.chat.length, 1);
   const last = run.core.messages[run.core.messages.length - 1];
   assert.equal(last.content, '半截回答'); // 半截输出保留
-});
-
-test('A05: partial (truncated stream) lands message plus retryable error card', async function () {
-  const { hooks } = makeHooks([
+  // A05：partial（截断流）落部分消息 + 可重试错误卡，按轮重跑成功
+  const { hooks: hooks2 } = makeHooks([
     { partial: true, message: { role: 'assistant', content: '截断的内容' }, errorText: '连接在回复结束前中断' },
     { message: { content: 'retry answer' } }
   ]);
-  const runner = Loop.createRunner(hooks);
-  const run = makeRun();
-  Core.appendUser(run.core, 'q');
-  const endReason = await runner.runTurn(run);
-  assert.equal(endReason, 'failed');
-  const msgs = run.core.messages;
+  const runner2 = Loop.createRunner(hooks2);
+  const run2 = makeRun();
+  Core.appendUser(run2.core, 'q');
+  const endReason2 = await runner2.runTurn(run2);
+  assert.equal(endReason2, 'failed');
+  const msgs = run2.core.messages;
   assert.equal(msgs[1].content, '截断的内容');       // 部分内容已落账
   assert.equal(msgs[2].role, 'error');
   assert.equal(msgs[2].retry, true);
   // 按轮重试：截断到 user，重跑成功
   const turnId = msgs[0].turnId;
-  const end2 = await runner.rerunTurn(run, turnId);
+  const end2 = await runner2.rerunTurn(run2, turnId);
   assert.equal(end2, 'done');
-  assert.equal(run.core.messages.length, 2);
-  assert.equal(run.core.messages[1].content, 'retry answer');
+  assert.equal(run2.core.messages.length, 2);
+  assert.equal(run2.core.messages[1].content, 'retry answer');
 });
 
-test('A06: stream deltas stay in memory and never touch the session document', async function () {
+test('A06: stream deltas stay in memory and never touch the session document; turn persists only at event points (start / before tools / tool results / end)', async function () {
   const { hooks, calls } = makeHooks([{ message: { content: 'final' } }]);
   const runner = Loop.createRunner(hooks);
   const run = makeRun();
@@ -203,52 +195,68 @@ test('A06: stream deltas stay in memory and never touch the session document', a
   assert.equal(run.doc.streamText, undefined);
   assert.equal(run.doc.streamReasoning, undefined);
   assert.equal(calls.persists, 0);
-});
-
-test('A06: turn persists only at event points (start / before tools / tool results / end)', async function () {
-  const { hooks, calls } = makeHooks([
+  // 轮次只在事件点落盘
+  const { hooks: hooks2, calls: calls2 } = makeHooks([
     toolCall('c1', 'search_openalex', { query: 'x' }),
     { message: { content: 'done' } }
   ]);
-  const run = makeRun();
+  const run2 = makeRun();
   let persistsWhileStreaming = 0;
   // 流式期间不应发生任何落盘
-  const origChat = hooks.chat;
-  const runnerHooks = Object.assign({}, hooks, {
+  const origChat = hooks2.chat;
+  const runnerHooks = Object.assign({}, hooks2, {
     chat: async function (input) {
-      run.streaming = true;
+      run2.streaming = true;
       const r = await origChat(input);
       return r;
     },
     persist: function (target) {
       if (target.streaming && target.streamText) persistsWhileStreaming++;
-      calls.persists++;
+      calls2.persists++;
     }
   });
   const runner2 = Loop.createRunner(runnerHooks);
-  Core.appendUser(run.core, 'q');
-  await runner2.runTurn(run);
+  Core.appendUser(run2.core, 'q');
+  await runner2.runTurn(run2);
   assert.equal(persistsWhileStreaming, 0);
   // 一次工具轮 = 开始 1 + 工具前 1 + 工具结果 1 + 收尾 1（+ 循环中的续跑判定不再落盘）
-  assert.ok(calls.persists <= 6, 'persists should be O(events), got ' + calls.persists);
-  assert.ok(calls.persists >= 3, 'at least start/before-tools/tool-results/end, got ' + calls.persists);
+  assert.ok(calls2.persists <= 6, 'persists should be O(events), got ' + calls2.persists);
+  assert.ok(calls2.persists >= 3, 'at least start/before-tools/tool-results/end, got ' + calls2.persists);
 });
 
-test('A06: restoreInterrupted converts leftover stream buffer into interrupted turn', function () {
-  const runner = Loop.createRunner(makeHooks([]).hooks);
-  const run = makeRun();
-  run.doc.streaming = true; // 上一次运行确实没收尾（新契约：中断以运行标记判定）
-  run.doc.streamText = '崩溃前的半截回复';
-  run.doc.streamReasoning = '推理片段';
-  const restored = runner.restoreInterrupted(run);
-  assert.equal(restored, true);
-  const msgs = run.core.messages;
-  assert.equal(msgs[0].content, '崩溃前的半截回复');
-  assert.equal(msgs[0].reasoning, '推理片段');
-  assert.equal(msgs[1].role, 'error');
-  assert.ok(msgs[1].content.indexOf('中断') !== -1);
-  assert.equal(run.doc.streamText, '');
-  assert.equal(runner.restoreInterrupted(run), false); // 无缓冲时不再追加
+test('restoreInterrupted salvages only unfinished runs, dedupes committed text and resets buffers', function () {
+  const cases = [
+    { name: 'no prior messages', streaming: true, text: '崩溃前的半截回复', reasoning: '推理片段', restored: true, count: 2, assistantIndex: 0 },
+    { name: 'finished run', streaming: false, text: '答案正文', restored: false, count: 0 },
+    { name: 'already committed', user: true, committed: '完整答案', streaming: true, text: '完整答案', restored: true, count: 3, assistantIndex: 1 },
+    { name: 'no salvageable text', user: true, streaming: true, text: '', restored: true, count: 2, errorText: '未完成' },
+    { name: 'partial stream', user: true, streaming: true, text: '写到一半就断了', reasoning: '推理片段', restored: true, count: 3, assistantIndex: 1, retry: true }
+  ];
+  for (const scenario of cases) {
+    const runner = Loop.createRunner(makeHooks([]).hooks);
+    const run = makeRun();
+    if (scenario.user) Core.appendUser(run.core, 'q');
+    if (scenario.committed) Core.appendAssistant(run.core, { content: scenario.committed });
+    run.doc.streaming = scenario.streaming;
+    run.doc.streamText = scenario.text;
+    run.doc.streamReasoning = scenario.reasoning || '';
+    assert.equal(runner.restoreInterrupted(run), scenario.restored, scenario.name);
+    assert.equal(run.core.messages.length, scenario.count, scenario.name);
+    if (scenario.assistantIndex !== undefined) {
+      const assistant = run.core.messages[scenario.assistantIndex];
+      assert.equal(assistant.content, scenario.text, scenario.name);
+      if (scenario.reasoning) assert.equal(assistant.reasoning, scenario.reasoning, scenario.name);
+    }
+    if (scenario.restored) {
+      const error = run.core.messages.at(-1);
+      assert.equal(error.role, 'error', scenario.name);
+      assert.ok(error.content.includes(scenario.errorText || '中断'), scenario.name);
+      if (scenario.retry) assert.equal(error.retry, true, scenario.name);
+    }
+    assert.equal(run.doc.streaming, false, scenario.name);
+    assert.equal(run.doc.streamText, '', scenario.name);
+    assert.equal(runner.restoreInterrupted(run), false, scenario.name + ': repeat restoration');
+  }
 });
 
 test('A13: rerunTurn edits a specific user message and reruns only that turn', async function () {
@@ -274,7 +282,7 @@ test('A13: rerunTurn edits a specific user message and reruns only that turn', a
   assert.equal(run.core.messages[1].content, 'edited answer');
 });
 
-test('A13: max_steps termination adds explainer error note', async function () {
+test('A13: max_steps termination adds explainer error note; summarize_paper extends the step budget only for its current turn', async function () {
   const { hooks } = makeHooks([
     toolCall('c1', 't', {}),
     toolCall('c2', 't', {}),
@@ -291,22 +299,20 @@ test('A13: max_steps termination adds explainer error note', async function () {
   const last = run.core.messages[run.core.messages.length - 1];
   assert.equal(last.role, 'error');
   assert.ok(last.content.indexOf('最大步数') !== -1);
-});
-
-test('summarize_paper extends the step budget only for its current turn', async function () {
+  // summarize_paper 只为当前轮扩展步数预算
   const script = Array.from({ length: 14 }, (_, i) => toolCall('review-' + i, 'summarize_paper', { paperId: 'p1', from: i * 8 + 1 }));
   script.push({ message: { content: '全文梳理完成' } });
-  const { hooks, calls } = makeHooks(script);
-  const runner = Loop.createRunner(hooks);
-  const run = makeRun();
-  run.core.maxSteps = 2;
-  Core.appendUser(run.core, '梳理整篇文献');
-  assert.equal(await runner.runTurn(run), 'done');
-  assert.equal(calls.tools.length, 14);
-  assert.equal(run.core.maxSteps, 2);
+  const { hooks: hooks2, calls: calls2 } = makeHooks(script);
+  const runner2 = Loop.createRunner(hooks2);
+  const run2 = makeRun();
+  run2.core.maxSteps = 2;
+  Core.appendUser(run2.core, '梳理整篇文献');
+  assert.equal(await runner2.runTurn(run2), 'done');
+  assert.equal(calls2.tools.length, 14);
+  assert.equal(run2.core.maxSteps, 2);
 });
 
-test('run_end event carries endReason for the UI', async function () {
+test('run_end event carries endReason; runTurn marks doc.streaming and clears buffers; R04: persist 在事件点被 await（工具执行前 assistant 已落盘）', async function () {
   const { hooks, calls } = makeHooks([{ message: { content: 'done' } }]);
   const runner = Loop.createRunner(hooks);
   const run = makeRun();
@@ -314,83 +320,25 @@ test('run_end event carries endReason for the UI', async function () {
   await runner.runTurn(run);
   const endEvent = calls.events.filter(function (e) { return e.type === 'run_end'; })[0];
   assert.equal(endEvent.endReason, 'done');
-});
-
-test('restoreInterrupted ignores leftover buffer when the run actually finished (no false 中断卡)', function () {
-  const runner = Loop.createRunner(makeHooks([]).hooks);
-  const run = makeRun();
-  // 正常收尾的运行：streaming 标记为 false，但缓冲可能因窗口期残留
-  run.doc.streaming = false;
-  run.doc.streamText = '答案正文';
-  assert.equal(runner.restoreInterrupted(run), false);
-  assert.equal(run.core.messages.length, 0);      // 不追加任何消息
-  assert.equal(run.doc.streamText, '');           // 残留缓冲仍被清掉
-});
-
-test('restoreInterrupted does not duplicate content already committed as a message', function () {
-  const runner = Loop.createRunner(makeHooks([]).hooks);
-  const run = makeRun();
-  Core.appendUser(run.core, 'q');
-  Core.appendAssistant(run.core, { content: '完整答案' });
-  run.doc.streaming = true;                       // 真中断（例如落账后立即被杀）
-  run.doc.streamText = '完整答案';                 // 缓冲与已落账内容相同
-  assert.equal(runner.restoreInterrupted(run), true);
-  assert.equal(run.core.messages.length, 3);      // 不追加重复的助手消息，只补一张中断卡
-  assert.equal(run.core.messages[1].content, '完整答案');
-  assert.equal(run.core.messages[2].role, 'error');
-  assert.equal(run.doc.streaming, false);         // 标记已复位
-});
-
-test('restoreInterrupted still reports a genuine interruption with no salvageable text', function () {
-  const runner = Loop.createRunner(makeHooks([]).hooks);
-  const run = makeRun();
-  Core.appendUser(run.core, 'q');
-  run.doc.streaming = true;   // 流式期间硬崩：缓冲从未落盘
-  run.doc.streamText = '';
-  assert.equal(runner.restoreInterrupted(run), true);
-  assert.equal(run.core.messages.length, 2);
-  assert.equal(run.core.messages[1].role, 'error');
-  assert.ok(run.core.messages[1].content.indexOf('未完成') !== -1);
-});
-
-test('restoreInterrupted still recovers a genuinely interrupted partial stream', function () {
-  const runner = Loop.createRunner(makeHooks([]).hooks);
-  const run = makeRun();
-  Core.appendUser(run.core, 'q');
-  run.doc.streaming = true;
-  run.doc.streamText = '写到一半就断了';
-  run.doc.streamReasoning = '推理片段';
-  assert.equal(runner.restoreInterrupted(run), true);
-  const msgs = run.core.messages;
-  assert.equal(msgs[1].content, '写到一半就断了');
-  assert.equal(msgs[1].reasoning, '推理片段');
-  assert.equal(msgs[2].role, 'error');
-  assert.equal(msgs[2].retry, true);
-  assert.equal(run.doc.streaming, false);
-  assert.equal(run.doc.streamText, '');
-});
-
-test('runTurn marks doc.streaming while running and clears buffers once the model returns', async function () {
-  const { hooks } = makeHooks([{ message: { content: 'final' } }]);
+  // runTurn 运行期间标记 doc.streaming，模型返回后清缓冲
+  const { hooks: hooks2 } = makeHooks([{ message: { content: 'final' } }]);
   let streamingSeenDuringRun = null;
-  const origPersist = hooks.persist;
-  const runner = Loop.createRunner(Object.assign({}, hooks, {
+  const origPersist = hooks2.persist;
+  const runner2 = Loop.createRunner(Object.assign({}, hooks2, {
     persist: function (run) {
       if (run.streaming) streamingSeenDuringRun = run.doc.streaming;
       origPersist(run);
     }
   }));
-  const run = makeRun();
-  Core.appendUser(run.core, 'q');
-  await runner.runTurn(run);
+  const run2 = makeRun();
+  Core.appendUser(run2.core, 'q');
+  await runner2.runTurn(run2);
   assert.equal(streamingSeenDuringRun, true);   // 运行期间标记为真
-  assert.equal(run.doc.streaming, false);       // 收尾后复位
-  assert.equal(run.doc.streamText, '');         // 缓冲已清
-});
-
-test('R04: persist 在事件点被 await——工具执行前 assistant 必须已完成落盘', async function () {
+  assert.equal(run2.doc.streaming, false);       // 收尾后复位
+  assert.equal(run2.doc.streamText, '');         // 缓冲已清
+  // R04：persist 在事件点被 await——工具执行前 assistant 必须已完成落盘
   const order = [];
-  const { hooks } = makeHooks([
+  const { hooks: hooks3 } = makeHooks([
     toolCall('c1', 't', {}),
     { message: { content: 'done!' } }
   ], {
@@ -403,10 +351,10 @@ test('R04: persist 在事件点被 await——工具执行前 assistant 必须�
     },
     executeTool: async function () { order.push('tool-ran'); return 'ok'; }
   });
-  const runner = Loop.createRunner(hooks);
-  const run = makeRun();
-  Core.appendUser(run.core, 'q');
-  assert.equal(await runner.runTurn(run), 'done');
+  const runner3 = Loop.createRunner(hooks3);
+  const run3 = makeRun();
+  Core.appendUser(run3.core, 'q');
+  assert.equal(await runner3.runTurn(run3), 'done');
   // 关键断言：带 assistant 消息的 checkpoint 完成先于工具执行
   assert.ok(order.indexOf('persisted:1a/0t') !== -1);
   assert.ok(order.indexOf('tool-ran') > order.indexOf('persisted:1a/0t'));
@@ -505,7 +453,7 @@ test('R08/R03: rerunTurn 恢复原轮冻结上下文；waitIdle 等当前轮收�
 /* ---------------- R17：上下文压缩钩子 / 溢出减半重试 / 用量回喂 ---------------- */
 const Context = require('../js/agentcontext.js');
 
-test('R17: maybeCompact 在每次模型请求前被 await（压缩后重建请求体）', async function () {
+test('R17: maybeCompact 在每次模型请求前被 await（压缩后重建请求体）；端点报上下文超长 → 预算减半重建请求体重试一次，成功后继续', async function () {
   let compacted = 0;
   const seen = [];
   const { hooks } = makeHooks([{ message: { content: '答' } }]);
@@ -526,33 +474,31 @@ test('R17: maybeCompact 在每次模型请求前被 await（压缩后重建请�
   const sent = seen[0].messages.map((m) => String(m.content || '')).join('\n');
   assert.ok(sent.indexOf('调研电池') === -1, '被压缩消息不进请求');
   assert.ok(sent.indexOf('上下文摘要') !== -1, '摘要进入请求');
-});
-
-test('R17: 端点报上下文超长 → 预算减半重建请求体重试一次，成功后继续', async function () {
-  const seen = [];
-  const { hooks, calls } = makeHooks([
+  // 端点报上下文超长 → 预算减半重建请求体重试一次，成功后继续
+  const seen2 = [];
+  const { hooks: hooks2, calls: calls2 } = makeHooks([
     new Error('AI 服务返回 HTTP 400：{"error":{"code":"context_length_exceeded","message":"This model\'s maximum context length is 8192 tokens"}}'),
     { message: { content: '减半后的回答' } }
   ]);
-  hooks.context = Context;
-  hooks.buildBody = function (run) {
+  hooks2.context = Context;
+  hooks2.buildBody = function (run) {
     const budget = Number(run.forceContextTokens) > 0 ? Number(run.forceContextTokens) : 256000;
     run.appliedContextTokens = budget;
-    seen.push(budget);
+    seen2.push(budget);
     return Core.buildRequestBody(run.core, { system: 'SYS', maxContextTokens: budget });
   };
-  const runner = Loop.createRunner(hooks);
-  const run = makeRun();
-  Core.appendUser(run.core, '问');
-  const endReason = await runner.runTurn(run);
-  assert.equal(endReason, 'done');
-  assert.equal(calls.chat.length, 2, '重试了一次');
-  assert.deepEqual(seen, [256000, 128000], '第二次请求用减半预算');
-  assert.ok(run.core.messages.some((m) => m.role === 'error' && String(m.content).indexOf('上下文超出模型限制') === 0), '插入可见的错误卡说明发生了什么');
-  assert.equal(run.core.messages[run.core.messages.length - 1].content, '减半后的回答');
+  const runner2 = Loop.createRunner(hooks2);
+  const run2 = makeRun();
+  Core.appendUser(run2.core, '问');
+  const endReason2 = await runner2.runTurn(run2);
+  assert.equal(endReason2, 'done');
+  assert.equal(calls2.chat.length, 2, '重试了一次');
+  assert.deepEqual(seen2, [256000, 128000], '第二次请求用减半预算');
+  assert.ok(run2.core.messages.some((m) => m.role === 'error' && String(m.content).indexOf('上下文超出模型限制') === 0), '插入可见的错误卡说明发生了什么');
+  assert.equal(run2.core.messages[run2.core.messages.length - 1].content, '减半后的回答');
 });
 
-test('R17: 溢出重试仍失败 → 如实失败，不无限重试；未注入 context 时不重试', async function () {
+test('R17: 溢出重试仍失败 → 如实失败，不无限重试；未注入 context 时不重试；usage.prompt_tokens 回喂 state.lastInputTokens（跨 serialize 持久化）', async function () {
   const overflow = () => new Error('AI 服务返回 HTTP 400：prompt is too long: 90000 tokens > 8192 maximum');
   const a = makeHooks([overflow(), overflow(), { message: { content: 'x' } }]);
   a.hooks.context = Context;
@@ -575,22 +521,20 @@ test('R17: 溢出重试仍失败 → 如实失败，不无限重试；未注入 
   const reasonB = await runnerB.runTurn(runB);
   assert.equal(reasonB, 'failed');
   assert.equal(b.calls.chat.length, 1, '无 context 模块时不重试');
-});
-
-test('R17: 端点回报 usage.prompt_tokens 回喂 state.lastInputTokens（跨 serialize 持久化）', async function () {
-  const { hooks } = makeHooks([{ message: { content: '答' }, usage: { prompt_tokens: 54321, completion_tokens: 77 } }]);
-  const runner = Loop.createRunner(hooks);
-  const run = makeRun();
-  Core.appendUser(run.core, '问');
-  await runner.runTurn(run);
-  assert.equal(run.core.lastInputTokens, 54321);
-  const restored = Core.deserialize(JSON.parse(JSON.stringify(Core.serialize(run.core))));
+  // 端点回报 usage.prompt_tokens 回喂 state.lastInputTokens
+  const { hooks: hooks2 } = makeHooks([{ message: { content: '答' }, usage: { prompt_tokens: 54321, completion_tokens: 77 } }]);
+  const runner2 = Loop.createRunner(hooks2);
+  const run2 = makeRun();
+  Core.appendUser(run2.core, '问');
+  await runner2.runTurn(run2);
+  assert.equal(run2.core.lastInputTokens, 54321);
+  const restored = Core.deserialize(JSON.parse(JSON.stringify(Core.serialize(run2.core))));
   assert.equal(restored.lastInputTokens, 54321);
 });
 
 /* ---------------- A-followup #1：压缩摘要不得抢占重试/编辑重发的目标 ---------------- */
 
-test('A-followup #1: 压缩后重试当前轮，重跑的是真实提问而不是上下文摘要', async function () {
+test('A-followup #1: 压缩后重试当前轮，重跑的是真实提问而不是上下文摘要；retryLast 跳过合成 user 消息（工具注入截图），定位到真实提问', async function () {
   const script = [{ message: { content: 'a1' } }, { message: { content: 'a2' } }];
   const { hooks, calls } = makeHooks(script);
   // 真实压缩路径（LitAgentContext.applyCompaction）：摘要带 synthetic + kind=compaction
@@ -624,22 +568,20 @@ test('A-followup #1: 压缩后重试当前轮，重跑的是真实提问而不�
   // 请求体里根本不会出现 CURRENT QUESTION。断言最后一条 user 消息就是真实提问。
   const lastUser = rerunBody.messages.filter((m) => m.role === 'user').pop();
   assert.equal(String(lastUser.content), 'CURRENT QUESTION', '重跑的输入是当前提问，不是摘要');
-});
-
-test('A-followup #1: retryLast 跳过合成 user 消息（工具注入截图），定位到真实提问', async function () {
-  const { hooks } = makeHooks([toolCall('c1', 'render_pdf_pages', {}), { message: { content: '看完了' } }, { message: { content: '重跑答案' } }]);
-  hooks.executeTool = async function () {
+  // retryLast 跳过合成 user 消息（工具注入截图），定位到真实提问
+  const { hooks: hooks2 } = makeHooks([toolCall('c1', 'render_pdf_pages', {}), { message: { content: '看完了' } }, { message: { content: '重跑答案' } }]);
+  hooks2.executeTool = async function () {
     return { text: '{"rendered":1}', images: [{ type: 'image', ref: 'session:s1|a.png', label: '第 3 页' }] };
   };
-  const runner = Loop.createRunner(hooks);
-  const run = makeRun();
-  Core.appendUser(run.core, 'REAL QUESTION');
-  await runner.runTurn(run);
-  const synthetic = run.core.messages.filter((m) => m.role === 'user' && m.synthetic === true);
+  const runner2 = Loop.createRunner(hooks2);
+  const run2 = makeRun();
+  Core.appendUser(run2.core, 'REAL QUESTION');
+  await runner2.runTurn(run2);
+  const synthetic = run2.core.messages.filter((m) => m.role === 'user' && m.synthetic === true);
   assert.equal(synthetic.length, 1, '截图合成消息确实存在（且是最后一条 user）');
-  assert.equal(run.core.messages[run.core.messages.length - 1].role, 'assistant');
-  assert.equal(await runner.retryLast(run), 'done');
-  const userMsgs = run.core.messages.filter((m) => m.role === 'user');
+  assert.equal(run2.core.messages[run2.core.messages.length - 1].role, 'assistant');
+  assert.equal(await runner2.retryLast(run2), 'done');
+  const userMsgs = run2.core.messages.filter((m) => m.role === 'user');
   assert.equal(userMsgs.length, 1);
   assert.equal(userMsgs[0].content, 'REAL QUESTION');
 });
@@ -678,42 +620,41 @@ test('修回复核: 重试已压缩旧轮时恢复该轮之前的原始上下文
   assert.doesNotMatch(sent, /SUMMARY OF Q1 AND Q2/, '覆盖目标轮的旧摘要不重复进入请求');
 });
 
-
-test('failed start checkpoint stops before requesting and always clears streaming', async () => {
-  const { hooks, calls } = makeHooks([{ message: { content: 'no' } }], { persist: async () => null });
-  const run = makeRun(); Core.appendUser(run.core, 'go');
-  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed');
-  assert.equal(calls.chat.length, 0); assert.equal(run.streaming, false); assert.equal(run.doc.streaming, false);
-  assert.equal(calls.events.at(-1).endReason, 'failed');
+test('checkpoint failures stop at start, before tools, after results and at final save', async () => {
+  const twoTools = { message: { content: '', tool_calls: [
+    toolCall('a', 'write', {}).message.tool_calls[0], toolCall('b', 'write2', {}).message.tool_calls[0]
+  ] } };
+  const cases = [
+    { name: 'start', failAt: 1, script: [{ message: { content: 'no' } }], chats: 0, tools: 0 },
+    { name: 'before tools', failAt: 2, script: [toolCall('a', 'write', {})], chats: 1, tools: 0, unexecuted: 'a' },
+    { name: 'after result', failAt: 3, script: [twoTools], chats: 1, tools: 1, completed: 'a', unexecuted: 'b' },
+    { name: 'final save', failAt: 2, throws: true, script: [{ message: { content: 'answer' } }], chats: 1, tools: 0 }
+  ];
+  for (const scenario of cases) {
+    let saves = 0;
+    const { hooks, calls } = makeHooks(scenario.script, { persist: async () => {
+      if (++saves !== scenario.failAt) return true;
+      if (scenario.throws) throw new Error('disk full');
+      return null;
+    } });
+    const run = makeRun();
+    Core.appendUser(run.core, 'go');
+    assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed', scenario.name);
+    assert.equal(calls.chat.length, scenario.chats, scenario.name);
+    assert.equal(calls.tools.length, scenario.tools, scenario.name);
+    assert.equal(run.streaming, false, scenario.name);
+    assert.equal(run.doc.streaming, false, scenario.name);
+    assert.equal(calls.events.at(-1).endReason, 'failed', scenario.name);
+    if (scenario.unexecuted) {
+      assert.match(run.core.messages.find(m => m.tool_call_id === scenario.unexecuted).content, /未执行/, scenario.name);
+    }
+    if (scenario.completed) {
+      assert.equal(run.core.messages.filter(m => m.tool_call_id === scenario.completed).length, 1, scenario.name);
+    }
+  }
 });
 
-test('failed tool checkpoint prevents every side effect and pairs unexecuted calls', async () => {
-  let saves = 0;
-  const { hooks, calls } = makeHooks([toolCall('a', 'write', {})], { persist: async () => ++saves === 2 ? null : true });
-  const run = makeRun(); Core.appendUser(run.core, 'go');
-  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed');
-  assert.equal(calls.tools.length, 0); assert.match(run.core.messages.find(m => m.tool_call_id === 'a').content, /未执行/);
-});
-
-test('failed result checkpoint stops the next tool and keeps completed result', async () => {
-  let saves = 0;
-  const response = { message: { content: '', tool_calls: [toolCall('a', 'write', {}).message.tool_calls[0], toolCall('b', 'write2', {}).message.tool_calls[0]] } };
-  const { hooks, calls } = makeHooks([response], { persist: async () => ++saves === 3 ? null : true });
-  const run = makeRun(); Core.appendUser(run.core, 'go');
-  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed');
-  assert.equal(calls.tools.length, 1); assert.equal(run.core.messages.filter(m => m.tool_call_id === 'a').length, 1);
-  assert.match(run.core.messages.find(m => m.tool_call_id === 'b').content, /未执行/);
-});
-
-test('failed final checkpoint cannot report done', async () => {
-  let saves = 0;
-  const { hooks, calls } = makeHooks([{ message: { content: 'answer' } }], { persist: async () => { if (++saves === 2) throw new Error('disk full'); return true; } });
-  const run = makeRun(); Core.appendUser(run.core, 'go');
-  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed'); assert.equal(calls.events.at(-1).endReason, 'failed');
-});
-
-
-test('request retry resumes after saved tools without replaying side effects, including reloaded sessions', async () => {
+test('request retry resumes after saved tools without replaying side effects (incl. reloaded sessions); partial request retry keeps prior tools and pairs partial calls as unexecuted', async () => {
   const { hooks, calls } = makeHooks([toolCall('a', 'write', {}), new Error('HTTP 503'), { message: { content: 'continued' } }]);
   const runner = Loop.createRunner(hooks), run = makeRun(); Core.appendUser(run.core, 'go');
   const turnId = run.core.turnId;
@@ -723,18 +664,16 @@ test('request retry resumes after saved tools without replaying side effects, in
   assert.equal(await runner.retryTurn(restored, turnId), 'done'); assert.equal(calls.tools.length, 1);
   assert.equal(restored.core.messages.filter(m => m.role === 'user' && !m.synthetic).length, 1);
   assert.equal(restored.core.messages.filter(m => m.tool_call_id === 'a').length, 1);
+  // partial request retry keeps prior tools and pairs partial calls as unexecuted
+  const { hooks: hooks2, calls: calls2 } = makeHooks([toolCall('a', 'write', {}), { partial: true, message: { content: 'partial', tool_calls: toolCall('b', 'write2', {}).message.tool_calls }, errorText: 'network lost' }, { message: { content: 'continue' } }]);
+  const runner2 = Loop.createRunner(hooks2), run2 = makeRun(); Core.appendUser(run2.core, 'go');
+  assert.equal(await runner2.runTurn(run2), 'failed');
+  assert.match(run2.core.messages.find(m => m.tool_call_id === 'b').content, /未执行/);
+  assert.equal(await runner2.retryLast(run2), 'done'); assert.equal(calls2.tools.length, 1);
+  assert.ok(calls2.chat.at(-1).messages.some(m => String(m.content).includes('已完成的工具结果仍有效')));
 });
 
-test('partial request retry keeps prior tools and pairs partial calls as unexecuted', async () => {
-  const { hooks, calls } = makeHooks([toolCall('a', 'write', {}), { partial: true, message: { content: 'partial', tool_calls: toolCall('b', 'write2', {}).message.tool_calls }, errorText: 'network lost' }, { message: { content: 'continue' } }]);
-  const runner = Loop.createRunner(hooks), run = makeRun(); Core.appendUser(run.core, 'go');
-  assert.equal(await runner.runTurn(run), 'failed');
-  assert.match(run.core.messages.find(m => m.tool_call_id === 'b').content, /未执行/);
-  assert.equal(await runner.retryLast(run), 'done'); assert.equal(calls.tools.length, 1);
-  assert.ok(calls.chat.at(-1).messages.some(m => String(m.content).includes('已完成的工具结果仍有效')));
-});
-
-test('queued steering persists and enters the request only after all tools are paired', async () => {
+test('queued steering persists and enters the request only after all tools are paired; queue submitted during a final response is consumed before the run finishes', async () => {
   const { hooks, calls } = makeHooks([{ message: { content: '', tool_calls: [toolCall('a', 't', {}).message.tool_calls[0], toolCall('b', 't2', {}).message.tool_calls[0]] } }, { message: { content: 'done' } }]);
   let runner; const run = makeRun(); Core.appendUser(run.core, 'go');
   hooks.executeTool = async name => { if (name === 't') await runner.enqueue(run.id, 'focus on 2024'); return name; };
@@ -744,17 +683,14 @@ test('queued steering persists and enters the request only after all tools are p
   assert.ok(steering > run.core.messages.findIndex(m => m.tool_call_id === 'b'));
   assert.ok(calls.chat.at(-1).messages.some(m => String(m.content).includes('focus on 2024')));
   assert.equal(run.doc.queuedInputs.length, 0);
+  // queue submitted during a final response is consumed before the run finishes
+  const { hooks: hooks2, calls: calls2 } = makeHooks([async () => { await runner2.enqueue('r1', 'also include caveats'); return { message: { content: 'first answer' } }; }, { message: { content: 'caveats' } }]);
+  const runner2 = Loop.createRunner(hooks2), run2 = makeRun(); Core.appendUser(run2.core, 'go');
+  assert.equal(await runner2.runTurn(run2), 'done'); assert.equal(calls2.chat.length, 2);
+  assert.equal(run2.core.messages.filter(m => m.kind === 'steering').length, 1);
 });
 
-test('queue submitted during a final response is consumed before the run finishes', async () => {
-  const { hooks, calls } = makeHooks([async () => { await runner.enqueue('r1', 'also include caveats'); return { message: { content: 'first answer' } }; }, { message: { content: 'caveats' } }]);
-  const runner = Loop.createRunner(hooks), run = makeRun(); Core.appendUser(run.core, 'go');
-  assert.equal(await runner.runTurn(run), 'done'); assert.equal(calls.chat.length, 2);
-  assert.equal(run.core.messages.filter(m => m.kind === 'steering').length, 1);
-});
-
-
-test('parallel local readers commit the fast result while slow reader is still active', async () => {
+test('parallel local readers commit the fast result while slow reader is still active; parallel persistence failure prevents further local reads and every write barrier', async () => {
   const calls = ['slow', 'fast', 'last'].map((name, i) => toolCall('parallel-' + i, name, {}).message.tool_calls[0]);
   const snapshots = []; let releaseSlow, fastSaved;
   const slowGate = new Promise(resolve => { releaseSlow = resolve; }), fastCheckpoint = new Promise(resolve => { fastSaved = resolve; });
@@ -767,23 +703,20 @@ test('parallel local readers commit the fast result while slow reader is still a
   assert.equal(run.streaming, true); assert.equal(snapshots.at(-1).some(m => m.tool_call_id === 'parallel-0'), false);
   releaseSlow(); assert.equal(await running, 'done');
   for (const call of calls) assert.equal(run.core.messages.filter(m => m.tool_call_id === call.id).length, 1);
-});
-
-test('parallel persistence failure prevents further local reads and every write barrier', async () => {
+  // parallel persistence failure prevents further local reads and every write barrier
   const toolCalls = ['read1', 'read2', 'read3', 'read4', 'write'].map((name, i) => toolCall('failure-' + i, name, {}).message.tool_calls[0]);
   const started = []; let saveCount = 0, cancellations = 0;
-  const { hooks } = makeHooks([{ message: { content: '', tool_calls: toolCalls } }]);
-  hooks.canParallel = call => call.name !== 'write'; hooks.cancelTools = async () => { cancellations++; };
-  hooks.executeTool = async name => { started.push(name); return name; };
-  hooks.persist = async () => ++saveCount === 3 ? null : true;
-  const run = makeRun(); Core.appendUser(run.core, 'go');
-  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'failed');
+  const { hooks: hooks2 } = makeHooks([{ message: { content: '', tool_calls: toolCalls } }]);
+  hooks2.canParallel = call => call.name !== 'write'; hooks2.cancelTools = async () => { cancellations++; };
+  hooks2.executeTool = async name => { started.push(name); return name; };
+  hooks2.persist = async () => ++saveCount === 3 ? null : true;
+  const run2 = makeRun(); Core.appendUser(run2.core, 'go');
+  assert.equal(await Loop.createRunner(hooks2).runTurn(run2), 'failed');
   assert.equal(started.includes('write'), false); assert.equal(started.includes('read4'), false); assert.equal(cancellations, 1);
-  for (const call of toolCalls) assert.equal(run.core.messages.filter(m => m.tool_call_id === call.id).length, 1);
+  for (const call of toolCalls) assert.equal(run2.core.messages.filter(m => m.tool_call_id === call.id).length, 1);
 });
 
-
-test('image result checkpoint failure followed by successful final save retains images for resumed requests', async () => {
+test('image result checkpoint failure followed by successful final save retains images for resumed requests; canceled model result retains complete unexecuted tool pairing', async () => {
   let saves = 0;
   const { hooks, calls } = makeHooks([toolCall('image', 'image_reader', {}), { message: { content: 'continued' } }]);
   hooks.executeTool = async () => ({ text: 'page attached', images: [{ type: 'image', ref: 'session:r1|附件/page.png' }] });
@@ -795,11 +728,9 @@ test('image result checkpoint failure followed by successful final save retains 
   const restored = { id: run.id, doc: structuredClone(run.doc), core: Core.deserialize(Core.serialize(run.core)), streaming: false };
   assert.equal(await runner.retryLast(restored), 'done');
   assert.ok(calls.chat.at(-1).messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image')));
-});
-
-test('canceled model result retains complete unexecuted tool pairing', async () => {
-  const { hooks } = makeHooks([{ aborted: true, message: { content: 'partial text', tool_calls: toolCall('not-run', 'write', {}).message.tool_calls } }]);
-  const run = makeRun(); Core.appendUser(run.core, 'go');
-  assert.equal(await Loop.createRunner(hooks).runTurn(run), 'stopped');
-  assert.match(run.core.messages.find(m => m.tool_call_id === 'not-run').content, /未执行/);
+  // canceled model result retains complete unexecuted tool pairing
+  const { hooks: hooks2 } = makeHooks([{ aborted: true, message: { content: 'partial text', tool_calls: toolCall('not-run', 'write', {}).message.tool_calls } }]);
+  const run2 = makeRun(); Core.appendUser(run2.core, 'go');
+  assert.equal(await Loop.createRunner(hooks2).runTurn(run2), 'stopped');
+  assert.match(run2.core.messages.find(m => m.tool_call_id === 'not-run').content, /未执行/);
 });

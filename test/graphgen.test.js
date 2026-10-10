@@ -37,7 +37,7 @@ function twoCommunities() {
   return lib;
 }
 
-test('buildGraphData: depth-1 BFS with induced subgraph edges only', async function () {
+test('buildGraphData: depth-1 BFS 诱导子图与指标；depth 0 只用给定文献；missing 种子如实上报不静默丢弃', async function () {
   const deps = makeDeps(fakeLib());
   const r = await G.buildGraphData(['A'], { depth: 1, maxNodes: 200 }, deps);
   const ids = r.nodes.map((n) => n.id).sort();
@@ -57,23 +57,24 @@ test('buildGraphData: depth-1 BFS with induced subgraph edges only', async funct
   assert.equal(c.outDeg, 0);
   assert.ok(c.rank > r.nodes.find((n) => n.id === 'A').rank);
   assert.equal(typeof r.communities.C, 'number');
+
+  {
+    // depth 0 = 只用给定文献（literature-mcp 诱导子图原语义）
+    const r = await G.buildGraphData(['A', 'B'], { depth: 0, maxNodes: 200 }, makeDeps(fakeLib()));
+    assert.deepEqual(r.nodes.map((n) => n.id).sort(), ['A', 'B']);
+    assert.deepEqual(r.edges.map((e) => e.from + '→' + e.to), ['A→B']);
+    assert.ok(r.nodes.every((n) => n.seed));
+  }
+
+  {
+    const r = await G.buildGraphData(['A', 'NOPE'], { depth: 0, maxNodes: 200 }, makeDeps(fakeLib()));
+    assert.deepEqual(r.missing, ['NOPE']);
+    assert.equal(r.meta.missingCount, 1);
+    assert.equal(r.nodes.length, 1);
+  }
 });
 
-test('buildGraphData: depth 0 = 只用给定文献（literature-mcp 诱导子图原语义）', async function () {
-  const r = await G.buildGraphData(['A', 'B'], { depth: 0, maxNodes: 200 }, makeDeps(fakeLib()));
-  assert.deepEqual(r.nodes.map((n) => n.id).sort(), ['A', 'B']);
-  assert.deepEqual(r.edges.map((e) => e.from + '→' + e.to), ['A→B']);
-  assert.ok(r.nodes.every((n) => n.seed));
-});
-
-test('buildGraphData: missing 种子如实上报，不静默丢弃', async function () {
-  const r = await G.buildGraphData(['A', 'NOPE'], { depth: 0, maxNodes: 200 }, makeDeps(fakeLib()));
-  assert.deepEqual(r.missing, ['NOPE']);
-  assert.equal(r.meta.missingCount, 1);
-  assert.equal(r.nodes.length, 1);
-});
-
-test('buildGraphData: missing neighbors fetched then joined', async function () {
+test('buildGraphData: missing 邻居拉取后并入；maxNodes cap 优先保留被引最多的候选', async function () {
   const lib = fakeLib();
   const missing = { E: { id: 'E', title: 'Epsilon', refs: ['C'] } };
   lib.A.refs = ['B', 'E'];
@@ -81,22 +82,22 @@ test('buildGraphData: missing neighbors fetched then joined', async function () 
   const r = await G.buildGraphData(['A'], { depth: 2, maxNodes: 200 }, deps);
   assert.ok(r.nodes.some((n) => n.id === 'E'));
   assert.ok(r.edges.some((e) => e.from === 'E' && e.to === 'C'));
+
+  {
+    // 两个种子都引用 N99（频次 2），其余 14 个邻居各被引用 1 次；
+    // cap=10 → 扩出 8 个邻居（2 种子 + 8 = 10 节点），N99 频次最高必进集合
+    const lib = { S1: { id: 'S1', title: 'S1', refs: [] }, S2: { id: 'S2', title: 'S2', refs: [] } };
+    for (let i = 0; i < 14; i++) lib['N' + i] = { id: 'N' + i, title: 'N' + i, refs: [] };
+    lib.N99 = { id: 'N99', title: 'Hub', refs: [] };
+    lib.S1.refs = ['N99'].concat(Array.from({ length: 7 }, (_, i) => 'N' + i));
+    lib.S2.refs = ['N99'].concat(Array.from({ length: 7 }, (_, i) => 'N' + (i + 7)));
+    const r = await G.buildGraphData(['S1', 'S2'], { depth: 1, maxNodes: 10 }, makeDeps(lib));
+    assert.ok(r.nodes.length <= 10, 'nodes=' + r.nodes.length);
+    assert.ok(r.nodes.some((n) => n.id === 'N99')); // 高频被引者优先进
+  }
 });
 
-test('buildGraphData: maxNodes cap picks most-referenced candidates', async function () {
-  // 两个种子都引用 N99（频次 2），其余 14 个邻居各被引用 1 次；
-  // cap=10 → 扩出 8 个邻居（2 种子 + 8 = 10 节点），N99 频次最高必进集合
-  const lib = { S1: { id: 'S1', title: 'S1', refs: [] }, S2: { id: 'S2', title: 'S2', refs: [] } };
-  for (let i = 0; i < 14; i++) lib['N' + i] = { id: 'N' + i, title: 'N' + i, refs: [] };
-  lib.N99 = { id: 'N99', title: 'Hub', refs: [] };
-  lib.S1.refs = ['N99'].concat(Array.from({ length: 7 }, (_, i) => 'N' + i));
-  lib.S2.refs = ['N99'].concat(Array.from({ length: 7 }, (_, i) => 'N' + (i + 7)));
-  const r = await G.buildGraphData(['S1', 'S2'], { depth: 1, maxNodes: 10 }, makeDeps(lib));
-  assert.ok(r.nodes.length <= 10, 'nodes=' + r.nodes.length);
-  assert.ok(r.nodes.some((n) => n.id === 'N99')); // 高频被引者优先进
-});
-
-test('buildGraphData: 默认 120、硬上限 500，超限后按重要性截取', async function () {
+test('buildGraphData: 默认 120/硬上限 500 超限按重要性截取；空种子产出空图带 meta；种子超限截取并如实回报隐藏数', async function () {
   assert.equal(G.DEFAULTS.maxNodes, 120);
   assert.equal(G.MAX_NODES, 500);
   const lib = {};
@@ -106,34 +107,34 @@ test('buildGraphData: 默认 120、硬上限 500，超限后按重要性截取',
   assert.equal(r.nodes.length, 500);
   assert.equal(r.meta.totalCount, 500); // 种子输入本身按 MAX_SEEDS=500 截取
   assert.equal(r.meta.hiddenCount, 0);
-});
 
-test('buildGraphData: empty seeds yield empty graph with meta', async function () {
-  const r = await G.buildGraphData([], { depth: 2, maxNodes: 200 }, makeDeps(fakeLib()));
-  assert.equal(r.nodes.length, 0);
-  assert.equal(r.edges.length, 0);
-  assert.equal(r.meta.nodeCount, 0);
-});
-
-test('buildGraphData: 种子超过上限时按重要性截取并如实回报隐藏数', async function () {
-  const lib = {};
-  for (let i = 0; i < 40; i++) {
-    lib['W' + i] = { id: 'W' + i, title: 'Paper ' + i, year: 2000 + (i % 10), citedBy: i, refs: [] };
+  {
+    const r = await G.buildGraphData([], { depth: 2, maxNodes: 200 }, makeDeps(fakeLib()));
+    assert.equal(r.nodes.length, 0);
+    assert.equal(r.edges.length, 0);
+    assert.equal(r.meta.nodeCount, 0);
   }
-  // 成环互引，保证每篇都有度；W39 被引最高
-  for (let i = 0; i < 40; i++) lib['W' + i].refs = ['W' + ((i + 1) % 40), 'W39'];
-  const r = await G.buildGraphData(Object.keys(lib), { depth: 0, maxNodes: 12 }, makeDeps(lib));
-  assert.equal(r.nodes.length, 12);
-  assert.equal(r.meta.totalCount, 40);
-  assert.equal(r.meta.hiddenCount, 28);
-  assert.equal(r.meta.truncated, true);
-  assert.ok(r.nodes.some((n) => n.id === 'W39'), '高被引者必须在保留集里');
-  // 边只在保留集内部（诱导子图）
-  const kept = new Set(r.nodes.map((n) => n.id));
-  assert.ok(r.edges.every((e) => kept.has(e.from) && kept.has(e.to)));
+
+  {
+    const lib = {};
+    for (let i = 0; i < 40; i++) {
+      lib['W' + i] = { id: 'W' + i, title: 'Paper ' + i, year: 2000 + (i % 10), citedBy: i, refs: [] };
+    }
+    // 成环互引，保证每篇都有度；W39 被引最高
+    for (let i = 0; i < 40; i++) lib['W' + i].refs = ['W' + ((i + 1) % 40), 'W39'];
+    const r = await G.buildGraphData(Object.keys(lib), { depth: 0, maxNodes: 12 }, makeDeps(lib));
+    assert.equal(r.nodes.length, 12);
+    assert.equal(r.meta.totalCount, 40);
+    assert.equal(r.meta.hiddenCount, 28);
+    assert.equal(r.meta.truncated, true);
+    assert.ok(r.nodes.some((n) => n.id === 'W39'), '高被引者必须在保留集里');
+    // 边只在保留集内部（诱导子图）
+    const kept = new Set(r.nodes.map((n) => n.id));
+    assert.ok(r.edges.every((e) => kept.has(e.from) && kept.has(e.to)));
+  }
 });
 
-test('pageRank ranks cited hubs above citations', function () {
+test('pageRank ranks cited hubs above citations (sum ≈ 1); selectImportantNodes: 上限内全保留，超限择优', function () {
   const ids = ['A', 'B', 'C'];
   const edges = [{ from: 'A', to: 'C' }, { from: 'B', to: 'C' }];
   const ranks = G.pageRank(ids, edges);
@@ -143,9 +144,7 @@ test('pageRank ranks cited hubs above citations', function () {
   let sum = 0;
   ranks.forEach((v) => { sum += v; });
   assert.ok(Math.abs(sum - 1) < 1e-6);
-});
 
-test('selectImportantNodes: 上限内全保留；超限按 被引/PageRank/被引/年份 择优', function () {
   const nodes = [
     { id: 'hot', title: 'Hot', year: 2010, citedBy: 1000 },
     { id: 'mid', title: 'Mid', year: 2020, citedBy: 100 },
@@ -160,7 +159,7 @@ test('selectImportantNodes: 上限内全保留；超限按 被引/PageRank/被�
   assert.ok(cut.scores.hot > cut.scores.new);
 });
 
-test('detectCommunities: 两个互引簇分成两个社区，编号按规模降序', function () {
+test('detectCommunities: 两个互引簇分成两个社区，编号按规模降序；无边图退化与 501 节点大图 Louvain 分支不抛错', function () {
   const lib = twoCommunities();
   const nodes = Object.keys(lib).map((id) => ({ id, year: lib[id].year, citedBy: lib[id].citedBy }));
   const edges = [];
@@ -172,22 +171,22 @@ test('detectCommunities: 两个互引簇分成两个社区，编号按规模降�
   assert.equal(communities.get('A0'), a);
   assert.equal(communities.get('B5'), b);
   assert.equal(a, 0, '规模相同/更大者编号更小（此处 A 簇被引更高，先排序）');
-});
 
-test('detectCommunities: 无边图退化为各自独立社区；大图走 Louvain 分支不抛错', function () {
-  const single = G.detectCommunities(['x', 'y'], []);
-  assert.equal(single.get('x'), 0);
-  assert.equal(single.get('y'), 1);
-  // 501 节点触发大图分支（>500）
-  const ids = [];
-  const edges = [];
-  for (let i = 0; i < 501; i++) {
-    ids.push('n' + i);
-    if (i > 0) edges.push({ from: 'n' + i, to: 'n' + (i - 1) });
+  {
+    const single = G.detectCommunities(['x', 'y'], []);
+    assert.equal(single.get('x'), 0);
+    assert.equal(single.get('y'), 1);
+    // 501 节点触发大图分支（>500）
+    const ids = [];
+    const edges = [];
+    for (let i = 0; i < 501; i++) {
+      ids.push('n' + i);
+      if (i > 0) edges.push({ from: 'n' + i, to: 'n' + (i - 1) });
+    }
+    const big = G.detectCommunities(ids, edges);
+    assert.equal(big.size, 501);
+    assert.ok(big.get('n0') !== undefined);
   }
-  const big = G.detectCommunities(ids, edges);
-  assert.equal(big.size, 501);
-  assert.ok(big.get('n0') !== undefined);
 });
 
 test('computeLayout: 确定性、无 NaN、按 √n 铺开', function () {
@@ -253,7 +252,7 @@ test('viewerData: 稀疏标签、年份顺序配色、被引对数尺寸、线�
   assert.equal(view.nodes.every((n) => Number.isFinite(n.x) && Number.isFinite(n.y)), true);
 });
 
-test('viewerData: 深浅主题各用一套年份顺序色阶', function () {
+test('viewerData: 深浅主题各用一套年份顺序色阶；图例使用与节点同源的年份渐变色条', function () {
   const graph = {
     nodes: [
       { id: 'a', title: 'A', year: 1990, citedBy: 1, authors: ['One'], refs: [] },
@@ -268,22 +267,22 @@ test('viewerData: 深浅主题各用一套年份顺序色阶', function () {
   assert.notEqual(light.nodes[0].color.background, light.nodes[2].color.background, '同社区的不同年份也应有不同颜色');
   assert.notEqual(light.nodes[0].color.background, light.nodes[1].color.background, '年份连续变化应映射到不同颜色');
   assert.notEqual(dark.nodes[0].color.background, dark.nodes[2].color.background, '深色主题同样按年份映射');
-});
 
-test('图例使用与节点同源的年份渐变色条', function () {
-  const graph = {
-    nodes: [
-      { id: 'a', title: 'A', year: 1990, citedBy: 1, authors: ['One'], refs: [] },
-      { id: 'b', title: 'B', year: 2024, citedBy: 9, authors: ['Two'], refs: [] }
-    ],
-    edges: [{ from: 'b', to: 'a' }], communities: { a: 0, b: 1 }, meta: {}
-  };
-  const view = G.viewerData(graph, { palette: 'light' });
-  const legend = G.legendHtml(view);
-  assert.ok(legend.includes('yearbar'), legend);
-  assert.ok(legend.includes('linear-gradient'), legend);
-  assert.ok(legend.includes(String(view.yearMin)), legend);
-  assert.ok(legend.includes(String(view.yearMax)), legend);
+  {
+    const graph = {
+      nodes: [
+        { id: 'a', title: 'A', year: 1990, citedBy: 1, authors: ['One'], refs: [] },
+        { id: 'b', title: 'B', year: 2024, citedBy: 9, authors: ['Two'], refs: [] }
+      ],
+      edges: [{ from: 'b', to: 'a' }], communities: { a: 0, b: 1 }, meta: {}
+    };
+    const view = G.viewerData(graph, { palette: 'light' });
+    const legend = G.legendHtml(view);
+    assert.ok(legend.includes('yearbar'), legend);
+    assert.ok(legend.includes('linear-gradient'), legend);
+    assert.ok(legend.includes(String(view.yearMin)), legend);
+    assert.ok(legend.includes(String(view.yearMax)), legend);
+  }
 });
 
 test('三栏版式与交互：列表/详情/图例都由数据侧预渲染（导出与应用内共用）', function () {
@@ -312,7 +311,7 @@ test('三栏版式与交互：列表/详情/图例都由数据侧预渲染（导
   assert.ok(summary.includes('节点 2'));
 });
 
-test('escapeForInlineScript neutralizes script-closing sequences', function () {
+test('escapeForInlineScript neutralizes script-closing sequences; renderGraphHtml: 三栏离线自包含、数据区不可逃逸、meta 与截断如实呈现', function () {
   const evil = '</script><img src=x onerror=alert(1)> and <!--x-->';
   const safe = G.escapeForInlineScript(JSON.stringify({ t: evil }));
   assert.ok(safe.indexOf('</script') === -1);
@@ -320,40 +319,40 @@ test('escapeForInlineScript neutralizes script-closing sequences', function () {
   // 能被 JSON.parse 无损还原
   const roundTrip = JSON.parse(safe);
   assert.equal(roundTrip.t, evil);
-});
 
-test('renderGraphHtml: 三栏离线自包含、数据区不可逃逸、meta 与截断如实呈现', function () {
-  const data = {
-    nodes: [{
-      id: 'A', title: 'Hello </script><script>alert(1)</script>', year: 2020, citedBy: 1,
-      authors: ['Eve Attacker'], refs: [], seed: true
-    }],
-    edges: [],
-    communities: { A: 0 },
-    meta: {
-      seeds: ['A'], depth: 2, maxNodes: 120, nodeCount: 1, edgeCount: 0,
-      totalCount: 9, hiddenCount: 8, truncated: true, communityCount: 1, builtAt: '2026-09-20T00:00:00Z'
-    }
-  };
-  const libText = 'var vis={DataSet:function(){},Network:function(){}};';
-  const html = G.renderGraphHtml(data, libText, { title: '测试图' });
-  // 正文只允许两处 </script>（库块与初始化块的收尾）
-  assert.equal((html.match(/<\/script>/g) || []).length, 2);
-  assert.ok(html.indexOf('测试图') !== -1);
-  assert.ok(html.indexOf('构建于 2026-09-20') !== -1);
-  assert.ok(html.indexOf('按重要性保留 1 篇，隐藏 8 篇') !== -1, '截断必须如实报出：' + html.slice(0, 200));
-  // 三栏骨架与图例都在
-  assert.ok(html.indexOf('id="paperList"') !== -1);
-  assert.ok(html.indexOf('id="detailCard"') !== -1);
-  assert.ok(html.indexOf('id="net"') !== -1);
-  assert.ok(html.indexOf('id="legend"') !== -1);
-  // 数据区：恶意串已被转义为安全序列（可被 JSON.parse 还原）
-  const m = html.match(/^var DATA=JSON\.parse\("(.*)"\);$/m);
-  assert.ok(m, 'payload present');
-  assert.ok(m[1].indexOf('</script') === -1);
-  const restored = JSON.parse(JSON.parse('"' + m[1] + '"'));
-  assert.equal(restored.nodes[0].paperTitle, data.nodes[0].title);
-  assert.equal(restored.texts.papers, '本图论文');
-  assert.ok(restored.options.physics.barnesHut, '力导向参数随快照固化');
-  assert.equal(restored.options.smooth, undefined);
+  {
+    const data = {
+      nodes: [{
+        id: 'A', title: 'Hello </script><script>alert(1)</script>', year: 2020, citedBy: 1,
+        authors: ['Eve Attacker'], refs: [], seed: true
+      }],
+      edges: [],
+      communities: { A: 0 },
+      meta: {
+        seeds: ['A'], depth: 2, maxNodes: 120, nodeCount: 1, edgeCount: 0,
+        totalCount: 9, hiddenCount: 8, truncated: true, communityCount: 1, builtAt: '2026-09-20T00:00:00Z'
+      }
+    };
+    const libText = 'var vis={DataSet:function(){},Network:function(){}};';
+    const html = G.renderGraphHtml(data, libText, { title: '测试图' });
+    // 正文只允许两处 </script>（库块与初始化块的收尾）
+    assert.equal((html.match(/<\/script>/g) || []).length, 2);
+    assert.ok(html.indexOf('测试图') !== -1);
+    assert.ok(html.indexOf('构建于 2026-09-20') !== -1);
+    assert.ok(html.indexOf('按重要性保留 1 篇，隐藏 8 篇') !== -1, '截断必须如实报出：' + html.slice(0, 200));
+    // 三栏骨架与图例都在
+    assert.ok(html.indexOf('id="paperList"') !== -1);
+    assert.ok(html.indexOf('id="detailCard"') !== -1);
+    assert.ok(html.indexOf('id="net"') !== -1);
+    assert.ok(html.indexOf('id="legend"') !== -1);
+    // 数据区：恶意串已被转义为安全序列（可被 JSON.parse 还原）
+    const m = html.match(/^var DATA=JSON\.parse\("(.*)"\);$/m);
+    assert.ok(m, 'payload present');
+    assert.ok(m[1].indexOf('</script') === -1);
+    const restored = JSON.parse(JSON.parse('"' + m[1] + '"'));
+    assert.equal(restored.nodes[0].paperTitle, data.nodes[0].title);
+    assert.equal(restored.texts.papers, '本图论文');
+    assert.ok(restored.options.physics.barnesHut, '力导向参数随快照固化');
+    assert.equal(restored.options.smooth, undefined);
+  }
 });

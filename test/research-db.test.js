@@ -27,31 +27,32 @@ const W2 = {
   authors: [], refs: [], concepts: [], keywords: []
 };
 
-test('upsertWorks is idempotent and fills ext_ids', async function () {
-  const { db } = await makeDb();
-  try {
-    db.upsertWorks([W1, W2]);
-    db.upsertWorks([W1]); // 重跑不重复
-    const stats = db.stats();
-    assert.equal(stats.total, 2);
-    assert.equal(stats.withAbstract, 1);
-    assert.equal(db.findByExtId('doi', '10.1000/a'), 'W1');
-    assert.equal(db.findByExtId('openalex', 'W1'), 'W1');
-    assert.equal(db.findByExtId('doi', '10.1000/missing'), null);
-  } finally { db.close(); }
-});
-
-test('upsert prefers non-empty fields on conflict', async function () {
-  const { db } = await makeDb();
-  try {
-    db.upsertWorks([W2]);
-    db.upsertWorks([Object.assign({}, W2, { abstract: '后来补上的摘要', citedBy: 9 })]);
-    const stats = db.stats();
-    assert.equal(stats.withAbstract, 1);
-    const [row] = db.getWorks(['W2']);
-    assert.equal(row.abstract, '后来补上的摘要');
-    assert.equal(row.citedBy, 9);
-  } finally { db.close(); }
+test('upsertWorks：幂等且填 ext_ids；冲突时非空字段优先', async function () {
+  {
+    const { db } = await makeDb();
+    try {
+      db.upsertWorks([W1, W2]);
+      db.upsertWorks([W1]); // 重跑不重复
+      const stats = db.stats();
+      assert.equal(stats.total, 2);
+      assert.equal(stats.withAbstract, 1);
+      assert.equal(db.findByExtId('doi', '10.1000/a'), 'W1');
+      assert.equal(db.findByExtId('openalex', 'W1'), 'W1');
+      assert.equal(db.findByExtId('doi', '10.1000/missing'), null);
+    } finally { db.close(); }
+  }
+  {
+    const { db } = await makeDb();
+    try {
+      db.upsertWorks([W2]);
+      db.upsertWorks([Object.assign({}, W2, { abstract: '后来补上的摘要', citedBy: 9 })]);
+      const stats = db.stats();
+      assert.equal(stats.withAbstract, 1);
+      const [row] = db.getWorks(['W2']);
+      assert.equal(row.abstract, '后来补上的摘要');
+      assert.equal(row.citedBy, 9);
+    } finally { db.close(); }
+  }
 });
 
 test('queryWorks: FTS trigram, short-query LIKE fallback, DOI and ID exact hits, year filter', async function () {
@@ -71,49 +72,50 @@ test('queryWorks: FTS trigram, short-query LIKE fallback, DOI and ID exact hits,
   } finally { db.close(); }
 });
 
-test('updateWorkText writes provenance and invalidates vectors', async function () {
-  const { db, dir } = await makeDb();
-  try {
-    db.upsertWorks([W1]);
-    // 模拟向量已建（直接写 vec.db，二期实装前的硬规则验证）
-    const vecDb = new DatabaseSync(path.join(dir, 'vec.db'));
-    vecDb.prepare("INSERT INTO vecs(work_id, model, dim, recipe, content_hash, vec, updated_at) VALUES('W1', 'm', 4, 1, 'h', x'00000000', 1)").run();
-    vecDb.close();
-    const r1 = db.updateWorkText('W1', { abstract: '' }, 'crossref');
-    assert.equal(r1.updated, 0); // 空值不覆盖
-    const r2 = db.updateWorkText('W1', { abstract: '回填后的摘要' }, 'crossref');
-    assert.equal(r2.updated, 1);
-    const [row] = db.getWorks(['W1']);
-    assert.equal(row.abstract, '回填后的摘要');
-    assert.equal(db.stats().vectors, 0); // 向量随内容失效
-    // FTS 同步更新：旧摘要不再命中，新摘要可命中
-    assert.equal(db.queryWorks({ q: '回填后的摘要' }).total, 1);
-    // provenance 记录存在
-    const { database: _drop } = { database: null };
-  } finally { db.close(); }
-});
-
-test('updateWorkText 内容未变短路：不重建 FTS、不删向量、不造假待办', async function () {
-  const { db } = await makeDb();
-  try {
-    db.upsertWorks([{ id: 'W70', title: 'Stable title', abstract: 'stable abstract', doi: '10.1/q' }]);
-    const model = 'm1';
-    const recipe = 2;
-    const pending = db.pendingEmbeddings({ model, recipe, limit: 5 });
-    db.vecPut([{ workId: 'W70', model: model, dim: 1, recipe: recipe, hash: pending[0].hash,
-      vec: Buffer.from(new Float32Array([1]).buffer) }]);
-    // 幂等回填（同一摘要原样再写一遍）：updated 0，向量保留、不重新变成待嵌
-    const r = db.updateWorkText('W70', { abstract: 'stable abstract' }, 'crossref');
-    assert.equal(r.updated, 0);
-    assert.equal(db.stats().vectors, 1);
-    assert.equal(db.pendingEmbeddings({ model, recipe, limit: 5 }).length, 0);
-    assert.ok(db.cosineSearch(Buffer.from(new Float32Array([1]).buffer), { limit: 5, model: model, recipe: recipe })
-      .some((h) => h.workId === 'W70'), '内容没变，向量必须仍在检索结果里');
-    // 内容真的变了：照旧全链路（R13 删 vec 行 → 重新待嵌）
-    const r2 = db.updateWorkText('W70', { abstract: 'changed abstract' }, 'crossref');
-    assert.equal(r2.updated, 1);
-    assert.equal(db.pendingEmbeddings({ model, recipe, limit: 5 }).length, 1);
-  } finally { db.close(); }
+test('updateWorkText：写 provenance 并使向量失效；内容未变短路（不重建 FTS、不删向量、不造假待办）', async function () {
+  {
+    const { db, dir } = await makeDb();
+    try {
+      db.upsertWorks([W1]);
+      // 模拟向量已建（直接写 vec.db，二期实装前的硬规则验证）
+      const vecDb = new DatabaseSync(path.join(dir, 'vec.db'));
+      vecDb.prepare("INSERT INTO vecs(work_id, model, dim, recipe, content_hash, vec, updated_at) VALUES('W1', 'm', 4, 1, 'h', x'00000000', 1)").run();
+      vecDb.close();
+      const r1 = db.updateWorkText('W1', { abstract: '' }, 'crossref');
+      assert.equal(r1.updated, 0); // 空值不覆盖
+      const r2 = db.updateWorkText('W1', { abstract: '回填后的摘要' }, 'crossref');
+      assert.equal(r2.updated, 1);
+      const [row] = db.getWorks(['W1']);
+      assert.equal(row.abstract, '回填后的摘要');
+      assert.equal(db.stats().vectors, 0); // 向量随内容失效
+      // FTS 同步更新：旧摘要不再命中，新摘要可命中
+      assert.equal(db.queryWorks({ q: '回填后的摘要' }).total, 1);
+      // provenance 记录存在
+      const { database: _drop } = { database: null };
+    } finally { db.close(); }
+  }
+  {
+    const { db } = await makeDb();
+    try {
+      db.upsertWorks([{ id: 'W70', title: 'Stable title', abstract: 'stable abstract', doi: '10.1/q' }]);
+      const model = 'm1';
+      const recipe = 2;
+      const pending = db.pendingEmbeddings({ model, recipe, limit: 5 });
+      db.vecPut([{ workId: 'W70', model: model, dim: 1, recipe: recipe, hash: pending[0].hash,
+        vec: Buffer.from(new Float32Array([1]).buffer) }]);
+      // 幂等回填（同一摘要原样再写一遍）：updated 0，向量保留、不重新变成待嵌
+      const r = db.updateWorkText('W70', { abstract: 'stable abstract' }, 'crossref');
+      assert.equal(r.updated, 0);
+      assert.equal(db.stats().vectors, 1);
+      assert.equal(db.pendingEmbeddings({ model, recipe, limit: 5 }).length, 0);
+      assert.ok(db.cosineSearch(Buffer.from(new Float32Array([1]).buffer), { limit: 5, model: model, recipe: recipe })
+        .some((h) => h.workId === 'W70'), '内容没变，向量必须仍在检索结果里');
+      // 内容真的变了：照旧全链路（R13 删 vec 行 → 重新待嵌）
+      const r2 = db.updateWorkText('W70', { abstract: 'changed abstract' }, 'crossref');
+      assert.equal(r2.updated, 1);
+      assert.equal(db.pendingEmbeddings({ model, recipe, limit: 5 }).length, 1);
+    } finally { db.close(); }
+  }
 });
 
 test('importFromHarness maps and imports idempotently', async function () {
@@ -204,52 +206,53 @@ test('vec layer: put, pending by hash/model/recipe, cosine search with year filt
   } finally { db.close(); }
 });
 
-test('pendingEmbeddings 两段式（对照上游 2026-10）：戳在即跳过，不再逐行重验 hash', async function () {
-  const { db, dir } = await makeDb();
-  try {
-    db.upsertWorks([
-      { id: 'WA', title: 'Alpha', abstract: 'a text', concepts: ['x'], keywords: ['y'] },
-      { id: 'WB', title: 'Beta', abstract: 'b text' },
-      { id: 'WC', title: '', abstract: '' }
-    ]);
-    const model = 'm1';
-    const recipe = 2;
-    let pending = db.pendingEmbeddings({ model, recipe, limit: 10 });
-    assert.deepEqual(pending.map((p) => p.work.id), ['WA', 'WB']); // 扫描序 + 空文本跳过
-    // 第二段才算 hash，且是当前内容算出的（vecPut 落库后写入路径的失真检测不受影响）
-    assert.equal(pending[0].hash, LitResearch.embeddingHash(pending[0].work));
-    db.vecPut(pending.map((p) => ({
-      workId: p.work.id, model: model, dim: 1, recipe: recipe, hash: p.hash,
-      vec: Buffer.from(new Float32Array([0.5]).buffer)
-    })));
-    assert.equal(db.pendingEmbeddings({ model, recipe, limit: 10 }).length, 0);
-    // 手工改坏 vecs.content_hash 也不再触发重嵌——已有当前模型+配方向量即视为最新
-    // （上游 embed_version 同一信任模型；应用的所有写路径都同步删 vec 行，R13）
-    const vecDb = new DatabaseSync(path.join(dir, 'vec.db'));
-    vecDb.prepare("UPDATE vecs SET content_hash = 'zzz'").run();
-    vecDb.close();
-    assert.equal(db.pendingEmbeddings({ model, recipe, limit: 10 }).length, 0);
-    // 换模型（等维不同空间）→ 全部重新待办；limit 截断按扫描序
-    assert.equal(db.pendingEmbeddings({ model: 'm2', recipe, limit: 10 }).length, 2);
-    assert.equal(db.pendingEmbeddings({ model: 'm2', recipe, limit: 1 })[0].work.id, 'WA');
-  } finally { db.close(); }
+test('待办扫描：pendingEmbeddings 两段式（戳在即跳过，不再逐行重验 hash）；findWorksNeedingAbstract 只挑空摘要带 DOI 的行', async function () {
+  {
+    const { db, dir } = await makeDb();
+    try {
+      db.upsertWorks([
+        { id: 'WA', title: 'Alpha', abstract: 'a text', concepts: ['x'], keywords: ['y'] },
+        { id: 'WB', title: 'Beta', abstract: 'b text' },
+        { id: 'WC', title: '', abstract: '' }
+      ]);
+      const model = 'm1';
+      const recipe = 2;
+      let pending = db.pendingEmbeddings({ model, recipe, limit: 10 });
+      assert.deepEqual(pending.map((p) => p.work.id), ['WA', 'WB']); // 扫描序 + 空文本跳过
+      // 第二段才算 hash，且是当前内容算出的（vecPut 落库后写入路径的失真检测不受影响）
+      assert.equal(pending[0].hash, LitResearch.embeddingHash(pending[0].work));
+      db.vecPut(pending.map((p) => ({
+        workId: p.work.id, model: model, dim: 1, recipe: recipe, hash: p.hash,
+        vec: Buffer.from(new Float32Array([0.5]).buffer)
+      })));
+      assert.equal(db.pendingEmbeddings({ model, recipe, limit: 10 }).length, 0);
+      // 手工改坏 vecs.content_hash 也不再触发重嵌——已有当前模型+配方向量即视为最新
+      // （上游 embed_version 同一信任模型；应用的所有写路径都同步删 vec 行，R13）
+      const vecDb = new DatabaseSync(path.join(dir, 'vec.db'));
+      vecDb.prepare("UPDATE vecs SET content_hash = 'zzz'").run();
+      vecDb.close();
+      assert.equal(db.pendingEmbeddings({ model, recipe, limit: 10 }).length, 0);
+      // 换模型（等维不同空间）→ 全部重新待办；limit 截断按扫描序
+      assert.equal(db.pendingEmbeddings({ model: 'm2', recipe, limit: 10 }).length, 2);
+      assert.equal(db.pendingEmbeddings({ model: 'm2', recipe, limit: 1 })[0].work.id, 'WA');
+    } finally { db.close(); }
+  }
+  {
+    const { db } = await makeDb();
+    try {
+      db.upsertWorks([
+        { id: 'W20', title: 'has', abstract: 'full', doi: '10.1/x' },
+        { id: 'W21', title: 'empty', abstract: '', doi: '10.1/y' },
+        { id: 'W22', title: 'nodoi', abstract: '', doi: '' }
+      ]);
+      const rows = db.findWorksNeedingAbstract({ limit: 10 });
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].id, 'W21');
+    } finally { db.close(); }
+  }
 });
 
-test('findWorksNeedingAbstract targets empty-abstract rows with DOI only', async function () {
-  const { db } = await makeDb();
-  try {
-    db.upsertWorks([
-      { id: 'W20', title: 'has', abstract: 'full', doi: '10.1/x' },
-      { id: 'W21', title: 'empty', abstract: '', doi: '10.1/y' },
-      { id: 'W22', title: 'nodoi', abstract: '', doi: '' }
-    ]);
-    const rows = db.findWorksNeedingAbstract({ limit: 10 });
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].id, 'W21');
-  } finally { db.close(); }
-});
-
-test('identity core round-trips into a fresh empty database', async function () {
+test('身份体系：identity core 空库 round-trip（元数据留空身份保留）；addExtIds / findIdByNormalizedTitle 挂靠既有身份', async function () {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-idcore-'));
   const db1 = createResearchDb({ dir });
   await db1.open();
@@ -275,9 +278,7 @@ test('identity core round-trips into a fresh empty database', async function () 
   // provenance 恢复（updateWorkText 曾记录）
   assert.equal(db2.findByExtId('doi', '10.1/z'), 'W30');
   db2.close();
-});
 
-test('addExtIds and findIdByNormalizedTitle (M9-4 web search ingest)', async function () {
   const { db } = await makeDb();
   try {
     db.upsertWorks([{ id: 'W50', title: 'Zinc-Ion Batteries: A Review', doi: '10.1/z' }]);
@@ -308,63 +309,64 @@ test('R09: 重复 upsert 的空摘要不重建空 FTS——按合并后的权威
   } finally { db.close(); }
 });
 
-test('R15: v1 → v2 迁移补 snippet/page_url 列并重建四列 FTS（老库不丢数据）', async function () {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-rdb-v1-'));
-  // 手工造一个 v1 库（原始 schema，无 snippet/page_url，FTS 三列）
-  const { DatabaseSync } = require('node:sqlite');
-  const raw = new DatabaseSync(path.join(dir, 'research.db'));
-  raw.exec(`
-    CREATE TABLE works(id TEXT PRIMARY KEY, doi TEXT DEFAULT '', title TEXT NOT NULL DEFAULT '',
-      year INTEGER, pubdate TEXT DEFAULT '', type TEXT DEFAULT '', source_id TEXT DEFAULT '',
-      source_name TEXT DEFAULT '', abstract TEXT DEFAULT '', lang TEXT DEFAULT '',
-      cited_by INTEGER DEFAULT 0, is_oa INTEGER DEFAULT 0, oa_url TEXT DEFAULT '',
-      authors_json TEXT DEFAULT '[]', refs_json TEXT DEFAULT '[]', concepts_json TEXT DEFAULT '[]',
-      keywords_json TEXT DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
-    CREATE TABLE ext_ids(work_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind, value));
-    CREATE INDEX idx_ext_ids_work ON ext_ids(work_id);
-    CREATE TABLE merge_log(old_id TEXT PRIMARY KEY, new_id TEXT NOT NULL, at INTEGER NOT NULL);
-    CREATE TABLE field_provenance(work_id TEXT NOT NULL, field TEXT NOT NULL, source TEXT NOT NULL,
-      fetched_at INTEGER NOT NULL, PRIMARY KEY(work_id, field));
-    CREATE TABLE searches(id INTEGER PRIMARY KEY AUTOINCREMENT, q TEXT DEFAULT '',
-      filters_json TEXT DEFAULT '{}', result_count INTEGER DEFAULT 0, at INTEGER NOT NULL);
-    CREATE VIRTUAL TABLE works_fts USING fts5(work_id UNINDEXED, title, abstract, tokenize='trigram');
-    INSERT INTO works(id, title, abstract, created_at, updated_at)
-      VALUES('W1', 'Legacy title', 'legacyabstractkeyword body', 1, 1);
-    INSERT INTO works_fts(work_id, title, abstract) VALUES('W1', 'Legacy title', 'legacyabstractkeyword body');
-    PRAGMA user_version = 1;
-  `);
-  raw.close();
+test('R15: v1 → v2 迁移补 snippet/page_url 列并重建四列 FTS（老库不丢数据）；upsert 非空补齐对 snippet/page_url 同样成立', async function () {
+  {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-rdb-v1-'));
+    // 手工造一个 v1 库（原始 schema，无 snippet/page_url，FTS 三列）
+    const { DatabaseSync } = require('node:sqlite');
+    const raw = new DatabaseSync(path.join(dir, 'research.db'));
+    raw.exec(`
+      CREATE TABLE works(id TEXT PRIMARY KEY, doi TEXT DEFAULT '', title TEXT NOT NULL DEFAULT '',
+        year INTEGER, pubdate TEXT DEFAULT '', type TEXT DEFAULT '', source_id TEXT DEFAULT '',
+        source_name TEXT DEFAULT '', abstract TEXT DEFAULT '', lang TEXT DEFAULT '',
+        cited_by INTEGER DEFAULT 0, is_oa INTEGER DEFAULT 0, oa_url TEXT DEFAULT '',
+        authors_json TEXT DEFAULT '[]', refs_json TEXT DEFAULT '[]', concepts_json TEXT DEFAULT '[]',
+        keywords_json TEXT DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      CREATE TABLE ext_ids(work_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind, value));
+      CREATE INDEX idx_ext_ids_work ON ext_ids(work_id);
+      CREATE TABLE merge_log(old_id TEXT PRIMARY KEY, new_id TEXT NOT NULL, at INTEGER NOT NULL);
+      CREATE TABLE field_provenance(work_id TEXT NOT NULL, field TEXT NOT NULL, source TEXT NOT NULL,
+        fetched_at INTEGER NOT NULL, PRIMARY KEY(work_id, field));
+      CREATE TABLE searches(id INTEGER PRIMARY KEY AUTOINCREMENT, q TEXT DEFAULT '',
+        filters_json TEXT DEFAULT '{}', result_count INTEGER DEFAULT 0, at INTEGER NOT NULL);
+      CREATE VIRTUAL TABLE works_fts USING fts5(work_id UNINDEXED, title, abstract, tokenize='trigram');
+      INSERT INTO works(id, title, abstract, created_at, updated_at)
+        VALUES('W1', 'Legacy title', 'legacyabstractkeyword body', 1, 1);
+      INSERT INTO works_fts(work_id, title, abstract) VALUES('W1', 'Legacy title', 'legacyabstractkeyword body');
+      PRAGMA user_version = 1;
+    `);
+    raw.close();
 
-  const db = createResearchDb({ dir });
-  await db.open();
-  try {
-    // 老数据仍在，且新列可写
-    const before = db.getWorks(['W1'])[0];
-    assert.equal(before.abstract, 'legacyabstractkeyword body');
-    assert.equal(before.snippet, '');
-    assert.equal(db.queryWorks({ q: 'legacyabstractkeyword' }).total, 1, '迁移后旧摘要仍可检索');
-    // snippet 入库后可被检索（FTS 覆盖四列）
-    db.upsertWorks([{ id: 'W2', title: 'Web page', snippet: 'websnippetkeyword 片段' }]);
-    assert.equal(db.queryWorks({ q: 'websnippetkeyword' }).total, 1, '网页片段进 FTS 可检索');
-    const row = db.getWorks(['W2'])[0];
-    assert.equal(row.snippet, 'websnippetkeyword 片段');
-    assert.equal(row.abstract, '', '网页片段不冒充摘要');
-    // page_url 往返
-    db.upsertWorks([{ id: 'W3', title: 'T', pageUrl: 'https://arxiv.org/abs/9' }]);
-    assert.equal(db.getWorks(['W3'])[0].pageUrl, 'https://arxiv.org/abs/9');
-  } finally { db.close(); }
-});
-
-test('R15: upsert 的非空补齐对 snippet/page_url 同样成立（空值不覆盖已有值）', async function () {
-  const { db } = await makeDb();
-  try {
-    db.upsertWorks([{ id: 'W50', title: 'T', snippet: 'keepme', pageUrl: 'https://a/b' }]);
-    db.upsertWorks([{ id: 'W50', title: 'T', snippet: '', pageUrl: '' }]);
-    const row = db.getWorks(['W50'])[0];
-    assert.equal(row.snippet, 'keepme');
-    assert.equal(row.pageUrl, 'https://a/b');
-    assert.equal(db.queryWorks({ q: 'keepme' }).total, 1, '空 snippet 不得清掉检索命中');
-  } finally { db.close(); }
+    const db = createResearchDb({ dir });
+    await db.open();
+    try {
+      // 老数据仍在，且新列可写
+      const before = db.getWorks(['W1'])[0];
+      assert.equal(before.abstract, 'legacyabstractkeyword body');
+      assert.equal(before.snippet, '');
+      assert.equal(db.queryWorks({ q: 'legacyabstractkeyword' }).total, 1, '迁移后旧摘要仍可检索');
+      // snippet 入库后可被检索（FTS 覆盖四列）
+      db.upsertWorks([{ id: 'W2', title: 'Web page', snippet: 'websnippetkeyword 片段' }]);
+      assert.equal(db.queryWorks({ q: 'websnippetkeyword' }).total, 1, '网页片段进 FTS 可检索');
+      const row = db.getWorks(['W2'])[0];
+      assert.equal(row.snippet, 'websnippetkeyword 片段');
+      assert.equal(row.abstract, '', '网页片段不冒充摘要');
+      // page_url 往返
+      db.upsertWorks([{ id: 'W3', title: 'T', pageUrl: 'https://arxiv.org/abs/9' }]);
+      assert.equal(db.getWorks(['W3'])[0].pageUrl, 'https://arxiv.org/abs/9');
+    } finally { db.close(); }
+  }
+  {
+    const { db } = await makeDb();
+    try {
+      db.upsertWorks([{ id: 'W50', title: 'T', snippet: 'keepme', pageUrl: 'https://a/b' }]);
+      db.upsertWorks([{ id: 'W50', title: 'T', snippet: '', pageUrl: '' }]);
+      const row = db.getWorks(['W50'])[0];
+      assert.equal(row.snippet, 'keepme');
+      assert.equal(row.pageUrl, 'https://a/b');
+      assert.equal(db.queryWorks({ q: 'keepme' }).total, 1, '空 snippet 不得清掉检索命中');
+    } finally { db.close(); }
+  }
 });
 
 test('R18: getRefsSnapshot 返回全库 (id → refs) 邻接快照，空 refs 不出现', async function () {
@@ -401,35 +403,38 @@ test('S3: 空格分词 = AND 语义（不再要求连续短语）；显式引号
 
 /* ---------------- R19：临时全文链（works_fulltext 侧表 + FTS 五列） ---------------- */
 
-test('R19: v3 全文窗口读写（fromChar 续读、charTotal、空文本拒绝、未命中 null）', async function () {
-  const { db } = await makeDb();
-  db.upsertWorks([{ id: 'W201', title: 'protocol paper', year: 2024, refs: [] }]);
-  assert.equal(db.getFulltextWindow('W201', 0, 100), null, '尚无全文');
-  assert.equal(db.upsertFulltext('W201', '   '), 0, '空文本拒绝写入');
-  const chars = db.upsertFulltext('W201', 'A'.repeat(25000) + '【第 3 页】methods');
-  assert.ok(chars > 25000);
-  const w1 = db.getFulltextWindow('W201', 0, 10000);
-  assert.equal(w1.charTotal, chars);
-  assert.equal(w1.text.length, 10000);
-  const w2 = db.getFulltextWindow('W201', 20000, 10000);
-  assert.equal(w2.fromChar, 20000);
-  assert.ok(w2.text.indexOf('methods') !== -1, '尾窗读到末尾内容');
-  // 越界偏移夹到末尾
-  const w3 = db.getFulltextWindow('W201', 999999, 10000);
-  assert.ok(w3.fromChar < chars);
-});
-
-test('R19: 全文进 FTS（search_research 可命中正文词）；元数据 upsert 不丢全文', async function () {
-  const { db } = await makeDb();
-  db.upsertWorks([{ id: 'W202', title: 'battery cycling', abstract: 'abstract only', refs: [] }]);
-  db.upsertFulltext('W202', '正文里独有的实验方案代号 xyzzy-experiment-42 出现在这里');
-  assert.equal(db.queryWorks({ q: 'xyzzy-experiment-42' }).works.length, 1, '仅存在于全文的词可检索');
-  assert.equal(db.queryWorks({ q: 'battery' }).works.length, 1, '标题命中不受影响');
-  // 重新 upsert 元数据（检索再次入库是常态）：全文与 FTS 行保留
-  db.upsertWorks([{ id: 'W202', title: 'battery cycling v2', abstract: '', citedBy: 99, refs: [] }]);
-  assert.equal(db.getWorks(['W202'])[0].fulltextChars > 0, true, 'fulltextChars 仍在');
-  assert.equal(db.queryWorks({ q: 'xyzzy-experiment-42' }).works.length, 1, 'FTS 的 fulltext 列未丢');
-  assert.equal(db.getWorks(['W202'])[0].citedBy, 99);
+test('R19: v3 全文窗口读写（fromChar 续读、空文本拒绝、未命中 null）；全文进 FTS 且元数据 upsert 不丢全文', async function () {
+  {
+    const { db } = await makeDb();
+    db.upsertWorks([{ id: 'W201', title: 'protocol paper', year: 2024, refs: [] }]);
+    assert.equal(db.getFulltextWindow('W201', 0, 100), null, '尚无全文');
+    assert.equal(db.upsertFulltext('W201', '   '), 0, '空文本拒绝写入');
+    const chars = db.upsertFulltext('W201', 'A'.repeat(25000) + '【第 3 页】methods');
+    assert.ok(chars > 25000);
+    const w1 = db.getFulltextWindow('W201', 0, 10000);
+    assert.equal(w1.charTotal, chars);
+    assert.equal(w1.text.length, 10000);
+    const w2 = db.getFulltextWindow('W201', 20000, 10000);
+    assert.equal(w2.fromChar, 20000);
+    assert.ok(w2.text.indexOf('methods') !== -1, '尾窗读到末尾内容');
+    // 越界偏移夹到末尾
+    const w3 = db.getFulltextWindow('W201', 999999, 10000);
+    assert.ok(w3.fromChar < chars);
+    db.close();
+  }
+  {
+    const { db } = await makeDb();
+    db.upsertWorks([{ id: 'W202', title: 'battery cycling', abstract: 'abstract only', refs: [] }]);
+    db.upsertFulltext('W202', '正文里独有的实验方案代号 xyzzy-experiment-42 出现在这里');
+    assert.equal(db.queryWorks({ q: 'xyzzy-experiment-42' }).works.length, 1, '仅存在于全文的词可检索');
+    assert.equal(db.queryWorks({ q: 'battery' }).works.length, 1, '标题命中不受影响');
+    // 重新 upsert 元数据（检索再次入库是常态）：全文与 FTS 行保留
+    db.upsertWorks([{ id: 'W202', title: 'battery cycling v2', abstract: '', citedBy: 99, refs: [] }]);
+    assert.equal(db.getWorks(['W202'])[0].fulltextChars > 0, true, 'fulltextChars 仍在');
+    assert.equal(db.queryWorks({ q: 'xyzzy-experiment-42' }).works.length, 1, 'FTS 的 fulltext 列未丢');
+    assert.equal(db.getWorks(['W202'])[0].citedBy, 99);
+    db.close();
+  }
 });
 
 test('性能回归：内容未变的 upsert 不重建 FTS 行（检索工具一次会 upsert 上百行）', async function () {
@@ -576,137 +581,138 @@ test('A-followup #4: vecCoverage 按当前模型 + 配方统计，不把「别�
   await db.close();
 });
 
-test('A-followup #5: 标题去重覆盖全库（不再只扫被引数前 400 篇）', async function () {
-  const { db } = await makeDb();
-  // 401 篇高被引 + 1 篇低被引，目标标题只属于低被引的那篇
-  const bulk = [];
-  for (let i = 0; i < 401; i++) {
-    bulk.push({ id: 'W5' + i, title: 'High cited paper number ' + i, citedBy: 10000 - i, refs: [] });
+test('A-followup #5: 标题去重覆盖全库（不再只扫被引数前 400 篇）、v3 旧库迁移回填 title_norm、title_norm 随 upsert / updateWorkText 同步维护', async function () {
+  {
+    const { db } = await makeDb();
+    // 401 篇高被引 + 1 篇低被引，目标标题只属于低被引的那篇
+    const bulk = [];
+    for (let i = 0; i < 401; i++) {
+      bulk.push({ id: 'W5' + i, title: 'High cited paper number ' + i, citedBy: 10000 - i, refs: [] });
+    }
+    db.upsertWorks(bulk);
+    db.upsertWorks([{ id: 'Wlow', title: 'Deep learning for zinc battery health estimation', citedBy: 0, refs: [] }]);
+    // 标题大小写/标点差异应归一化后命中同一身份
+    assert.equal(db.findIdByNormalizedTitle('deep  learning for zinc battery health ESTIMATION!!'), 'Wlow');
+    assert.equal(db.findIdByNormalizedTitle('Deep learning for zinc battery health estimation'), 'Wlow');
+    assert.equal(db.findIdByNormalizedTitle('High cited paper number 400'), 'W5400');
+    // 过短标题不参与匹配（沿用既有下限）
+    assert.equal(db.findIdByNormalizedTitle('short'), null);
+    await db.close();
   }
-  db.upsertWorks(bulk);
-  db.upsertWorks([{ id: 'Wlow', title: 'Deep learning for zinc battery health estimation', citedBy: 0, refs: [] }]);
-  // 标题大小写/标点差异应归一化后命中同一身份
-  assert.equal(db.findIdByNormalizedTitle('deep  learning for zinc battery health ESTIMATION!!'), 'Wlow');
-  assert.equal(db.findIdByNormalizedTitle('Deep learning for zinc battery health estimation'), 'Wlow');
-  assert.equal(db.findIdByNormalizedTitle('High cited paper number 400'), 'W5400');
-  // 过短标题不参与匹配（沿用既有下限）
-  assert.equal(db.findIdByNormalizedTitle('short'), null);
-  await db.close();
+  {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-research-v3-'));
+    const file = path.join(dir, 'research.db');
+    const raw = new DatabaseSync(file);
+    raw.exec(`PRAGMA journal_mode = WAL; PRAGMA user_version = 3;`);
+    raw.exec(`CREATE TABLE works(id TEXT PRIMARY KEY, doi TEXT DEFAULT '', title TEXT NOT NULL DEFAULT '',
+      year INTEGER, pubdate TEXT DEFAULT '', type TEXT DEFAULT '', source_id TEXT DEFAULT '', source_name TEXT DEFAULT '',
+      abstract TEXT DEFAULT '', snippet TEXT DEFAULT '', page_url TEXT DEFAULT '', lang TEXT DEFAULT '',
+      cited_by INTEGER DEFAULT 0, is_oa INTEGER DEFAULT 0, oa_url TEXT DEFAULT '',
+      authors_json TEXT DEFAULT '[]', refs_json TEXT DEFAULT '[]', concepts_json TEXT DEFAULT '[]',
+      keywords_json TEXT DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    // v3 库应有的 FTS 与全文侧表（迁移只在 <3 时重建 FTS）
+    raw.exec(`CREATE VIRTUAL TABLE works_fts USING fts5(work_id UNINDEXED, title, abstract, snippet, fulltext, tokenize='trigram')`);
+    raw.exec(`CREATE TABLE works_fulltext(work_id TEXT PRIMARY KEY, content TEXT NOT NULL DEFAULT '', chars INTEGER NOT NULL DEFAULT 0, fetched_at INTEGER NOT NULL DEFAULT 0)`);
+    raw.prepare(`INSERT INTO works(id, title, created_at, updated_at) VALUES('Wold', 'Zinc Battery Health Estimation', 1, 1)`).run();
+    raw.prepare(`INSERT INTO works_fts(work_id, title, abstract, snippet, fulltext) VALUES('Wold', 'Zinc Battery Health Estimation', '', '', '')`).run();
+    raw.close();
+    const db = createResearchDb({ dir: dir });
+    await db.open(); // v3 → v4：加列 + 索引 + 回填
+    assert.equal(db.findIdByNormalizedTitle('zinc battery health estimation'), 'Wold', '迁移回填后旧行可命中');
+    assert.equal(db.findIdByNormalizedTitle('Zinc  Battery   Health Estimation!!'), 'Wold', '规范化后同键');
+    await db.close();
+  }
+  {
+    const { db } = await makeDb();
+    db.upsertWorks([{ id: 'W500', title: 'Zinc Battery Health Estimation', refs: [] }]);
+    assert.equal(db.findIdByNormalizedTitle('zinc battery health estimation'), 'W500');
+    // upsert 改标题：规范化键跟着走，旧键不再命中
+    db.upsertWorks([{ id: 'W500', title: 'Nickel Battery Aging Model', refs: [] }]);
+    assert.equal(db.findIdByNormalizedTitle('Nickel Battery Aging Model'), 'W500');
+    assert.equal(db.findIdByNormalizedTitle('Zinc Battery Health Estimation'), null, '旧标题不再命中');
+    // updateWorkText 改标题同样维护（回填链会走这条路）
+    db.updateWorkText('W500', { title: 'Solid State Electrolyte Review' }, 'crossref');
+    assert.equal(db.findIdByNormalizedTitle('Solid State Electrolyte Review'), 'W500');
+    // 只改摘要不动标题：标题键保持
+    db.updateWorkText('W500', { abstract: 'new abstract' }, 'crossref');
+    assert.equal(db.findIdByNormalizedTitle('Solid State Electrolyte Review'), 'W500');
+    await db.close();
+  }
 });
 
-test('A-followup #5: v3 旧库迁移时回填 title_norm（旧行迁移后可参与去重）', async function () {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-research-v3-'));
-  const file = path.join(dir, 'research.db');
-  const raw = new DatabaseSync(file);
-  raw.exec(`PRAGMA journal_mode = WAL; PRAGMA user_version = 3;`);
-  raw.exec(`CREATE TABLE works(id TEXT PRIMARY KEY, doi TEXT DEFAULT '', title TEXT NOT NULL DEFAULT '',
-    year INTEGER, pubdate TEXT DEFAULT '', type TEXT DEFAULT '', source_id TEXT DEFAULT '', source_name TEXT DEFAULT '',
-    abstract TEXT DEFAULT '', snippet TEXT DEFAULT '', page_url TEXT DEFAULT '', lang TEXT DEFAULT '',
-    cited_by INTEGER DEFAULT 0, is_oa INTEGER DEFAULT 0, oa_url TEXT DEFAULT '',
-    authors_json TEXT DEFAULT '[]', refs_json TEXT DEFAULT '[]', concepts_json TEXT DEFAULT '[]',
-    keywords_json TEXT DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
-  // v3 库应有的 FTS 与全文侧表（迁移只在 <3 时重建 FTS）
-  raw.exec(`CREATE VIRTUAL TABLE works_fts USING fts5(work_id UNINDEXED, title, abstract, snippet, fulltext, tokenize='trigram')`);
-  raw.exec(`CREATE TABLE works_fulltext(work_id TEXT PRIMARY KEY, content TEXT NOT NULL DEFAULT '', chars INTEGER NOT NULL DEFAULT 0, fetched_at INTEGER NOT NULL DEFAULT 0)`);
-  raw.prepare(`INSERT INTO works(id, title, created_at, updated_at) VALUES('Wold', 'Zinc Battery Health Estimation', 1, 1)`).run();
-  raw.prepare(`INSERT INTO works_fts(work_id, title, abstract, snippet, fulltext) VALUES('Wold', 'Zinc Battery Health Estimation', '', '', '')`).run();
-  raw.close();
-  const db = createResearchDb({ dir: dir });
-  await db.open(); // v3 → v4：加列 + 索引 + 回填
-  assert.equal(db.findIdByNormalizedTitle('zinc battery health estimation'), 'Wold', '迁移回填后旧行可命中');
-  assert.equal(db.findIdByNormalizedTitle('Zinc  Battery   Health Estimation!!'), 'Wold', '规范化后同键');
-  await db.close();
-});
+test('cosineSearch 缓存：同 (model,recipe) 冷热路径结果逐位一致，过滤与维度检查照常；vecPut/upsertWorks/updateWorkText/vecClear 各写入路径都要让缓存归零', async function () {
+  {
+    const { db } = await makeDb();
+    try {
+      db.upsertWorks([
+        { id: 'C1', title: 'Alpha', abstract: 'a', year: 2020 },
+        { id: 'C2', title: 'Beta', abstract: 'b', year: 2023 },
+        { id: 'C3', title: 'Gamma', abstract: 'g', year: 2025 }
+      ]);
+      const model = 'mc';
+      const recipe = 3;
+      // 3 维向量方向各异，避免同分并列的顺序偶然性
+      db.vecPut([
+        { workId: 'C1', model, dim: 3, recipe, hash: 'h1', vec: Buffer.from(new Float32Array([1, 0, 0]).buffer) },
+        { workId: 'C2', model, dim: 3, recipe, hash: 'h2', vec: Buffer.from(new Float32Array([0.6, 0.8, 0]).buffer) },
+        { workId: 'C3', model, dim: 3, recipe, hash: 'h3', vec: Buffer.from(new Float32Array([0, 0.1, 0.99]).buffer) }
+      ]);
+      const q = Buffer.from(new Float32Array([1, 0, 0]).buffer);
+      const cold = db.cosineSearch(q, { limit: 3, model, recipe });
+      const warm = db.cosineSearch(q, { limit: 3, model, recipe });
+      assert.deepEqual(warm, cold, '缓存命中路径与冷路径结果一致');
+      assert.equal(cold[0].workId, 'C1');
+      assert.ok(cold[0].score > 0.99);
+      // 维度不符的行照旧跳过（与旧实现的逐行 v.length 检查同语义）
+      db.vecPut([{ workId: 'C4', model, dim: 2, recipe, hash: 'h4', vec: Buffer.from(new Float32Array([1, 0]).buffer) }]);
+      const mixed = db.cosineSearch(q, { limit: 5, model, recipe });
+      assert.ok(!mixed.some((h) => h.workId === 'C4'), '维度不符的行不得进入结果');
+      assert.equal(mixed.length, 3);
+      // 热缓存下年份过滤 / limit 照常
+      const filtered = db.cosineSearch(q, { limit: 3, model, recipe, yearFrom: 2021 });
+      assert.deepEqual(filtered.map((h) => h.workId), ['C2', 'C3']);
+      assert.equal(db.cosineSearch(q, { limit: 1, model, recipe }).length, 1);
+      // 无 model/recipe 的兼容调用不走缓存也正确，且不得破坏已有缓存
+      assert.equal(db.cosineSearch(q, { limit: 5 }).length, 3);
+      const warmAgain = db.cosineSearch(q, { limit: 3, model, recipe });
+      assert.deepEqual(warmAgain, cold, '兼容调用不得破坏已有缓存');
+    } finally { db.close(); }
+  }
+  {
+    const { db } = await makeDb();
+    try {
+      db.upsertWorks([
+        { id: 'D1', title: 'Alpha', abstract: 'a', year: 2020 },
+        { id: 'D2', title: 'Beta', abstract: 'b', year: 2023 }
+      ]);
+      const model = 'md';
+      const recipe = 4;
+      db.vecPut([
+        { workId: 'D1', model, dim: 1, recipe, hash: 'h1', vec: Buffer.from(new Float32Array([1]).buffer) },
+        { workId: 'D2', model, dim: 1, recipe, hash: 'h2', vec: Buffer.from(new Float32Array([0.5]).buffer) }
+      ]);
+      const q = Buffer.from(new Float32Array([1]).buffer);
+      db.cosineSearch(q, { limit: 5, model, recipe });   // 建缓存
 
-test('A-followup #5: title_norm 随 upsert / updateWorkText 同步维护', async function () {
-  const { db } = await makeDb();
-  db.upsertWorks([{ id: 'W500', title: 'Zinc Battery Health Estimation', refs: [] }]);
-  assert.equal(db.findIdByNormalizedTitle('zinc battery health estimation'), 'W500');
-  // upsert 改标题：规范化键跟着走，旧键不再命中
-  db.upsertWorks([{ id: 'W500', title: 'Nickel Battery Aging Model', refs: [] }]);
-  assert.equal(db.findIdByNormalizedTitle('Nickel Battery Aging Model'), 'W500');
-  assert.equal(db.findIdByNormalizedTitle('Zinc Battery Health Estimation'), null, '旧标题不再命中');
-  // updateWorkText 改标题同样维护（回填链会走这条路）
-  db.updateWorkText('W500', { title: 'Solid State Electrolyte Review' }, 'crossref');
-  assert.equal(db.findIdByNormalizedTitle('Solid State Electrolyte Review'), 'W500');
-  // 只改摘要不动标题：标题键保持
-  db.updateWorkText('W500', { abstract: 'new abstract' }, 'crossref');
-  assert.equal(db.findIdByNormalizedTitle('Solid State Electrolyte Review'), 'W500');
-  await db.close();
-});
+      // ① vecPut 新向量：热缓存必须看得到新行
+      db.upsertWorks([{ id: 'D3', title: 'Gamma', abstract: 'g', year: 2024 }]);
+      db.vecPut([{ workId: 'D3', model, dim: 1, recipe, hash: 'h3', vec: Buffer.from(new Float32Array([0.9]).buffer) }]);
+      const afterPut = db.cosineSearch(q, { limit: 5, model, recipe });
+      assert.ok(afterPut.some((h) => h.workId === 'D3'), 'vecPut 后新向量必须可检索');
 
-test('cosineSearch 缓存：同 (model,recipe) 冷热路径结果逐位一致，过滤与维度检查照常', async function () {
-  const { db } = await makeDb();
-  try {
-    db.upsertWorks([
-      { id: 'C1', title: 'Alpha', abstract: 'a', year: 2020 },
-      { id: 'C2', title: 'Beta', abstract: 'b', year: 2023 },
-      { id: 'C3', title: 'Gamma', abstract: 'g', year: 2025 }
-    ]);
-    const model = 'mc';
-    const recipe = 3;
-    // 3 维向量方向各异，避免同分并列的顺序偶然性
-    db.vecPut([
-      { workId: 'C1', model, dim: 3, recipe, hash: 'h1', vec: Buffer.from(new Float32Array([1, 0, 0]).buffer) },
-      { workId: 'C2', model, dim: 3, recipe, hash: 'h2', vec: Buffer.from(new Float32Array([0.6, 0.8, 0]).buffer) },
-      { workId: 'C3', model, dim: 3, recipe, hash: 'h3', vec: Buffer.from(new Float32Array([0, 0.1, 0.99]).buffer) }
-    ]);
-    const q = Buffer.from(new Float32Array([1, 0, 0]).buffer);
-    const cold = db.cosineSearch(q, { limit: 3, model, recipe });
-    const warm = db.cosineSearch(q, { limit: 3, model, recipe });
-    assert.deepEqual(warm, cold, '缓存命中路径与冷路径结果一致');
-    assert.equal(cold[0].workId, 'C1');
-    assert.ok(cold[0].score > 0.99);
-    // 维度不符的行照旧跳过（与旧实现的逐行 v.length 检查同语义）
-    db.vecPut([{ workId: 'C4', model, dim: 2, recipe, hash: 'h4', vec: Buffer.from(new Float32Array([1, 0]).buffer) }]);
-    const mixed = db.cosineSearch(q, { limit: 5, model, recipe });
-    assert.ok(!mixed.some((h) => h.workId === 'C4'), '维度不符的行不得进入结果');
-    assert.equal(mixed.length, 3);
-    // 热缓存下年份过滤 / limit 照常
-    const filtered = db.cosineSearch(q, { limit: 3, model, recipe, yearFrom: 2021 });
-    assert.deepEqual(filtered.map((h) => h.workId), ['C2', 'C3']);
-    assert.equal(db.cosineSearch(q, { limit: 1, model, recipe }).length, 1);
-    // 无 model/recipe 的兼容调用不走缓存也正确，且不得破坏已有缓存
-    assert.equal(db.cosineSearch(q, { limit: 5 }).length, 3);
-    const warmAgain = db.cosineSearch(q, { limit: 3, model, recipe });
-    assert.deepEqual(warmAgain, cold, '兼容调用不得破坏已有缓存');
-  } finally { db.close(); }
-});
+      // ② upsertWorks 改年份：yearCache 必须失效（年份不进嵌入 hash，向量仍在，只有年份变了）
+      db.upsertWorks([{ id: 'D3', title: 'Gamma', abstract: 'g', year: 2001 }]);
+      const afterYear = db.cosineSearch(q, { limit: 5, model, recipe, yearFrom: 2023 });
+      assert.ok(!afterYear.some((h) => h.workId === 'D3'), '改年份后旧年份不得继续生效');
 
-test('cosineSearch 缓存失效：vecPut/upsertWorks/updateWorkText/vecClear 各写入路径都要让缓存归零', async function () {
-  const { db } = await makeDb();
-  try {
-    db.upsertWorks([
-      { id: 'D1', title: 'Alpha', abstract: 'a', year: 2020 },
-      { id: 'D2', title: 'Beta', abstract: 'b', year: 2023 }
-    ]);
-    const model = 'md';
-    const recipe = 4;
-    db.vecPut([
-      { workId: 'D1', model, dim: 1, recipe, hash: 'h1', vec: Buffer.from(new Float32Array([1]).buffer) },
-      { workId: 'D2', model, dim: 1, recipe, hash: 'h2', vec: Buffer.from(new Float32Array([0.5]).buffer) }
-    ]);
-    const q = Buffer.from(new Float32Array([1]).buffer);
-    db.cosineSearch(q, { limit: 5, model, recipe });   // 建缓存
+      // ③ updateWorkText 改摘要（R13 删 vec 行）：该 work 必须退出检索，缓存不得残留旧向量
+      db.updateWorkText('D3', { abstract: 'changed abstract' }, 'bench');
+      const afterText = db.cosineSearch(q, { limit: 5, model, recipe });
+      assert.ok(!afterText.some((h) => h.workId === 'D3'), '内容一变旧向量必须立即退出检索');
 
-    // ① vecPut 新向量：热缓存必须看得到新行
-    db.upsertWorks([{ id: 'D3', title: 'Gamma', abstract: 'g', year: 2024 }]);
-    db.vecPut([{ workId: 'D3', model, dim: 1, recipe, hash: 'h3', vec: Buffer.from(new Float32Array([0.9]).buffer) }]);
-    const afterPut = db.cosineSearch(q, { limit: 5, model, recipe });
-    assert.ok(afterPut.some((h) => h.workId === 'D3'), 'vecPut 后新向量必须可检索');
-
-    // ② upsertWorks 改年份：yearCache 必须失效（年份不进嵌入 hash，向量仍在，只有年份变了）
-    db.upsertWorks([{ id: 'D3', title: 'Gamma', abstract: 'g', year: 2001 }]);
-    const afterYear = db.cosineSearch(q, { limit: 5, model, recipe, yearFrom: 2023 });
-    assert.ok(!afterYear.some((h) => h.workId === 'D3'), '改年份后旧年份不得继续生效');
-
-    // ③ updateWorkText 改摘要（R13 删 vec 行）：该 work 必须退出检索，缓存不得残留旧向量
-    db.updateWorkText('D3', { abstract: 'changed abstract' }, 'bench');
-    const afterText = db.cosineSearch(q, { limit: 5, model, recipe });
-    assert.ok(!afterText.some((h) => h.workId === 'D3'), '内容一变旧向量必须立即退出检索');
-
-    // ④ vecClear：全清后检索为空
-    db.vecClear();
-    assert.equal(db.cosineSearch(q, { limit: 5, model, recipe }).length, 0);
-  } finally { db.close(); }
+      // ④ vecClear：全清后检索为空
+      db.vecClear();
+      assert.equal(db.cosineSearch(q, { limit: 5, model, recipe }).length, 0);
+    } finally { db.close(); }
+  }
 });

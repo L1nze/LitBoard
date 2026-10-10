@@ -46,7 +46,7 @@ test('CNKI EndNote export fills missing metadata on a detail page', async functi
   assert.equal(result.sourceType, 'translator:cnki');
 });
 
-test('CNKI journal tooltip does not become part of the captured journal name', async function () {
+test('CNKI journal tooltip never becomes part of the captured journal name: EndNote export, journal meta fallback, and generic meta fallback', async function () {
   let listener;
   const title = { textContent: '基于超声时频域主成分分析的磷酸铁锂储能电池荷电状态评估' };
   const elements = {
@@ -69,50 +69,50 @@ test('CNKI journal tooltip does not become part of the captured journal name', a
   const result = await new Promise(resolve => listener({ type: 'litboard-extract' }, {}, resolve));
   assert.equal(result.venue, '高电压技术');
   assert.equal(LitTranslators.parseCnkiPublicationInfo('高电压技术，查看该刊数据库收录来源').venue, '高电压技术');
-});
 
-test('CNKI journal meta fallback also removes the database-source tooltip', async function () {
-  let listener;
-  const title = { textContent: '基于超声时频域主成分分析的磷酸铁锂储能电池荷电状态评估' };
-  const elements = {
-    '.wx-tit h1, .doc-top, #paramfilename': title,
-    '.wx-tit > h1, .wx-tit h1': title,
-    'meta[name="citation_journal_title"], meta[property="citation_journal_title"]':
-      { content: '高电压技术 · 查看该刊数据库收录来源' }
-  };
-  const context = {
-    document: { head: { innerHTML: '' }, querySelector: selector => elements[selector] || null, querySelectorAll: () => [] },
-    location: { hostname: 'kns.cnki.net', pathname: '/kcms2/article/abstract', href: 'https://kns.cnki.net/kcms2/article/abstract?v=article' },
-    URL,
-    chrome: { runtime: { onMessage: { addListener: fn => { listener = fn; } } } },
-    window: { LitTranslators }
-  };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'extension', 'content.js'), 'utf8'), context);
-  const result = await new Promise(resolve => listener({ type: 'litboard-extract' }, {}, resolve));
-  assert.equal(result.venue, '高电压技术');
-});
+  {
+    let listener;
+    const title = { textContent: '基于超声时频域主成分分析的磷酸铁锂储能电池荷电状态评估' };
+    const elements = {
+      '.wx-tit h1, .doc-top, #paramfilename': title,
+      '.wx-tit > h1, .wx-tit h1': title,
+      'meta[name="citation_journal_title"], meta[property="citation_journal_title"]':
+        { content: '高电压技术 · 查看该刊数据库收录来源' }
+    };
+    const context = {
+      document: { head: { innerHTML: '' }, querySelector: selector => elements[selector] || null, querySelectorAll: () => [] },
+      location: { hostname: 'kns.cnki.net', pathname: '/kcms2/article/abstract', href: 'https://kns.cnki.net/kcms2/article/abstract?v=article' },
+      URL,
+      chrome: { runtime: { onMessage: { addListener: fn => { listener = fn; } } } },
+      window: { LitTranslators }
+    };
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'extension', 'content.js'), 'utf8'), context);
+    const result = await new Promise(resolve => listener({ type: 'litboard-extract' }, {}, resolve));
+    assert.equal(result.venue, '高电压技术');
+  }
 
-test('CNKI generic metadata fallback removes the journal tooltip when detail selectors change', async function () {
-  let listener;
-  const elements = {
-    'meta[name="citation_title"], meta[property="citation_title"]': { content: '储能电池荷电状态评估' },
-    'meta[name="citation_journal_title"], meta[property="citation_journal_title"]':
-      { content: '高电压技术 · 查看该刊数据库收录来源' }
-  };
-  const context = {
-    document: {
-      title: '储能电池荷电状态评估', body: { innerText: '' },
-      querySelector: selector => elements[selector] || null,
-      querySelectorAll: () => []
-    },
-    location: { hostname: 'kns.cnki.net', pathname: '/kcms2/article/abstract', href: 'https://kns.cnki.net/kcms2/article/abstract?v=article' },
-    URL,
-    chrome: { runtime: { onMessage: { addListener: fn => { listener = fn; } } } },
-    window: { LitTranslators }
-  };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'extension', 'content.js'), 'utf8'), context);
-  const result = await new Promise(resolve => listener({ type: 'litboard-extract' }, {}, resolve));
-  assert.equal(result.venue, '高电压技术');
+  {
+    let listener;
+    const elements = {
+      'meta[name="citation_title"], meta[property="citation_title"]': { content: '储能电池荷电状态评估' },
+      'meta[name="citation_journal_title"], meta[property="citation_journal_title"]':
+        { content: '高电压技术 · 查看该刊数据库收录来源' }
+    };
+    const context = {
+      document: {
+        title: '储能电池荷电状态评估', body: { innerText: '' },
+        querySelector: selector => elements[selector] || null,
+        querySelectorAll: () => []
+      },
+      location: { hostname: 'kns.cnki.net', pathname: '/kcms2/article/abstract', href: 'https://kns.cnki.net/kcms2/article/abstract?v=article' },
+      URL,
+      chrome: { runtime: { onMessage: { addListener: fn => { listener = fn; } } } },
+      window: { LitTranslators }
+    };
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'extension', 'content.js'), 'utf8'), context);
+    const result = await new Promise(resolve => listener({ type: 'litboard-extract' }, {}, resolve));
+    assert.equal(result.venue, '高电压技术');
+  }
 });
 
 function ctx(url, metaMap, texts, opts) {
@@ -136,7 +136,7 @@ function ctx(url, metaMap, texts, opts) {
   };
 }
 
-test('arXiv translator maps abs page to preprint with eprint extras', function () {
+test('dedicated translators: arXiv maps abs page to preprint with eprint extras; PubMed records PMID and finds DOI in page text; CNKI splits semicolon authors and keeps dbcode; unmatched returns null and matched-but-failing returns failed report', function () {
   const r = LitTranslators.runTranslators(ctx('https://arxiv.org/abs/1706.03762v5', {
     'citation_title': 'Attention Is All You Need',
     'citation_author': 'Ashish Vaswani; Noam Shazeer',
@@ -149,36 +149,35 @@ test('arXiv translator maps abs page to preprint with eprint extras', function (
   assert.equal(r.item.bibtexExtra.eprint, '1706.03762');
   assert.equal(r.item.date, '2017/06/12');
   assert.equal(r.item.attachments[0].url, 'https://arxiv.org/pdf/1706.03762');
+
+  {
+    const r = LitTranslators.runTranslators(ctx('https://pubmed.ncbi.nlm.nih.gov/12345678/', {
+      'citation_title': 'Some Study',
+      'citation_author': 'Jane Doe'
+    }, { '.citation-doi': 'doi: 10.1000/example' }));
+    assert.equal(r.report.translator, 'pubmed');
+    assert.equal(r.item.bibtexExtra.pmid, '12345678');
+    assert.equal(r.item.doi, '10.1000/example');
+  }
+
+  {
+    const r = LitTranslators.runTranslators(ctx('https://kns.cnki.net/kcms2/article/abstract?v=x&dbcode=CJFD', {
+      'citation_title': '深度学习综述',
+      'citation_author': '张三; 李四; 王五'
+    }));
+    assert.equal(r.report.translator, 'cnki');
+    assert.deepEqual(r.item.authors, ['张三', '李四', '王五']);
+    assert.equal(r.item.bibtexExtra.dbcode, 'CJFD');
+  }
+
+  {
+    assert.equal(LitTranslators.runTranslators(ctx('https://example.com/paper', {})), null);
+    const r = LitTranslators.runTranslators(ctx('https://arxiv.org/abs/1706.03762', {})); // 无 meta 仍可出标题？无 citation_title → itemFromMeta 空标题
+    assert.ok(r.report.failed === true || r.report.translator === 'arxiv');
+  }
 });
 
-test('PubMed translator records PMID and finds DOI in page text', function () {
-  const r = LitTranslators.runTranslators(ctx('https://pubmed.ncbi.nlm.nih.gov/12345678/', {
-    'citation_title': 'Some Study',
-    'citation_author': 'Jane Doe'
-  }, { '.citation-doi': 'doi: 10.1000/example' }));
-  assert.equal(r.report.translator, 'pubmed');
-  assert.equal(r.item.bibtexExtra.pmid, '12345678');
-  assert.equal(r.item.doi, '10.1000/example');
-});
-
-test('CNKI translator splits semicolon authors and keeps dbcode', function () {
-  const r = LitTranslators.runTranslators(ctx('https://kns.cnki.net/kcms2/article/abstract?v=x&dbcode=CJFD', {
-    'citation_title': '深度学习综述',
-    'citation_author': '张三; 李四; 王五'
-  }));
-  assert.equal(r.report.translator, 'cnki');
-  assert.deepEqual(r.item.authors, ['张三', '李四', '王五']);
-  assert.equal(r.item.bibtexExtra.dbcode, 'CJFD');
-});
-
-
-test('unmatched site returns null; matched-but-failing returns failed report', function () {
-  assert.equal(LitTranslators.runTranslators(ctx('https://example.com/paper', {})), null);
-  const r = LitTranslators.runTranslators(ctx('https://arxiv.org/abs/1706.03762', {})); // 无 meta 仍可出标题？无 citation_title → itemFromMeta 空标题
-  assert.ok(r.report.failed === true || r.report.translator === 'arxiv');
-});
-
-test('publisher generic layer maps repeated citation_author and conference entries', function () {
+test('publisher generic layer maps repeated citation_author and conference entries; biorxiv preprint marks server and preprint entry type', function () {
   const r = LitTranslators.runTranslators({
     url: () => 'https://ieeexplore.ieee.org/document/1234567',
     meta: (n) => ({
@@ -194,17 +193,17 @@ test('publisher generic layer maps repeated citation_author and conference entri
   assert.equal(r.item.venue, 'Proc. IEEE ICML');
   assert.equal(r.item.entryType, 'inproceedings');
   assert.equal(r.item.attachments.length, 1);
-});
 
-test('biorxiv preprint marks server and preprint entry type', function () {
-  const r = LitTranslators.runTranslators({
-    url: () => 'https://www.biorxiv.org/content/10.1101/2024.01.01.123456',
-    meta: (n) => ({ 'citation_title': 'A Preprint', 'citation_doi': '10.1101/2024.01.01.123456' }[n] || ''),
-    metas: () => [],
-    jsonld: () => []
-  });
-  assert.equal(r.item.entryType, 'preprint');
-  assert.equal(r.item.bibtexExtra.server, 'bioRxiv');
+  {
+    const r = LitTranslators.runTranslators({
+      url: () => 'https://www.biorxiv.org/content/10.1101/2024.01.01.123456',
+      meta: (n) => ({ 'citation_title': 'A Preprint', 'citation_doi': '10.1101/2024.01.01.123456' }[n] || ''),
+      metas: () => [],
+      jsonld: () => []
+    });
+    assert.equal(r.item.entryType, 'preprint');
+    assert.equal(r.item.bibtexExtra.server, 'bioRxiv');
+  }
 });
 
 test('google scholar detail page uses citation meta; missing meta reports failure reason', function () {
@@ -227,7 +226,7 @@ test('google scholar detail page uses citation meta; missing meta reports failur
   assert.equal(fail.report.reason, 'no-meta'); // 调用方据此提示具体失败原因
 });
 
-test('keyword tags collect from repeated citation_keywords', function () {
+test('publisher layer field mapping: repeated citation_keywords collect as tags; volume/issue/first-last pages/date via shared fixture', function () {
   const r = LitTranslators.runTranslators({
     url: () => 'https://www.nature.com/articles/s41586-020-0000-0',
     meta: (n) => ({ 'citation_title': 'Nature Paper' }[n] || ''),
@@ -236,9 +235,7 @@ test('keyword tags collect from repeated citation_keywords', function () {
   });
   assert.equal(r.report.translator, 'publisher');
   assert.deepEqual(r.item.tags, ['crispr', 'genomics']);
-});
 
-test('publisher layer maps volume/issue/first-last pages/date via shared fixture', function () {
   const miss = LitTranslators.runTranslators(ctx('https://journals.aps.org/prl/abstract/10.1103/x', { 'citation_title': 'T' }));
   assert.equal(miss, null); // 未命中站点
   const p = LitTranslators.runTranslators(ctx('https://www.sciencedirect.com/science/article/pii/S0092867420301445', {
@@ -262,7 +259,7 @@ test('publisher layer maps volume/issue/first-last pages/date via shared fixture
   assert.equal(p.item.sourceType, 'translator:publisher');
 });
 
-test('google scholar PDF fallback via ctx.attr when no citation_pdf_url', function () {
+test('matching fallbacks: google scholar PDF via ctx.attr when no citation_pdf_url; publisher host matching covers springer/oup/cambridge variants', function () {
   const r = LitTranslators.runTranslators(ctx('https://scholar.google.com/scholar?cluster=123', {
     'citation_title': 'Scholar With PDF'
   }, {}, { attrs: { 'a[href*="pdf"]': { href: 'https://example.edu/paper.pdf' } } }));
@@ -270,9 +267,7 @@ test('google scholar PDF fallback via ctx.attr when no citation_pdf_url', functi
   assert.equal(r.item.attachments.length, 1);
   assert.equal(r.item.attachments[0].url, 'https://example.edu/paper.pdf');
   assert.equal(r.item.attachments[0].source, 'page-link');
-});
 
-test('publisher host matching covers springer/oup/cambridge variants', function () {
   ['https://link.springer.com/article/10.1007/s112', 'https://academic.oup.com/bioinformatics/article/36/1/1',
    'https://www.cambridge.org/core/journals/1', 'https://journals.plos.org/plosone/article?id=10.1/x',
    'https://www.frontiersin.org/articles/10.3389/fx', 'https://pubs.acs.org/doi/10.1021/x'].forEach(function (url) {

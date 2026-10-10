@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const LitDocx = require('../js/docx.js');
 
-test('buildDocx/readDocxFields round-trips citation fields in document order', async function () {
+test('buildDocx/readDocxFields round-trips citation fields in document order, XML-sensitive payloads, and footnote/endnote stories', async function () {
   const bytes = await LitDocx.buildDocx([
     { text: '前言' },
     { runs: [{ text: '甲说 ' }, { citation: { payload: { version: 1, items: [{ paperId: 'p1' }] }, text: '[1]' } }, { text: '，乙说 ' }, { citation: { payload: { version: 1, items: [{ paperId: 'p2', locator: '3' }] }, text: '[2]' } }, { text: '。' }] },
@@ -25,40 +25,35 @@ test('buildDocx/readDocxFields round-trips citation fields in document order', a
   assert.equal(fields[0].text, '[1]');
   assert.deepEqual(fields[1].payload.items[0], { paperId: 'p2', locator: '3' });
   assert.equal(fields[1].text, '[2]');
-});
 
-test('payload JSON with XML-sensitive characters survives the round trip', async function () {
+  // payload JSON 里的 XML 敏感字符原样存活往返
   const payload = { version: 1, items: [{ paperId: 'p1', suffix: 'see <Table> & "Fig. 1"' }] };
-  const bytes = await LitDocx.buildDocx([{ runs: [{ citation: { payload: payload, text: '[1]' } }] }]);
-  const fields = await LitDocx.readDocxFields(bytes);
-  assert.deepEqual(fields[0].payload, payload);
-});
+  const escBytes = await LitDocx.buildDocx([{ runs: [{ citation: { payload: payload, text: '[1]' } }] }]);
+  const escFields = await LitDocx.readDocxFields(escBytes);
+  assert.deepEqual(escFields[0].payload, payload);
 
-test('readDocxFieldsAll includes citation domains in footnotes and endnotes', async function () {
+  // 脚注/尾注里的引文域由 readDocxFieldsAll 收全
   const field = function (paperId, label) {
     return '<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r>' +
       '<w:r><w:instrText xml:space="preserve"> ADDIN LitBoard.Citation.1 &quot;{&quot;version&quot;:1,&quot;items&quot;:[{&quot;paperId&quot;:&quot;' + paperId + '&quot;}]}</w:instrText></w:r>' +
       '<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>' + label + '</w:t></w:r>' +
       '<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>';
   };
-  const bytes = await LitDocx.zipStore([
+  const storyBytes = await LitDocx.zipStore([
     { name: 'word/document.xml', data: '<w:document>' + field('p1', '[1]') + '</w:document>' },
     { name: 'word/footnotes.xml', data: '<w:footnotes>' + field('p2', '[2]') + '</w:footnotes>' },
     { name: 'word/endnotes.xml', data: '<w:endnotes>' + field('p3', '[3]') + '</w:endnotes>' }
   ]);
-  const fields = await LitDocx.readDocxFieldsAll(bytes);
-  assert.equal(fields.length, 3);
-  assert.deepEqual(fields.map(function (item) { return item.part; }), ['word/document.xml', 'word/footnotes.xml', 'word/endnotes.xml']);
-  assert.deepEqual(fields.map(function (item) { return item.text; }), ['[1]', '[2]', '[3]']);
+  const allFields = await LitDocx.readDocxFieldsAll(storyBytes);
+  assert.equal(allFields.length, 3);
+  assert.deepEqual(allFields.map(function (item) { return item.part; }), ['word/document.xml', 'word/footnotes.xml', 'word/endnotes.xml']);
+  assert.deepEqual(allFields.map(function (item) { return item.text; }), ['[1]', '[2]', '[3]']);
 });
 
-test('zip entries reject traversal names', function () {
+test('zip layer: traversal names rejected/sanitized, deflate entries inflated, output deterministic', async function () {
   assert.throws(function () {
     LitDocx.zipStore([{ name: '../evil.txt', data: 'x' }]);
   }, /非法 ZIP 条目名/);
-});
-
-test('zipRead: foreign-crafted traversal entries are sanitized by JSZip on load', async function () {
   // JSZip 3.10.1 loadAsync 对条目名做 sanitizeRelativePath（剥 `..` 与前导斜杠），
   // 所以恶意名字到不了我们的 assertSafeReadName；这里锁定这一行为作为防线事实。
   const JSZip = require('../vendor/jszip/jszip.min.js');
@@ -67,31 +62,28 @@ test('zipRead: foreign-crafted traversal entries are sanitized by JSZip on load'
   const bytes = await zip.generateAsync({ type: 'uint8array', compression: 'STORE' });
   const entries = await LitDocx.zipRead(bytes);
   assert.deepEqual(entries.map(function (e) { return e.name; }), ['evil.txt']);
-});
 
-test('zipRead inflates deflate (method 8) entries in any environment', async function () {
-  const JSZip = require('../vendor/jszip/jszip.min.js');
-  const zip = new JSZip();
-  zip.file('word/document.xml', '<w:document><w:p>压缩内容</w:p></w:document>');
-  const bytes = await zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE' });
-  const entries = await LitDocx.zipRead(bytes);
-  assert.equal(entries.length, 1);
-  assert.match(Buffer.from(entries[0].data).toString('utf8'), /压缩内容/);
-});
+  // deflate（method 8）条目在任何环境都能解压
+  const zipDeflate = new JSZip();
+  zipDeflate.file('word/document.xml', '<w:document><w:p>压缩内容</w:p></w:document>');
+  const deflateBytes = await zipDeflate.generateAsync({ type: 'uint8array', compression: 'DEFLATE' });
+  const deflateEntries = await LitDocx.zipRead(deflateBytes);
+  assert.equal(deflateEntries.length, 1);
+  assert.match(Buffer.from(deflateEntries[0].data).toString('utf8'), /压缩内容/);
 
-test('zipStore output is deterministic for the same entries', async function () {
-  const entries = [
+  // 相同条目（顺序不同）输出字节一致
+  const detEntries = [
     { name: 'b.xml', data: '乙' },
     { name: 'a.xml', data: '甲' }
   ];
-  const first = await LitDocx.zipStore(entries);
-  const second = await LitDocx.zipStore(entries.slice().reverse());
+  const first = await LitDocx.zipStore(detEntries);
+  const second = await LitDocx.zipStore(detEntries.slice().reverse());
   assert.deepEqual(Buffer.from(first), Buffer.from(second));
 });
 
 /* ---------- 旧格式兼容：替换前自写 stored-ZIP 产出的字节必须仍然可读 ---------- */
 
-test('legacy fixture: pre-JSZip buildDocx bytes still parse (fields + media)', async function () {
+test('legacy fixtures: pre-JSZip bytes still parse (document fields + media, footnotes/endnotes stories)', async function () {
   const bytes = fs.readFileSync(path.join(__dirname, 'fixtures', 'legacy-docx-build.bin'));
   const entries = await LitDocx.zipRead(bytes);
   const names = entries.map(function (e) { return e.name; }).sort();
@@ -102,18 +94,16 @@ test('legacy fixture: pre-JSZip buildDocx bytes still parse (fields + media)', a
   assert.equal(fields.length, 1);
   assert.deepEqual(fields[0].payload, { version: 1, items: [{ paperId: 'p1' }] });
   assert.equal(fields[0].text, '[1,2]');
-});
 
-test('legacy fixture: pre-JSZip multi-story zip keeps footnotes/endnotes fields', async function () {
-  const bytes = fs.readFileSync(path.join(__dirname, 'fixtures', 'legacy-docx-stories.bin'));
-  const fields = await LitDocx.readDocxFieldsAll(bytes);
-  assert.equal(fields.length, 3);
-  assert.deepEqual(fields.map(function (item) { return item.part; }),
+  const storyBytes = fs.readFileSync(path.join(__dirname, 'fixtures', 'legacy-docx-stories.bin'));
+  const storyFields = await LitDocx.readDocxFieldsAll(storyBytes);
+  assert.equal(storyFields.length, 3);
+  assert.deepEqual(storyFields.map(function (item) { return item.part; }),
     ['word/document.xml', 'word/footnotes.xml', 'word/endnotes.xml']);
-  assert.deepEqual(fields.map(function (item) { return item.text; }), ['[1]', '[2]', '[3]']);
+  assert.deepEqual(storyFields.map(function (item) { return item.text; }), ['[1]', '[2]', '[3]']);
 });
 
-test('convertZoteroFields maps resolved keys and keeps unmatched embedded snapshots', function () {
+test('convertZoteroFields maps resolved keys and keeps unmatched embedded snapshots; buildDocxFromFields rebuilds a converted document', async function () {
   const zoteroField = function (citationID, key, title, year) {
     return {
       instr: ' ADDIN ZOTERO_ITEM CSL_CITATION ' + JSON.stringify({
@@ -156,9 +146,8 @@ test('convertZoteroFields maps resolved keys and keeps unmatched embedded snapsh
   assert.equal(unmatched.payload.items[0].paperId, ''); // 保留嵌入快照，等待 UI 选择
   assert.equal(unmatched.payload.items[0].cslItem.title, 'Gone Paper');
   assert.match(result.fields[2].instr, /LitBoard\.Citation\.1/); // 已有 LitBoard 域原样保留
-});
 
-test('buildDocxFromFields rebuilds a converted document (new copy)', async function () {
+  // 转换结果重建为新文档（new copy）
   const zotero = {
     instr: ' ADDIN ZOTERO_ITEM CSL_CITATION ' + JSON.stringify({
       citationID: 'z1',
@@ -167,13 +156,13 @@ test('buildDocxFromFields rebuilds a converted document (new copy)', async funct
     }),
     text: '(Anon)'
   };
-  const converted = LitDocx.convertZoteroFields([zotero], { resolveKey: function () { return 'pK1'; } });
-  const bytes = await LitDocx.buildDocxFromFields(converted.fields, [{ text: '其余段落' }]);
-  const fields = await LitDocx.readDocxFields(bytes);
-  assert.equal(fields.length, 1);
-  assert.equal(fields[0].addin, 'LitBoard.Citation.1');
-  assert.equal(fields[0].payload.items[0].paperId, 'pK1');
-  assert.equal(fields[0].text, '(Anon)');
+  const rebuild = LitDocx.convertZoteroFields([zotero], { resolveKey: function () { return 'pK1'; } });
+  const rebuildBytes = await LitDocx.buildDocxFromFields(rebuild.fields, [{ text: '其余段落' }]);
+  const rebuildFields = await LitDocx.readDocxFields(rebuildBytes);
+  assert.equal(rebuildFields.length, 1);
+  assert.equal(rebuildFields[0].addin, 'LitBoard.Citation.1');
+  assert.equal(rebuildFields[0].payload.items[0].paperId, 'pK1');
+  assert.equal(rebuildFields[0].text, '(Anon)');
 });
 
 test('docx image runs embed media parts with rels', async function () {
@@ -226,8 +215,7 @@ test('convertZoteroDocxXml swaps Zotero field instructions in place and keeps ev
   assert.match(kept, /ZOTERO_ITEM/);
 });
 
-test('F08 回归：多段 instrText 拼接（Word 长指令拆段）', async function () {
-  const LitDocx = require('../js/docx.js');
+test('F08 回归：多段 instrText 拼接（Word 长指令拆段），PAGE 等非 Zotero 域混排不错位', async function () {
   const payload = JSON.stringify({ version: 1, items: [{ paperId: 'p1', cslItem: { id: 'p1' } }] });
   const instr = ' ADDIN LitBoard.Citation.1 "' + payload + '"';
   const mid = Math.floor(instr.length / 2);
@@ -244,26 +232,23 @@ test('F08 回归：多段 instrText 拼接（Word 长指令拆段）', async fun
   assert.equal(fields[0].addin, 'LitBoard.Citation.1');
   assert.equal(fields[0].payload.items[0].paperId, 'p1');
   assert.equal(fields[0].text, '(Smith 2020)');
-});
 
-test('F08 回归：PAGE 等非 Zotero 域混排不错位，分段 Zotero 指令完整转换', async function () {
-  const LitDocx = require('../js/docx.js');
+  // PAGE 域 + Zotero 域（指令拆两段）混排：不错位、不残留
   function fldChar(t) { return '<w:r><w:fldChar w:fldCharType="' + t + '"/></w:r>'; }
   function instrRun(s) { return '<w:r><w:instrText xml:space="preserve">' + s.replace(/"/g, '&quot;') + '</w:instrText></w:r>'; }
   const zJson = JSON.stringify({ citationID: 'z1', properties: {}, citationItems: [{ id: 1, uris: ['http://zotero.org/users/local/x/items/K1'], itemData: { title: 'T1' } }] });
-  // PAGE 域 + Zotero 域（指令拆两段）混排
-  const xml = '<?xml version="1.0"?><w:document xmlns:w="w"><w:p>' +
+  const mixXml = '<?xml version="1.0"?><w:document xmlns:w="w"><w:p>' +
     fldChar('begin') + instrRun(' PAGE ') + fldChar('separate') + '<w:r><w:t>1</w:t></w:r>' + fldChar('end') +
     fldChar('begin') +
     instrRun(' ADDIN ZOTERO_ITEM CSL_CITATION ' + zJson.slice(0, 40)) +
     instrRun(zJson.slice(40)) +
     fldChar('separate') + '<w:r><w:t>(T1)</w:t></w:r>' + fldChar('end') +
     '</w:p></w:document>';
-  const fields = LitDocx.convertZoteroFields(
+  const convFields = LitDocx.convertZoteroFields(
     [{ instr: ' ADDIN ZOTERO_ITEM CSL_CITATION ' + zJson, text: '(T1)' }],
     { resolveKey: function () { return 'pK1'; } }
   ).fields;
-  const out = LitDocx.convertZoteroDocxXml(xml, fields);
+  const out = LitDocx.convertZoteroDocxXml(mixXml, convFields);
   assert.match(out, / PAGE /);                                    // PAGE 域完好
   assert.doesNotMatch(out, /ZOTERO_ITEM/);                        // Zotero 域全替换
   assert.match(out, /ADDIN LitBoard\.Citation\.1 &quot;/);        // 新指令写入
@@ -282,7 +267,7 @@ async function documentXml(bytes) {
   return Buffer.from(entry.data).toString('utf8');
 }
 
-test('富文本 run：上标/斜体/小型大写转成真正的字符格式，而不是字面标签', async function () {
+test('富文本 run：上标/斜体/小型大写转成真正的字符格式；w:tab / w:br 直接产出，不参与文本', async function () {
   const bytes = await LitDocx.buildDocx([{ runs: [
     { text: '[1]' },
     { text: ',2', sup: true },
@@ -302,18 +287,17 @@ test('富文本 run：上标/斜体/小型大写转成真正的字符格式，�
   assert.match(xml, /<w:rPr><w:vertAlign w:val="subscript"\/><\/w:rPr>/);
   // 没有任何 HTML 标签残留
   assert.doesNotMatch(xml, /&lt;sup&gt;|<sup>/);
+
+  // 制表位与换行
+  const tabBytes = await LitDocx.buildDocx([{ runs: [{ text: '[1]' }, { tab: true }, { text: 'HE K.' }, { br: true }, { text: 'next' }] }]);
+  const tabXml = await documentXml(tabBytes);
+  assert.match(tabXml, /<w:r><w:tab\/><\/w:r>/);
+  assert.match(tabXml, /<w:r><w:br\/><\/w:r>/);
+  const tabFields = await LitDocx.readDocxFields(tabBytes);
+  assert.equal(tabFields.length, 0);   // 没有域时读回为空，制表位不会混进文本
 });
 
-test('制表位与换行 run：w:tab / w:br 直接产出，不参与文本', async function () {
-  const bytes = await LitDocx.buildDocx([{ runs: [{ text: '[1]' }, { tab: true }, { text: 'HE K.' }, { br: true }, { text: 'next' }] }]);
-  const xml = await documentXml(bytes);
-  assert.match(xml, /<w:r><w:tab\/><\/w:r>/);
-  assert.match(xml, /<w:r><w:br\/><\/w:r>/);
-  const fields = await LitDocx.readDocxFields(bytes);
-  assert.equal(fields.length, 0);   // 没有域时读回为空，制表位不会混进文本
-});
-
-test('引文域的 runs 形态：域结果可以是多个带格式 run，且读回文本仍然正确', async function () {
+test('引文域的 runs 形态：多 run 带格式拼接正确；只给 text 时按纯文本处理（读回兼容形态）', async function () {
   const payload = { version: 1, items: [{ paperId: 'p1' }] };
   const bytes = await LitDocx.buildDocx([{ runs: [{ text: '见 ' }, {
     citation: { payload: payload, runs: [{ text: '[1' }, { text: '–3', sup: true }, { text: ']' }] }
@@ -323,13 +307,12 @@ test('引文域的 runs 形态：域结果可以是多个带格式 run，且读�
   assert.deepEqual(fields[0].payload, payload);
   assert.equal(fields[0].text, '[1–3]');            // 域结果文本跨 run 拼接
   assert.match(await documentXml(bytes), /<w:vertAlign w:val="superscript"\/>/);
-});
 
-test('引文域只给 text 时按纯文本处理（docx 读回路径的兼容形态）', async function () {
-  const bytes = await LitDocx.buildDocx([{ runs: [{ citation: { payload: { version: 1, items: [] }, text: '<sup>[1]</sup>' } }] }]);
-  const xml = await documentXml(bytes);
-  assert.match(xml, /<w:t xml:space="preserve">&lt;sup&gt;\[1\]&lt;\/sup&gt;<\/w:t>/);
-  assert.doesNotMatch(xml, /vertAlign/);
+  // 只给 text：按纯文本输出，不产生字符格式
+  const plainBytes = await LitDocx.buildDocx([{ runs: [{ citation: { payload: { version: 1, items: [] }, text: '<sup>[1]</sup>' } }] }]);
+  const plainXml = await documentXml(plainBytes);
+  assert.match(plainXml, /<w:t xml:space="preserve">&lt;sup&gt;\[1\]&lt;\/sup&gt;<\/w:t>/);
+  assert.doesNotMatch(plainXml, /vertAlign/);
 });
 
 test('段落格式：悬挂缩进/制表位/段后距/行距按 twips 落成 w:pPr', async function () {

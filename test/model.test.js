@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const LitModel = require('../js/model.js');
 
-test('normalizePaper repairs unsafe and malformed backup fields', function () {
+test('normalizePaper repairs unsafe and malformed backup fields and maps legacy read status', function () {
   const paper = LitModel.normalizePaper({
     id: '" onclick=alert(1)',
     title: 42,
@@ -23,27 +23,21 @@ test('normalizePaper repairs unsafe and malformed backup fields', function () {
   assert.equal(paper.rating, 5);
   assert.equal(paper.citations, null);
   assert.equal(paper.url, '');
-});
-
-test('legacy read status becomes reading', function () {
   assert.equal(LitModel.normalizePaper({ id: 'p1', title: 'Paper', status: 'read' }).status, 'reading');
 });
 
-test('normalizeLibrary accepts both raw arrays and backup envelopes', function () {
+test('normalizeLibrary accepts raw arrays and backup envelopes; envelope carries schema version', function () {
   const source = [{ id: 'p1', title: 'Paper', authors: [] }];
   assert.equal(LitModel.normalizeLibrary(source).length, 1);
   assert.equal(LitModel.normalizeLibrary({ schemaVersion: 1, papers: source }).length, 1);
   assert.deepEqual(LitModel.normalizeLibrary({ papers: 'bad' }), []);
-});
-
-test('envelope includes a schema version and normalized papers', function () {
   const value = LitModel.envelope([{ id: 'p1', title: 'Paper', status: 'invalid' }]);
   assert.equal(value.schemaVersion, LitModel.SCHEMA_VERSION);
   assert.equal(value.papers[0].status, 'unread');
   assert.match(value.updatedAt, /^\d{4}-\d{2}-\d{2}T/);
 });
 
-test('workspace normalizes folders and paper folder assignments', function () {
+test('workspace normalizes folders and paper folder assignments, preserving nesting and breaking cycles', function () {
   const value = LitModel.normalizeWorkspace({
     folders: [{ id: 'f1', name: 'Methods' }, { id: 'bad id', name: 'Ignored' }],
     papers: [{ id: 'p1', title: 'Paper', folderIds: ['f1', 'f1', 'orphan'] }]
@@ -56,9 +50,6 @@ test('workspace normalizes folders and paper folder assignments', function () {
   assert.equal(typeof value.folders[0].updatedAt, 'number');
   assert.equal(value.folders[0].deletedAt, null);
   assert.deepEqual(value.papers[0].folderIds, ['f1']);
-});
-
-test('folder normalization preserves nesting and breaks invalid cycles', function () {
   const folders = LitModel.normalizeFolders([
     { id: 'root', name: 'Root' },
     { id: 'child', name: 'Child', parentId: 'root' },
@@ -72,68 +63,56 @@ test('folder normalization preserves nesting and breaks invalid cycles', functio
   assert.ok(!byId.a.parentId || !byId.b.parentId);
 });
 
-test('normalization removes imported Zotero noise tags', function () {
-  const paper = LitModel.normalizePaper({
+test('normalizePaper strips Zotero noise tags and normalizes journal-rank cache and flags', function () {
+  const tagPaper = LitModel.normalizePaper({
     id: 'p1', title: 'Paper', tags: ['/unread', '🌟 No DOI found', '🌟starred', '机器学习']
   });
-  assert.deepEqual(paper.tags, ['机器学习']);
-});
-
-test('normalizePaper retains a compact journal-rank cache', function () {
-  const paper = LitModel.normalizePaper({
+  assert.deepEqual(tagPaper.tags, ['机器学习']);
+  const rankPaper = LitModel.normalizePaper({
     id: 'p1', title: 'Paper', journalRank: { abbr: 'Nature', xr: '1', xrTop: '新锐 Top', beihe: '北大核心', imf: 48.5, jci: 11.14 }
   });
-  assert.deepEqual(paper.journalRank, {
+  assert.deepEqual(rankPaper.journalRank, {
     abbr: 'Nature', jcr: '', cas: '', casTop: '', xr: '1', xrTop: 'Top', beihe: '北核', imf: 48.5, jci: 11.14, updatedAt: null
   });
-});
-
-test('normalizePaper hides negative or missing journal-rank flags', function () {
-  const paper = LitModel.normalizePaper({
+  const flagPaper = LitModel.normalizePaper({
     id: 'p1', title: 'Paper', journalRank: {
       xr: '未收录', xrTop: '未收录Top', beihe: '未收录', imf: 0, jcr: '未收录'
     }
   });
-  assert.equal(paper.journalRank, null);
+  assert.equal(flagPaper.journalRank, null);
 });
 
-test('normalizePaper validates PDF annotations in PDF coordinates', function () {
-  const paper = LitModel.normalizePaper({
+test('normalizePaper validates annotation PDF coordinates and preserves remote asset metadata', function () {
+  const annPaper = LitModel.normalizePaper({
     id: 'p1', title: 'Paper', pdfAnnotations: [
       { id: 'a1', type: 'underline', color: '#FFAA00', text: 'quote', comment: 'note',
         position: { pageIndex: 2, rects: [[30, 40, 10, 20]] }, createdAt: 10, updatedAt: 20 },
       { id: 'broken', position: { pageIndex: -1, rects: [] } }
     ]
   });
-  assert.deepEqual(paper.pdfAnnotations, [{
+  assert.deepEqual(annPaper.pdfAnnotations, [{
     id: 'a1', type: 'underline', color: '#ffaa00', attachmentId: '', tags: [], text: 'quote', comment: 'note',
     position: { pageIndex: 2, rects: [[10, 20, 30, 40]] }, createdAt: 10, updatedAt: 20
   }]);
-});
-
-test('normalizePaper preserves validated remote asset metadata for attachments and snapshots', function () {
   const hash = 'a'.repeat(64);
-  const paper = LitModel.normalizePaper({ id: 'p-assets', attachments: [
+  const assetPaper = LitModel.normalizePaper({ id: 'p-assets', attachments: [
     { id: 'a1', kind: 'pdf', fileName: 'paper.pdf', cloudName: 'p-assets.pdf', cloudHash: hash, cloudSize: 12 }
   ], pdfAnnotations: [{ id: 'n1', type: 'snapshot', cloudName: 'snapshots/p-assets/n1.png', cloudHash: hash, cloudSize: 8,
     position: { pageIndex: 0, rects: [[1, 2, 3, 4]] } }] });
-  assert.equal(paper.attachments[0].cloudHash, hash);
-  assert.equal(paper.attachments[0].cloudSize, 12);
-  assert.equal(paper.pdfAnnotations[0].cloudName, 'snapshots/p-assets/n1.png');
-  assert.equal(paper.pdfAnnotations[0].cloudHash, hash);
-  assert.equal(paper.pdfAnnotations[0].cloudSize, 8);
+  assert.equal(assetPaper.attachments[0].cloudHash, hash);
+  assert.equal(assetPaper.attachments[0].cloudSize, 12);
+  assert.equal(assetPaper.pdfAnnotations[0].cloudName, 'snapshots/p-assets/n1.png');
+  assert.equal(assetPaper.pdfAnnotations[0].cloudHash, hash);
+  assert.equal(assetPaper.pdfAnnotations[0].cloudSize, 8);
 });
 
-test('citation keys use the lowercase first-author family name and year', function () {
+test('citation keys: lowercase family name and year, imported keys, disambiguation and pinned precedence', function () {
   assert.equal(LitModel.citationKeyBase({ authors: ['Ada Lovelace'], year: 1843 }), 'lovelace1843');
   assert.equal(LitModel.citationKeyBase({ authors: ['Lovelace, Ada'], year: 1843 }), 'lovelace1843');
   assert.equal(LitModel.citationKeyBase({ authors: ['José García'], year: 2024 }), 'garcia2024');
   assert.equal(LitModel.citationKeyBase({ authors: ['张三'], year: 2025 }), 'zhangsan2025');
   assert.equal(LitModel.citationKeyBase({ authors: ['欧阳娜娜'], year: 2025 }), 'ouyangnana2025');
   assert.equal(LitModel.citationKeyBase({ authors: [], year: null }), 'anonnodate');
-});
-
-test('library normalization preserves imported keys and disambiguates generated collisions', function () {
   const papers = LitModel.normalizeLibrary([
     { id: 'p1', key: 'ImportedKey', title: 'First', authors: ['Ada Lovelace'], year: 1843 },
     { id: 'p2', key: 'OtherKey', title: 'Second', authors: ['Ada Lovelace'], year: 1843 },
@@ -142,18 +121,15 @@ test('library normalization preserves imported keys and disambiguates generated 
   ]);
   assert.deepEqual(papers.map(function (paper) { return paper.key; }),
     ['ImportedKey', 'OtherKey', 'lovelace1843', 'lovelace1843a']);
-});
-
-test('pinned citation keys win over unpinned collisions', function () {
-  const papers = LitModel.normalizeLibrary([
+  const pinned = LitModel.normalizeLibrary([
     { id: 'p1', key: 'smith2020', title: 'A', authors: ['John Smith'], year: 2020 },
     { id: 'p2', key: 'smith2020', keyPinned: true, title: 'B', authors: ['Jane Smith'], year: 2020 }
   ]);
-  assert.equal(papers[1].key, 'smith2020'); // 钉住者保住原 key
-  assert.equal(papers[0].key, 'smith2020a'); // 未钉住者让位
+  assert.equal(pinned[1].key, 'smith2020'); // 钉住者保住原 key
+  assert.equal(pinned[0].key, 'smith2020a'); // 未钉住者让位
 });
 
-test('normalizePaper migrates legacy PDF fields into a primary attachment', function () {
+test('normalizePaper migrates legacy PDF fields into a primary attachment and keeps supplementary ones', function () {
   const paper = LitModel.normalizePaper({
     id: 'p1', title: 'Paper', pdfPath: 'D:\\docs\\a.pdf', pdfFileName: 'a.pdf',
     pdfFingerprint: 'A'.repeat(64), pdfCloudName: 'p1.pdf', pdfSyncSignature: '12:34'
@@ -166,18 +142,15 @@ test('normalizePaper migrates legacy PDF fields into a primary attachment', func
   assert.equal(paper.pdfPath, 'D:\\docs\\a.pdf');
   assert.equal(paper.pdfFingerprint, 'a'.repeat(64));
   assert.equal(paper.pdfCloudName, 'p1.pdf');
-});
-
-test('normalizePaper keeps supplementary attachments alongside the primary PDF', function () {
-  const paper = LitModel.normalizePaper({
+  const suppPaper = LitModel.normalizePaper({
     id: 'p1', title: 'Paper', pdfPath: 'D:\\docs\\a.pdf',
     attachments: [
       { id: 'att1', kind: 'supp', fileName: 'code.zip', path: 'D:\\docs\\code.zip' }
     ]
   });
-  assert.equal(paper.attachments.length, 2);
-  assert.equal(paper.attachments[0].kind, 'pdf'); // 迁移的主 PDF 排最前
-  assert.equal(paper.attachments[1].id, 'att1');
+  assert.equal(suppPaper.attachments.length, 2);
+  assert.equal(suppPaper.attachments[0].kind, 'pdf'); // 迁移的主 PDF 排最前
+  assert.equal(suppPaper.attachments[1].id, 'att1');
 });
 
 test('normalizePaper carries v8 fields and tombstone timestamps', function () {
@@ -194,14 +167,21 @@ test('normalizePaper carries v8 fields and tombstone timestamps', function () {
   assert.equal(LitModel.touch(paper).updatedAt >= 200, true);
 });
 
-test('unknown entry types fall back to misc while preserving sourceType', function () {
-  const unknown = LitModel.normalizePaper({ title: 'P', entryType: 'video' });
-  assert.equal(unknown.entryType, 'misc');
-  assert.equal(unknown.sourceType, 'video');
-  assert.equal(LitModel.normalizePaper({ title: 'P', entryType: 'mastersthesis' }).entryType, 'mastersthesis');
+test('normalizePaper preserves unknown source types and accepts supported entry types', function () {
+  const cases = [
+    { input: 'video', entryType: 'misc', sourceType: 'video' },
+    { input: 'dataset', entryType: 'misc', sourceType: 'dataset' },
+    { input: 'mastersthesis', entryType: 'mastersthesis', sourceType: '' },
+    { input: 'article', entryType: 'article', sourceType: '' }
+  ];
+  for (const scenario of cases) {
+    const paper = LitModel.normalizePaper({ title: 'P', entryType: scenario.input });
+    assert.equal(paper.entryType, scenario.entryType, scenario.input);
+    assert.equal(paper.sourceType, scenario.sourceType, scenario.input);
+  }
 });
 
-test('workspace normalizes saved searches and tag colors', function () {
+test('workspace normalizes saved searches and tag colors and preserves their sync metadata', function () {
   const ws = LitModel.normalizeWorkspace({
     papers: [],
     savedSearches: [{ id: 's1', name: '近三年高引', query: 'year>=2021 rating>=4' }, { name: '', query: 'x' }],
@@ -210,10 +190,7 @@ test('workspace normalizes saved searches and tag colors', function () {
   assert.equal(ws.savedSearches.length, 1);
   assert.equal(ws.savedSearches[0].query, 'year>=2021 rating>=4');
   assert.deepEqual(ws.tagColors, { 综述: '#ffaa00' });
-});
-
-test('workspace preserves sync metadata for searches and tag colors', function () {
-  const ws = LitModel.normalizeWorkspace({
+  const syncWs = LitModel.normalizeWorkspace({
     papers: [],
     savedSearches: [{ id: 's1', name: '近三年高引', query: 'year>=2023', updatedAt: 100, deletedAt: 200 }],
     tagColors: { 综述: '#ffaa00' },
@@ -222,11 +199,11 @@ test('workspace preserves sync metadata for searches and tag colors', function (
       { tag: '旧标签', color: '#112233', updatedAt: 100, deletedAt: 200 }
     ]
   });
-  assert.equal(ws.savedSearches[0].updatedAt, 100);
-  assert.equal(ws.savedSearches[0].deletedAt, 200);
-  assert.deepEqual(ws.tagColors, { 综述: '#ffaa00' });
-  assert.equal(ws.tagColorRecords.length, 2);
-  assert.equal(ws.tagColorRecords[1].deletedAt, 200);
+  assert.equal(syncWs.savedSearches[0].updatedAt, 100);
+  assert.equal(syncWs.savedSearches[0].deletedAt, 200);
+  assert.deepEqual(syncWs.tagColors, { 综述: '#ffaa00' });
+  assert.equal(syncWs.tagColorRecords.length, 2);
+  assert.equal(syncWs.tagColorRecords[1].deletedAt, 200);
 });
 
 test('workspace change tracking touches only changed entities', function () {
@@ -242,24 +219,18 @@ test('workspace change tracking touches only changed entities', function () {
   assert.equal(workspace.folders[0].updatedAt, 100);
 });
 
-test('normalizePaper retains only valid SHA-256 PDF fingerprints', function () {
+test('normalizePaper validates fingerprints and bibtex extras and strips publisher-only venue names', function () {
   assert.equal(LitModel.normalizePaper({ title: 'Paper', pdfFingerprint: 'A'.repeat(64) }).pdfFingerprint, 'a'.repeat(64));
   assert.equal(LitModel.normalizePaper({ title: 'Paper', pdfFingerprint: 'not-a-hash' }).pdfFingerprint, '');
-});
-
-test('normalizePaper preserves BibTeX extra fields as a string map', function () {
-  const paper = LitModel.normalizePaper({
+  const extraPaper = LitModel.normalizePaper({
     title: 'Paper',
     bibtexExtra: { keywords: 'ai, import', eprint: 1234, badKeyWithSpace: 'keep', empty: '' }
   });
-  assert.deepEqual(paper.bibtexExtra, {
+  assert.deepEqual(extraPaper.bibtexExtra, {
     badkeywithspace: 'keep',
     eprint: '1234',
     keywords: 'ai, import'
   });
-});
-
-test('normalizePaper strips publisher-only venue names', function () {
   assert.equal(LitModel.normalizePaper({ title: 'P', venue: 'Elsevier' }).venue, '');
   assert.equal(LitModel.normalizePaper({ title: 'P', venue: 'Elsevier Ltd.' }).venue, '');
   assert.equal(LitModel.normalizePaper({ title: 'P', venue: 'Springer' }).venue, '');
@@ -272,7 +243,7 @@ test('normalizePaper strips publisher-only venue names', function () {
 
 /* ---------- schema v12：结构化创作者 / 完整日期 / Note 实体 / 批注附件关联 ---------- */
 
-test('v12 creators: authors is a projection of structured creators', function () {
+test('v12 creators: authors project from structured creators and legacy strings parse back', function () {
   const paper = LitModel.normalizePaper({
     title: 'T',
     creators: [
@@ -283,23 +254,20 @@ test('v12 creators: authors is a projection of structured creators', function ()
   });
   assert.equal(paper.creators.length, 3);
   assert.deepEqual(paper.authors, ['Vaswani, Ashish', 'World Health Organization']);
-});
-
-test('v12 legacy author strings parse into creators (comma / CJK / institution)', function () {
-  const paper = LitModel.normalizePaper({
+  const legacyPaper = LitModel.normalizePaper({
     title: 'T',
     authors: ['Zhang San', '李四', 'World Health Organization', 'Smith, John']
   });
-  assert.deepEqual(paper.creators.map(function (c) { return [c.family, c.given, c.name]; }), [
+  assert.deepEqual(legacyPaper.creators.map(function (c) { return [c.family, c.given, c.name]; }), [
     ['San', 'Zhang', ''],
     ['李四', '', ''],
     ['', '', 'World Health Organization'],
     ['Smith', 'John', '']
   ]);
-  assert.deepEqual(paper.authors, ['San, Zhang', '李四', 'World Health Organization', 'Smith, John']);
+  assert.deepEqual(legacyPaper.authors, ['San, Zhang', '李四', 'World Health Organization', 'Smith, John']);
 });
 
-test('v12 date is authoritative and year is a projection', function () {
+test('v12 date is authoritative with year as projection; validation follows the real calendar', function () {
   const full = LitModel.normalizePaper({ title: 'T', date: '2021-03-15', year: 1999 });
   assert.equal(full.year, 2021);
   assert.equal(full.date, '2021-03-15');
@@ -312,24 +280,13 @@ test('v12 date is authoritative and year is a projection', function () {
   const partial = LitModel.normalizePaper({ title: 'T', date: '2020-07' });
   assert.equal(partial.date, '2020-07');
   assert.equal(partial.year, 2020);
-});
-
-test('date validation follows the real calendar', function () {
   assert.equal(LitModel.normalizeDate('2024-02-29'), '2024-02-29');
   assert.equal(LitModel.normalizeDate('2023-02-29'), '');
   assert.equal(LitModel.normalizeDate('2024-04-31'), '');
   assert.equal(LitModel.normalizeDate('2024-06-31'), '');
 });
 
-test('v12 keeps unmappable source type instead of silently dropping it', function () {
-  const paper = LitModel.normalizePaper({ title: 'T', entryType: 'dataset' });
-  assert.equal(paper.entryType, 'misc');
-  assert.equal(paper.sourceType, 'dataset');
-  const normal = LitModel.normalizePaper({ title: 'T', entryType: 'article' });
-  assert.equal(normal.sourceType, '');
-});
-
-test('v12 normalizeNote validates shape and keeps tombstones', function () {
+test('v12 notes: shape validation keeps tombstones, legacy migration is idempotent and projection is authoritative', function () {
   const notes = LitModel.normalizeNotes([
     { id: 'n1', paperId: 'p1', content: 'x', format: 'weird', createdAt: 5, updatedAt: 6 },
     { id: 'n2', paperId: '', title: '主题', content: '', deletedAt: 123, createdAt: 5, updatedAt: 6 },
@@ -340,9 +297,6 @@ test('v12 normalizeNote validates shape and keeps tombstones', function () {
   assert.equal(notes[1].deletedAt, 123); // 墓碑保留，供同步删除传播
   const rich = LitModel.normalizeNote({ id: 'n3', content: '{}', format: 'richtext' });
   assert.equal(rich.format, 'richtext');
-});
-
-test('v12 legacy paper.notes migrates to a Note entity idempotently', function () {
   const ws = LitModel.normalizeWorkspace({
     papers: [{ id: 'p1', title: 'T', notes: 'hello note', addedAt: 10, updatedAt: 20 }]
   });
@@ -355,18 +309,15 @@ test('v12 legacy paper.notes migrates to a Note entity idempotently', function (
   const again = LitModel.normalizeWorkspace(ws);
   assert.equal(again.notes.length, 1); // 幂等：重复 normalize 不产生重复笔记
   assert.equal(again.papers[0].notes, 'hello note');
-});
-
-test('v12 projection prefers the notes collection over stale legacy text', function () {
-  const ws = LitModel.normalizeWorkspace({
+  const mixedWs = LitModel.normalizeWorkspace({
     papers: [{ id: 'p1', title: 'T', notes: 'stale copy', addedAt: 10, updatedAt: 20 }],
     notes: [{ id: 'n1', paperId: 'p1', content: 'authoritative', createdAt: 30, updatedAt: 30 }]
   });
-  assert.equal(ws.notes.length, 1); // 未把过期投影再迁移成新笔记
-  assert.equal(ws.papers[0].notes, 'authoritative');
+  assert.equal(mixedWs.notes.length, 1); // 未把过期投影再迁移成新笔记
+  assert.equal(mixedWs.papers[0].notes, 'authoritative');
 });
 
-test('v12 annotations backfill attachmentId from the primary PDF attachment', function () {
+test('v12 annotations: backfill attachmentId from the primary PDF and accept EPUB CFI / web anchors', function () {
   const paper = LitModel.normalizePaper({
     id: 'p1', title: 'T',
     attachments: [{ id: 'att1', kind: 'pdf', fileName: 'a.pdf', path: '/a.pdf' }],
@@ -378,9 +329,6 @@ test('v12 annotations backfill attachmentId from the primary PDF attachment', fu
     pdfAnnotations: [{ id: 'an1', type: 'highlight', position: { pageIndex: 0, rects: [[0, 0, 1, 1]] } }]
   });
   assert.equal(orphan.pdfAnnotations[0].attachmentId, ''); // 无附件：保留记录、留空
-});
-
-test('v12 annotations accept EPUB CFI / web text anchors without a page index', function () {
   const anns = LitModel.normalizePdfAnnotations([
     { id: 'e1', type: 'highlight', position: { cfi: 'epubcfi(/6/4!/2)' } },
     { id: 'w1', type: 'highlight', position: { textAnchor: { exact: 'quoted', prefix: 'a', suffix: 'b' } } },
@@ -405,7 +353,7 @@ test('v12 envelope and signatures carry the notes collection', function () {
   assert.ok(sigs.notes.n1);
 });
 
-test('attachment kinds epub/snapshot are kept and zoteroKey is validated', function () {
+test('attachment and note-asset entries validate kind, zoteroKey, hashes and dedupe by path', function () {
   const epub = LitModel.normalizeAttachment({ id: 'a1', kind: 'epub', fileName: 'book.epub', zoteroKey: 'ABCD2345' });
   assert.equal(epub.kind, 'epub'); // 不因缺 .pdf 后缀回落 other
   assert.equal(epub.zoteroKey, 'ABCD2345');
@@ -416,9 +364,6 @@ test('attachment kinds epub/snapshot are kept and zoteroKey is validated', funct
   const invalidKey = LitModel.normalizeAttachment({ id: 'a4', kind: 'supp', fileName: 's.pdf', zoteroKey: 'bad key!' });
   assert.equal(invalidKey.kind, 'supp');
   assert.equal(invalidKey.zoteroKey, ''); // 非法字符清空
-});
-
-test('v12 note assets validate entries, drop empties and dedupe by path', function () {
   const goodHash = 'a'.repeat(64);
   const note = LitModel.normalizeNote({
     id: 'n1', paperId: 'p1', content: 'x', zoteroKey: 'ZKEY1234',
@@ -442,42 +387,32 @@ test('v12 note assets validate entries, drop empties and dedupe by path', functi
   assert.equal(LitModel.normalizeNote({ id: 'n2', zoteroKey: 'bad key!' }).zoteroKey, '');
 });
 
-test('annotationFingerprint rounds rects so tiny float differences match', function () {
+test('annotation helpers: fingerprint rounds rects, dedupeAnnotations keeps first, tags are cleaned', function () {
   const a = { type: 'highlight', text: 'hello', position: { pageIndex: 2, rects: [[0.4, 10.2, 50.49, 3.6]] } };
   const b = { type: 'highlight', text: 'hello', position: { pageIndex: 2, rects: [[0, 10, 50, 4]] } };
   assert.equal(LitModel.annotationFingerprint(a), LitModel.annotationFingerprint(b));
   assert.equal(LitModel.annotationFingerprint(null), '');
   assert.notEqual(LitModel.annotationFingerprint(a),
     LitModel.annotationFingerprint({ type: 'highlight', text: 'hello', position: { pageIndex: 3, rects: [[0, 10, 50, 4]] } }));
-});
-
-test('dedupeAnnotations keeps the first occurrence and never merges different texts', function () {
   const first = { id: 'a1', type: 'highlight', text: 'same', position: { pageIndex: 0, rects: [[0.4, 1, 2, 3]] } };
   const dup = { id: 'a2', type: 'highlight', text: 'same', position: { pageIndex: 0, rects: [[0, 1, 2, 3]] } };
   const otherText = { id: 'a3', type: 'highlight', text: 'different', position: { pageIndex: 0, rects: [[0, 1, 2, 3]] } };
   const out = LitModel.dedupeAnnotations([first, dup, otherText]);
   assert.deepEqual(out.map(function (a) { return a.id; }), ['a1', 'a3']);
   assert.deepEqual(LitModel.dedupeAnnotations(null), []);
-});
-
-test('v12+ annotations carry clean tags for color/tag-based note picking', function () {
-  const paper = LitModel.normalizePaper({
+  const tagPaper = LitModel.normalizePaper({
     id: 'p1', title: 'T',
     pdfAnnotations: [{ id: 'a1', type: 'highlight', tags: ['方法', '方法', '/unread', '关键'], position: { pageIndex: 0, rects: [[0, 0, 1, 1]] } }]
   });
-  assert.deepEqual(paper.pdfAnnotations[0].tags, ['方法', '关键']); // 去重 + 噪音标签过滤
+  assert.deepEqual(tagPaper.pdfAnnotations[0].tags, ['方法', '关键']); // 去重 + 噪音标签过滤
 });
 
-test('v12+ notes keep migrated markdown source in sourceMarkdown', function () {
+test('v12+ field preservation: sourceMarkdown cap, lastReadAt excluded from signatures, saved-search AST', function () {
   const note = LitModel.normalizeNote({ id: 'n1', content: '# 旧笔记\n> 摘录', format: 'markdown', sourceMarkdown: '# 旧笔记\n> 摘录' });
   assert.equal(note.sourceMarkdown, '# 旧笔记\n> 摘录');
   assert.equal(note.format, 'markdown');
   const migrated = LitModel.normalizeNote({ id: 'n2', content: '<p>富文本</p>', format: 'richtext', sourceMarkdown: '原文'.repeat(300000) });
   assert.ok(migrated.sourceMarkdown.length <= 200000);
-});
-
-test('v12+ papers carry lastReadAt excluded from content signatures', function () {
-  const LitModel = require('../js/model.js');
   const p = LitModel.normalizePaper({ id: 'p1', title: 'T' });
   assert.equal(p.lastReadAt, null);
   const read = LitModel.normalizePaper({ id: 'p1', title: 'T', lastReadAt: 1700000000000 });
@@ -486,10 +421,6 @@ test('v12+ papers carry lastReadAt excluded from content signatures', function (
   const withRead = LitModel.normalizePaper({ id: 'p1', title: 'T', lastReadAt: 1700000000000 });
   const sigB = LitModel.workspaceSignatures({ papers: [withRead] }).papers.p1;
   assert.equal(sigA, sigB); // 阅读时间不构成内容变化
-});
-
-test('v12+ saved searches persist versioned AST alongside query text', function () {
-  const LitModel = require('../js/model.js');
   const search = LitModel.normalizeSavedSearch({ id: 's1', name: '高引', query: 'citations>100', ast: '{"v":2,"root":{"op":"cmp"}}' });
   assert.equal(search.ast, '{"v":2,"root":{"op":"cmp"}}');
   const legacy = LitModel.normalizeSavedSearch({ id: 's2', name: '旧', query: 'has:pdf' });
@@ -546,7 +477,7 @@ test('F04 回归：补全只写投影 year/authors 会漂移保存签名，须�
   assert.equal(norm.authors[0], 'Bengio, Yoshua');
 });
 
-test('normalizePaper keeps researchIds (M9 phase 2)', function () {
+test('researchIds: normalizePaper keeps valid ids and merge unions them as a set (M9 phase 2)', function () {
   const paper = LitModel.normalizePaper({
     id: 'p1', title: 'T',
     researchIds: ['W123', 'W123', 'local:abc', 42, '', null]
@@ -554,9 +485,6 @@ test('normalizePaper keeps researchIds (M9 phase 2)', function () {
   assert.deepEqual(paper.researchIds, ['W123', 'local:abc', '42']);
   const clean = LitModel.normalizePaper({ id: 'p2', title: 'T' }, function () { return 'pid2'; });
   assert.deepEqual(clean.researchIds, []);
-});
-
-test('merge treats researchIds as a set field (M9 phase 2)', function () {
   const LitMerge = require('../js/merge.js');
   const base = { id: 'p1', title: 'T', researchIds: ['W1'] };
   const local = { id: 'p1', title: 'T', researchIds: ['W1', 'W2'] };

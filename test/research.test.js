@@ -4,22 +4,18 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const LitResearch = require('../js/research.js');
 
-test('shortWorkId strips openalex URL forms', function () {
+test('OpenAlex 归一化小函数：shortWorkId 剥 URL 形态、normalizeDoi 去前缀小写、abstractFromInvertedIndex 按位置重组', function () {
   assert.equal(LitResearch.shortWorkId('https://openalex.org/W2741809807'), 'W2741809807');
   assert.equal(LitResearch.shortWorkId('W123'), 'W123');
   assert.equal(LitResearch.shortWorkId('w9'), 'W9');
   assert.equal(LitResearch.shortWorkId('https://openalex.org/S4210208519'), 'S4210208519');
   assert.equal(LitResearch.shortWorkId(''), '');
   assert.equal(LitResearch.shortWorkId('local:abc'), 'local:abc');
-});
 
-test('normalizeDoi strips prefixes and lowercases', function () {
   assert.equal(LitResearch.normalizeDoi('https://doi.org/10.1016/J.XYZ.2024.01.001'), '10.1016/j.xyz.2024.01.001');
   assert.equal(LitResearch.normalizeDoi('doi:10.1234/ABC'), '10.1234/abc');
   assert.equal(LitResearch.normalizeDoi(''), '');
-});
 
-test('abstractFromInvertedIndex reassembles text by position', function () {
   assert.equal(
     LitResearch.abstractFromInvertedIndex({ '锌': [0], '电池': [1], '重要': [3] }),
     '锌 电池 重要'
@@ -28,7 +24,7 @@ test('abstractFromInvertedIndex reassembles text by position', function () {
   assert.equal(LitResearch.abstractFromInvertedIndex('not-an-object'), '');
 });
 
-test('normalizeOpenAlexWork maps a full work payload', function () {
+test('normalizeOpenAlexWork 全量映射；extIdsForRow / mergeExtIdLists 按 kind+value 去重', function () {
   const row = LitResearch.normalizeOpenAlexWork({
     id: 'https://openalex.org/W42',
     doi: 'https://doi.org/10.1000/XYZ',
@@ -58,9 +54,7 @@ test('normalizeOpenAlexWork maps a full work payload', function () {
   assert.equal(row.authors[0].orcid, '0000-0001-0002-0003');
   assert.deepEqual(row.refs, ['W1', 'W2', 'garbage']);
   assert.equal(LitResearch.normalizeOpenAlexWork(null).id, '');
-});
 
-test('extIdsForRow and mergeExtIdLists dedupe by kind+value', function () {
   const a = LitResearch.extIdsForRow({ id: 'W1', doi: '10.1/a' });
   const b = LitResearch.extIdsForRow({ id: 'W2', doi: '10.1/a' });
   const merged = LitResearch.mergeExtIdLists(a, b);
@@ -69,33 +63,32 @@ test('extIdsForRow and mergeExtIdLists dedupe by kind+value', function () {
   assert.equal(local.length, 0);
 });
 
-test('sanitizeFileStem handles illegal chars, reserved names, trailing dots and length', function () {
-  assert.equal(LitResearch.sanitizeFileStem('a<b>c|d/e'), 'a b c d e');
-  assert.equal(LitResearch.sanitizeFileStem('CON'), 'CON_');
-  assert.equal(LitResearch.sanitizeFileStem('com1.txt'), 'com1.txt_');
-  assert.equal(LitResearch.sanitizeFileStem('name... '), 'name');
-  assert.equal(LitResearch.sanitizeFileStem('   '), '未命名');
-  const long = LitResearch.sanitizeFileStem('标'.repeat(100), 50);
-  assert.equal(Array.from(long).length, 50);
-});
-
-test('sessionDirName appends two-digit sequence', function () {
-  assert.equal(LitResearch.sessionDirName('锂电池 Review', 1), '锂电池 Review 01');
-  assert.equal(LitResearch.sessionDirName('锂电池 Review', 12), '锂电池 Review 12');
-});
-
-test('sessionTitleFrom truncates to ~20 chars', function () {
-  assert.equal(LitResearch.sessionTitleFrom('  关于   超声电池监测的文献调研与分析 '), '关于 超声电池监测的文献调研与分析');
-  assert.equal(LitResearch.sessionTitleFrom(''), '新会话');
-  const long = LitResearch.sessionTitleFrom('字'.repeat(30));
-  assert.equal(Array.from(long).length, 21); // 20 字 + 省略号
-});
-
-test('truncateForDisk marks truncation', function () {
-  assert.equal(LitResearch.truncateForDisk('abc', 10), 'abc');
-  const out = LitResearch.truncateForDisk('x'.repeat(50), 10);
-  assert.equal(out.slice(0, 10), 'xxxxxxxxxx');
-  assert.ok(out.indexOf('已截断') !== -1);
+test('命名与截断辅助：sanitizeFileStem 非法字符/保留名/尾点/长度、sessionDirName 两位序号、sessionTitleFrom 截断到 ~20 字、truncateForDisk 标记截断', function () {
+  {
+    assert.equal(LitResearch.sanitizeFileStem('a<b>c|d/e'), 'a b c d e');
+    assert.equal(LitResearch.sanitizeFileStem('CON'), 'CON_');
+    assert.equal(LitResearch.sanitizeFileStem('com1.txt'), 'com1.txt_');
+    assert.equal(LitResearch.sanitizeFileStem('name... '), 'name');
+    assert.equal(LitResearch.sanitizeFileStem('   '), '未命名');
+    const long = LitResearch.sanitizeFileStem('标'.repeat(100), 50);
+    assert.equal(Array.from(long).length, 50);
+  }
+  {
+    assert.equal(LitResearch.sessionDirName('锂电池 Review', 1), '锂电池 Review 01');
+    assert.equal(LitResearch.sessionDirName('锂电池 Review', 12), '锂电池 Review 12');
+  }
+  {
+    assert.equal(LitResearch.sessionTitleFrom('  关于   超声电池监测的文献调研与分析 '), '关于 超声电池监测的文献调研与分析');
+    assert.equal(LitResearch.sessionTitleFrom(''), '新会话');
+    const long = LitResearch.sessionTitleFrom('字'.repeat(30));
+    assert.equal(Array.from(long).length, 21); // 20 字 + 省略号
+  }
+  {
+    assert.equal(LitResearch.truncateForDisk('abc', 10), 'abc');
+    const out = LitResearch.truncateForDisk('x'.repeat(50), 10);
+    assert.equal(out.slice(0, 10), 'xxxxxxxxxx');
+    assert.ok(out.indexOf('已截断') !== -1);
+  }
 });
 
 test('renderSessionMarkdown and sanitizeSessionForDisk round-trip safely', function () {
@@ -125,37 +118,37 @@ test('renderSessionMarkdown and sanitizeSessionForDisk round-trip safely', funct
   assert.equal(session.messages[2].content.length, 99999);
 });
 
-test('embeddingText follows the harness recipe and caps lengths', function () {
-  const row = {
-    title: 'Zinc batteries',
-    abstract: 'A'.repeat(5000),
-    concepts: ['Physics', 'Chemistry'],
-    keywords: ['battery', 'zinc']
-  };
-  const text = LitResearch.embeddingText(row);
-  assert.ok(text.startsWith('Zinc batteries\nAbstract: '));
-  assert.ok(text.indexOf('Concepts: Physics, Chemistry') !== -1);
-  assert.ok(text.indexOf('Keywords: battery, zinc') !== -1);
-  assert.ok(text.length <= 3000);
-  // 摘要在 2200 字符处截断
-  const absPart = text.split('\n')[1];
-  assert.ok(absPart.length <= 2200 + 'Abstract: '.length);
-  assert.equal(LitResearch.embeddingText({}), '');
-});
-
-test('contentHash/embeddingHash are stable and input-sensitive', function () {
-  const row = { title: 'T', abstract: 'A', concepts: ['c'], keywords: ['k'] };
-  assert.equal(LitResearch.embeddingHash(row), LitResearch.embeddingHash({ title: 'T', abstract: 'A', concepts: ['c'], keywords: ['k'] }));
-  assert.notEqual(LitResearch.embeddingHash(row), LitResearch.embeddingHash({ title: 'T2', abstract: 'A', concepts: ['c'], keywords: ['k'] }));
-  assert.equal(LitResearch.contentHash(''), LitResearch.contentHash(''));
-  assert.notEqual(LitResearch.contentHash('a'), LitResearch.contentHash('b'));
-  assert.match(LitResearch.contentHash('x'), /^[0-9a-f]{16}$/);
-});
-
-test('estimateEmbedTokens weights CJK', function () {
-  assert.ok(LitResearch.estimateEmbedTokens(['电池电池电池电池']) >= 4);
-  assert.ok(LitResearch.estimateEmbedTokens(['battery health']) <= 4);
-  assert.equal(LitResearch.estimateEmbedTokens([]), 0);
+test('嵌入辅助：embeddingText 按 harness 配方并截断、contentHash/embeddingHash 稳定且输入敏感、estimateEmbedTokens CJK 加权', function () {
+  {
+    const row = {
+      title: 'Zinc batteries',
+      abstract: 'A'.repeat(5000),
+      concepts: ['Physics', 'Chemistry'],
+      keywords: ['battery', 'zinc']
+    };
+    const text = LitResearch.embeddingText(row);
+    assert.ok(text.startsWith('Zinc batteries\nAbstract: '));
+    assert.ok(text.indexOf('Concepts: Physics, Chemistry') !== -1);
+    assert.ok(text.indexOf('Keywords: battery, zinc') !== -1);
+    assert.ok(text.length <= 3000);
+    // 摘要在 2200 字符处截断
+    const absPart = text.split('\n')[1];
+    assert.ok(absPart.length <= 2200 + 'Abstract: '.length);
+    assert.equal(LitResearch.embeddingText({}), '');
+  }
+  {
+    const row = { title: 'T', abstract: 'A', concepts: ['c'], keywords: ['k'] };
+    assert.equal(LitResearch.embeddingHash(row), LitResearch.embeddingHash({ title: 'T', abstract: 'A', concepts: ['c'], keywords: ['k'] }));
+    assert.notEqual(LitResearch.embeddingHash(row), LitResearch.embeddingHash({ title: 'T2', abstract: 'A', concepts: ['c'], keywords: ['k'] }));
+    assert.equal(LitResearch.contentHash(''), LitResearch.contentHash(''));
+    assert.notEqual(LitResearch.contentHash('a'), LitResearch.contentHash('b'));
+    assert.match(LitResearch.contentHash('x'), /^[0-9a-f]{16}$/);
+  }
+  {
+    assert.ok(LitResearch.estimateEmbedTokens(['电池电池电池电池']) >= 4);
+    assert.ok(LitResearch.estimateEmbedTokens(['battery health']) <= 4);
+    assert.equal(LitResearch.estimateEmbedTokens([]), 0);
+  }
 });
 
 test('A-followup #4: vectorReadiness 按当前模型覆盖判定，区分「没配」与「模型过期」', function () {

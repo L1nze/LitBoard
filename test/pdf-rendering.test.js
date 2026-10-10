@@ -19,10 +19,11 @@ function loadPdfModule() {
   return context.window.LitPdf;
 }
 
-test('MuPDF module worker is the only packaged PDF rendering engine', function () {
+test('MuPDF module worker is the only packaged PDF engine; raster pixels map 1:1 and the renderer toggle is gone', function () {
   const pdfSource = fs.readFileSync(path.join(root, 'js', 'pdfimport.js'), 'utf8');
   const workerSource = fs.readFileSync(path.join(root, 'js', 'mupdf-worker.js'), 'utf8');
   const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+  const appSource = fs.readFileSync(path.join(root, 'js', 'app.js'), 'utf8');
 
   assert.match(pdfSource, /MuPDF\.js 单内核/);
   assert.match(workerSource, /import\('\.\.\/vendor\/mupdf\/mupdf\.js'\)/);
@@ -30,11 +31,9 @@ test('MuPDF module worker is the only packaged PDF rendering engine', function (
   ['mupdf.js', 'mupdf-wasm.js', 'mupdf-wasm.wasm', 'LICENSE'].forEach(function (name) {
     assert.ok(fs.statSync(path.join(root, 'vendor', 'mupdf', name)).size > 0);
   });
-});
 
-test('PDF raster resolution maps bitmap pixels 1:1 to device pixels', function () {
-  const ratio = loadPdfModule().renderPixelRatio;
   // 默认：位图精确等于 devicePixelRatio——合成期零重采样，边缘不带灰晕
+  const ratio = loadPdfModule().renderPixelRatio;
   assert.equal(ratio({ width: 800, height: 1100 }, 1.25), 1.25);
   assert.equal(ratio({ width: 800, height: 1100 }, 2), 2);
   assert.equal(ratio({ width: 800, height: 1100 }, 1), 1);
@@ -45,12 +44,8 @@ test('PDF raster resolution maps bitmap pixels 1:1 to device pixels', function (
   const capped = ratio(viewport, 2);
   assert.ok(capped < 2, 'oversized page should hit the canvas pixel cap');
   assert.ok(viewport.width * viewport.height * capped * capped <= 25165824 + 1);
-});
 
-test('renderer override is removed from the PDF toolbar and persisted positions', function () {
-  const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
-  const appSource = fs.readFileSync(path.join(root, 'js', 'app.js'), 'utf8');
-
+  // renderer 切换已从 PDF 工具栏与持久化位置移除
   assert.doesNotMatch(html, /pdf-renderer-toggle/);
   assert.doesNotMatch(appSource, /pdfState\.renderer/);
 });
@@ -63,8 +58,9 @@ test('formula fixture contains embedded font programs for fidelity regression', 
   assert.match(fixture, /\/Length2\s+\d+/);
 });
 
-test('PDF selection geometry trims browser line boxes without changing character endpoints', function () {
+test('PDF selection geometry trims character rects (default, real font metrics, fallback) and merges adjacent fragments', function () {
   const geometry = loadPdfModule().selectionGeometry;
+  // 默认按比例裁剪行盒，字符端点不动
   const rect = geometry.normalizeCharacterRect({
     left: 10, top: 20, right: 50, bottom: 40, width: 40, height: 20
   }, 0);
@@ -73,34 +69,27 @@ test('PDF selection geometry trims browser line boxes without changing character
   assert.equal(rect.right, 50);
   assert.ok(Math.abs(rect.height - 17.2) < 1e-9);
   assert.ok(Math.abs(rect.top - 21.4) < 1e-9);
-});
 
-test('PDF selection geometry uses real font metrics to keep descenders inside the box', function () {
-  const geometry = loadPdfModule().selectionGeometry;
-  // 行盒 17.68px（line-height:1 的最小行盒），字体 Arial 度量：ascent 10.86 / descent 2.54
+  // 真实字体度量：行盒 17.68px（line-height:1 的最小行盒），字体 Arial 度量：ascent 10.86 / descent 2.54
   const metrics = { fontSize: 12, ascent: 10.86, descent: 2.54 };
-  const rect = geometry.normalizeCharacterRect({
+  const rectMetrics = geometry.normalizeCharacterRect({
     left: 10, top: 20, right: 50, bottom: 37.68, width: 40, height: 17.68
   }, 0, metrics);
 
-  assert.equal(rect.left, 10);
-  assert.equal(rect.right, 50);
+  assert.equal(rectMetrics.left, 10);
+  assert.equal(rectMetrics.right, 50);
   // baseline = 20 + (17.68-13.4)/2 + 10.86 = 33.0
-  assert.ok(Math.abs(rect.top - 22.14) < 1e-9);
-  assert.ok(Math.abs(rect.bottom - 35.54) < 1e-9);
-  assert.ok(Math.abs(rect.height - 13.4) < 1e-9);
-});
+  assert.ok(Math.abs(rectMetrics.top - 22.14) < 1e-9);
+  assert.ok(Math.abs(rectMetrics.bottom - 35.54) < 1e-9);
+  assert.ok(Math.abs(rectMetrics.height - 13.4) < 1e-9);
 
-test('PDF selection metrics path falls back to proportional trim when metrics are absent', function () {
-  const geometry = loadPdfModule().selectionGeometry;
-  const rect = geometry.normalizeCharacterRect({
+  // 度量缺失时回退按比例裁剪
+  const rectFallback = geometry.normalizeCharacterRect({
     left: 10, top: 20, right: 50, bottom: 37.68, width: 40, height: 17.68
   }, 0, null);
-  assert.ok(Math.abs(rect.height - 17.68 * 0.86) < 1e-9);
-});
+  assert.ok(Math.abs(rectFallback.height - 17.68 * 0.86) < 1e-9);
 
-test('PDF selection geometry merges adjacent fragments but keeps separate lines', function () {
-  const geometry = loadPdfModule().selectionGeometry;
+  // 相邻片段矩形合并，跨行保留
   const merged = geometry.mergeRects([
     { left: 10, top: 10, right: 30, bottom: 20, width: 20, height: 10 },
     { left: 31, top: 10, right: 50, bottom: 20, width: 19, height: 10 },
@@ -142,7 +131,7 @@ function muLine(text, x, top, size, advance) {
     font: '', size: size, text: text, sizes: sizes, quads: quads };
 }
 
-test('MuPDF page text keeps per-character quads and drops whitespace-only lines', function () {
+test('MuPDF page text keeps per-character quads (whitespace-only lines dropped) and maps them to viewport rects', function () {
   const geometry = loadPdfModule().selectionGeometry;
   const pageData = {
     lines: [muLine('磷酸铁锂电池', 99.3, 135.5, 12, 12), muLine('   ', 99.3, 155.5, 12, 12)]
@@ -158,24 +147,21 @@ test('MuPDF page text keeps per-character quads and drops whitespace-only lines'
   assert.equal(item.muBox[0], 99.3);
   assert.ok(Math.abs(item.transform[5] - (842.04 - 135.5)) < 1e-6);
   assert.equal(item.transform[3], 12);
-});
 
-test('per-character quads become viewport rects through the page viewport', function () {
-  const geometry = loadPdfModule().selectionGeometry;
-  const content = geometry.textItems({ lines: [muLine('硕士', 408, 100, 15, 15)] }, [0, 0, 600, 800]);
-  const item = content.items[0];
   // 页高 800、缩放 2：MuPDF (x, top) → 视口 (2x, 2top)
+  const contentVp = geometry.textItems({ lines: [muLine('硕士', 408, 100, 15, 15)] }, [0, 0, 600, 800]);
+  const itemVp = contentVp.items[0];
   const viewport = { convertMuRect: function (rect) {
     return [rect[0] * 2, rect[1] * 2, rect[2] * 2, rect[3] * 2];
   } };
-  const rects = geometry.charViewportRects(item, viewport);
+  const rects = geometry.charViewportRects(itemVp, viewport);
 
   assert.equal(rects.length, 2);
   assert.equal(rects[0][0], 816);
   assert.equal(rects[1][0], 846);
   // 「硕士」两个字：并集宽度恰好是两倍字宽
   const fragment = geometry.fragmentViewportRect({
-    textContent: item.str, _litCharRects: rects, _litBox: [816, 200, 876, 230]
+    textContent: itemVp.str, _litCharRects: rects, _litBox: [816, 200, 876, 230]
   }, 0, 2);
   assert.equal(fragment.rect[0], 816);
   assert.equal(fragment.rect[2], 876);
@@ -198,7 +184,7 @@ function bandRect(left, top, right, bottom) {
     width: right - left, height: bottom - top };
 }
 
-test('focus line trim drops the next line when the pointer barely crossed the boundary', function () {
+test('focus line trim drops barely-entered lines (boundary, paragraph gap, single-line, rotated, invalid) and dropBandLine removes the whole line', function () {
   const geometry = loadPdfModule().selectionGeometry;
   // 两行行盒：y 100–120 / 124–144（4px 行距）。行高 20 → eps = 6px
   const bands = [bandRect(10, 100, 300, 120), bandRect(10, 124, 300, 144)];
@@ -215,15 +201,12 @@ test('focus line trim drops the next line when the pointer barely crossed the bo
   assert.equal(droppedBack.top, 100);
   // 反向且鼠标已深入第一行 → 保留
   assert.equal(geometry.focusLineTrim(bands, 108, false), null);
-});
 
-test('focus line trim tolerates paragraph gaps and ignores single-line or rotated bands', function () {
-  const geometry = loadPdfModule().selectionGeometry;
   // 段间距 32px：鼠标停在段间空白（越过上一行底 20px）不应选中下一段
   const para = [bandRect(10, 100, 300, 120), bandRect(10, 152, 300, 172)];
-  const dropped = geometry.focusLineTrim(para, 140, true);
-  assert.ok(dropped);
-  assert.equal(dropped.top, 152);
+  const droppedPara = geometry.focusLineTrim(para, 140, true);
+  assert.ok(droppedPara);
+  assert.equal(droppedPara.top, 152);
   assert.equal(geometry.focusLineTrim(para, 161, true), null);
 
   // 单行选区永不剔除（唯一行不可能被误选）
@@ -235,16 +218,13 @@ test('focus line trim tolerates paragraph gaps and ignores single-line or rotate
   // 非法输入
   assert.equal(geometry.focusLineTrim(null, 100, true), null);
   assert.equal(geometry.focusLineTrim([bandRect(10, 100, 300, 120)], NaN, true), null);
-});
 
-test('dropBandLine removes every rect of the dropped line but keeps other lines', function () {
-  const geometry = loadPdfModule().selectionGeometry;
-  // 第二行由两个 span 组成（同一行两段矩形）
-  const bands = [
+  // dropBandLine：第二行由两个 span 组成（同一行两段矩形），整行全部剔除
+  const multiBands = [
     bandRect(10, 100, 300, 120),
     bandRect(10, 124, 150, 144), bandRect(152, 124, 300, 144)
   ];
-  const kept = geometry.dropBandLine(bands, { left: 10, top: 124, right: 300, bottom: 144,
+  const kept = geometry.dropBandLine(multiBands, { left: 10, top: 124, right: 300, bottom: 144,
     width: 290, height: 20 });
   assert.equal(kept.length, 1);
   assert.equal(kept[0].top, 100);
@@ -263,7 +243,7 @@ function fragmentText(items, fragments) {
   }).join('');
 }
 
-test('reader search keeps fragment itemIndex aligned with text layer divs (empty items occupy slots)', function () {
+test('reader search maps fragments across items: empty-slot div alignment, split words without false spaces', function () {
   const api = loadPdfModule();
   const items = [
     { str: 'shown in figure (a) and ' },
@@ -282,17 +262,14 @@ test('reader search keeps fragment itemIndex aligned with text layer divs (empty
     assert.equal(slice, items[fragment.itemIndex].str.slice(fragment.start, fragment.end));
   });
   assert.equal(fragmentText(items, matches[0].fragments), 'snapshot');
-});
 
-test('reader search matches words split across items without inserting a false space', function () {
-  const api = loadPdfModule();
   // 同一行内因字体/TJ 数组断开的两个 chunk 之间没有空格字形，join(' ') 会拆散单词
-  const items = [{ str: 'snaps' }, { str: 'hot' }, { str: ' of the' }];
-  const matches = api.searchPageText(items, 'snapshot');
-  assert.equal(matches.length, 1);
-  assert.equal(fragmentText(items, matches[0].fragments), 'snapshot');
+  const splitItems = [{ str: 'snaps' }, { str: 'hot' }, { str: ' of the' }];
+  const splitMatches = api.searchPageText(splitItems, 'snapshot');
+  assert.equal(splitMatches.length, 1);
+  assert.equal(fragmentText(splitItems, splitMatches[0].fragments), 'snapshot');
   // 跨 realm（vm 上下文）对象不用 deepStrictEqual，比较序列化形态
-  assert.equal(JSON.stringify(matches[0].fragments), JSON.stringify([
+  assert.equal(JSON.stringify(splitMatches[0].fragments), JSON.stringify([
     { itemIndex: 0, start: 0, end: 5 },
     { itemIndex: 1, start: 0, end: 3 }
   ]));
@@ -321,7 +298,7 @@ test('reader search joins phrases across line breaks and resolves hyphenation', 
   assert.equal(api.searchPageText([{ str: 'well-known' }], 'well-known').length, 1);
 });
 
-test('reader search folds case, ligatures, fullwidth, and whitespace like PDF.js find', function () {
+test('reader search match basics: folding (case, ligature, fullwidth, whitespace), CJK boundaries, multiple matches', function () {
   const api = loadPdfModule();
   // 连字 ﬁ → fi
   assert.equal(api.searchPageText([{ str: '\uFB01le system' }], 'file').length, 1);
@@ -334,33 +311,28 @@ test('reader search folds case, ligatures, fullwidth, and whitespace like PDF.js
   assert.equal(api.searchPageText([{ str: 'Snapshot' }], 'SNAPSHOT').length, 1);
   // 空白 needle 不产生命中
   assert.equal(JSON.stringify(api.searchPageText([{ str: 'text' }], '   ')), '[]');
-});
 
-test('reader search keeps CJK boundaries space-free across lines', function () {
-  const api = loadPdfModule();
-  const items = [
+  // CJK 行界不插空格，跨行仍可命中
+  const cjkItems = [
     { str: '\u4E2D\u6587\u6587\u732E', hasEOL: true },
     { str: '\u68C0\u7D22\u51C6\u5EA6' }
   ];
-  assert.equal(api.searchPageText(items, '\u6587\u732E\u68C0\u7D22').length, 1);
+  assert.equal(api.searchPageText(cjkItems, '\u6587\u732E\u68C0\u7D22').length, 1);
   // 拉丁行界折叠为单空格：跨行词组仍可命中
   const latin = [
     { str: 'target', hasEOL: true },
     { str: 'text' }
   ];
   assert.equal(api.searchPageText(latin, 'target text').length, 1);
+
+  // 多个不重叠命中与命中文本上报
+  const multiMatches = api.searchPageText([{ str: 'the cat and the dog and the bird' }], 'the');
+  assert.equal(multiMatches.length, 3);
+  assert.equal(multiMatches[0].text, 'the');
+  assert.equal(multiMatches[2].fragments[0].start, 24);
 });
 
-test('reader search finds multiple non-overlapping matches and reports match text', function () {
-  const api = loadPdfModule();
-  const items = [{ str: 'the cat and the dog and the bird' }];
-  const matches = api.searchPageText(items, 'the');
-  assert.equal(matches.length, 3);
-  assert.equal(matches[0].text, 'the');
-  assert.equal(matches[2].fragments[0].start, 24);
-});
-
-test('reader search match-case option keeps folding consistent on both sides', function () {
+test('reader search options: caseSensitive and wholeWord keep folding and boundaries consistent', function () {
   const api = loadPdfModule();
   const items = [{ str: 'Snapshot snapshot SNAPSHOT' }];
   assert.equal(api.searchPageText(items, 'snapshot').length, 3); // 默认忽略大小写
@@ -374,13 +346,11 @@ test('reader search match-case option keeps folding consistent on both sides', f
   assert.equal(api.searchPageText([{ str: '\uFF34\uFF45\uFF58\uFF54' }], 'text', { caseSensitive: true }).length, 0);
   assert.equal(api.searchPageText([{ str: '\uFB01le' }], 'file', { caseSensitive: true }).length, 1);
   assert.equal(api.searchPageText([{ str: '\uFB01le' }], 'File', { caseSensitive: true }).length, 0);
-});
 
-test('reader search whole-word option rejects embedded matches and keeps scanning', function () {
-  const api = loadPdfModule();
-  const items = [{ str: 'the theory is thematic; the cat' }];
-  assert.equal(api.searchPageText(items, 'the').length, 4); // the/theory/thematic/the
-  const whole = api.searchPageText(items, 'the', { wholeWord: true });
+  // 全字匹配：嵌入式命中被否决后逐位推进，跨 item 命中照常映射片段
+  const wordItems = [{ str: 'the theory is thematic; the cat' }];
+  assert.equal(api.searchPageText(wordItems, 'the').length, 4); // the/theory/thematic/the
+  const whole = api.searchPageText(wordItems, 'the', { wholeWord: true });
   assert.equal(whole.length, 2);
   assert.equal(whole[0].fragments[0].start, 0);
   assert.equal(whole[1].fragments[0].start, 24);
@@ -396,7 +366,7 @@ test('reader search whole-word option rejects embedded matches and keeps scannin
   assert.equal(api.searchPageText([{ str: 'The the' }], 'The', { caseSensitive: true, wholeWord: true }).length, 1);
 });
 
-test('reader search match-case option wires through app.js search options UI', function () {
+test('reader search app wiring: options UI bound and all rendered pages repainted on query change', function () {
   const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
   const appSource = fs.readFileSync(path.join(root, 'js', 'app.js'), 'utf8');
 
@@ -406,10 +376,6 @@ test('reader search match-case option wires through app.js search options UI', f
   assert.match(appSource, /bindPdfSearchOption\('#pdf-search-word', 'litboard\.pdfSearchWord'\)/);
   assert.match(appSource, /caseSensitive:\s*pdfSearchOptionOn\('#pdf-search-case'\)/);
   assert.match(appSource, /wholeWord:\s*pdfSearchOptionOn\('#pdf-search-word'\)/);
-});
-
-test('reader search repaints all rendered pages when the query changes (no stale highlights)', function () {
-  const appSource = fs.readFileSync(path.join(root, 'js', 'app.js'), 'utf8');
   // 换查询只重画「当前命中页」会把旧查询的高亮残留在其它已渲染页上
   // （逐字输入时每个中间态各跳一次页，残留成数轮旧高亮叠加）；
   // renderSearchLayer 对空结果也会先移除旧层，重画全部已渲染页即同时完成清理
