@@ -292,15 +292,17 @@
     return colors;
   }
 
-  function workspaceParts(value) {
+  function workspaceParts(value, now) {
     var input = value && typeof value === 'object' ? value : {};
     var papersInput = Array.isArray(input) ? input : input.papers;
     var records = model.normalizeTagColorRecords(input.tagColorRecords, input.tagColors);
     return {
-      papers: model.normalizeLibrary(papersInput || []),
-      notes: model.normalizeNotes(input.notes),
-      folders: model.normalizeFolders(input.folders),
-      savedSearches: model.normalizeSavedSearches(input.savedSearches),
+      // now：字段缺失时的时间戳兜底统一取计划时刻——两侧分别 normalize 各取各的
+      // Date.now()，跨毫秒即出现"同内容不同 addedAt"的幻影冲突（2026-10 排查）
+      papers: model.normalizeLibrary(papersInput || [], undefined, now),
+      notes: model.normalizeNotes(input.notes, undefined, now),
+      folders: model.normalizeFolders(input.folders, now),
+      savedSearches: model.normalizeSavedSearches(input.savedSearches, undefined, now),
       tagColorRecords: records,
       tagColors: tagColorsFromRecords(records)
     };
@@ -568,9 +570,9 @@
     var localValue = hasOwn.call(options, 'localWorkspace') ? options.localWorkspace : options.local;
     var remoteInput = hasOwn.call(options, 'remoteWorkspace') ? options.remoteWorkspace : options.remote;
     var remoteValue = unwrapWorkspace(remoteInput);
-    var baseParts = workspaceParts(baseValue);
-    var localParts = workspaceParts(localValue);
-    var remoteParts = workspaceParts(remoteValue);
+    var baseParts = workspaceParts(baseValue, now);
+    var localParts = workspaceParts(localValue, now);
+    var remoteParts = workspaceParts(remoteValue, now);
     var plan = {
       planVersion: 1,
       version: SYNC_VERSION,

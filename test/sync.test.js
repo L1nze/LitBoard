@@ -2267,3 +2267,26 @@ test('remote inspection excludes tombstones and checks only current attachment r
   assert.equal(plan.remoteCount, 0, 'no deleted papers in the comparison summary');
   assert.equal(plan.remoteResetSuspected, false, 'tombstones are not an unexpectedly cleared remote library');
 });
+
+  // 2026-10 幻影冲突回归：两侧附件都缺 addedAt 时，normalize 不得各盖各的
+  // Date.now()（两次调用跨毫秒即被 LWW 判成附件冲突，对照弹窗无端弹出、
+  // 同步在列举前暂停）。计划内所有侧必须共用同一个 now 盖章。
+  test('两侧都缺 addedAt 的附件不因 normalize 盖章先后产生幻影冲突', function () {
+    const realNow = Date.now;
+    let tick = 1700000000000;
+    Date.now = function () { return ++tick; }; // 每次调用 +1ms：未修复时两侧必差 1ms
+    try {
+      const paper = { id: 'p1', title: 'T', attachments: [{ id: 'a1', kind: 'pdf', fileName: 'x.pdf' }] };
+      const plan = LitSync.createSyncPlan({
+        localWorkspace: { papers: [JSON.parse(JSON.stringify(paper))], folders: [] },
+        remoteWorkspace: { papers: [JSON.parse(JSON.stringify(paper))], folders: [] },
+        mode: 'sync', now: 1700000000999
+      });
+      assert.equal(plan.conflicts.length, 0, '同内容两侧仅缺 addedAt：不应有冲突，实际 ' + JSON.stringify(plan.conflicts.map(function (c) { return c.conflictId; })));
+      assert.equal(plan.local.papers[0].attachments[0].addedAt, 1700000000999);
+      assert.equal(plan.remote.papers[0].attachments[0].addedAt, 1700000000999);
+      // 文献与文件夹的 addedAt/updatedAt 同理共用计划 now（folder 夹具缺 updatedAt）
+      assert.equal(plan.local.papers[0].addedAt, 1700000000999);
+      assert.equal(plan.remote.papers[0].addedAt, 1700000000999);
+    } finally { Date.now = realNow; }
+  });

@@ -287,7 +287,7 @@
     };
     return rank.abbr || rank.jcr || rank.cas || rank.casTop || rank.xr || rank.xrTop || rank.beihe || rank.imf != null || rank.jci != null ? rank : null;
   }
-  function normalizePdfAnnotations(value) {
+  function normalizePdfAnnotations(value, now) {
     if (!Array.isArray(value)) return [];
     var seen = {};
     var VALID_TYPES = { highlight: true, underline: true, note: true, snapshot: true, ink: true };
@@ -336,7 +336,7 @@
             Math.max.apply(null, xs), Math.max.apply(null, ys)]];
         }
       } else if (!rects.length && !hasNonPdfAnchor) return null;
-      var createdAt = finiteNumber(item.createdAt) || Date.now();
+      var createdAt = finiteNumber(item.createdAt) || normalizeStamp(now);
       seen[id] = true;
       var normalized = {
         id: id,
@@ -396,7 +396,14 @@
     return '';
   }
 
-  function normalizeAttachment(value, idFactory) {
+  /** normalize 的时间戳兜底：字段缺失时才用。计划式同步传入统一 now——
+   * 两侧分别 normalize 时若各取各的 Date.now()，跨毫秒即产生"同内容不同时间戳"
+   * 的幻影冲突（对照弹窗无端弹出、同步在列举前暂停）。 */
+  function normalizeStamp(now) {
+    return isFinite(now) && now > 0 ? Math.trunc(now) : Date.now();
+  }
+
+  function normalizeAttachment(value, idFactory, now) {
     var a = value && typeof value === 'object' ? value : {};
     var fileName = text(a.fileName).trim();
     var path = text(a.path);
@@ -418,11 +425,11 @@
         var size = finiteNumber(a.cloudSize);
         return size != null && size >= 0 ? Math.trunc(size) : null;
       })(),
-      addedAt: timestampOrNull(a.addedAt) || Date.now()
+      addedAt: timestampOrNull(a.addedAt) || normalizeStamp(now)
     };
   }
 
-  function normalizePaper(raw, idFactory) {
+  function normalizePaper(raw, idFactory, now) {
     var p = raw && typeof raw === 'object' ? raw : {};
     var year = finiteNumber(p.year);
     var citations = finiteNumber(p.citations);
@@ -430,14 +437,14 @@
     var id = validId(p.id) || (idFactory || fallbackId)();
     var pdfCloudName = text(p.pdfCloudName);
     var paperSourceLibraryId = sourceLibraryId(p.sourceLibraryId || p.libraryId || (p.source && p.source.libraryId));
-    var added = timestampOrNull(p.addedAt) || Date.now();
+    var added = timestampOrNull(p.addedAt) || normalizeStamp(now);
 
     // 多附件（v8）：旧版单 PDF 字段自动迁移为主 PDF 附件
     // Attachment IDs are persisted/imported values; keep prototype names such as
     // "toString" from looking already-seen in the dedupe table.
     var attachments = [], seenAttachments = Object.create(null);
     (Array.isArray(p.attachments) ? p.attachments : []).forEach(function (rawAtt) {
-      var att = normalizeAttachment(rawAtt, idFactory);
+      var att = normalizeAttachment(rawAtt, idFactory, now);
       if (!att || seenAttachments[att.id]) return;
       if (!att.sourceLibraryId && paperSourceLibraryId) att.sourceLibraryId = paperSourceLibraryId;
       seenAttachments[att.id] = true;
@@ -473,7 +480,7 @@
     if (date) year = Number(date.slice(0, 4));
     else if (year != null && year >= 1000 && year <= 3000) date = String(Math.trunc(year));
     // 批注附件关联（v12）：无 attachmentId 的旧批注回填主 PDF 附件；无附件则留空保留
-    var annotations = normalizePdfAnnotations(p.pdfAnnotations);
+    var annotations = normalizePdfAnnotations(p.pdfAnnotations, now);
     annotations.forEach(function (ann) {
       if (!ann.sourceLibraryId && paperSourceLibraryId) ann.sourceLibraryId = paperSourceLibraryId;
     });
@@ -555,11 +562,11 @@
     return paper;
   }
 
-  function normalizeLibrary(value, idFactory) {
+  function normalizeLibrary(value, idFactory, now) {
     var list = Array.isArray(value) ? value : (value && Array.isArray(value.papers) ? value.papers : []);
     var seenIds = Object.create(null);
     var papers = list.map(function (raw) {
-      var paper = normalizePaper(raw, idFactory);
+      var paper = normalizePaper(raw, idFactory, now);
       if (seenIds[paper.id]) paper.id = (idFactory || fallbackId)();
       seenIds[paper.id] = true;
       return paper;
@@ -567,7 +574,7 @@
     return assignCitationKeys(papers);
   }
 
-  function normalizeFolders(value) {
+  function normalizeFolders(value, now) {
     var list = Array.isArray(value) ? value : [];
     var seen = Object.create(null), result = list.map(function (raw, index) {
       var folder = raw && typeof raw === 'object' ? raw : {};
@@ -583,7 +590,7 @@
         name: name,
         parentId: parentId && parentId !== id ? parentId : '',
         sortIndex: sortIndex,
-        updatedAt: timestampOrNull(folder.updatedAt) || Date.now(),
+        updatedAt: timestampOrNull(folder.updatedAt) || normalizeStamp(now),
         deletedAt: timestampOrNull(folder.deletedAt)
       };
     }).filter(Boolean);
@@ -601,7 +608,7 @@
     return result;
   }
 
-  function normalizeSavedSearch(value, idFactory) {
+  function normalizeSavedSearch(value, idFactory, now) {
     var s = value && typeof value === 'object' ? value : {};
     var name = text(s.name).trim().slice(0, 80);
     var query = text(s.query).trim().slice(0, 500);
@@ -613,15 +620,15 @@
       query: query,
       ast: text(s.ast).slice(0, 20000), // 阶段四：版本化 AST 序列化（旧记录为空 → 运行时按 query 解析，自动迁移）
       sortIndex: isFinite(sortIndex) && sortIndex >= 0 ? Math.trunc(sortIndex) : 0,
-      updatedAt: timestampOrNull(s.updatedAt) || Date.now(),
+      updatedAt: timestampOrNull(s.updatedAt) || normalizeStamp(now),
       deletedAt: timestampOrNull(s.deletedAt)
     };
   }
-  function normalizeSavedSearches(value, idFactory) {
+  function normalizeSavedSearches(value, idFactory, now) {
     var list = Array.isArray(value) ? value : [];
     var seen = {};
     return list.map(function (raw, index) {
-      var search = normalizeSavedSearch(raw, idFactory);
+      var search = normalizeSavedSearch(raw, idFactory, now);
       if (!search || seen[search.id]) return null;
       seen[search.id] = true;
       if (!raw || typeof raw !== 'object' || !isFinite(Number(raw.sortIndex)) || Number(raw.sortIndex) < 0) search.sortIndex = index;
@@ -630,7 +637,7 @@
   }
 
   /* ---- 独立笔记实体（v12）：顶层同步集合，可挂文献（paperId）或作主题笔记（paperId=''） ---- */
-  function normalizeNoteAsset(value) {
+  function normalizeNoteAsset(value, now) {
     var a = value && typeof value === 'object' ? value : {};
     var fileName = text(a.fileName).trim().slice(0, 200);
     var path = text(a.path).slice(0, 500);
@@ -644,15 +651,15 @@
       cloudName: cloudName && cloudName.length <= 200 && !/[?#]/.test(cloudName) && cloudName.indexOf('..') === -1 ? cloudName : '',
       cloudHash: /^[a-f0-9]{64}$/.test(cloudHash) ? cloudHash : '',
       cloudSize: size != null && size >= 0 ? Math.trunc(size) : null,
-      addedAt: timestampOrNull(a.addedAt) || Date.now()
+      addedAt: timestampOrNull(a.addedAt) || normalizeStamp(now)
     };
   }
-  function normalizeNote(value, idFactory) {
+  function normalizeNote(value, idFactory, now) {
     var n = value && typeof value === 'object' ? value : {};
-    var createdAt = timestampOrNull(n.createdAt) || Date.now();
+    var createdAt = timestampOrNull(n.createdAt) || normalizeStamp(now);
     var assets = [], seenAssets = {};
     (Array.isArray(n.assets) ? n.assets : []).slice(0, 200).forEach(function (rawAsset) {
-      var asset = normalizeNoteAsset(rawAsset);
+      var asset = normalizeNoteAsset(rawAsset, now);
       if (!asset) return;
       var key = asset.path || asset.cloudName || asset.fileName;
       if (seenAssets[key]) return;
@@ -676,11 +683,11 @@
       deletedAt: timestampOrNull(n.deletedAt)
     };
   }
-  function normalizeNotes(value, idFactory) {
+  function normalizeNotes(value, idFactory, now) {
     var list = Array.isArray(value) ? value : [];
     var seen = {};
     return list.map(function (raw) {
-      var note = normalizeNote(raw, idFactory);
+      var note = normalizeNote(raw, idFactory, now);
       if (seen[note.id]) return null;
       seen[note.id] = true;
       return note;
@@ -865,16 +872,16 @@
     return workspace;
   }
 
-  function normalizeWorkspace(value, idFactory) {
-    var folders = normalizeFolders(value && value.folders);
+  function normalizeWorkspace(value, idFactory, now) {
+    var folders = normalizeFolders(value && value.folders, now);
     var folderSet = Object.create(null);
     folders.forEach(function (folder) { if (!folder.deletedAt) folderSet[folder.id] = true; });
-    var papers = normalizeLibrary(value, idFactory);
+    var papers = normalizeLibrary(value, idFactory, now);
     papers.forEach(function (paper) {
       paper.folderIds = paper.folderIds.filter(function (id) { return !!folderSet[id]; });
       paper.relatedIds = paper.relatedIds.filter(function (rid) { return rid !== paper.id; });
     });
-    var notes = normalizeNotes(value && value.notes, idFactory);
+    var notes = normalizeNotes(value && value.notes, idFactory, now);
     migrateLegacyPaperNotes(papers, notes);
     projectPaperNotes(papers, notes);
     var tagColorRecords = normalizeTagColorRecords(value && value.tagColorRecords, value && value.tagColors);
@@ -882,7 +889,7 @@
       papers: papers,
       notes: notes,
       folders: folders,
-      savedSearches: normalizeSavedSearches(value && value.savedSearches, idFactory),
+      savedSearches: normalizeSavedSearches(value && value.savedSearches, idFactory, now),
       tagColors: tagColorsFromRecords(tagColorRecords),
       tagColorRecords: tagColorRecords
     };
