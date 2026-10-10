@@ -289,6 +289,8 @@ function createWindow() {
             cloudMirrorControlsPresent: !!document.querySelector('#sync-remote-mirror') &&
               !!document.querySelector('#sync-mirror-confirm') && !document.querySelector('#sync-mirror-confirm').checked &&
               !!document.querySelector('#sync-mirror-cleanup') && !document.querySelector('#sync-mirror-cleanup').checked &&
+              !!document.querySelector('#sync-mirror-cleanup-option') && document.querySelector('#sync-mirror-cleanup-option').hidden &&
+              !!document.querySelector('#sync-mirror-cleanup-option #sync-mirror-cleanup') &&
               !!document.querySelector('#sync-mirror-cleanup-hint'),
             remoteRecoveryApiPresent: !!window.litboardDesktop.inspectNutstoreRemote && !window.litboardDesktop.pullNutstoreConfig &&
               !!window.litboardDesktop.createNutstoreSyncPlan && !!window.litboardDesktop.applyNutstoreSyncPlan,

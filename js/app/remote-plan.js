@@ -366,10 +366,9 @@
       var cleanupBox = $('#sync-mirror-cleanup');
       cleanupBox.checked = false;
       cleanupBox.disabled = !plan.cleanupSupported;
-      // 禁用必须当场说明原因：顶部摘要距勾选框隔了整个清单，用户只看到「点不动」
+      $('#sync-mirror-cleanup-option').hidden = !plan.cleanupSupported;
       var cleanupBlock = plan.cleanupSupported ? '' :
-        T('云端未提供这些文件的可靠版本标识（ETag），归档已停用，本次仅同步文献条目');
-      cleanupBox.title = cleanupBlock;
+        T('云端未提供这些文件的可靠版本标识（ETag），本次不归档多余文件，文件保留原位；文献与附件仍正常同步');
       var cleanupHint = $('#sync-mirror-cleanup-hint');
       if (cleanupHint) {
         cleanupHint.hidden = plan.cleanupSupported;
@@ -387,11 +386,11 @@
         });
         (plan.extras || []).forEach(function (asset, index) {
           remotePlanModel.items.push({ key: 'mirror-extra:' + index, kind: 'info', label: T('多余文件 · ') + asset.name,
-            hint: T('仅勾选归档时移动；未勾选则保留原文件'), remoteText: asset.name });
+            hint: plan.cleanupSupported ? T('仅勾选归档时移动；未勾选则保留原文件') : T('本次不归档，文件保留原位'), remoteText: asset.name });
         });
         (plan.missing || []).forEach(function (asset, index) {
           remotePlanModel.items.push({ key: 'mirror-missing:' + index, kind: 'info', label: T('待补齐附件 · ') + asset.name,
-            hint: asset.hasLocalPath ? T('执行时核对本机文件并补传') : T('本机未登记文件路径；无法补齐时会停止整理'), localText: asset.name });
+            hint: asset.hasLocalPath ? T('执行时核对本机文件并补传') : T('本机未登记文件路径；可同步文献，归档前需补齐附件'), localText: asset.name });
         });
       }
 
@@ -660,7 +659,7 @@
       }
     }
 
-    function setRemotePlanCompleted(message) {
+    function setRemotePlanCompleted(message, incomplete) {
       remotePlanApplying = false;
       remotePlanStopping = false;
       $('#sync-mirror-options').hidden = true;
@@ -671,7 +670,7 @@
       if (progress) progress.hidden = false;
       if (list) list.hidden = true;
       if (toolbar) toolbar.hidden = true;
-      setRemotePlanProgress({ phase: 'done', message: message || T('同步完成') });
+      setRemotePlanProgress({ phase: incomplete ? 'error' : 'done', message: message || T('同步完成') });
       var cancelButton = $('#sync-remote-plan-cancel');
       if (cancelButton) {
         cancelButton.disabled = false;
@@ -742,6 +741,7 @@
         }
         var assets = result && result.assets || {};
         applyAssetFailures = (assets.failures || []).length;
+        if (mirrorResult) applyAssetFailures = Math.max(applyAssetFailures, mirrorResult.pendingAttachments || 0);
         if (result && result.paused) applyPaused = result;
         if (workspace && workspace.papers) {
           // 暂停时也落库：用户已经做出的决议不能丢，附件续传交给限流调度
@@ -768,14 +768,16 @@
         }
         var label = planMode === 'mirror' ? T('云端整理完成') : planMode === 'merge' ? T('同步对照已应用') : T('云端恢复完成');
         if (mirrorResult) {
-          label = (mirrorResult.complete ? T('云端整理完成') : T('文献清单已更新，文件整理未完成，请重新预览')) +
+          label = (mirrorResult.complete
+            ? mirrorResult.cleanupRequested === false ? T('文献清单已更新，未归档多余文件') : T('云端整理完成')
+            : T('文献清单已更新，文件整理未完成，请重新预览')) +
             ' · ' + T('已归档文件：') + mirrorResult.moved + ' · ' + T('备份目录：') + mirrorResult.archivePath +
             (mirrorResult.message ? ' · ' + mirrorResult.message : '');
           if (!mirrorResult.complete) applyAssetFailures++;
         }
         if (applyAssetFailures && !mirrorResult) label += '（' + applyAssetFailures + T(' 个附件未完成，下次同步自动续传）');
         setSyncInlineStatus('sync-remote-status', label, applyAssetFailures ? 'warning' : 'success');
-        setRemotePlanCompleted(label);
+        setRemotePlanCompleted(label, mirrorResult && (!mirrorResult.complete || mirrorResult.pendingAttachments > 0));
         toast(label);
         if (!mirrorResult || mirrorResult.complete) inspectRemote();
       }).catch(function (error) {

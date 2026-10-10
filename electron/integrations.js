@@ -1302,14 +1302,12 @@ function createIntegrations(options) {
   const PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getetag/></d:prop></d:propfind>';
   const PROPFIND_PAGE_SIZE = 750; // 坚果云单次列目录上限，超出需按 Range: rows=a-b 翻页
 
-  function parsePropfindNames(body, attachmentsUrl, verifyListing) {
-    const entries = parsePropfindEntries(body, attachmentsUrl, verifyListing);
-    return entries === null ? null : new Set(entries.keys());
-  }
-
-  /** 按 <response> 块解析 href→getetag 映射。返回 null 表示清单含失败条目或
-   *  无法解析（verifyListing 语义与 parsePropfindNames 一致）；getetag 缺失的
-   *  条目记为空串（部分服务端不给集合/文件返回 ETag）。 */
+  /** 按 <response> 块解析 href→getetag 映射与集合（目录）清单。返回 null 表示清单
+   *  含失败条目或无法解析（verifyListing 语义与 walkRemoteAssets 一致）；getetag
+   *  缺失的条目记为空串（部分服务端不给文件返回 ETag）。
+   *  集合必须按 resourcetype 识别，不能依赖 href 尾斜杠——坚果云目录 href 不带
+   *  尾斜杠，只带 <resourcetype><d:collection/>；若把目录当文件，多余文件判定与
+   *  MOVE 归档都会把整层子目录当成单个对象，后果是真实的附件目录被整体搬走。 */
   function parsePropfindEntries(body, attachmentsUrl, verifyListing) {
     if (verifyListing) {
       // A DAV href alone is not proof of existence: a multistatus can contain failed entries.
@@ -1327,9 +1325,11 @@ function createIntegrations(options) {
     const baseUrl = new URL(attachmentsUrl.replace(/\/+$/, '') + '/');
     const basePath = baseUrl.pathname;
     const entriesMap = new Map();
+    const collections = [];
     const responsePattern = /<(?:[A-Za-z_][\w.-]*:)?response\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?response>/gi;
     const hrefPattern = /<(?:[A-Za-z_][\w.-]*:)?href\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?href>/i;
     const etagPattern = /<(?:[A-Za-z_][\w.-]*:)?getetag\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?getetag>/i;
+    const collectionPattern = /<(?:[A-Za-z_][\w.-]*:)?resourcetype\b[^>]*>[\s\S]*?<(?:[A-Za-z_][\w.-]*:)?collection\b/i;
     let block;
     while ((block = responsePattern.exec(body))) {
       const href = hrefPattern.exec(block[1]);
@@ -1339,76 +1339,92 @@ function createIntegrations(options) {
       if (target.origin !== baseUrl.origin || target.pathname.indexOf(basePath) !== 0) continue;
       let relative = target.pathname.slice(basePath.length);
       try { relative = decodeURIComponent(relative); } catch (error) { continue; }
-      if (!relative || relative.endsWith('/')) continue;
+      if (!relative) continue;
+      if (collectionPattern.test(block[1]) || relative.endsWith('/')) {
+        const folderName = safeCloudName(relative.replace(/\/+$/, ''));
+        if (folderName) collections.push(folderName);
+        continue;
+      }
       const name = safeCloudName(relative);
       if (!name) continue;
       const etagMatch = etagPattern.exec(block[1]);
       entriesMap.set(name, etagMatch ? xmlText(etagMatch[1]).trim() : '');
     }
-    return entriesMap;
+    return { files: entriesMap, folders: collections };
   }
 
-  /** 真实列出云端 attachments/ 下的对象名（分页）。返回：
-   *  Set —— 实际清单；null —— 服务器不支持该 PROPFIND（403/405/501）。 */
-  async function listRemoteAssetNames(remoteOptions, verifyListing) {
-    const names = new Set();
+  /** 分页列出一个目录的一层（Depth: 1）。返回 { files, folders }（名字均为相对
+   *  attachments 根的路径）；null —— 服务器不支持 PROPFIND（403/405/501）或
+   *  清单不可信。 */
+  async function propfindFolder(remoteOptions, folderUrl, verifyListing) {
+    const files = new Map();
+    const folders = new Set();
     for (let page = 0; page < 40; page++) {
       const start = page * PROPFIND_PAGE_SIZE;
-      const response = await request(remoteOptions.attachmentsUrl, {
+      const response = await request(folderUrl, {
         method: 'PROPFIND',
         headers: Object.assign({
-          Depth: 'infinity', 'Content-Type': 'application/xml; charset=utf-8',
+          Depth: '1', 'Content-Type': 'application/xml; charset=utf-8',
           Range: 'rows=' + start + '-' + (start + PROPFIND_PAGE_SIZE - 1)
         }, remoteOptions.headers),
         body: PROPFIND_BODY
       });
       throwIfWebDavRateLimited(response);
-      if (response.status === 404 || response.status === 409) return verifyListing && page > 0 ? null : names;
-      // 部分 WebDAV 服务不支持 Depth:infinity；此时回退到库 JSON 登记名（见调用方）。
+      if (response.status === 404 || response.status === 409) return verifyListing && page > 0 ? null : { files: files, folders: folders };
+      // 部分 WebDAV 服务不支持 PROPFIND；此时回退到库 JSON 登记名（见调用方）。
       if (response.status === 403 || response.status === 405 || response.status === 501) return null;
       if (!response.ok) throw new Error('坚果云附件清单读取失败（' + response.status + '）');
       const pageBody = await response.text();
-      const pageNames = parsePropfindNames(pageBody, remoteOptions.attachmentsUrl, verifyListing);
-      if (pageNames === null) return null;
+      const parsed = parsePropfindEntries(pageBody, remoteOptions.attachmentsUrl, verifyListing);
+      if (parsed === null) return null;
       let fresh = 0;
-      pageNames.forEach(function (name) { if (!names.has(name)) { names.add(name); fresh++; } });
+      parsed.files.forEach(function (etag, name) { if (!files.has(name)) { files.set(name, etag); fresh++; } });
+      parsed.folders.forEach(function (name) { folders.add(name); });
       // 不足一页 = 最后一页；fresh=0 = 服务器忽略 Range 一次性给全（或分页停滞）
-      const entries = verifyListing ? (pageBody.match(/<(?:[A-Za-z_][\w.-]*:)?response\b/gi) || []).length : pageNames.size;
-      if (entries < PROPFIND_PAGE_SIZE) return names;
-      if (fresh === 0) return verifyListing ? null : names;
+      const entries = verifyListing ? (pageBody.match(/<(?:[A-Za-z_][\w.-]*:)?response\b/gi) || []).length : parsed.files.size + parsed.folders.length;
+      if (entries < PROPFIND_PAGE_SIZE) return { files: files, folders: folders };
+      if (fresh === 0) return verifyListing ? null : { files: files, folders: folders };
     }
-    return verifyListing ? null : names;
+    return verifyListing ? null : { files: files, folders: folders };
   }
 
-  /** 与 listRemoteAssetNames 同一遍分页 PROPFIND，但收集 name→getetag 映射。
+  /** 逐层递归的真实云端对象清单（name→getetag）。坚果云忽略 Depth: infinity
+   *  （实测与 Depth: 1 返回完全一致），子目录里的对象只有逐层列才能看见——
+   *  否则子目录文件会被误判「云端缺失」而每轮重传，子目录本身会被误判成
+   *  「多余文件」参与归档。null 语义同 propfindFolder。 */
+  const PROPFIND_MAX_DEPTH = 8;     // 附件命名约定最深 2 级（<key>/<file>、notes/<id>/<file>），留足余量
+  const PROPFIND_MAX_FOLDERS = 2000; // 防御失控服务端（软链/回环目录）
+  async function walkRemoteAssets(remoteOptions, verifyListing) {
+    const files = new Map();
+    const visited = new Set();
+    const queue = [''];
+    while (queue.length) {
+      const folder = queue.shift();
+      if (visited.has(folder)) continue;
+      visited.add(folder);
+      if (visited.size > PROPFIND_MAX_FOLDERS) break;
+      if (folder && folder.split('/').length > PROPFIND_MAX_DEPTH) continue;
+      const folderUrl = folder ? joinUrl(remoteOptions.attachmentsUrl, folder) : remoteOptions.attachmentsUrl;
+      const listing = await propfindFolder(remoteOptions, folderUrl, verifyListing);
+      if (listing === null) return null;
+      listing.files.forEach(function (etag, name) { files.set(name, etag); });
+      listing.folders.forEach(function (name) { if (!visited.has(name)) queue.push(name); });
+    }
+    return files;
+  }
+
+  /** 真实列出云端 attachments/ 下的对象名（含子目录，分页 + 递归）。返回：
+   *  Set —— 实际清单；null —— 服务器不支持该 PROPFIND（403/405/501）。 */
+  async function listRemoteAssetNames(remoteOptions, verifyListing) {
+    const files = await walkRemoteAssets(remoteOptions, verifyListing);
+    return files === null ? null : new Set(files.keys());
+  }
+
+  /** 与 listRemoteAssetNames 同一路径，返回 name→getetag 映射。
    *  坚果云 HEAD 不返回 ETag，归档前的文件版本核对只能靠清单属性（或回退逐文件
    *  GET/HEAD，见调用方）。返回 null 语义同上。 */
   async function listRemoteAssetEtags(remoteOptions, verifyListing) {
-    const entriesMap = new Map();
-    for (let page = 0; page < 40; page++) {
-      const start = page * PROPFIND_PAGE_SIZE;
-      const response = await request(remoteOptions.attachmentsUrl, {
-        method: 'PROPFIND',
-        headers: Object.assign({
-          Depth: 'infinity', 'Content-Type': 'application/xml; charset=utf-8',
-          Range: 'rows=' + start + '-' + (start + PROPFIND_PAGE_SIZE - 1)
-        }, remoteOptions.headers),
-        body: PROPFIND_BODY
-      });
-      throwIfWebDavRateLimited(response);
-      if (response.status === 404 || response.status === 409) return verifyListing && page > 0 ? null : entriesMap;
-      if (response.status === 403 || response.status === 405 || response.status === 501) return null;
-      if (!response.ok) throw new Error('坚果云附件清单读取失败（' + response.status + '）');
-      const pageBody = await response.text();
-      const pageEntries = parsePropfindEntries(pageBody, remoteOptions.attachmentsUrl, verifyListing);
-      if (pageEntries === null) return null;
-      let fresh = 0;
-      pageEntries.forEach(function (etag, name) { if (!entriesMap.has(name)) { entriesMap.set(name, etag); fresh++; } });
-      const entries = verifyListing ? (pageBody.match(/<(?:[A-Za-z_][\w.-]*:)?response\b/gi) || []).length : pageEntries.size;
-      if (entries < PROPFIND_PAGE_SIZE) return entriesMap;
-      if (fresh === 0) return verifyListing ? null : entriesMap;
-    }
-    return verifyListing ? null : entriesMap;
+    return walkRemoteAssets(remoteOptions, verifyListing);
   }
 
   /** 本会话的云端对象存在性证据。库 JSON 里的 cloudName 登记绝不能当存在性
@@ -1467,8 +1483,9 @@ function createIntegrations(options) {
       return result;
     }
     if (!response.ok) throw new Error('坚果云读取失败（' + response.status + '）');
+    const remoteText = await response.text();
     let remote;
-    try { remote = JSON.parse(await response.text()); } catch (error) { throw new Error('坚果云同步文件不是有效 JSON'); }
+    try { remote = JSON.parse(remoteText); } catch (error) { throw new Error('坚果云同步文件不是有效 JSON'); }
     if (!remote || typeof remote !== 'object' || Array.isArray(remote)) throw new Error('坚果云同步文件内容无效');
     if (!LitSync.isSupportedSyncVersion(remote.syncVersion)) {
       throw new Error('不支持的 LitBoard 同步版本：' + remote.syncVersion);
@@ -3524,6 +3541,7 @@ function createIntegrations(options) {
     hash: hashWorkspace, safeName: safeCloudName, join: joinUrl,
     checkCancelled: throwIfSyncCancelled, rateLimit: throwIfWebDavRateLimited,
     ensureFolder: ensureWebDavFolder, syncAssets: syncWorkspaceAssets,
+    sanitizeAssets: sanitizeCloudAssets,
     writeLibrary: writeCloudLibrary, writeBase: writeSyncBase, syncWorkspace: LitSync.syncWorkspace,
     progress: emitSyncProgress,
     withSession: async function (remoteOptions, task) {

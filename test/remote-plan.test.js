@@ -36,7 +36,7 @@ function makeHarness(planOverride, inspection, overrides) {
   const extra = overrides || {};
   const els = {};
   const ids = [
-    '#sync-remote-mirror', '#sync-mirror-options', '#sync-mirror-confirm', '#sync-mirror-cleanup', '#sync-mirror-cleanup-hint', '#sync-remote-plan-title',
+    '#sync-remote-mirror', '#sync-mirror-options', '#sync-mirror-confirm', '#sync-mirror-cleanup-option', '#sync-mirror-cleanup', '#sync-mirror-cleanup-hint', '#sync-remote-plan-title',
     '#sync-conflict-list', '#sync-conflict-mask', '#sync-remote-plan-mask', '#sync-remote-plan-list',
     '#sync-remote-plan-filter', '#sync-remote-plan-summary', '#sync-remote-plan-apply',
     '#sync-remote-plan-cancel', '#sync-remote-plan-progress', '#sync-remote-plan-progress-text',
@@ -240,6 +240,7 @@ test('整理预览列出文件，须单独确认；默认不归档多余文件',
   assert.equal(h.els['#sync-remote-plan-apply'].disabled, true);
   assert.equal(h.api.stateForTest().model.items.length, 3);
   assert.equal(h.els['#sync-mirror-cleanup'].disabled, false);
+  assert.equal(h.els['#sync-mirror-cleanup-option'].hidden, false);
   assert.equal(h.els['#sync-mirror-cleanup-hint'].hidden, true, '归档可用时不显示提示');
   h.api.apply(); assert.equal(h.calls.applied, null);
   h.els['#sync-mirror-confirm'].checked = true;
@@ -249,14 +250,17 @@ test('整理预览列出文件，须单独确认；默认不归档多余文件',
   assert.equal(h.calls.applied.resolutions['mirror:confirm'], 'local');
   assert.equal(h.calls.applied.resolutions['mirror:cleanup'], 'remote');
 
-  // 缺少可靠 ETag 时归档被禁用：必须在勾选框旁说明原因，而不是让用户对着点不动的框
+  // 缺少可靠 ETag 时不展示无法使用的归档选项；仍可确认并同步，默认保留多余文件。
   const blocked = makeHarness({ mode: 'mirror', planId: 'mirror-blocked', localCount: 0, remoteCount: 1, cleanupSupported: false,
     changes: [], extras: [{ name: 'a.pdf' }], missing: [], archivePath: 'backups/cleanup-blocked/' });
   blocked.els['#sync-remote-mirror'].click(); await flush();
   assert.equal(blocked.els['#sync-mirror-cleanup'].disabled, true, '缺少版本标识时归档勾选框禁用');
+  assert.equal(blocked.els['#sync-mirror-cleanup-option'].hidden, true);
   assert.equal(blocked.els['#sync-mirror-cleanup-hint'].hidden, false);
-  assert.match(blocked.els['#sync-mirror-cleanup-hint'].textContent, /ETag/);
-  assert.match(blocked.els['#sync-mirror-cleanup'].title, /ETag/);
+  blocked.els['#sync-mirror-confirm'].checked = true;
+  blocked.els['#sync-mirror-confirm'].handlers.change[0].call(blocked.els['#sync-mirror-confirm']);
+  blocked.api.apply(); await flush();
+  assert.equal(blocked.calls.applied.resolutions['mirror:cleanup'], 'remote');
 });
 
 test('整理失败原因留在当前弹窗内，不藏在遮罩下，也不显示成功百分比', async () => {
@@ -277,6 +281,22 @@ test('整理失败原因留在当前弹窗内，不藏在遮罩下，也不显�
   assert.equal(h.els['#sync-remote-plan-apply'].disabled, true, 'a failed mirror must be previewed again');
   h.els['#sync-remote-plan-cancel'].click();
   assert.equal(h.els['#sync-remote-plan-mask'].hidden, true);
+});
+
+test('partial cloud cleanup remains visibly incomplete instead of displaying 100% success', async () => {
+  const h = makeHarness({ mode: 'mirror', planId: 'partial-mirror', localCount: 1, remoteCount: 2,
+    cleanupSupported: true, changes: [], extras: [], missing: [] }, null,
+  { applyPlan: () => Promise.resolve({ workspace: { papers: [] },
+    mirror: { complete: false, moved: 1, archivePath: 'backups/partial/', message: 'HTTP 412' } }) });
+  h.els['#sync-remote-mirror'].click(); await flush();
+  const confirm = h.els['#sync-mirror-confirm'];
+  confirm.checked = true; confirm.handlers.change[0].call(confirm);
+  h.api.apply(); await flush();
+  assert.equal(h.els['#sync-remote-plan-progress'].hidden, false);
+  assert.match(h.els['#sync-remote-plan-progress-text'].textContent, /文件整理未完成.*HTTP 412/);
+  assert.equal(h.els['#sync-remote-plan-progress-bar'].hidden, true);
+  assert.equal(h.els['#sync-remote-plan-progress-percent'].textContent, '');
+  assert.equal(h.els['#sync-remote-plan-cancel'].textContent, '关闭');
 });
 
 /* ---------- 生成期竞态回归：镜像预览是分钟级只读任务，期间后台同步曾把对照结果静默作废 ---------- */
@@ -336,4 +356,20 @@ test('对照：生成被取代显式作废不悬挂；后台同步进行中点�
   assert.strictEqual(busy.api.stateForTest().creating, false);
   assert.match(busy.calls.statuses[busy.calls.statuses.length - 1].text, /后台同步/);
   assert.strictEqual(busy.calls.statuses[busy.calls.statuses.length - 1].kind, 'warning');
+});
+
+test('metadata-only mirror applies the workspace but keeps missing attachments visible as a warning', async () => {
+  const h = makeHarness({ mode: 'mirror', planId: 'metadata-warning', localCount: 1, remoteCount: 2,
+    cleanupSupported: false, changes: [], extras: [], missing: [] }, null,
+  { applyPlan: () => Promise.resolve({ workspace: { papers: [] }, assets: { failures: [], missingOnCloud: 1 },
+    mirror: { complete: true, cleanupRequested: false, pendingAttachments: 1, moved: 0,
+      archivePath: 'backups/metadata/', message: '仍有 1 个附件待补齐 · missing-source.pdf' } }) });
+  h.els['#sync-remote-mirror'].click(); await flush();
+  const confirm = h.els['#sync-mirror-confirm'];
+  confirm.checked = true; confirm.handlers.change[0].call(confirm);
+  h.api.apply(); await flush();
+  assert.equal(h.calls.appliedWorkspace, 1);
+  assert.match(h.els['#sync-remote-plan-progress-text'].textContent, /文献清单已更新，未归档多余文件.*missing-source\.pdf/);
+  assert.equal(h.els['#sync-remote-plan-progress-percent'].textContent, '');
+  assert.equal(h.calls.statuses.find(s => s.text.includes('missing-source.pdf')).kind, 'warning');
 });

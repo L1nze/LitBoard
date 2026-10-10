@@ -28,7 +28,7 @@ async function fixture(t, options = {}) {
   put(library, JSON.stringify(Sync.createSyncEnvelope(remote)));
   put(attachments + 'keep.pdf', pdf); put(attachments + 'extra.pdf', '%PDF-extra'); put(attachments + 'orphan.pdf', '%PDF-orphan');
   const state = { local, files, calls, library, attachments, base, put, denyListing: false, omitEtags: false,
-    failUpload: false, failBackup: false, afterMove: null, progress: [] };
+    failUpload: false, failBackup: false, afterMove: null, progress: [], depthOne: false };
   const api = createIntegrations({ baseDir: dir, homeDir: dir, readWorkspace: async () => state.local,
     requestTimeoutMs: options.requestTimeoutMs,
     notify: (channel, payload) => { if (channel === 'integrations:sync-progress') state.progress.push(payload); },
@@ -46,6 +46,30 @@ async function fixture(t, options = {}) {
       if (method === 'PROPFIND') {
         if (state.denyListing) return new Response('', { status: 405 });
         const root = url.replace(/\/$/, '') + '/';
+        if (state.depthOne) {
+          // 坚果云实测形态：忽略 Depth: infinity，只回第一层；目录 href 不带尾斜杠，
+          // 用 resourcetype=collection 标识且 getetag 为空元素。
+          const hasChildren = [...files.keys()].some(k => k.startsWith(root));
+          if (url !== attachments && url !== attachments.replace(/\/$/, '') && !hasChildren) return new Response('', { status: 404 });
+          const direct = [], subfolders = new Set();
+          for (const key of files.keys()) {
+            if (!key.startsWith(root)) continue;
+            const rest = key.slice(root.length), slash = rest.indexOf('/');
+            if (slash === -1) direct.push(key);
+            else subfolders.add(rest.slice(0, slash));
+          }
+          const collectionXml = href => '<d:response><d:href>' + href +
+            '</d:href><d:propstat><d:prop><d:getetag/><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>';
+          const entries = [collectionXml(new URL(url.replace(/\/$/, '')).pathname)]
+            .concat([...subfolders].map(name => collectionXml(new URL(root + name).pathname)))
+            .concat(direct.map(k => {
+              const file = files.get(k);
+              const etag = file && !state.omitEtags ? '<d:getetag>' + file.etag + '</d:getetag>' : '';
+              return '<d:response><d:href>' + new URL(k).pathname +
+                '</d:href><d:propstat><d:prop>' + etag + '<d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>';
+            }));
+          return new Response('<d:multistatus xmlns:d="DAV:">' + entries.join('') + '</d:multistatus>', { status: 207 });
+        }
         const names = [root].concat([...files.keys()].filter(k => k.startsWith(root)));
         return new Response('<d:multistatus xmlns:d="DAV:">' + names.map(k => {
           const file = files.get(k);
@@ -146,6 +170,63 @@ test('metadata-only choice leaves extra files intact; cleanup is never implicit'
   await assert.rejects(f.api.applyNutstoreSyncPlan({ planId: plan.planId }), /确认/);
   const result = await f.apply(plan, 'remote');
   assert.equal(result.mirror.moved, 0); assert.ok(!f.calls.some(c => c.method === 'MOVE'));
+});
+
+test('metadata-only mirror reconciles the library despite an attachment with no source or cloud object', async t => {
+  const f = await fixture(t);
+  f.local.papers[0].attachments.push({ id: 'unavailable', kind: 'pdf', fileName: 'missing-source.pdf', path: '' });
+  const plan = await f.preview();
+  assert.equal(plan.missing.length, 1);
+  const result = await f.apply(plan, 'remote');
+  const cloud = JSON.parse(f.files.get(f.library).body);
+  assert.equal(cloud.papers.find(p => p.id === 'p').title, 'Local title');
+  assert.ok(cloud.papers.find(p => p.id === 'extra').deletedAt);
+  assert.equal(result.assets.missingOnCloud, 1);
+  assert.equal(cloud.papers.find(p => p.id === 'p').attachments.find(a => a.id === 'unavailable').fileName, 'missing-source.pdf');
+  assert.ok(f.files.has(f.attachments + 'extra.pdf'));
+  assert.ok(!f.calls.some(c => c.method === 'MOVE'));
+});
+
+test('metadata-only mirror does not publish a cloud attachment claim when its upload failed', async t => {
+  const f = await fixture(t);
+  f.files.delete(f.attachments + 'keep.pdf');
+  f.failUpload = true;
+  const plan = await f.preview();
+  const result = await f.apply(plan, 'remote');
+  const cloud = JSON.parse(f.files.get(f.library).body);
+  const attachment = cloud.papers.find(p => p.id === 'p').attachments[0];
+  assert.equal(attachment.fileName, 'p.pdf');
+  assert.ok(!attachment.cloudName, 'a failed PUT cannot be published as an existing cloud object');
+  assert.equal(result.workspace.papers.find(p => p.id === 'p').attachments[0].path, f.local.papers[0].attachments[0].path);
+  assert.equal(result.assets.pendingUpload, 1);
+  assert.equal(result.mirror.pendingAttachments, 1);
+  assert.ok(!f.calls.some(c => c.method === 'MOVE'));
+});
+
+test('metadata-only mirror preserves a missing-file description without retaining a nonexistent cloud claim', async t => {
+  const f = await fixture(t);
+  f.files.delete(f.attachments + 'keep.pdf');
+  f.local.papers[0].attachments[0].path = '';
+  const result = await f.apply(await f.preview(), 'remote');
+  const cloud = JSON.parse(f.files.get(f.library).body);
+  const attachment = cloud.papers.find(p => p.id === 'p').attachments[0];
+  assert.equal(attachment.fileName, 'p.pdf');
+  assert.ok(!attachment.cloudName);
+  assert.equal(result.mirror.pendingAttachments, 1);
+  assert.match(result.mirror.message, /p\.pdf/);
+  assert.ok(f.files.has(f.attachments + 'extra.pdf'));
+});
+
+test('archiving still refuses source-less attachments and names the file that must be restored', async t => {
+  for (const localPath of ['', 'C:/unavailable-fixture/missing.pdf']) {
+    const f = await fixture(t);
+    f.local.papers[0].attachments.push({ id: 'unavailable', kind: 'pdf', fileName: 'missing-source.pdf', path: localPath });
+    const original = f.files.get(f.library).body.toString();
+    await assert.rejects(f.apply(await f.preview()), /附件未完成.*missing-source\.pdf/);
+    assert.equal(f.files.get(f.library).body.toString(), original);
+    assert.ok(f.files.has(f.attachments + 'extra.pdf'));
+    assert.ok(!f.calls.some(c => c.method === 'MOVE'));
+  }
 });
 
 test('stale local/remote/object each invalidate the mirror before any remote mutation', async t => {
@@ -283,4 +364,56 @@ test('when the server omits getetag the preview falls back to per-file HEAD and 
   assert.equal(plan.cleanupSupported, true);
   const result = await f.apply(plan, 'remote');
   assert.equal(result.mirror.complete, true, '执行前核对同样回退 HEAD');
+});
+
+test('坚果云形态清单（Depth 1 + 无尾斜杠集合条目）：目录不进多余文件，子目录附件不误判缺失', async t => {
+  const f = await fixture(t);
+  f.depthOne = true;
+  // 被引用附件放进子目录（Zotero 导入形态）；另一个子目录里藏着真孤儿
+  const nested = 'zAAA11111/zatt_1.pdf';
+  f.local.papers[0].attachments[0].cloudName = nested;
+  f.put(f.attachments + nested, '%PDF-nested');
+  f.put(f.attachments + 'zBBB22222/zatt_2.pdf', '%PDF-true-orphan');
+  const plan = await f.preview();
+  assert.deepEqual(plan.extras.map(a => a.name).sort(),
+    ['extra.pdf', 'keep.pdf', 'orphan.pdf', 'zBBB22222/zatt_2.pdf'],
+    '目录 zAAA11111/zBBB22222 不得被当成多余文件');
+  assert.equal(plan.missing.length, 0, '子目录里的被引用附件经递归清单可见，不算待补齐');
+  assert.equal(plan.cleanupSupported, true);
+  const propfindUrls = f.calls.filter(c => c.method === 'PROPFIND').map(c => c.url);
+  assert.ok(propfindUrls.includes(f.attachments + 'zAAA11111'), '递归列出被引用子目录');
+  assert.ok(propfindUrls.includes(f.attachments + 'zBBB22222'), '递归列出孤儿子目录');
+  assert.equal(propfindUrls.filter(u => u === f.attachments.replace(/\/$/, '')).length, 1, '名字与 ETag 共用同一次递归清单');
+  const result = await f.apply(plan);
+  assert.equal(result.mirror.complete, true);
+  assert.equal(result.mirror.moved, 4);
+  assert.ok(f.files.has(f.attachments + nested), '子目录里的被引用附件原样保留');
+  assert.ok(!f.files.has(f.attachments + 'zBBB22222/zatt_2.pdf'));
+  assert.ok(f.calls.filter(c => c.method === 'MOVE').every(c => !/zAAA11111$|zBBB22222$/.test(c.url)),
+    '归档不得对目录本身发 MOVE');
+});
+
+test('mirror library body timeout and cancellation retain their cause instead of reporting corrupt JSON', async t => {
+  for (const mode of ['timeout', 'cancel']) {
+    const f = await fixture(t, { requestTimeoutMs: 40 });
+    let started;
+    const receiving = new Promise(resolve => { started = resolve; });
+    f.onGet = (url, init) => {
+      if (url !== f.library) return null;
+      const response = new Response(new ReadableStream({ start(controller) {
+        init.signal.addEventListener('abort', () => controller.error(new Error('aborted')), { once: true });
+      } }), { status: 200, headers: { ETag: '"library"' } });
+      const read = response.text.bind(response);
+      response.text = () => { started(); return read(); };
+      return response;
+    };
+    const reading = f.preview();
+    const rejected = assert.rejects(reading, error => mode === 'cancel'
+      ? error.code === 'SYNC_CANCELLED'
+      : /网络请求超时/.test(error.message));
+    await receiving;
+    if (mode === 'cancel') f.api.cancelNutstoreSync();
+    await rejected;
+    assert.ok(f.calls.every(c => ['GET', 'HEAD', 'PROPFIND'].includes(c.method)));
+  }
 });

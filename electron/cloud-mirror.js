@@ -49,7 +49,11 @@ function createCloudMirror(hooks) {
       if (baseline.exists && !strong(baseline.etag)) fail(T('云端不提供可靠的版本标识，不能安全整理'));
       const built = Mirror.build(input.workspace, baseline.remote || {}, Date.now());
       progress('inventory', T('正在列出云端文件清单…'));
-      const inventory = await hooks.listAssets(options, true);
+      // 带 ETag 的递归清单一次给出名字与版本标识；服务器不支持清单（null）时回退
+      // 仅名字的清单，多余文件的版本标识再逐文件 HEAD 补齐（坚果云 HEAD 不返回
+      //  ETag，此时按强校验要求归档选项不可用）。
+      const etags = hooks.listAssetEtags ? await hooks.listAssetEtags(options, true) : null;
+      const inventory = etags ? new Set(etags.keys()) : await hooks.listAssets(options, true);
       if (inventory === null) fail(T('无法取得完整云端文件清单，不能生成整理计划'));
       const names = new Set(Mirror.activeAssets(built.workspace).map(a => a.cloudName).filter(Boolean));
       const candidates = [];
@@ -58,9 +62,6 @@ function createCloudMirror(hooks) {
         if (hooks.safeName(name) !== name) fail(T('云端文件名无法安全处理，请先检查：') + name);
         candidates.push(name);
       }
-      // 多余文件的 ETag 优先取自清单 PROPFIND 的 getetag（坚果云 HEAD 不返回 ETag，
-      // 逐文件 HEAD 既拿不到版本标识、又受节流间隔拖慢预览）；清单未提供时回退 HEAD。
-      const etags = hooks.listAssetEtags ? await hooks.listAssetEtags(options, true) : null;
       const extras = [];
       for (let i = 0; i < candidates.length; i++) {
         hooks.checkCancelled();
@@ -93,7 +94,7 @@ function createCloudMirror(hooks) {
     await assertLocal(plan, input.workspace);
     return hooks.withSession(plan.options, async function (session) {
       const progress = (phase, message) => hooks.progress({ scope: 'apply-plan', planId: plan.id, phase: phase, message: message });
-      let written = null, workspace = clone(plan.workspace), moved = 0;
+      let written = null, workspace = clone(plan.workspace), moved = 0, pendingAttachments = 0;
       const archivePath = 'backups/cleanup-' + plan.id + '/';
       const archiveUrl = hooks.join(plan.options.folderUrl, archivePath.replace(/\/$/, ''));
       try {
@@ -136,10 +137,20 @@ function createCloudMirror(hooks) {
                 : T('正在补齐当前文献库的附件…') });
           } });
         hooks.checkCancelled();
-        if ((assets.failures || []).length || assets.pendingUpload || assets.missingOnCloud) {
-          const details = (assets.failures || []).slice(0, 3).map(error => error.message).join('；');
+        const unavailable = Mirror.activeAssets(workspace).filter(asset => {
+          const name = hooks.safeName(asset.cloudName);
+          return !name || (!inventory.has(name) && !session.verifiedNames.has(name));
+        });
+        pendingAttachments = Math.max((assets.failures || []).length,
+          (assets.pendingUpload || 0) + (assets.missingOnCloud || 0), unavailable.length);
+        const missingNames = unavailable.slice(0, 3).map(asset => asset.fileName || asset.cloudName || asset.id).join('；');
+        const details = [missingNames ? T('缺少附件文件：') + missingNames : '']
+          .concat((assets.failures || []).slice(0, 3).map(error => error.message)).filter(Boolean).slice(0, 3).join('；');
+        // Metadata-only reconciliation must not be blocked by missing files. Archiving still requires every live asset.
+        if (cleanup === 'local' && pendingAttachments) {
           fail(T('当前文献库仍有附件未完成，未替换云端清单，也未清理文件；请补齐后重新预览') + (details ? ' · ' + details : ''));
         }
+        if (cleanup === 'remote') workspace = hooks.sanitizeAssets(workspace, session.verifiedNames, inventory).workspace;
         await assertLocal(plan, input.workspace);
         await assertRemote(plan, current);
         written = await hooks.writeLibrary(plan.options, workspace, current, progress, session);
@@ -173,12 +184,14 @@ function createCloudMirror(hooks) {
         await assertRemote(plan, written.current);
         await assertLocal(plan, input.workspace);
         plans.delete(plan.id);
-        return { workspace: workspace, assets: assets, mirror: { complete: true, moved: moved, archivePath: archivePath } };
+        return { workspace: workspace, assets: assets, mirror: { complete: true, moved: moved, archivePath: archivePath,
+          cleanupRequested: cleanup === 'local', pendingAttachments: pendingAttachments,
+          message: pendingAttachments ? T('仍有 {count} 个附件待补齐', { count: pendingAttachments }) + (details ? ' · ' + details : '') : '' } };
       } catch (error) {
         plans.delete(plan.id); // Interrupted destructive plans are never auto-replayed.
         if (!written) throw error;
         return { workspace: error.code === 'LOCAL_MIRROR_STALE' ? null : workspace, mirror: { complete: false, moved: moved, archivePath: archivePath,
-          message: String(error.message || error) } };
+          cleanupRequested: cleanup === 'local', pendingAttachments: pendingAttachments, message: String(error.message || error) } };
       }
     });
   }
