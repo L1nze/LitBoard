@@ -51,9 +51,14 @@ function createCloudMirror(hooks) {
       progress('inventory', T('正在列出云端文件清单…'));
       // 带 ETag 的递归清单一次给出名字与版本标识；服务器不支持清单（null）时回退
       // 仅名字的清单，多余文件的版本标识再逐文件 HEAD 补齐（坚果云 HEAD 不返回
-      //  ETag，此时按强校验要求归档选项不可用）。
-      const etags = hooks.listAssetEtags ? await hooks.listAssetEtags(options, true) : null;
-      const inventory = etags ? new Set(etags.keys()) : await hooks.listAssets(options, true);
+      //  ETag，此时按强校验要求归档选项不可用）。递归列举在节流档位下是分钟级
+      // 过程，必须随目录推进上报进度，否则界面像卡死。
+      const scanProgress = function (scan) {
+        progress('inventory', T('正在列出云端文件清单（已列 {folders} 个目录 / {files} 个文件）…',
+          { folders: scan.folders, files: scan.files }));
+      };
+      const etags = hooks.listAssetEtags ? await hooks.listAssetEtags(options, true, scanProgress) : null;
+      const inventory = etags ? new Set(etags.keys()) : await hooks.listAssets(options, true, scanProgress);
       if (inventory === null) fail(T('无法取得完整云端文件清单，不能生成整理计划'));
       const names = new Set(Mirror.activeAssets(built.workspace).map(a => a.cloudName).filter(Boolean));
       const candidates = [];
@@ -101,7 +106,10 @@ function createCloudMirror(hooks) {
         const current = await assertRemote(plan, plan.baseline);
         // Every object in the reviewed removal list must still be the same object, before any mutation.
         if (cleanup === 'local') {
-          const fresh = hooks.listAssetEtags ? await hooks.listAssetEtags(plan.options, true) : null;
+          const fresh = hooks.listAssetEtags ? await hooks.listAssetEtags(plan.options, true, function (scan) {
+            progress('inventory', T('正在列出云端文件清单（已列 {folders} 个目录 / {files} 个文件）…',
+              { folders: scan.folders, files: scan.files }));
+          }) : null;
           for (const asset of plan.extras) {
             const listed = fresh ? fresh.get(asset.name) : '';
             const current = listed || await head(plan.options, asset.name);
@@ -123,7 +131,10 @@ function createCloudMirror(hooks) {
         if (await verify.text() !== manifest) fail(T('整理备份校验失败，已停止'));
         hooks.checkCancelled();
         progress('assets', T('正在补齐当前文献库的附件…'));
-        const inventory = await hooks.listAssets(plan.options, true);
+        const inventory = await hooks.listAssets(plan.options, true, function (scan) {
+          progress('inventory', T('正在列出云端文件清单（已列 {folders} 个目录 / {files} 个文件）…',
+            { folders: scan.folders, files: scan.files }));
+        });
         if (inventory === null) fail(T('云端文件清单不可用，已停止整理'));
         const assets = await hooks.syncAssets(workspace, plan.options, { strict: false, remoteAssets: inventory,
           ledger: session.ledger, verifiedNames: session.verifiedNames,

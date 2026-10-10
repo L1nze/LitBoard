@@ -1394,7 +1394,7 @@ function createIntegrations(options) {
    *  「多余文件」参与归档。null 语义同 propfindFolder。 */
   const PROPFIND_MAX_DEPTH = 8;     // 附件命名约定最深 2 级（<key>/<file>、notes/<id>/<file>），留足余量
   const PROPFIND_MAX_FOLDERS = 2000; // 防御失控服务端（软链/回环目录）
-  async function walkRemoteAssets(remoteOptions, verifyListing) {
+  async function walkRemoteAssets(remoteOptions, verifyListing, onProgress) {
     const files = new Map();
     const visited = new Set();
     const queue = [''];
@@ -1409,22 +1409,25 @@ function createIntegrations(options) {
       if (listing === null) return null;
       listing.files.forEach(function (etag, name) { files.set(name, etag); });
       listing.folders.forEach(function (name) { if (!visited.has(name)) queue.push(name); });
+      // 逐层列举在节流档位下是分钟级过程：每列完一个目录报一次进度，UI 不能停在
+      // 静态的「正在列出云端文件清单…」上让用户以为卡死。
+      if (onProgress) onProgress({ folders: visited.size, files: files.size });
     }
     return files;
   }
 
   /** 真实列出云端 attachments/ 下的对象名（含子目录，分页 + 递归）。返回：
    *  Set —— 实际清单；null —— 服务器不支持该 PROPFIND（403/405/501）。 */
-  async function listRemoteAssetNames(remoteOptions, verifyListing) {
-    const files = await walkRemoteAssets(remoteOptions, verifyListing);
+  async function listRemoteAssetNames(remoteOptions, verifyListing, onProgress) {
+    const files = await walkRemoteAssets(remoteOptions, verifyListing, onProgress);
     return files === null ? null : new Set(files.keys());
   }
 
   /** 与 listRemoteAssetNames 同一路径，返回 name→getetag 映射。
    *  坚果云 HEAD 不返回 ETag，归档前的文件版本核对只能靠清单属性（或回退逐文件
    *  GET/HEAD，见调用方）。返回 null 语义同上。 */
-  async function listRemoteAssetEtags(remoteOptions, verifyListing) {
-    return walkRemoteAssets(remoteOptions, verifyListing);
+  async function listRemoteAssetEtags(remoteOptions, verifyListing, onProgress) {
+    return walkRemoteAssets(remoteOptions, verifyListing, onProgress);
   }
 
   /** 本会话的云端对象存在性证据。库 JSON 里的 cloudName 登记绝不能当存在性

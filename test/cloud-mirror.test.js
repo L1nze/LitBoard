@@ -391,6 +391,10 @@ test('坚果云形态清单（Depth 1 + 无尾斜杠集合条目）：目录不�
   assert.ok(!f.files.has(f.attachments + 'zBBB22222/zatt_2.pdf'));
   assert.ok(f.calls.filter(c => c.method === 'MOVE').every(c => !/zAAA11111$|zBBB22222$/.test(c.url)),
     '归档不得对目录本身发 MOVE');
+  const inventorySteps = f.progress.filter(p => p.scope === 'plan' && p.phase === 'inventory')
+    .map(p => p.message).filter(m => /个目录/.test(m));
+  assert.equal(inventorySteps.length, 3, '根目录 + 两个子目录各报一次进度（递归列举在节流下是分钟级，不能静态悬挂）');
+  assert.match(inventorySteps[2], /3 个目录 \/ 5 个文件/, '末次进度携带累计目录与文件数');
 });
 
 test('mirror library body timeout and cancellation retain their cause instead of reporting corrupt JSON', async t => {
