@@ -177,6 +177,9 @@ function createCloudMirror(hooks) {
           hooks.checkCancelled();
           progress('cleanup', T('正在归档多余文件（') + (i + 1) + '/' + plan.extras.length + '）：' + asset.name);
           const destination = hooks.join(archiveUrl, String(i) + '.asset');
+          // 注意：实测坚果云忽略 MOVE 的 If-Match（错误 ETag 也返回 201 照移）——
+          // 防并发改动的真实防线是本循环前对每个 extra 的清单 ETag 复核与每步的
+          // assertRemote（附件被并发改动必然伴随库 JSON 变化），If-Match 只是协议礼貌。
           const response = await hooks.request(hooks.join(plan.options.attachmentsUrl, asset.name), { method: 'MOVE',
             headers: Object.assign({}, plan.options.headers, { Destination: destination, Overwrite: 'F', 'If-Match': asset.etag }) });
           checkResponse(response);

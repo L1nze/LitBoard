@@ -3421,15 +3421,23 @@ function createIntegrations(options) {
     const workspace = LitModel.normalizeWorkspace(value);
     const candidates = workspace.papers.filter(function (paper) { return !!paper.zoteroAttachmentKey; });
     let cursor = 0, downloaded = 0, existing = 0, missing = 0, failed = 0;
+    const total = candidates.length;
+    // 与云端整理同一教训：分钟级的多请求循环必须有实时进度，且 429 不能静默计为失败
+    const report = function () {
+      const done = downloaded + existing + missing + failed;
+      emitSyncProgress({ scope: 'zotero-migrate', phase: 'download', done: done, total: total,
+        message: '正在从坚果云迁移 Zotero 附件（' + done + '/' + total + '）…' });
+    };
     async function worker() {
       while (cursor < candidates.length) {
         const paper = candidates[cursor++];
         if (paper.pdfPath) {
-          try { await fs.access(paper.pdfPath); existing++; continue; } catch (error) { paper.pdfPath = ''; }
+          try { await fs.access(paper.pdfPath); existing++; report(); continue; } catch (error) { paper.pdfPath = ''; }
         }
         const response = await request(joinUrl(cloudFolder, paper.zoteroAttachmentKey + '.zip'), { method: 'GET', headers: headers });
-        if (response.status === 404) { missing++; continue; }
-        if (!response.ok) { failed++; continue; }
+        throwIfWebDavRateLimited(response);
+        if (response.status === 404) { missing++; report(); continue; }
+        if (!response.ok) { failed++; report(); continue; }
         try {
           const archive = Buffer.from(await response.arrayBuffer());
           const pdf = extractFirstPdfFromZip(archive);
@@ -3450,7 +3458,8 @@ function createIntegrations(options) {
           const normalized = LitModel.normalizePaper(paper);
           workspace.papers[workspace.papers.indexOf(paper)] = normalized;
           downloaded++;
-        } catch (error) { failed++; }
+          report();
+        } catch (error) { failed++; report(); }
       }
     }
     await Promise.all([worker(), worker(), worker(), worker()]);

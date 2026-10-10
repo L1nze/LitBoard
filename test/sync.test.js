@@ -1056,6 +1056,45 @@ test('Zotero cloud migration downloads a keyed archive into LitBoard storage', a
   assert.equal(await fs.readFile(result.workspace.papers[0].pdfPath, 'utf8'), '%PDF-cloud');
 });
 
+test('Zotero cloud migration reports per-file progress and surfaces 429 instead of counting it as failure', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-zotero-migrate-progress-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const archive = storedZip('paper.pdf', '%PDF-cloud');
+  const events = [];
+  let rateLimited = false;
+  const integrations = createIntegrations({
+    baseDir: dir, homeDir: dir,
+    notify: function (channel, payload) { if (channel === 'integrations:sync-progress') events.push(payload); },
+    safeStorage: {
+      isEncryptionAvailable: function () { return true; },
+      encryptString: function (value) { return Buffer.from(value, 'utf8'); },
+      decryptString: function (value) { return value.toString('utf8'); }
+    },
+    fetch: async function (url, init) {
+      if (rateLimited) return new Response('Too Many Requests', { status: 429 });
+      return new Response(archive, { status: 200 });
+    }
+  });
+  await integrations.saveConfig({ nutstoreUser: 'user@example.com', nutstorePassword: 'secret', zoteroWebDavFolder: 'zotero' });
+  const workspace = { papers: [1, 2, 3].map(function (n) {
+    return { id: 'p' + n, title: 'Paper ' + n, zoteroAttachmentKey: 'KEY' + n };
+  }), folders: [] };
+  const result = await integrations.migrateZoteroCloudAttachments(workspace);
+  assert.equal(result.downloaded, 3);
+  const migrateEvents = events.filter(function (event) { return event.scope === 'zotero-migrate'; });
+  assert.equal(migrateEvents.length, 3, '每个附件落定一次进度');
+  assert.deepEqual(migrateEvents.map(function (event) { return event.done; }).sort(), [1, 2, 3]);
+  assert.equal(migrateEvents[2].total, 3);
+  assert.match(migrateEvents[2].message, /3\/3/);
+
+  rateLimited = true;
+  await assert.rejects(integrations.migrateZoteroCloudAttachments(workspace), function (error) {
+    assert.equal(error.code, 'WEBDAV_RATE_LIMITED');
+    assert.match(error.message, /频率限制/);
+    return true;
+  });
+});
+
 /* ---------- 同步协议 v6：来源字段/附件索引 + v3-v5 读取兼容 ---------- */
 
 test('v6 envelope round-trips the notes collection', function () {

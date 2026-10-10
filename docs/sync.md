@@ -57,6 +57,12 @@ LitBoard/                          ← 同步目录（设置页可改，大小�
 整层真实附件），目录里的对象被误判"云端缺失"而每轮重传。目录的 getetag 为
 空元素，强 ETag 校验天然会拒绝把目录纳入归档，但这不是可以依赖的防线。
 
+2026-10 真机探测补记：坚果云 **MOVE 忽略 If-Match**（错误 ETag 也 201 照移），
+归档的防并发改动只能依赖应用层复核（清单 ETag 比对 + 每步库版本断言）；另有
+**瞬时 400 窗口**（`IllegalArgument / Unable to decode byte array as character set
+US-ASCII`，带 body 的请求全挂、GET 正常，秒~分钟级自愈），触发条件未查明，
+目前按致命错误原样报出，未做自动重试。
+
 ### 3. 覆盖云端前必须留档
 
 覆盖 `litboard-library.json` 之前：本地 `sync-history/` 写入当前内容（内容寻址，

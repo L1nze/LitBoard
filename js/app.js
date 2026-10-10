@@ -3689,7 +3689,14 @@
   function showSyncConflicts(conflicts) { if (remotePlan) remotePlan.showConflicts(conflicts); }
   function showRemotePlan(plan) { if (remotePlan) remotePlan.show(plan); }
   function closeRemotePlanDialog() { if (remotePlan) remotePlan.close(); }
-  function handleSyncProgress(payload) { if (remotePlan) remotePlan.handleProgress(payload); }
+  function handleSyncProgress(payload) {
+    if (remotePlan) remotePlan.handleProgress(payload);
+    // Zotero 云附件迁移在设置页直接跑（无对照弹窗），进度落到同步状态行
+    if (payload && payload.scope === 'zotero-migrate' && payload.message) {
+      var migrateStatus = $('#sync-status');
+      if (migrateStatus) migrateStatus.textContent = payload.message;
+    }
+  }
 
   /* ---- 期刊分区（js/app/journal-rank.js）：适配层 ---- */
   var journalRank = null;
