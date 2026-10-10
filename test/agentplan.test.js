@@ -91,3 +91,43 @@ test('isPlanCompleted：全部完成才算完成，供 UI 自动收起面板', (
   assert.equal(P.isPlanCompleted(P.validateResearchPlan(pending, { messages })), false);
   assert.equal(P.isPlanCompleted(P.validateResearchPlan(plan({ status: 'blocked' }), { messages })), false);
 });
+
+/* ---------------- 证据短别名（2026-10 真机会话复盘） ----------------
+ * 模型标记步骤完成时编造 call_2/call_4 这类短 id，连续 5 次被
+ * 「证据不是当前会话成功工具结果」拒绝后放弃作答，计划永远停在初版。
+ * 修复：请求里每条工具结果行首标注 [cN]；校验接受 cN 别名或完整 id；
+ * 拒绝时报错附带近期可用调用（cN=工具名），一次改对。 */
+const multi = [
+  { role: 'assistant', tool_calls: [
+    { id: 'call_4c60566058ae49a9a67c760a', function: { name: 'search_library' } },
+    { id: 'call_f0c4255d92e14b6daaa5753b', function: { name: 'get_paper' } }
+  ] },
+  { role: 'tool', name: 'search_library', tool_call_id: 'call_4c60566058ae49a9a67c760a', content: '{"papers":[1]}' },
+  { role: 'tool', name: 'get_paper', tool_call_id: 'call_f0c4255d92e14b6daaa5753b', content: '{"id":"p1"}' }
+];
+test('evidenceCallIds 接受 [cN] 短别名（编号 = 存储顺序的 tool 消息序号）', () => {
+  const alias = P.toolAliasMap(multi);
+  assert.equal(alias.byId['call_4c60566058ae49a9a67c760a'], 'c1');
+  assert.equal(alias.byId['call_f0c4255d92e14b6daaa5753b'], 'c2');
+  assert.equal(P.validateProposal(plan({ evidenceCallIds: ['c1'] }), { messages: multi }).ok, true);
+  assert.equal(P.validateProposal(plan({ evidenceCallIds: ['c2'] }), { messages: multi }).ok, true);
+  assert.equal(P.validateProposal(plan({ evidenceCallIds: ['call_4c60566058ae49a9a67c760a'] }), { messages: multi }).ok, true);
+});
+test('编造的 call_N 被 rejected 且报错附带近期可用调用提示', () => {
+  const result = P.validateProposal(plan({ evidenceCallIds: ['call_4'] }), { messages: multi });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /证据不是当前会话成功工具结果：call_4/);
+  assert.match(result.error, /近期可用：c1=search_library、c2=get_paper/);
+  assert.match(result.error, /\[cN\] 短 id/);
+});
+test('agentcore 请求渲染的 [cN] 前缀与 agentplan 别名编号一致', () => {
+  const Core = require('../js/agentcore');
+  const state = { messages: multi, historyMessageCap: 0 };
+  const body = Core.buildRequestBody(state, {});
+  const tools = body.messages.filter((m) => m.role === 'tool');
+  assert.equal(tools.length, 2);
+  assert.match(tools[0].content, /^\[c1\] /);
+  assert.match(tools[1].content, /^\[c2\] /);
+  // 模型引用渲染里看到的 c2 → 校验侧解析为同一调用
+  assert.equal(P.validateProposal(plan({ evidenceCallIds: ['c2'] }), { messages: multi }).ok, true);
+});

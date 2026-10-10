@@ -39,6 +39,33 @@
     }
     return true;
   }
+  /** 全历史中第 n 条 tool 结果（1 起）的短别名映射——模型引用证据时不必抄写
+   *  长随机 id（实践中会编造 call_2 这类短 id 而被拒）。编号按存储顺序数
+   *  role:'tool' 消息；agentcore.buildRequestBody 用同一编号在请求里给每条
+   *  工具结果行首标注 [cN]，两处必须一致（test/agentplan.test.js 交叉校验）。 */
+  function toolAliasMap(messages) {
+    var byId = {}, byAlias = {}, seq = 0;
+    (messages || []).forEach(function (msg) {
+      if (msg && msg.role === 'tool' && msg.tool_call_id) {
+        seq++;
+        var id = String(msg.tool_call_id);
+        byId[id] = 'c' + seq;
+        byAlias['c' + seq] = id;
+      }
+    });
+    return { byId: byId, byAlias: byAlias, count: seq };
+  }
+  /** 近期可作证据的成功调用提示（校验失败时教模型一次改对，而不是连猜六次后放弃） */
+  function recentEvidenceHint(messages, ids, aliases, limit) {
+    var hints = [];
+    for (var i = (messages || []).length - 1; i >= 0 && hints.length < (limit || 6); i--) {
+      var msg = messages[i];
+      if (msg && msg.role === 'tool' && msg.tool_call_id && ids.has(String(msg.tool_call_id)) && msg.name) {
+        hints.unshift((aliases.byId[String(msg.tool_call_id)] || '?') + '=' + msg.name);
+      }
+    }
+    return hints.join('、');
+  }
   function evidenceIds(messages) {
     var requested = new Map(), ids = new Set();
     (messages || []).forEach(function (msg) {
@@ -79,12 +106,22 @@
   }
   function validateResearchPlan(input, context) {
     var plan = shape(input), ctx = context || {}, ids = evidenceIds(ctx.messages), files = new Set((ctx.attachments || []).map(function (a) { return typeof a === 'string' ? a : a && a.file; }));
+    // 证据引用接受 [cN] 短别名或完整 call id（别名编号见 toolAliasMap）
+    var aliases = toolAliasMap(ctx.messages);
+    var resolveEvidence = function (id) { return aliases.byAlias[String(id)] || String(id); };
     // 显式更改 goal 开始新课题；新课题仍须独立满足证据与依赖检查。
     var previous = ctx.previousPlan, old = new Map(previous && previous.goal === plan.goal && previous.steps ? previous.steps.map(function (s) { return [s.id, s]; }) : []);
     var byId = new Map(plan.steps.map(function (s) { return [s.id, s]; }));
     plan.steps.forEach(function (step) {
       if (step.status === 'in_progress' && step.dependsOn.some(function (id) { return byId.get(id).status !== 'completed'; })) fail('开始步骤的依赖尚未完成：' + step.id);
-      step.evidenceCallIds.forEach(function (id) { if (!ids.has(id)) fail('证据不是当前会话成功工具结果：' + id); });
+      step.evidenceCallIds.forEach(function (id) {
+        if (ids.has(resolveEvidence(id))) return;
+        // 报错带上近期可用的成功调用（短 id=工具名）：模型拿真实 id 一次改对。
+        // 此前只报「不是成功工具结果」，模型连猜 call_2/call_4 五次全拒后放弃，
+        // 计划永远停在上次状态（2026-10 真机会话复盘）。
+        var hint = recentEvidenceHint(ctx.messages, ids, aliases);
+        fail('证据不是当前会话成功工具结果：' + id + (hint ? '。近期可用：' + hint + '（引用 [cN] 短 id 或完整 call_… id 均可）' : ''));
+      });
       step.artifacts.forEach(function (file) { if (!files.has(file)) fail('附件尚未登记：' + file); });
       if (step.status === 'completed') {
         if (old.has(step.id) && old.get(step.id).content !== step.content) fail('修改步骤内容后必须重置状态：' + step.id);
@@ -116,5 +153,5 @@
     return !!(plan && Array.isArray(plan.steps) && plan.steps.length &&
       plan.steps.every(function (step) { return step && step.status === 'completed'; }));
   }
-  return { normalizePlan: shape, validateResearchPlan: validateResearchPlan, validateProposal: validateProposal, getResearchPlan: getResearchPlan, isPlanCompleted: isPlanCompleted, successfulResult: successfulResult, evidenceIds: evidenceIds };
+  return { normalizePlan: shape, validateResearchPlan: validateResearchPlan, validateProposal: validateProposal, getResearchPlan: getResearchPlan, isPlanCompleted: isPlanCompleted, successfulResult: successfulResult, evidenceIds: evidenceIds, toolAliasMap: toolAliasMap };
 });

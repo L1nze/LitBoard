@@ -353,9 +353,17 @@
       if (window_[ti].role === 'user' && window_[ti].synthetic !== true) { trailingStart = ti; break; }
     }
     var callsById = collectCallIds(window_);
+    // 证据短别名：请求里每条工具结果行首标注 [cN]，模型在 update_research_plan 的
+    // evidenceCallIds 里引用 cN 即可，不必抄写长随机 call_… id——实践中模型会编造
+    // call_2 这类短 id 而被证据校验连续拒绝（编号规则与 js/agentplan.toolAliasMap 一致，
+    // 按存储顺序数 role:'tool' 消息；加载顺序无关，运行时查找）。
+    var Plan = (typeof module === 'object' && module.exports) ? require('./agentplan.js')
+      : (typeof window !== 'undefined' && window.LitAgentPlan ? window.LitAgentPlan : null);
+    var aliasById = Plan && Plan.toolAliasMap ? Plan.toolAliasMap(state.messages).byId : null;
     messages = messages.concat(window_.map(function (msg, index) {
       if (msg.role === 'tool') {
-        return { role: 'tool', tool_call_id: msg.tool_call_id, content: msg.content };
+        var alias = aliasById ? aliasById[String(msg.tool_call_id)] : null;
+        return { role: 'tool', tool_call_id: msg.tool_call_id, content: alias ? '[' + alias + '] ' + msg.content : msg.content };
       }
       if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
         // 只回放窗口内仍被后续 tool 消息引用的调用（防止悬挂 tool_call_id）

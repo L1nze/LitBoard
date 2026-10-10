@@ -169,7 +169,9 @@ test('maskToolMessage：只换 content，配对字段不动（经 buildRequestBo
   assert.ok(toolOut[0].content.indexOf('旧工具结果已清除') !== -1);
   assert.ok(toolOut[0].content.indexOf('1000') !== -1, '占位行注明原长度');
   assert.equal(toolOut[0].tool_call_id, 'c1', 'tool_call_id 保留，配对不破坏');
-  assert.equal(toolOut[1].content, big(1000), '窗口尾部 keepLast 条消息内的工具结果不掩码');
+  // 证据短别名（agentplan.toolAliasMap）：请求里的工具结果行首带 [cN]，其后内容原样
+  assert.match(toolOut[1].content, /^\[c2\] /, '工具结果行首带证据短别名');
+  assert.equal(toolOut[1].content.slice('[c2] '.length), big(1000), '窗口尾部 keepLast 条消息内的工具结果不掩码');
 });
 
 test('isContextOverflowError 多家中英文措辞命中、普通错误不误判；emergencyBudget 减半且有下限', () => {
