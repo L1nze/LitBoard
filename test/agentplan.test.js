@@ -42,10 +42,15 @@ test('明确新课题允许复用步骤编号，但仍要求真实证据', () =>
   assert.equal(P.validateProposal(next, { messages, previousPlan }).ok, true);
   assert.equal(P.validateProposal(next, { messages: [], previousPlan }).ok, false);
 });
-test('稳定 id 内容变化后不能维持完成，重复 id 拒绝', () => {
-  const previousPlan = P.validateResearchPlan(plan(), { messages });
-  assert.equal(P.validateProposal(plan({ content: '重新阅读' }), { messages, previousPlan }).ok, false);
-  assert.equal(P.validateProposal(plan({ content: '重新阅读', status: 'pending' }), { messages, previousPlan }).ok, true);
+test('稳定 id 描述可随进度调整，完成仍须有效证据且重复 id 拒绝', () => {
+  for (const status of ['pending', 'in_progress', 'blocked', 'completed']) {
+    const previousPlan = P.validateResearchPlan(plan({ status }), { messages });
+    const next = plan({ content: '检索相关文献' });
+    assert.equal(P.validateProposal(next, { messages, previousPlan }).ok, true, status);
+    assert.equal(P.validateProposal({ ...next, steps: [{ ...next.steps[0], evidenceCallIds: [] }] }, { messages, previousPlan }).ok, false);
+    assert.equal(P.validateProposal(next, { messages: [], previousPlan }).ok, false);
+    assert.equal(P.validateProposal(plan({ content: '重新阅读', status: 'pending' }), { messages, previousPlan }).ok, true);
+  }
   const input = plan(); input.steps.push({ ...input.steps[0] });
   assert.equal(P.validateProposal(input, { messages }).ok, false);
 });

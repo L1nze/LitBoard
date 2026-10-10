@@ -146,7 +146,7 @@
         fromChar: { type: 'integer', minimum: 0, description: '续读字符偏移，初读为 0' }
       }, ['file']),
       schema('read_research_plan', '读取当前会话已保存的调研计划。中断后继续时先核对计划及已完成工具结果，不重复执行已完成操作。', {}),
-      schema('update_research_plan', '创建或完整替换当前会话的调研计划（不修改文献库）。复杂任务先规划，再随进展更新；简单问答无需计划。一次只进行一个步骤。沿用 read_research_plan 的稳定 id，dependsOn 是前置步骤 id。只有依赖完成才可开始；完成必须提供 evidenceCallIds（本会话成功工具调用 id，优先用每条工具结果开头的 [cN] 短 id，如 c3，完整 call_… id 也可）或 artifacts（本会话已登记附件 file），程序会校验引用；note 记录来源 ID、页码或续读位置；受阻时标记 blocked 并说明原因，不能把尝试过当作完成。', {
+      schema('update_research_plan', '创建或完整替换当前会话的调研计划（不修改文献库）。复杂任务先规划，再随进展更新；简单问答无需计划。一次只进行一个步骤。沿用 read_research_plan 的稳定 id；同一步骤可调整 content 措辞并同时更新状态，实质新增或改变工作范围时应新增步骤或重置为 pending/in_progress，不能沿用无关证据宣称完成。dependsOn 是前置步骤 id。只有依赖完成才可开始；完成必须提供 evidenceCallIds（本会话成功工具调用 id，优先用每条工具结果开头的 [cN] 短 id，如 c3，完整 call_… id 也可）或 artifacts（本会话已登记附件 file），程序会校验引用；note 记录来源 ID、页码或续读位置；受阻时标记 blocked 并说明原因，不能把尝试过当作完成。', {
         goal: { type: 'string', maxLength: 300, minLength: 1 },
         steps: { type: 'array', maxItems: 12, items: { type: 'object', properties: {
           id: { type: 'string', description: '稳定步骤 id（首次可省略，更新时沿用；1–64 个非空白字符，中文可用，不含空格）' },

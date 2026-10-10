@@ -72,6 +72,46 @@ test('upload → pending references → user request → actual file read and re
   } finally { await sessions.flushAll(); await fsp.rm(root, { recursive: true, force: true }); }
 });
 
+test('完成步骤时调整描述，工具更新应保存并在恢复后的面板显示最新进度', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'litboard-plan-ui-'));
+  const sessions = createSessions({ rootDir: path.join(root, 'sessions') });
+  try {
+    const created = await sessions.create({ title: 'research' });
+    const run = { id: created.id, doc: created.data, core: Core.initState(), streaming: false };
+    const { context, nodes } = harness(run, {});
+    async function update(input, callId) {
+      Core.appendAssistant(run.core, { tool_calls: [{ id: callId, function: { name: 'update_research_plan', arguments: JSON.stringify(input) } }] });
+      const output = await context.tools.execute('update_research_plan', input, { messages: run.core.messages });
+      Core.appendToolResults(run.core, [{ callId, name: 'update_research_plan', result: output }]);
+      assert.equal(JSON.parse(output).error, undefined, output);
+    }
+    const initial = { goal: '调研', steps: [
+      { id: 'read-paper', content: '通读当前论文方法与结果（第3-6页），明确参数与SOC/SOH关联', status: 'in_progress' },
+      { id: 'synthesis', content: '综合给出建议', status: 'pending', dependsOn: ['read-paper'] }
+    ] };
+    await update(initial, 'plan-initial');
+    Core.appendAssistant(run.core, { tool_calls: [{ id: 'read-result', function: { name: 'read_session_file', arguments: '{}' } }] });
+    Core.appendToolResults(run.core, [{ callId: 'read-result', name: 'read_session_file', result: JSON.stringify({ text: '论文方法与结果' }) }]);
+    const next = { goal: initial.goal, steps: [
+      { ...initial.steps[0], content: '通读当前论文方法与结果，明确参数与SOC/SOH关联', status: 'completed', evidenceCallIds: ['c2'] },
+      { ...initial.steps[1], status: 'in_progress' }
+    ] };
+    await update(next, 'plan-progress');
+    // 已完成步骤在后续更新中也可能重新措辞，证据和稳定 id 仍然有效。
+    next.steps[0].content = '阅读当前论文方法与结果，明确参数与SOC/SOH关联';
+    await update(next, 'plan-reworded');
+    await sessions.commit(run.id, Object.assign(run.doc, Core.serialize(run.core)));
+    const saved = await sessions.read(run.id);
+    const restored = { core: Core.deserialize(saved), doc: saved, streaming: false };
+    context.renderPlan(restored);
+    const actual = Agent.getResearchPlan(saved.messages);
+    assert.equal(actual.steps[0].status, 'completed');
+    assert.equal(actual.steps[0].content, next.steps[0].content);
+    assert.equal(actual.steps[1].status, 'in_progress');
+    assert.match(nodes.get('agent-plan').children[0].children[0].text, /1\/2/);
+  } finally { await sessions.flushAll(); await fsp.rm(root, { recursive: true, force: true }); }
+});
+
 test('pending references can be removed and excess uploads fail without losing the previous choice', async () => {
   const run = { id: 's', doc: {}, core: Core.initState(), pendingReferences: [{ name: 'first', file: '附件/first.txt' }] };
   let imports = 0;

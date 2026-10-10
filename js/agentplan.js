@@ -109,8 +109,6 @@
     // 证据引用接受 [cN] 短别名或完整 call id（别名编号见 toolAliasMap）
     var aliases = toolAliasMap(ctx.messages);
     var resolveEvidence = function (id) { return aliases.byAlias[String(id)] || String(id); };
-    // 显式更改 goal 开始新课题；新课题仍须独立满足证据与依赖检查。
-    var previous = ctx.previousPlan, old = new Map(previous && previous.goal === plan.goal && previous.steps ? previous.steps.map(function (s) { return [s.id, s]; }) : []);
     var byId = new Map(plan.steps.map(function (s) { return [s.id, s]; }));
     plan.steps.forEach(function (step) {
       if (step.status === 'in_progress' && step.dependsOn.some(function (id) { return byId.get(id).status !== 'completed'; })) fail('开始步骤的依赖尚未完成：' + step.id);
@@ -124,7 +122,7 @@
       });
       step.artifacts.forEach(function (file) { if (!files.has(file)) fail('附件尚未登记：' + file); });
       if (step.status === 'completed') {
-        if (old.has(step.id) && old.get(step.id).content !== step.content) fail('修改步骤内容后必须重置状态：' + step.id);
+        // content 是可调整的描述；字面变化无法判定任务范围是否改变，完成依据由引用和依赖校验。
         if (!step.evidenceCallIds.length && !step.artifacts.length) fail('完成步骤需要成功工具证据或已登记附件：' + step.id);
         if (step.dependsOn.some(function (id) { return byId.get(id).status !== 'completed'; })) fail('完成步骤的依赖尚未完成：' + step.id);
       }
