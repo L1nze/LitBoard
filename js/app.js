@@ -252,7 +252,7 @@
 
   /* 两侧栏可调范围：拖拽钳制、持久化回读、ARIA 三处共用一份，免得改一处漏两处。
      右栏上限放宽到 800（详情/对话面板在宽屏下值得更宽）；实际能拖到多少还要过
-     applyPaneSizes 的「中间栏至少留 520px」——那是防止列表被挤扁的硬底线。 */
+     applyPaneSizes 的「中间栏至少留 430px」——与 CSS 网格下限保持一致。 */
   var PANE_LIMITS = { left: { min: 160, max: 360 }, right: { min: 300, max: 800 } };
 
   function readPaneSizes() {
@@ -268,18 +268,22 @@
   function applyPaneSizes(sizes) {
     var workspace = $('.workspace');
     if (!workspace) return;
-    var available = Math.max(0, workspace.clientWidth - 520);
+    var railWidth = parseFloat(getComputedStyle(workspace).getPropertyValue('--rail-width')) || 42;
+    var available = Math.max(0, workspace.clientWidth - railWidth - 430);
     var left = clamp(sizes.left, PANE_LIMITS.left.min, PANE_LIMITS.left.max);
     var right = clamp(sizes.right, PANE_LIMITS.right.min, PANE_LIMITS.right.max);
     var leftCollapsed = workspace.classList.contains('left-collapsed');
     var rightCollapsed = workspace.classList.contains('rail-collapsed');
-    var leftReserved = leftCollapsed ? 28 : left;
+    var leftHidden = window.matchMedia('(max-width: 960px)').matches;
+    var leftReserved = leftHidden ? 0 : leftCollapsed ? 28 : left;
     var rightReserved = rightCollapsed ? 0 : right;
-    if (leftReserved + rightReserved > available && available >= 460) {
+    var minReserved = (leftHidden ? 0 : leftCollapsed ? 28 : PANE_LIMITS.left.min) +
+      (rightCollapsed ? 0 : PANE_LIMITS.right.min);
+    if (leftReserved + rightReserved > available && available >= minReserved) {
       if (!rightCollapsed && right > PANE_LIMITS.right.min) {
         right = Math.max(PANE_LIMITS.right.min, available - leftReserved);
       }
-      if (!leftCollapsed && left + (rightCollapsed ? 0 : right) > available) {
+      if (!leftHidden && !leftCollapsed && left + (rightCollapsed ? 0 : right) > available) {
         left = Math.max(PANE_LIMITS.left.min, available - (rightCollapsed ? 0 : right));
       }
     }
@@ -1679,25 +1683,8 @@
       main.appendChild(label);
       select.appendChild(main);
       select.appendChild(count);
-      var del = document.createElement('button');
-      del.className = 'folder-delete';
-      del.dataset.deleteFolder = folder.id;
-      del.title = T('删除文件夹');
-      del.setAttribute('aria-label', T('删除文件夹 ') + folder.name);
-      del.textContent = '×';
-      var add = document.createElement('button');
-      add.className = 'folder-add-child';
-      add.dataset.parentFolder = folder.id;
-      add.title = T('新建子文件夹');
-      add.setAttribute('aria-label', T('在 ') + folder.name + T(' 下新建文件夹'));
-      add.textContent = '+';
-      var actions = document.createElement('span');
-      actions.className = 'folder-actions';
-      actions.appendChild(add);
-      actions.appendChild(del);
       row.appendChild(toggle);
       row.appendChild(select);
-      row.appendChild(actions);
       list.appendChild(row);
     });
     $('#folder-empty').hidden = state.folders.length > 0;
@@ -3692,6 +3679,7 @@
       fillSyncForm: fillSyncForm,
       setSyncIndicator: setSyncIndicator,
       isSyncBusy: function () { return syncBusy; },
+      setSyncBusy: function (value) { syncBusy = value; },
       scheduleSyncResume: scheduleSyncResume,
       download: download,
       stamp: stamp
@@ -10110,10 +10098,6 @@
     $('#folder-list').addEventListener('click', function (e) {
       var toggle = e.target.closest('[data-toggle-folder]');
       if (toggle) { toggleFolder(toggle.dataset.toggleFolder); return; }
-      var addChild = e.target.closest('[data-parent-folder]');
-      if (addChild) { openFolderCreator(addChild.dataset.parentFolder); return; }
-      var del = e.target.closest('[data-delete-folder]');
-      if (del) { deleteFolder(del.dataset.deleteFolder); return; }
       var item = e.target.closest('[data-folder]');
       if (item) { selectFolder(item.dataset.folder, { multi: e.ctrlKey || e.metaKey, range: e.shiftKey });  }
     });
@@ -10221,7 +10205,7 @@
     $('#folder-list').addEventListener('dragstart', function (e) {
       var row = e.target.closest('.folder-item[data-folder]');
       if (!row || !e.dataTransfer) return;
-      if (e.target.closest('.folder-toggle, .folder-delete, .folder-add-child')) {
+      if (e.target.closest('.folder-toggle')) {
         e.preventDefault();
         return;
       }

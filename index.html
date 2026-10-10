@@ -88,11 +88,11 @@
     </div>
     <div class="brand-update">
       <span class="brand-version" id="topbar-version"></span>
-      <button class="btn" id="topbar-check-update"><svg class="ic" aria-hidden="true"><use href="#lb-i-refresh"/></svg><span class="btn-label">检查更新</span></button>
+      <button class="btn" id="topbar-check-update" title="检查更新" aria-label="检查更新"><svg class="ic" aria-hidden="true"><use href="#lb-i-refresh"/></svg><span class="btn-label">检查更新</span></button>
     </div>
     <div class="topbar-actions">
-      <button class="btn" id="btn-import" title="导入 .bib / .ris / .pdf / .json 文件"><svg class="ic" aria-hidden="true"><use href="#lb-i-folder-import"/></svg>导入文件</button>
-      <button class="btn" id="btn-add" title="按 DOI / arXiv / 标题添加，或手动录入"><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg>添加</button>
+      <button class="btn" id="btn-import" title="导入 .bib / .ris / .pdf / .json 文件"><svg class="ic" aria-hidden="true"><use href="#lb-i-folder-import"/></svg><span class="btn-label">导入文件</span></button>
+      <button class="btn" id="btn-add" title="按 DOI / arXiv / 标题添加，或手动录入"><svg class="ic" aria-hidden="true"><use href="#lb-i-plus"/></svg><span class="btn-label">添加</span></button>
       <button class="btn" id="btn-enrich" title="用 OpenAlex、Semantic Scholar、Crossref 补全元数据"><svg class="ic" aria-hidden="true"><use href="#lb-i-sparkle"/></svg><span class="btn-label">一键补全</span></button>
       <button class="btn btn-icon" id="btn-enrich-stop" title="中断补全（已命中的结果保留，下次从断点继续）" hidden><svg class="ic" aria-hidden="true"><use href="#lb-i-x"/></svg></button>
       <button class="btn" id="btn-word" title="在 Word 中插入引文与参考文献表（Word 2016+，免安装免宏）"><svg class="ic" aria-hidden="true"><use href="#lb-i-quote"/></svg><span class="btn-label">插入引文</span></button>
@@ -1234,6 +1234,7 @@
           <button type="button" class="btn" id="sync-remote-inspect">查看云端内容</button>
           <button type="button" class="btn" id="sync-remote-restore">从云端恢复…</button>
           <button type="button" class="btn" id="sync-remote-merge">对比本机与云端…</button>
+          <button type="button" class="btn" id="sync-remote-mirror">以本机为准整理云端…</button>
           <span class="sync-inline-status" id="sync-remote-status" role="status" aria-live="polite"></span>
         </div>
       </section>
@@ -1569,6 +1570,11 @@
       <button class="btn" id="sync-remote-choose-local">未决项采用本机</button>
       <button class="btn" id="sync-remote-choose-remote">未决项采用云端</button>
       <input type="search" class="search" id="sync-remote-plan-filter" placeholder="搜索对照项..." style="max-width: 220px; margin-left: auto; height: 30px; font-size: 12px;">
+    </div>
+    <div id="sync-mirror-options" hidden>
+      <p class="field-hint">请先暂停其他设备的同步。整理会用本机内容更新云端，并保留删除标记；多余文件可移入云端备份目录，不会直接销毁。</p>
+      <label><input type="checkbox" id="sync-mirror-confirm"> 我已核对下方清单，确认以当前本机文献库为准</label>
+      <label><input type="checkbox" id="sync-mirror-cleanup"> 同时将清单中的多余文件移入云端备份目录</label>
     </div>
     <div class="remote-plan-list" id="sync-remote-plan-list"></div>
     <div class="remote-plan-progress" id="sync-remote-plan-progress" hidden>

@@ -10,6 +10,7 @@ const LitSync = require('../js/sync.js');
 const LitZotero = require('../js/zotero.js');
 const LitNoteMl = require('../js/noteml.js');
 const LitTranslate = require('../js/translate.js');
+const { createCloudMirror } = require('./cloud-mirror.js');
 const LitEmbedCfg = require('../js/embedcfg.js');
 const LitAgentCfg = require('../js/agentcfg.js');
 const { itemAttachmentDir } = require('./item-storage.js');
@@ -1331,18 +1332,21 @@ function createIntegrations(options) {
         body: PROPFIND_BODY
       });
       throwIfWebDavRateLimited(response);
-      if (response.status === 404 || response.status === 409) return names;
+      if (response.status === 404 || response.status === 409) return verifyListing && page > 0 ? null : names;
       // 部分 WebDAV 服务不支持 Depth:infinity；此时回退到库 JSON 登记名（见调用方）。
       if (response.status === 403 || response.status === 405 || response.status === 501) return null;
       if (!response.ok) throw new Error('坚果云附件清单读取失败（' + response.status + '）');
-      const pageNames = parsePropfindNames(await response.text(), remoteOptions.attachmentsUrl, verifyListing);
+      const pageBody = await response.text();
+      const pageNames = parsePropfindNames(pageBody, remoteOptions.attachmentsUrl, verifyListing);
       if (pageNames === null) return null;
       let fresh = 0;
       pageNames.forEach(function (name) { if (!names.has(name)) { names.add(name); fresh++; } });
       // 不足一页 = 最后一页；fresh=0 = 服务器忽略 Range 一次性给全（或分页停滞）
-      if (pageNames.size < PROPFIND_PAGE_SIZE || fresh === 0) break;
+      const entries = verifyListing ? (pageBody.match(/<(?:[A-Za-z_][\w.-]*:)?response\b/gi) || []).length : pageNames.size;
+      if (entries < PROPFIND_PAGE_SIZE) return names;
+      if (fresh === 0) return verifyListing ? null : names;
     }
-    return names;
+    return verifyListing ? null : names;
   }
 
   /** 本会话的云端对象存在性证据。库 JSON 里的 cloudName 登记绝不能当存在性
@@ -2295,6 +2299,7 @@ function createIntegrations(options) {
 
   async function createNutstoreSyncPlan(input) {
     const value = input && typeof input === 'object' ? input : {};
+    if (value.mode === 'mirror') return runSyncTask(function () { return cloudMirror.create(value); });
     const remoteOptions = await resolveNutstoreOptions(value);
     // 计划流程随后会自行做真实 PROPFIND（resolveRemoteAssetNames），这里跳过
     // inspect 的对账扫描，避免一次会话列两遍附件清单。
@@ -2586,6 +2591,7 @@ function createIntegrations(options) {
 
   async function applyNutstoreSyncPlan(input) {
     const value = input && typeof input === 'object' ? input : {};
+    if (cloudMirror.has(value.planId)) return cloudMirror.apply(value);
     const plan = pendingSyncPlans.get(String(value.planId || ''));
     if (!plan) throw new Error('同步计划不存在或已过期，请重新检查云端');
     const reportProgress = function (phase, extra) {
@@ -3448,6 +3454,23 @@ function createIntegrations(options) {
       agentActiveProviderId: picked.activeId
     });
   }
+
+  const cloudMirror = createCloudMirror({
+    resolveOptions: resolveNutstoreOptions, readWorkspace: options.readWorkspace,
+    readLibrary: readRemoteLibrary, listAssets: listRemoteAssetNames, request: request,
+    hash: hashWorkspace, safeName: safeCloudName, join: joinUrl,
+    checkCancelled: throwIfSyncCancelled, rateLimit: throwIfWebDavRateLimited,
+    ensureFolder: ensureWebDavFolder, syncAssets: syncWorkspaceAssets,
+    writeLibrary: writeCloudLibrary, writeBase: writeSyncBase, syncWorkspace: LitSync.syncWorkspace,
+    progress: emitSyncProgress,
+    withSession: async function (remoteOptions, task) {
+      const session = await createSyncSession(remoteOptions);
+      const previous = activePacer;
+      activePacer = session.pacer;
+      try { return await task(session); }
+      finally { if (activePacer === session.pacer) activePacer = previous; }
+    }
+  });
 
   return { getConfig, saveConfig, getResearchRuntimeConfig, getAgentProviderRuntime, revealSecret, setAgentSelection,
     nutstoreSync: function (value) { return runSyncTask(function () { return nutstoreSync(value); }); }, cancelNutstoreSync,

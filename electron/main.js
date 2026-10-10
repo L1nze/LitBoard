@@ -286,6 +286,9 @@ function createWindow() {
             syncNowInCloudPresent: !!document.querySelector('#sync-run') &&
               !!document.querySelector('#sync-run').closest('.sync-section[data-sync-group="cloud"]') &&
               !document.querySelector('.sync-modal-actions #sync-run'),
+            cloudMirrorControlsPresent: !!document.querySelector('#sync-remote-mirror') &&
+              !!document.querySelector('#sync-mirror-confirm') && !document.querySelector('#sync-mirror-confirm').checked &&
+              !!document.querySelector('#sync-mirror-cleanup') && !document.querySelector('#sync-mirror-cleanup').checked,
             remoteRecoveryApiPresent: !!window.litboardDesktop.inspectNutstoreRemote && !window.litboardDesktop.pullNutstoreConfig &&
               !!window.litboardDesktop.createNutstoreSyncPlan && !!window.litboardDesktop.applyNutstoreSyncPlan,
             // 「数据与备份」的排列：本地数据位置 → 会话记录 → Zotero 文献库 → 完整备份…
@@ -863,9 +866,14 @@ function createWindow() {
               ids.push(row.dataset.folder);
             }
             const row = id => query('#folder-list .folder-item[data-folder="' + id + '"]');
+            result.folderRowsCompact = ids.every(id => row(id).querySelector('.library-count') &&
+              !row(id).querySelector('.folder-actions, .folder-add-child, .folder-delete'));
             row(ids[0]).dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 120 }));
             result.folderImportContextAction = !!query('#ctx-menu') &&
               query('#ctx-menu').textContent.indexOf('在此导入文件夹') !== -1;
+            result.folderContextActionsPresent = !!query('#ctx-menu') &&
+              query('#ctx-menu').textContent.indexOf('新建子文件夹') !== -1 &&
+              query('#ctx-menu').textContent.indexOf('删除文件夹') !== -1;
             document.dispatchEvent(new MouseEvent('click', { bubbles: true }));
             const click = (id, opts) => row(id).querySelector('.folder-select').dispatchEvent(new MouseEvent('click', Object.assign({ bubbles: true }, opts)));
             const selected = () => ids.filter(id => row(id).getAttribute('aria-selected') === 'true');
@@ -913,7 +921,11 @@ function createWindow() {
             for (const id of ids) {
               result.folderCrudStep = 'delete';
               if (!row(id)) continue; // 删除父集合必须一并删除两层子集合。
-              row(id).querySelector('.folder-delete').click();
+              row(id).dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 30, clientY: 120 }));
+              const deleteAction = Array.from(document.querySelectorAll('#ctx-menu .menu-item'))
+                .find(button => button.textContent === '删除文件夹');
+              if (!deleteAction) return false;
+              deleteAction.click();
               query('#dlg-ok').click();
               if (!await waitFor(() => !row(id))) return false;
               if (id === ids[0] && (row(ids[1]) || row(ids[2]))) return false;
@@ -1792,6 +1804,60 @@ function createWindow() {
             workspaceOverflow: ws ? ws.scrollWidth - ws.clientWidth : 0
           };
         })()`);
+        // 字体缩放会改变 CSS 视口宽度；同时覆盖顶栏断点两侧和补全中的长文案。
+        result.responsiveLayout = [];
+        const zoomBefore = mainWindow.webContents.getZoomFactor();
+        const toolbarBefore = await mainWindow.webContents.executeJavaScript(`(() => {
+          const label = document.querySelector('#btn-enrich .btn-label');
+          const stop = document.querySelector('#btn-enrich-stop');
+          const issues = document.querySelector('#btn-issues');
+          const ws = document.querySelector('.workspace');
+          const before = { label: label.textContent, stop: stop.hidden, issues: issues.hidden, transition: ws.style.transition };
+          // 隐藏窗口可能暂停动画帧；直接验证最终轨道宽度，避免采到过渡中间态。
+          ws.style.transition = 'none';
+          label.textContent = 'Enriching 10000/10000';
+          stop.hidden = false;
+          issues.hidden = false;
+          return before;
+        })()`);
+        for (const zoom of [1, 1.2, 1.3]) {
+          mainWindow.webContents.setZoomFactor(zoom);
+          for (const width of [1080, 1240, 1280, 1512]) {
+            mainWindow.setContentSize(width, sizeBefore[1]);
+            // 隐藏窗口的原生 resize 派发可能滞后；截图刷新视口，再走真实的 resize handler。
+            await mainWindow.webContents.capturePage();
+            await mainWindow.webContents.executeJavaScript(`window.dispatchEvent(new Event('resize'));`);
+            await new Promise(resolve => setTimeout(resolve, 500));
+            const layout = await mainWindow.webContents.executeJavaScript(`(() => {
+              const bar = document.querySelector('.topbar');
+              const ws = document.querySelector('.workspace');
+              const buttons = [...bar.querySelectorAll('button')].filter(b => b.getBoundingClientRect().height > 0);
+              const rects = buttons.map(b => b.getBoundingClientRect());
+              const tops = rects.map(r => r.top);
+              return {
+                innerWidth,
+                docOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+                barOverflow: bar.scrollWidth - bar.clientWidth,
+                workspaceOverflow: ws.scrollWidth - ws.clientWidth,
+                workspaceWidth: ws.clientWidth,
+                gridColumns: getComputedStyle(ws).gridTemplateColumns,
+                sideWidths: [ws.dataset.leftWidth, ws.dataset.rightWidth],
+                buttonsVisible: rects.every(r => r.left >= -1 && r.right <= innerWidth + 1 && r.width >= 30),
+                topSpread: Math.round(Math.max(...tops) - Math.min(...tops))
+              };
+            })()`);
+            const viewportMatches = Math.abs(layout.innerWidth - mainWindow.getContentSize()[0] / zoom) <= 3;
+            result.responsiveLayout.push({ width, zoom, viewportMatches, ...layout });
+          }
+        }
+        await mainWindow.webContents.executeJavaScript(`(() => {
+          const before = ${JSON.stringify(toolbarBefore)};
+          document.querySelector('#btn-enrich .btn-label').textContent = before.label;
+          document.querySelector('#btn-enrich-stop').hidden = before.stop;
+          document.querySelector('#btn-issues').hidden = before.issues;
+          document.querySelector('.workspace').style.transition = before.transition;
+        })()`);
+        mainWindow.webContents.setZoomFactor(zoomBefore);
         mainWindow.setContentSize(sizeBefore[0], sizeBefore[1]);
         // 弹窗栈覆盖：DOM 里每个 .modal-mask 都必须在 LitModal 登记（漏登记 = Esc 关不掉 + 单键快捷键穿透）
         result.modalStackCoverage = await mainWindow.webContents.executeJavaScript(`(function () {
@@ -1908,6 +1974,7 @@ function createWindow() {
           result.issuesCenterPresent && result.onboardPresent &&
           result.pdfNavigationUiPresent && result.paginationPresent &&
           result.paginationWorks && result.folderCreateOpens && result.folderCrudAndDragWorks && result.renderedRows <= 100 && result.sqliteStorageReady &&
+          result.folderRowsCompact === true && result.folderContextActionsPresent === true &&
           result.libraryNavContextMenu === true &&
           result.trashNavPresent && result.smartFolderUiAbsent && result.tagManagePresent && result.cslUiPresent &&
           result.syncIndicatorPresent && result.bridgeUiPresent && result.pdfReaderExtrasPresent && result.pdfSideControlsWork &&
@@ -1919,6 +1986,8 @@ function createWindow() {
           result.topbarMenuExclusive === true && result.topbarMenuOnTop === true &&
           result.topbarNarrow && result.topbarNarrow.noWrap === true && result.topbarNarrow.topSpread <= 3 &&
           result.topbarNarrow.overflow <= 1 && result.topbarNarrow.innerWidth <= 1090 &&
+          result.responsiveLayout.every(layout => layout.docOverflow <= 1 && layout.barOverflow <= 1 &&
+            layout.workspaceOverflow <= 1 && layout.buttonsVisible && layout.topSpread <= 3 && layout.viewportMatches) &&
           result.removedSettingsAbsent && result.simplifiedBackupUiPresent &&
           result.saveLibraryWorks && result.cslVendorRender && result.quitAckWorks && result.closeRequestAckWorks && pdfPassed && pdfWritePassed && pdfTabDetailPassed && epubPassed &&
           selectionPopoverPassed;
@@ -2161,6 +2230,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
     console.warn('LitBoard database was damaged and has been restored from a full snapshot.');
   }
   ctx.integrations = createIntegrations({
+    readWorkspace: function () { return ctx.libraryDb.loadState(); },
     baseDir: configDir,
     homeDir: app.getPath('home'),
     appDataDir: app.getPath('appData'),

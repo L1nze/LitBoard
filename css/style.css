@@ -671,6 +671,11 @@ body, .topbar, .library-sidebar, .detail-sidebar, .drawer, .tile, .chart-card,
   display: flex; align-items: center; gap: 10px;
   flex: none; min-width: 0;
 }
+.topbar-left { flex: 1; }
+/* 文案随剩余空间收缩，给右侧工具和窗口控制留出完整宽度；长状态不撑开整窗。 */
+.topbar-left .topbar-actions { flex: 1; min-width: 0; }
+.topbar-left .topbar-actions .btn { flex-shrink: 1; min-width: 32px; }
+.topbar-left .btn-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .topbar-right { gap: 0; }
 /* 工具簇内的语义分组分隔线（历史 | 导出 | 同步/主题/设置 | 更多） */
 .topbar-sep {
@@ -691,6 +696,9 @@ body, .topbar, .library-sidebar, .detail-sidebar, .drawer, .tile, .chart-card,
   .topbar { gap: 8px; padding-left: 14px; }
   .topbar-actions { gap: 3px; }
   .topbar .btn { padding: 5px 8px; gap: 3px; font-size: 12px; }
+}
+@media (max-width: 1000px) {
+  .brand-update .btn-label { display: none; }
 }
 
 /* ---------------- 按钮 ---------------- */
@@ -1407,25 +1415,6 @@ body.resizing-tags { cursor: row-resize; user-select: none; }
   font-variant-numeric: tabular-nums;
   line-height: 1.4;
 }
-.folder-actions { display: flex; visibility: hidden; align-items: center; flex: 0 0 46px; }
-.folder-delete,
-.folder-add-child {
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--danger);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.folder-add-child { color: var(--text-secondary); }
-.folder-item:hover .folder-actions,
-.folder-item:focus-within .folder-actions { visibility: visible; }
-.folder-add-child:hover { background: var(--hover); color: var(--text-primary); }
-.folder-delete:hover { background: var(--danger-soft); }
 .folder-empty {
   padding: 12px 8px;
   color: var(--text-muted);
@@ -1606,12 +1595,12 @@ body.resizing-tags { cursor: row-resize; user-select: none; }
 
 .lit-table tbody tr.detail-active { background: var(--accent-soft); }
 
-@media (max-width: 900px) {
-  /* 下限与主网格一致（430px）；窗口最小 1080 时此断点本不会触发，仅作防御 */
+@media (max-width: 960px) {
+  /* 字体放大后 CSS 视口可小于 1080；三栏最小预算为 160 + 430 + 300 + 42 = 932。 */
   .workspace { grid-template-columns: minmax(430px, 1fr) var(--detail-column-width, var(--detail-width)) var(--rail-width); }
   .center-pane { grid-column: 1; }
   .detail-sidebar { grid-column: 2; }
-  .right-rail { grid-column: 3; }
+  .workspace .right-rail { grid-column: 3; }
   .library-sidebar { display: none; }
   .pane-resizer-left { display: none; }
   #btn-left-sidebar-open, #btn-left-sidebar-collapse { display: none !important; }

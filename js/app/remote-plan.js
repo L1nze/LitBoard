@@ -22,6 +22,7 @@
     var fillSyncForm = options.fillSyncForm;
     var setSyncIndicator = options.setSyncIndicator;
     var isSyncBusy = options.isSyncBusy || function () { return false; };
+    var setSyncBusy = options.setSyncBusy || function () {};
     var download = options.download;
     var stamp = options.stamp || function () { return new Date().toISOString().slice(0, 10); };
     var refreshSyncFormAfterSync = false;
@@ -45,12 +46,18 @@
     }
     var pendingConflictExport = [];
     var pendingRemotePlan = null;
+    var mirrorLocalSnapshot = null;
     var pendingRemoteResolutions = {};
     var LOCAL_EMPTY_RESET_KEY = 'plan:local-empty-reset'; // 与主进程 integrations.js 保持一致
     var MASS_DROP_RESET_KEY = 'plan:mass-drop-reset';     // 合并将大批移除云端词条的强制确认
     var FIRST_UPLOAD_KEY = 'plan:first-upload';           // 云端无库、本机非空的首传确认
     var remotePlanApplying = false;
     var remotePlanStopping = false;
+    // 计划生成进行中：生成占用主进程同步槽位（runSyncTask 串行），渲染层必须
+    // 同步置 busy——否则编辑防抖/15 分钟定时/限流续传的后台同步会插队，一边在
+    // 主进程撞车报「已有同步任务正在进行」，一边递增 inspectionRevision 把刚
+    // 生成的对照静默作废，状态行永远停在「正在读取云端并生成对照…」。
+    var remotePlanCreating = false;
 
     function remotePlanId(plan) {
       return plan && (plan.planId || plan.id || plan.token) || '';
@@ -125,14 +132,23 @@
       if (!pendingRemotePlan) return;
       var totalRequired = remotePlanModel.requiredKeys.size;
       var resolvedCount = remotePlanModel.resolvedKeys.size;
-      var totalItems = remotePlanModel.items.length;
+      if (pendingRemotePlan.mode === 'mirror') {
+        $('#sync-remote-plan-summary').textContent = T('以本机为准整理云端') + ' · ' +
+          T('本机有效文献：') + pendingRemotePlan.localCount + T(' 篇') + ' · ' +
+          T('云端有效文献：') + pendingRemotePlan.remoteCount + T(' 篇') + ' · ' +
+          T('多余文件：') + (pendingRemotePlan.extras || []).length + ' · ' + T('待补齐附件：') + (pendingRemotePlan.missing || []).length +
+          ' · ' + T('备份目录：') + pendingRemotePlan.archivePath +
+          (pendingRemotePlan.cleanupSupported ? '' : ' · ' + T('部分文件缺少版本标识，暂不可归档，只能同步文献'));
+        return;
+      }
+      var localOnlyCount = remotePlanModel.items.filter(function (item) { return item.kind === 'local-only'; }).length;
       var remoteState = pendingRemotePlan.remoteExists === false
         ? T('云端库文件不存在')
         : T('云端 ') + (pendingRemotePlan.remoteCount == null ? T('未知') : pendingRemotePlan.remoteCount) + T(' 篇');
       var summary = (pendingRemotePlan.mode === 'restore' ? T('云端恢复') : T('普通同步')) +
         ' · ' + remoteState +
         T(' · 待选择 ') + totalRequired + T(' 项（已选 ') + resolvedCount + '/' + totalRequired + '）' +
-        (totalItems > totalRequired ? T('，仅本机 ') + (totalItems - totalRequired) + T(' 项') : '') + '。' +
+        (localOnlyCount ? T('，仅本机 ') + localOnlyCount + T(' 项') : '') + '。' +
         T('采用本机＝本机保留；云端无此条目时会重新上传，云端已有另一版本时保持云端副本不变。') +
         T('采用云端＝本机改用云端内容。') +
         (pendingRemotePlan.localEmptyReset ? T('检测到本机文献为 0 而同步基线仍有内容（常见于本机读取失败或切换过数据目录），已暂停自动同步，请先选择处理方式。') :
@@ -192,6 +208,7 @@
       var undecided = 0;
       for (var i = 0; i < remotePlanModel.items.length; i++) {
         var item = remotePlanModel.items[i];
+        if (item.kind === 'info') continue;
         if (pendingRemoteResolutions[item.key] !== choice) changed++;
         pendingRemoteResolutions[item.key] = choice;
         if (item.isRequired) {
@@ -224,6 +241,7 @@
       head.appendChild(hint);
       row.appendChild(head);
 
+      if (item.kind === 'info') return row;
       var curChoice = pendingRemoteResolutions[key];
 
       if (item.kind === 'conflict') {
@@ -342,6 +360,31 @@
       remotePlanModel.filterText = '';
       remotePlanModel.chunkSize = 60;
 
+      var isMirror = plan.mode === 'mirror';
+      $('#sync-mirror-options').hidden = !isMirror;
+      $('#sync-mirror-confirm').checked = false;
+      $('#sync-mirror-cleanup').checked = false;
+      $('#sync-mirror-cleanup').disabled = !plan.cleanupSupported;
+      $('#sync-remote-choose-local').hidden = isMirror;
+      $('#sync-remote-choose-remote').hidden = isMirror;
+      $('#sync-remote-plan-title').textContent = isMirror ? T('以本机为准整理云端') : T('云端同步对照');
+      if (isMirror) {
+        remotePlanModel.requiredKeys.add('mirror:confirm');
+        pendingRemoteResolutions['mirror:cleanup'] = 'remote';
+        (plan.changes || []).forEach(function (change, index) {
+          var action = change.action === 'remove' ? T('从云端库移除') : change.action === 'upload' ? T('上传本机条目') : T('以本机内容更新');
+          remotePlanModel.items.push({ key: 'mirror-change:' + index, kind: 'info', label: action + ' · ' + ({ papers: T('文献'), notes: T('笔记'), folders: T('文件夹'), savedSearches: T('智能文件夹'), tagColorRecords: T('标签颜色') }[change.collection] || '') + ' · ' + change.title, hint: '', localText: change.title });
+        });
+        (plan.extras || []).forEach(function (asset, index) {
+          remotePlanModel.items.push({ key: 'mirror-extra:' + index, kind: 'info', label: T('多余文件 · ') + asset.name,
+            hint: T('仅勾选归档时移动；未勾选则保留原文件'), remoteText: asset.name });
+        });
+        (plan.missing || []).forEach(function (asset, index) {
+          remotePlanModel.items.push({ key: 'mirror-missing:' + index, kind: 'info', label: T('待补齐附件 · ') + asset.name,
+            hint: asset.hasLocalPath ? T('执行时核对本机文件并补传') : T('本机未登记文件路径；无法补齐时会停止整理'), localText: asset.name });
+        });
+      }
+
       var allConflicts = remotePlanConflicts(plan);
       var conflicts = allConflicts.filter(function (conflict) { return conflict.direction !== 'local-only'; });
       var localOnly = remotePlanLocalOnly(plan);
@@ -434,6 +477,15 @@
         });
       });
 
+      (plan.remoteOnly || []).forEach(function (marker, index) {
+        var entity = marker.entity || marker.value || {};
+        if (entity.deletedAt) return;
+        remotePlanModel.items.push({ key: 'remote-info:' + index, kind: 'info',
+          label: T('仅云端 · ') + (entity.title || entity.name || marker.id),
+          hint: T('普通同步按合并计划处理；要使云端与本机一致，请使用「以本机为准整理云端」'),
+          remoteText: entity.title || entity.name || marker.id });
+      });
+
       remotePlanModel.filteredItems = remotePlanModel.items;
 
       var filterInput = $('#sync-remote-plan-filter');
@@ -453,6 +505,7 @@
     var inspectionRevision = 0;
 
     function inspectRemote() {
+      if (remotePlanCreating) return; // 生成中的计划占用状态行与同步槽位，手动检查顺延
       if (!desktop || !desktop.inspectNutstoreRemote) { setSyncInlineStatus('sync-remote-status', T('当前版本不支持云端检查'), 'error'); return; }
       var revision = ++inspectionRevision;
       var config = syncFormValue();
@@ -498,14 +551,35 @@
     }
 
     function createRemotePlan(mode) {
-      inspectionRevision++;
+      if (remotePlanApplying || remotePlanCreating) return;
+      if (isSyncBusy()) { setSyncInlineStatus('sync-remote-status', T('后台同步正在进行，请稍后再试'), 'warning'); return; }
       if (!desktop || !desktop.createNutstoreSyncPlan) { setSyncInlineStatus('sync-remote-status', T('当前版本不支持云端恢复计划'), 'error'); return; }
+      var requestRevision = ++inspectionRevision;
+      remotePlanCreating = true;
+      setSyncBusy(true);
       setSyncInlineStatus('sync-remote-status', T('正在读取云端并生成对照…'), 'pending');
-      desktop.createNutstoreSyncPlan({ config: syncFormValue(), workspace: workspacePayload(), mode: mode }).then(function (plan) {
+      var currentWorkspace = workspacePayload();
+      var snapshot = JSON.stringify(currentWorkspace);
+      var stopButton = $('#sync-stop');
+      if (mode === 'mirror' && stopButton) { stopButton.hidden = false; stopButton.disabled = false; }
+      Promise.resolve().then(function () {
+        return desktop.createNutstoreSyncPlan({ config: syncFormValue(), workspace: currentWorkspace, mode: mode });
+      }).then(function (plan) {
+        if (requestRevision !== inspectionRevision) {
+          // 被更新的请求取代：必须明确告知并复位，不能让状态行悬挂在「正在生成」
+          setSyncInlineStatus('sync-remote-status', T('云端状态已变化，本次对照已作废，请重试'), 'warning');
+          return;
+        }
+        if (mode === 'mirror' && JSON.stringify(workspacePayload()) !== snapshot) throw new Error(T('本机文献库已变化，请重新预览整理计划'));
+        mirrorLocalSnapshot = mode === 'mirror' ? snapshot : null;
         renderRemotePlan(plan || {});
         setSyncInlineStatus('sync-remote-status', T('已生成对照，请完成选择后应用'), 'warning');
       }).catch(function (error) {
         setSyncInlineStatus('sync-remote-status', error && error.message || String(error), 'error');
+      }).finally(function () {
+        remotePlanCreating = false;
+        setSyncBusy(false);
+        if (mode === 'mirror' && stopButton) stopButton.hidden = true;
       });
     }
 
@@ -527,6 +601,8 @@
 
     function setRemotePlanApplying(applying) {
       remotePlanApplying = applying;
+      $('#sync-mirror-confirm').disabled = applying;
+      $('#sync-mirror-cleanup').disabled = applying || !(pendingRemotePlan && pendingRemotePlan.cleanupSupported);
       var progress = $('#sync-remote-plan-progress');
       var list = $('#sync-remote-plan-list');
       var filterInput = $('#sync-remote-plan-filter');
@@ -576,6 +652,7 @@
     function setRemotePlanCompleted(message) {
       remotePlanApplying = false;
       remotePlanStopping = false;
+      $('#sync-mirror-options').hidden = true;
       var progress = $('#sync-remote-plan-progress');
       var list = $('#sync-remote-plan-list');
       var filterInput = $('#sync-remote-plan-filter');
@@ -601,6 +678,12 @@
         }
         return;
       }
+      // 计划生成中的只读预览可能长达数分钟（逐文件 HEAD 受节流间隔限制），
+      // 阶段进度必须透到对照状态行，否则看起来与卡死无异。
+      if (remotePlanCreating && payload.scope === 'plan') {
+        if (payload.message) setSyncInlineStatus('sync-remote-status', payload.message, 'pending');
+        return;
+      }
       // 后台自动同步：设置弹窗开着时把阶段信息透出到状态行
       if (payload.message && isSyncBusy()) {
         var status = $('#sync-status');
@@ -612,7 +695,7 @@
     function applyRemotePlan() {
       inspectionRevision++;
       if (!pendingRemotePlan || !desktop || !desktop.applyNutstoreSyncPlan) return;
-      if (remotePlanApplying) return;
+      if (remotePlanApplying || remotePlanCreating) return;
       // 首传确认选了「取消」：云端本来就没有库文件，直接关弹窗即可，无需调后端
       if (pendingRemotePlan.firstUploadSuspected &&
           String(pendingRemoteResolutions[FIRST_UPLOAD_KEY]).toLowerCase() === 'remote') {
@@ -621,17 +704,31 @@
         return;
       }
       var planMode = pendingRemotePlan.mode;
+      if (planMode === 'mirror' && (pendingRemoteResolutions['mirror:confirm'] !== 'local' || mirrorLocalSnapshot !== JSON.stringify(workspacePayload()))) {
+        setSyncInlineStatus('sync-remote-status', T('请核对确认；本机内容变化后需重新预览整理计划'), 'warning');
+        return;
+      }
       var button = $('#sync-remote-plan-apply'); button.disabled = true;
       remotePlanStopping = false;
       var cancelButton = $('#sync-remote-plan-cancel');
       if (cancelButton) { cancelButton.disabled = false; cancelButton.textContent = T('停止同步'); }
       setRemotePlanApplying(true);
+      setSyncBusy(true); // 应用同样占用主进程同步槽位，后台同步不得插队撞车
       setRemotePlanProgress({ phase: 'verify', message: T('正在校验云端版本…') });
       setSyncInlineStatus('sync-remote-status', T('正在校验云端版本并应用…'), 'pending');
       var applyAssetFailures = 0;
       var applyPaused = null;
-      desktop.applyNutstoreSyncPlan({ planId: remotePlanId(pendingRemotePlan), resolutions: pendingRemoteResolutions }).then(function (result) {
+      var mirrorResult = null;
+      Promise.resolve().then(function () {
+        return desktop.applyNutstoreSyncPlan({ planId: remotePlanId(pendingRemotePlan), resolutions: pendingRemoteResolutions, workspace: workspacePayload() });
+      }).then(function (result) {
         var workspace = result && result.workspace ? result.workspace : result;
+        mirrorResult = result && result.mirror;
+        if (mirrorResult && mirrorLocalSnapshot !== JSON.stringify(workspacePayload())) {
+          workspace = null;
+          mirrorResult.complete = false;
+          mirrorResult.message = T('本机已有新修改，未用整理结果覆盖；请重新对照');
+        }
         var assets = result && result.assets || {};
         applyAssetFailures = (assets.failures || []).length;
         if (result && result.paused) applyPaused = result;
@@ -658,19 +755,27 @@
           toast('⚠ ' + pausedLabel);
           return;
         }
-        var label = planMode === 'merge' ? T('同步对照已应用') : T('云端恢复完成');
-        if (applyAssetFailures) label += '（' + applyAssetFailures + T(' 个附件未完成，下次同步自动续传）');
+        var label = planMode === 'mirror' ? T('云端整理完成') : planMode === 'merge' ? T('同步对照已应用') : T('云端恢复完成');
+        if (mirrorResult) {
+          label = (mirrorResult.complete ? T('云端整理完成') : T('文献清单已更新，文件整理未完成，请重新预览')) +
+            ' · ' + T('已归档文件：') + mirrorResult.moved + ' · ' + T('备份目录：') + mirrorResult.archivePath +
+            (mirrorResult.message ? ' · ' + mirrorResult.message : '');
+          if (!mirrorResult.complete) applyAssetFailures++;
+        }
+        if (applyAssetFailures && !mirrorResult) label += '（' + applyAssetFailures + T(' 个附件未完成，下次同步自动续传）');
         setSyncInlineStatus('sync-remote-status', label, applyAssetFailures ? 'warning' : 'success');
         setRemotePlanCompleted(label);
         toast(label);
-        inspectRemote();
+        if (!mirrorResult || mirrorResult.complete) inspectRemote();
       }).catch(function (error) {
         var stopped = error && (error.code === 'SYNC_CANCELLED' || String(error.message || error).indexOf('同步已停止') !== -1);
         resetRemotePlanProgressUi();
-        button.disabled = false;
+        button.disabled = planMode === 'mirror';
         setSyncInlineStatus('sync-remote-status', stopped
           ? T('同步已停止；已上传附件下次可续传') : error && error.message || String(error),
         stopped ? 'warning' : 'error');
+      }).finally(function () {
+        setSyncBusy(false);
       });
     }
 
@@ -693,6 +798,14 @@
       $('#sync-remote-inspect').addEventListener('click', api.inspect);
       $('#sync-remote-restore').addEventListener('click', function () { api.createPlan('restore'); });
       $('#sync-remote-merge').addEventListener('click', function () { api.createPlan('merge'); });
+      $('#sync-remote-mirror').addEventListener('click', function () { api.createPlan('mirror'); });
+      $('#sync-mirror-confirm').addEventListener('change', function () {
+        setRemotePlanChoice('mirror:confirm', this.checked ? 'local' : '');
+        updateRemotePlanSummary();
+      });
+      $('#sync-mirror-cleanup').addEventListener('change', function () {
+        pendingRemoteResolutions['mirror:cleanup'] = this.checked ? 'local' : 'remote';
+      });
       $('#sync-remote-plan-cancel').addEventListener('click', cancelOrCloseRemotePlan);
       $('#sync-remote-plan-apply').addEventListener('click', api.apply);
       $('#sync-remote-choose-local').addEventListener('click', function () {
@@ -757,7 +870,8 @@
       markRefreshFormAfterSync: function () { refreshSyncFormAfterSync = true; },
       shouldRefreshForm: function () { return refreshSyncFormAfterSync; },
       stateForTest: function () {
-        return { model: remotePlanModel, plan: pendingRemotePlan, resolutions: pendingRemoteResolutions, applying: remotePlanApplying };
+        return { model: remotePlanModel, plan: pendingRemotePlan, resolutions: pendingRemoteResolutions,
+          applying: remotePlanApplying, creating: remotePlanCreating };
       }
     };
     return api;
