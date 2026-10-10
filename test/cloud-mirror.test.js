@@ -10,7 +10,7 @@ const Mirror = require('../js/cloudmirror.js');
 const Sync = require('../js/sync.js');
 const { createIntegrations } = require('../electron/integrations.js');
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-mirror-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const base = 'https://dav.jianguoyun.com/dav/LitBoard/';
@@ -27,13 +27,19 @@ async function fixture(t) {
     notes: [{ id: 'remoteNote', paperId: 'extra' }], folders: [{ id: 'remoteFolder', name: 'remote' }] });
   put(library, JSON.stringify(Sync.createSyncEnvelope(remote)));
   put(attachments + 'keep.pdf', pdf); put(attachments + 'extra.pdf', '%PDF-extra'); put(attachments + 'orphan.pdf', '%PDF-orphan');
-  const state = { local, files, calls, library, attachments, base, put, denyListing: false, failUpload: false, failBackup: false, afterMove: null, progress: [] };
+  const state = { local, files, calls, library, attachments, base, put, denyListing: false, omitEtags: false,
+    failUpload: false, failBackup: false, afterMove: null, progress: [] };
   const api = createIntegrations({ baseDir: dir, homeDir: dir, readWorkspace: async () => state.local,
+    requestTimeoutMs: options.requestTimeoutMs,
     notify: (channel, payload) => { if (channel === 'integrations:sync-progress') state.progress.push(payload); },
     safeStorage: { isEncryptionAvailable: () => true, encryptString: s => Buffer.from(s), decryptString: b => b.toString() },
     fetch: async (url, init) => {
       const method = init.method, headers = init.headers || {}; calls.push({ method, url, headers });
       const item = files.get(url);
+      if (method === 'GET' && state.onGet) {
+        const response = state.onGet(url, init, item);
+        if (response) return response;
+      }
       if (method === 'GET' || method === 'HEAD') return item
         ? new Response(method === 'HEAD' ? null : item.body, { status: 200, headers: { ETag: item.etag, 'Content-Length': item.body.length } })
         : new Response('', { status: 404 });
@@ -41,13 +47,18 @@ async function fixture(t) {
         if (state.denyListing) return new Response('', { status: 405 });
         const root = url.replace(/\/$/, '') + '/';
         const names = [root].concat([...files.keys()].filter(k => k.startsWith(root)));
-        return new Response('<d:multistatus xmlns:d="DAV:">' + names.map(k => '<d:response><d:href>' + new URL(k).pathname +
-          '</d:href><d:propstat><d:prop/><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>').join('') + '</d:multistatus>', { status: 207 });
+        return new Response('<d:multistatus xmlns:d="DAV:">' + names.map(k => {
+          const file = files.get(k);
+          const etag = file && !state.omitEtags ? '<d:getetag>' + file.etag + '</d:getetag>' : '';
+          return '<d:response><d:href>' + new URL(k).pathname +
+            '</d:href><d:propstat><d:prop>' + etag + '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>';
+        }).join('') + '</d:multistatus>', { status: 207 });
       }
       if (method === 'MKCOL') return new Response('', { status: 201 });
       if (headers['If-Match'] && (!item || headers['If-Match'] !== item.etag)) return new Response('', { status: 412 });
       if (headers['If-None-Match'] === '*' && item) return new Response('', { status: 412 });
       if (method === 'PUT') {
+        if (state.onAssetUpload && url.startsWith(attachments)) state.onAssetUpload(url);
         if (state.failUpload && url.startsWith(attachments)) return new Response('', { status: 500 });
         if (state.failBackup && url.endsWith('manifest.json')) return new Response('', { status: 500 });
         put(url, init.body); return new Response('', { status: 201, headers: { ETag: files.get(url).etag } });
@@ -97,6 +108,27 @@ test('mirror preview is read-only; apply reconciles entries and archives exact r
   const extrasSteps = f.progress.filter(p => p.scope === 'plan' && p.phase === 'extras');
   assert.equal(extrasSteps.length, plan.extras.length, 'one progress event per extra file HEAD');
   assert.match(extrasSteps[0].message, /1\/2/);
+});
+
+test('mirror attachment progress advances before each upload and identifies the active plan and file', async t => {
+  const f = await fixture(t);
+  f.files.delete(f.attachments + 'keep.pdf');
+  f.local.papers[0].attachments.push({ ...f.local.papers[0].attachments[0],
+    id: 'b', fileName: 'second.pdf', cloudName: 'second.pdf' });
+  const plan = await f.preview(), duringUploads = [];
+  f.onAssetUpload = () => {
+    duringUploads.push(f.progress.filter(p => p.scope === 'apply-plan' && p.phase === 'assets').at(-1));
+  };
+  const result = await f.apply(plan, 'remote');
+  assert.equal(result.assets.uploaded, 2);
+  assert.deepEqual(duringUploads.map(p => [p.planId, p.done, p.total, p.current]), [
+    [plan.planId, 0, 2, 'p.pdf'],
+    [plan.planId, 1, 2, 'second.pdf']
+  ], 'the dialog must receive current-file progress while uploads are still in flight');
+  const completed = f.progress.filter(p => p.scope === 'apply-plan' && p.phase === 'assets').at(-1);
+  assert.equal(completed.done, 2);
+  assert.equal(completed.total, 2);
+  assert.match(duringUploads[1].message, /1\/2.*second\.pdf/);
 });
 
 test('cleanup protects live PDFs, snapshots, annotations and note images, excludes deleted owners', () => {
@@ -179,4 +211,76 @@ test('cancel after a move stops further cleanup and never auto-replays the plan'
   assert.ok(f.files.has(f.base + plan.archivePath + 'manifest.json'));
   assert.ok(f.files.has(f.attachments + 'orphan.pdf'));
   await assert.rejects(f.apply(plan), /过期/);
+});
+
+test('mirror stops waiting when an attachment response body stalls after headers', async t => {
+  const f = await fixture(t, { requestTimeoutMs: 40 });
+  f.local.papers[0].attachments[0].path = '';
+  const plan = await f.preview(), original = f.files.get(f.library).body.toString();
+  let stream, started;
+  const receiving = new Promise(resolve => { started = resolve; });
+  f.onGet = (url, init) => {
+    if (url !== f.attachments + 'keep.pdf') return null;
+    const response = new Response(new ReadableStream({ start(controller) {
+      stream = controller;
+      init.signal.addEventListener('abort', () => controller.error(new Error('aborted')), { once: true });
+    } }), { status: 200 });
+    const read = response.arrayBuffer.bind(response);
+    response.arrayBuffer = () => { started(); return read(); };
+    return response;
+  };
+  const applying = f.apply(plan).then(() => 'completed', error => error.message);
+  await receiving;
+  const outcome = await Promise.race([applying, new Promise(resolve => setTimeout(() => resolve('still waiting'), 2000))]);
+  stream.error(new Error('fixture cleanup'));
+  await applying;
+  assert.notEqual(outcome, 'still waiting', 'the response-body read must have a deadline, not only the response headers');
+  assert.match(outcome, /附件未完成/);
+  assert.match(outcome, /网络请求超时/, 'the visible failure must retain the transport cause');
+  assert.equal(f.files.get(f.library).body.toString(), original);
+  assert.ok(!f.calls.some(c => c.method === 'MOVE'));
+});
+
+test('mirror cancellation interrupts an attachment response body after headers', async t => {
+  const f = await fixture(t);
+  f.local.papers[0].attachments[0].path = '';
+  const plan = await f.preview();
+  let stream, started;
+  const receiving = new Promise(resolve => { started = resolve; });
+  f.onGet = (url, init) => {
+    if (url !== f.attachments + 'keep.pdf') return null;
+    const response = new Response(new ReadableStream({ start(controller) {
+      stream = controller;
+      init.signal.addEventListener('abort', () => controller.error(new Error('aborted')), { once: true });
+    } }), { status: 200 });
+    const read = response.arrayBuffer.bind(response);
+    response.arrayBuffer = () => { started(); return read(); };
+    return response;
+  };
+  const applying = f.apply(plan).then(() => 'completed', error => error.code);
+  await receiving;
+  f.api.cancelNutstoreSync();
+  const outcome = await Promise.race([applying, new Promise(resolve => setTimeout(() => resolve('still waiting'), 2000))]);
+  stream.error(new Error('fixture cleanup'));
+  await applying;
+  assert.equal(outcome, 'SYNC_CANCELLED', 'stop must interrupt the download, not wait for its body to finish');
+  assert.ok(!f.calls.some(c => c.method === 'MOVE'));
+});
+
+test('extra-file ETags come from the listing getetag: preview sends no HEADs and cleanup still archives', async t => {
+  const f = await fixture(t), plan = await f.preview();
+  assert.ok(!f.calls.some(c => c.method === 'HEAD'), '坚果云 HEAD 不带 ETag；ETag 必须来自清单 getetag');
+  assert.equal(plan.cleanupSupported, true);
+  const result = await f.apply(plan);
+  assert.equal(result.mirror.complete, true);
+  assert.equal(result.mirror.moved, 2, '执行前核对走同一份清单映射，归档照常');
+});
+
+test('when the server omits getetag the preview falls back to per-file HEAD and keeps cleanup available', async t => {
+  const f = await fixture(t); f.omitEtags = true;
+  const plan = await f.preview();
+  assert.ok(f.calls.some(c => c.method === 'HEAD'), '清单无 getetag 时回退逐文件 HEAD');
+  assert.equal(plan.cleanupSupported, true);
+  const result = await f.apply(plan, 'remote');
+  assert.equal(result.mirror.complete, true, '执行前核对同样回退 HEAD');
 });

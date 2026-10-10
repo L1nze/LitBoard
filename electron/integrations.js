@@ -203,47 +203,64 @@ function createIntegrations(options) {
   // 同步会话期间非空的节流器：所有 WebDAV 请求经它排队（坚果云 30 分钟窗口预算），
   // 并在响应 429 时记下暂停时刻。仅在 runSyncTask 串行保护的同步会话内赋值。
   let activePacer = null;
-  const dispatchRequest = function (url, init) {
-    return new Promise(function (resolve, reject) {
-      let settled = false;
-      const controller = typeof AbortController === 'function' ? new AbortController() : null;
-      const sync = syncContext.getStore();
-      if (sync && sync.signal.aborted) { reject(syncCancelled()); return; }
-      const requestInit = Object.assign({}, init || {});
-      if (controller) requestInit.signal = controller.signal;
-      function finish() { clearTimeout(timer); if (sync) sync.signal.removeEventListener('abort', onAbort); }
-      function onAbort() {
-        if (settled) return;
-        settled = true;
-        if (controller) controller.abort();
-        finish();
-        reject(syncCancelled());
-      }
-      if (sync) sync.signal.addEventListener('abort', onAbort, { once: true });
-      // 上传大附件时 30s 默认值会中途掐死传输：按负载大小放宽最后期限
-      const reqBody = requestInit.body;
-      const bodySize = reqBody == null ? 0 : (typeof reqBody === 'string' ? Buffer.byteLength(reqBody) :
-        (typeof reqBody.length === 'number' ? reqBody.length : (typeof reqBody.byteLength === 'number' ? reqBody.byteLength : 0)));
-      const timeoutMs = requestTimeoutMs(bodySize, REQUEST_TIMEOUT_MS);
-      const timer = setTimeout(function () {
-        if (settled) return;
-        settled = true;
-        if (controller) controller.abort();
-        finish();
-        reject(new Error('网络请求超时（' + Math.round(timeoutMs / 1000) + 's）：' + String(url)));
-      }, timeoutMs);
-      Promise.resolve().then(function () { if (sync && sync.signal.aborted) throw syncCancelled(); return rawRequest(url, requestInit); }).then(function (response) {
-        if (settled) return;
-        settled = true;
-        finish();
-        resolve(response);
-      }, function (error) {
-        if (settled) return;
-        settled = true;
-        finish();
-        reject(error);
+  const dispatchRequest = async function (url, init) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const sync = syncContext.getStore();
+    const requestInit = Object.assign({}, init || {});
+    if (controller) requestInit.signal = controller.signal;
+    const startedAt = Date.now();
+    const reqBody = requestInit.body;
+    const bodySize = reqBody == null ? 0 : (typeof reqBody === 'string' ? Buffer.byteLength(reqBody) :
+      (typeof reqBody.length === 'number' ? reqBody.length : (typeof reqBody.byteLength === 'number' ? reqBody.byteLength : 0)));
+    const timeoutMs = requestTimeoutMs(bodySize, REQUEST_TIMEOUT_MS);
+    function timed(operation, remainingMs, deadlineMs) {
+      return new Promise(function (resolve, reject) {
+        let settled = false;
+        if (sync && sync.signal.aborted) {
+          if (controller) controller.abort();
+          reject(syncCancelled());
+          return;
+        }
+        function finish() { clearTimeout(timer); if (sync) sync.signal.removeEventListener('abort', onAbort); }
+        function onAbort() {
+          if (settled) return;
+          settled = true;
+          if (controller) controller.abort();
+          finish();
+          reject(syncCancelled());
+        }
+        const timer = setTimeout(function () {
+          if (settled) return;
+          settled = true;
+          if (controller) controller.abort();
+          finish();
+          reject(new Error('网络请求超时（' + Math.round(deadlineMs / 1000) + 's）：' + String(url)));
+        }, Math.max(1, remainingMs));
+        if (sync) sync.signal.addEventListener('abort', onAbort, { once: true });
+        Promise.resolve().then(function () {
+          if (sync && sync.signal.aborted) throw syncCancelled();
+          return operation();
+        }).then(function (value) {
+          if (settled) return;
+          settled = true; finish(); resolve(value);
+        }, function (error) {
+          if (settled) return;
+          settled = true; finish(); reject(error);
+        });
       });
-    });
+    }
+    const response = await timed(function () { return rawRequest(url, requestInit); }, timeoutMs, timeoutMs);
+    // fetch 在响应头到达时即返回；读完整响应体仍需受截止时间和停止信号约束。
+    const responseSize = response.headers && response.headers.get ? Number(response.headers.get('content-length')) || 0 : 0;
+    const readTimeoutMs = requestTimeoutMs(Math.max(bodySize, responseSize), REQUEST_TIMEOUT_MS);
+    for (const method of ['text', 'arrayBuffer']) {
+      if (typeof response[method] !== 'function') continue;
+      const read = response[method];
+      response[method] = function () {
+        return timed(function () { return read.call(response); }, readTimeoutMs - (Date.now() - startedAt), readTimeoutMs);
+      };
+    }
+    return response;
   };
   const request = async function (url, init) {
     if (activePacer) await activePacer.acquire();
@@ -1282,16 +1299,24 @@ function createIntegrations(options) {
       .replace(/&apos;/g, "'").replace(/&amp;/g, '&');
   }
 
-  const PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>';
+  const PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getetag/></d:prop></d:propfind>';
   const PROPFIND_PAGE_SIZE = 750; // 坚果云单次列目录上限，超出需按 Range: rows=a-b 翻页
 
   function parsePropfindNames(body, attachmentsUrl, verifyListing) {
+    const entries = parsePropfindEntries(body, attachmentsUrl, verifyListing);
+    return entries === null ? null : new Set(entries.keys());
+  }
+
+  /** 按 <response> 块解析 href→getetag 映射。返回 null 表示清单含失败条目或
+   *  无法解析（verifyListing 语义与 parsePropfindNames 一致）；getetag 缺失的
+   *  条目记为空串（部分服务端不给集合/文件返回 ETag）。 */
+  function parsePropfindEntries(body, attachmentsUrl, verifyListing) {
     if (verifyListing) {
       // A DAV href alone is not proof of existence: a multistatus can contain failed entries.
-      const entries = body.match(/<(?:[A-Za-z_][\w.-]*:)?response\b[^>]*>[\s\S]*?<\/(?:[A-Za-z_][\w.-]*:)?response>/gi);
-      if (!entries) return null;
+      const blocks = body.match(/<(?:[A-Za-z_][\w.-]*:)?response\b[^>]*>[\s\S]*?<\/(?:[A-Za-z_][\w.-]*:)?response>/gi);
+      if (!blocks) return null;
       const confirmed = [];
-      for (const entry of entries) {
+      for (const entry of blocks) {
         const statuses = Array.from(entry.matchAll(/<(?:[A-Za-z_][\w.-]*:)?status\b[^>]*>\s*HTTP\/[^ ]+\s+(\d{3})/gi), function (match) { return Number(match[1]); });
         if (statuses.some(function (status) { return status >= 200 && status < 300; })) confirmed.push(entry);
         else if (!statuses.length || statuses.some(function (status) { return status !== 404; })) return null;
@@ -1301,20 +1326,26 @@ function createIntegrations(options) {
 
     const baseUrl = new URL(attachmentsUrl.replace(/\/+$/, '') + '/');
     const basePath = baseUrl.pathname;
-    const names = new Set();
-    const hrefPattern = /<(?:[A-Za-z_][\w.-]*:)?href\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?href>/gi;
-    let match;
-    while ((match = hrefPattern.exec(body))) {
+    const entriesMap = new Map();
+    const responsePattern = /<(?:[A-Za-z_][\w.-]*:)?response\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?response>/gi;
+    const hrefPattern = /<(?:[A-Za-z_][\w.-]*:)?href\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?href>/i;
+    const etagPattern = /<(?:[A-Za-z_][\w.-]*:)?getetag\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?getetag>/i;
+    let block;
+    while ((block = responsePattern.exec(body))) {
+      const href = hrefPattern.exec(block[1]);
+      if (!href) continue;
       let target;
-      try { target = new URL(xmlText(match[1]).trim(), baseUrl); } catch (error) { continue; }
+      try { target = new URL(xmlText(href[1]).trim(), baseUrl); } catch (error) { continue; }
       if (target.origin !== baseUrl.origin || target.pathname.indexOf(basePath) !== 0) continue;
       let relative = target.pathname.slice(basePath.length);
       try { relative = decodeURIComponent(relative); } catch (error) { continue; }
       if (!relative || relative.endsWith('/')) continue;
       const name = safeCloudName(relative);
-      if (name) names.add(name);
+      if (!name) continue;
+      const etagMatch = etagPattern.exec(block[1]);
+      entriesMap.set(name, etagMatch ? xmlText(etagMatch[1]).trim() : '');
     }
-    return names;
+    return entriesMap;
   }
 
   /** 真实列出云端 attachments/ 下的对象名（分页）。返回：
@@ -1347,6 +1378,37 @@ function createIntegrations(options) {
       if (fresh === 0) return verifyListing ? null : names;
     }
     return verifyListing ? null : names;
+  }
+
+  /** 与 listRemoteAssetNames 同一遍分页 PROPFIND，但收集 name→getetag 映射。
+   *  坚果云 HEAD 不返回 ETag，归档前的文件版本核对只能靠清单属性（或回退逐文件
+   *  GET/HEAD，见调用方）。返回 null 语义同上。 */
+  async function listRemoteAssetEtags(remoteOptions, verifyListing) {
+    const entriesMap = new Map();
+    for (let page = 0; page < 40; page++) {
+      const start = page * PROPFIND_PAGE_SIZE;
+      const response = await request(remoteOptions.attachmentsUrl, {
+        method: 'PROPFIND',
+        headers: Object.assign({
+          Depth: 'infinity', 'Content-Type': 'application/xml; charset=utf-8',
+          Range: 'rows=' + start + '-' + (start + PROPFIND_PAGE_SIZE - 1)
+        }, remoteOptions.headers),
+        body: PROPFIND_BODY
+      });
+      throwIfWebDavRateLimited(response);
+      if (response.status === 404 || response.status === 409) return verifyListing && page > 0 ? null : entriesMap;
+      if (response.status === 403 || response.status === 405 || response.status === 501) return null;
+      if (!response.ok) throw new Error('坚果云附件清单读取失败（' + response.status + '）');
+      const pageBody = await response.text();
+      const pageEntries = parsePropfindEntries(pageBody, remoteOptions.attachmentsUrl, verifyListing);
+      if (pageEntries === null) return null;
+      let fresh = 0;
+      pageEntries.forEach(function (etag, name) { if (!entriesMap.has(name)) { entriesMap.set(name, etag); fresh++; } });
+      const entries = verifyListing ? (pageBody.match(/<(?:[A-Za-z_][\w.-]*:)?response\b/gi) || []).length : pageEntries.size;
+      if (entries < PROPFIND_PAGE_SIZE) return entriesMap;
+      if (fresh === 0) return verifyListing ? null : entriesMap;
+    }
+    return verifyListing ? null : entriesMap;
   }
 
   /** 本会话的云端对象存在性证据。库 JSON 里的 cloudName 登记绝不能当存在性
@@ -3457,7 +3519,8 @@ function createIntegrations(options) {
 
   const cloudMirror = createCloudMirror({
     resolveOptions: resolveNutstoreOptions, readWorkspace: options.readWorkspace,
-    readLibrary: readRemoteLibrary, listAssets: listRemoteAssetNames, request: request,
+    readLibrary: readRemoteLibrary, listAssets: listRemoteAssetNames, listAssetEtags: listRemoteAssetEtags,
+    request: request,
     hash: hashWorkspace, safeName: safeCloudName, join: joinUrl,
     checkCancelled: throwIfSyncCancelled, rateLimit: throwIfWebDavRateLimited,
     ensureFolder: ensureWebDavFolder, syncAssets: syncWorkspaceAssets,
@@ -3493,8 +3556,8 @@ function createIntegrations(options) {
  * remoteKey（账号 + 远端库 URL）失效；成功收尾后按当前工作区裁剪。
  * -------------------------------------------------------------------- */
 
-/** 按请求负载大小放宽超时（仅上传类请求携带 body）：无负载用基准值；有负载按
- * 256KB/s 悲观上行速率 + 15s 余量，封顶 10 分钟防止连接真挂死。这只是「放弃等
+/** 按传输大小放宽超时：请求体或响应 Content-Length 无大小时用基准值；有大小按
+ * 256KB/s 悲观速率 + 15s 余量，封顶 10 分钟防止连接真挂死。这只是「放弃等
  * 待的最后期限」，不影响实际传输速度——客户端不做任何限速。 */
 function requestTimeoutMs(bodySize, baseMs) {
   const base = Number.isFinite(Number(baseMs)) && Number(baseMs) > 0 ? Number(baseMs) : 30000;

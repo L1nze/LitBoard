@@ -288,7 +288,8 @@ function createWindow() {
               !document.querySelector('.sync-modal-actions #sync-run'),
             cloudMirrorControlsPresent: !!document.querySelector('#sync-remote-mirror') &&
               !!document.querySelector('#sync-mirror-confirm') && !document.querySelector('#sync-mirror-confirm').checked &&
-              !!document.querySelector('#sync-mirror-cleanup') && !document.querySelector('#sync-mirror-cleanup').checked,
+              !!document.querySelector('#sync-mirror-cleanup') && !document.querySelector('#sync-mirror-cleanup').checked &&
+              !!document.querySelector('#sync-mirror-cleanup-hint'),
             remoteRecoveryApiPresent: !!window.litboardDesktop.inspectNutstoreRemote && !window.litboardDesktop.pullNutstoreConfig &&
               !!window.litboardDesktop.createNutstoreSyncPlan && !!window.litboardDesktop.applyNutstoreSyncPlan,
             // 「数据与备份」的排列：本地数据位置 → 会话记录 → Zotero 文献库 → 完整备份…

@@ -363,8 +363,18 @@
       var isMirror = plan.mode === 'mirror';
       $('#sync-mirror-options').hidden = !isMirror;
       $('#sync-mirror-confirm').checked = false;
-      $('#sync-mirror-cleanup').checked = false;
-      $('#sync-mirror-cleanup').disabled = !plan.cleanupSupported;
+      var cleanupBox = $('#sync-mirror-cleanup');
+      cleanupBox.checked = false;
+      cleanupBox.disabled = !plan.cleanupSupported;
+      // 禁用必须当场说明原因：顶部摘要距勾选框隔了整个清单，用户只看到「点不动」
+      var cleanupBlock = plan.cleanupSupported ? '' :
+        T('云端未提供这些文件的可靠版本标识（ETag），归档已停用，本次仅同步文献条目');
+      cleanupBox.title = cleanupBlock;
+      var cleanupHint = $('#sync-mirror-cleanup-hint');
+      if (cleanupHint) {
+        cleanupHint.hidden = plan.cleanupSupported;
+        cleanupHint.textContent = cleanupBlock;
+      }
       $('#sync-remote-choose-local').hidden = isMirror;
       $('#sync-remote-choose-remote').hidden = isMirror;
       $('#sync-remote-plan-title').textContent = isMirror ? T('以本机为准整理云端') : T('云端同步对照');
@@ -619,6 +629,7 @@
       var bar = $('#sync-remote-plan-progress-bar');
       if (text && payload.message) text.textContent = payload.message;
       if (!bar) return;
+      bar.hidden = payload.phase === 'error';
       if (payload.phase === 'assets' && payload.total > 0) {
         bar.max = payload.total;
         bar.value = Math.max(0, Math.min(payload.done, payload.total));
@@ -771,9 +782,11 @@
         var stopped = error && (error.code === 'SYNC_CANCELLED' || String(error.message || error).indexOf('同步已停止') !== -1);
         resetRemotePlanProgressUi();
         button.disabled = planMode === 'mirror';
-        setSyncInlineStatus('sync-remote-status', stopped
-          ? T('同步已停止；已上传附件下次可续传') : error && error.message || String(error),
-        stopped ? 'warning' : 'error');
+        var message = stopped ? T('同步已停止；已上传附件下次可续传') : error && error.message || String(error);
+        setRemotePlanProgress({ phase: 'error', message: message });
+        $('#sync-remote-plan-progress').hidden = false;
+        $('#sync-remote-plan-cancel').textContent = T('关闭');
+        setSyncInlineStatus('sync-remote-status', message, stopped ? 'warning' : 'error');
       }).finally(function () {
         setSyncBusy(false);
       });

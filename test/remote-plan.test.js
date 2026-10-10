@@ -36,7 +36,7 @@ function makeHarness(planOverride, inspection, overrides) {
   const extra = overrides || {};
   const els = {};
   const ids = [
-    '#sync-remote-mirror', '#sync-mirror-options', '#sync-mirror-confirm', '#sync-mirror-cleanup', '#sync-remote-plan-title',
+    '#sync-remote-mirror', '#sync-mirror-options', '#sync-mirror-confirm', '#sync-mirror-cleanup', '#sync-mirror-cleanup-hint', '#sync-remote-plan-title',
     '#sync-conflict-list', '#sync-conflict-mask', '#sync-remote-plan-mask', '#sync-remote-plan-list',
     '#sync-remote-plan-filter', '#sync-remote-plan-summary', '#sync-remote-plan-apply',
     '#sync-remote-plan-cancel', '#sync-remote-plan-progress', '#sync-remote-plan-progress-text',
@@ -78,7 +78,10 @@ function makeHarness(planOverride, inspection, overrides) {
           calls.created = input; calls.createdCount++;
           return extra.createPlan ? extra.createPlan(input) : Promise.resolve(PLAN);
         },
-        applyNutstoreSyncPlan: function (input) { calls.applied = input; return Promise.resolve({ workspace: { papers: [] }, assets: { failures: [] } }); },
+        applyNutstoreSyncPlan: function (input) {
+          calls.applied = input;
+          return extra.applyPlan ? extra.applyPlan(input) : Promise.resolve({ workspace: { papers: [] }, assets: { failures: [] } });
+        },
         inspectNutstoreRemote: function (input) { calls.inspected = input; return inspection ? inspection() : Promise.resolve({ exists: true, counts: { papers: 5 } }); },
         getIntegrationConfig: function () { return Promise.resolve({ autoWriteBack: false }); }
       };
@@ -236,6 +239,8 @@ test('整理预览列出文件，须单独确认；默认不归档多余文件',
   assert.equal(h.els['#sync-remote-choose-local'].hidden, true);
   assert.equal(h.els['#sync-remote-plan-apply'].disabled, true);
   assert.equal(h.api.stateForTest().model.items.length, 3);
+  assert.equal(h.els['#sync-mirror-cleanup'].disabled, false);
+  assert.equal(h.els['#sync-mirror-cleanup-hint'].hidden, true, '归档可用时不显示提示');
   h.api.apply(); assert.equal(h.calls.applied, null);
   h.els['#sync-mirror-confirm'].checked = true;
   h.els['#sync-mirror-confirm'].handlers.change[0].call(h.els['#sync-mirror-confirm']);
@@ -243,6 +248,35 @@ test('整理预览列出文件，须单独确认；默认不归档多余文件',
   h.api.apply(); await flush();
   assert.equal(h.calls.applied.resolutions['mirror:confirm'], 'local');
   assert.equal(h.calls.applied.resolutions['mirror:cleanup'], 'remote');
+
+  // 缺少可靠 ETag 时归档被禁用：必须在勾选框旁说明原因，而不是让用户对着点不动的框
+  const blocked = makeHarness({ mode: 'mirror', planId: 'mirror-blocked', localCount: 0, remoteCount: 1, cleanupSupported: false,
+    changes: [], extras: [{ name: 'a.pdf' }], missing: [], archivePath: 'backups/cleanup-blocked/' });
+  blocked.els['#sync-remote-mirror'].click(); await flush();
+  assert.equal(blocked.els['#sync-mirror-cleanup'].disabled, true, '缺少版本标识时归档勾选框禁用');
+  assert.equal(blocked.els['#sync-mirror-cleanup-hint'].hidden, false);
+  assert.match(blocked.els['#sync-mirror-cleanup-hint'].textContent, /ETag/);
+  assert.match(blocked.els['#sync-mirror-cleanup'].title, /ETag/);
+});
+
+test('整理失败原因留在当前弹窗内，不藏在遮罩下，也不显示成功百分比', async () => {
+  const message = '当前文献库仍有附件未完成，未替换云端清单，也未清理文件；请补齐后重新预览';
+  const h = makeHarness({ mode: 'mirror', planId: 'failed-mirror', localCount: 1, remoteCount: 2,
+    cleanupSupported: true, changes: [], extras: [], missing: [], conflicts: [], localOnly: [] }, null,
+  { applyPlan: () => Promise.reject(new Error(message)) });
+  h.els['#sync-remote-mirror'].click(); await flush();
+  const confirm = h.els['#sync-mirror-confirm'];
+  confirm.checked = true; confirm.handlers.change[0].call(confirm);
+  h.api.apply(); await flush();
+  assert.equal(h.els['#sync-remote-plan-mask'].hidden, false);
+  assert.equal(h.els['#sync-remote-plan-progress'].hidden, false, 'failure must remain visible in the modal');
+  assert.equal(h.els['#sync-remote-plan-progress-text'].textContent, message);
+  assert.equal(h.els['#sync-remote-plan-progress-bar'].hidden, true, 'a failed operation is not a completed progress bar');
+  assert.equal(h.els['#sync-remote-plan-progress-percent'].textContent, '');
+  assert.equal(h.calls.appliedWorkspace, 0);
+  assert.equal(h.els['#sync-remote-plan-apply'].disabled, true, 'a failed mirror must be previewed again');
+  h.els['#sync-remote-plan-cancel'].click();
+  assert.equal(h.els['#sync-remote-plan-mask'].hidden, true);
 });
 
 /* ---------- 生成期竞态回归：镜像预览是分钟级只读任务，期间后台同步曾把对照结果静默作废 ---------- */
