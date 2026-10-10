@@ -452,3 +452,94 @@ test('云端 JSON 自证捷径已废除：登记名不再跳过真实 PROPFIND',
   assert.ok(dav.state.propfinds >= 1, '登记名存在也必须做真实 PROPFIND');
   assert.equal(result.assets.uploaded, 1, '真实清单缺对象：重传，而不是采信库 JSON');
 });
+
+/* ---------------- 逐目录列举的进度上报与选择性下钻（2026-10 反馈环） ----------------
+ * 症状：生成对照/立即同步在读云端附件清单阶段（scan-assets）只报一次静态文案，
+ * 免费档限流 3.1s/请求 × 每文献一个子目录 = 分钟级无进度，界面与卡死无异。
+ * mock 按 Depth:1 真实语义只返回一层子项（objects: [相对路径, 内容字节]）。 */
+
+function makeDepthOneDav(objects, libraryText) {
+  const state = { propfinds: [], progress: [] };
+  const rootUrl = 'https://dav.jianguoyun.com/dav/LitBoard/attachments';
+  const libraryUrl = 'https://dav.jianguoyun.com/dav/LitBoard/litboard-library.json';
+  const files = new Map();
+  objects.forEach(function (pair) { files.set(rootUrl + '/' + pair[0], pair[1]); });
+  if (libraryText != null) files.set(libraryUrl, libraryText);
+  const fetch = async function (url, init) {
+    if (init.method === 'GET') {
+      const body = files.get(url);
+      return body !== undefined ? new Response(body, { status: 200, headers: { ETag: '"e1"' } }) : new Response('', { status: 404 });
+    }
+    if (init.method === 'PUT') { files.set(url, init.body); return new Response('', { status: 201 }); }
+    if (init.method === 'MKCOL') return new Response('', { status: 201 });
+    if (init.method === 'PROPFIND') {
+      const rel = url.startsWith(rootUrl + '/') ? url.slice(rootUrl.length + 1) : '';
+      state.propfinds.push(rel);
+      const prefix = rel ? rel + '/' : '';
+      const childFiles = new Set();
+      const childFolders = new Set();
+      for (const key of files.keys()) {
+        if (!key.startsWith(rootUrl + '/')) continue;
+        const rest = key.slice(rootUrl.length + 1);
+        if (!rest.startsWith(prefix) || rest === rel) continue;
+        const tail = rest.slice(prefix.length);
+        const slash = tail.indexOf('/');
+        if (!tail) continue;
+        if (slash === -1) childFiles.add(tail); else childFolders.add(tail.slice(0, slash));
+      }
+      const entry = function (name, isFolder) {
+        const href = '/dav/LitBoard/attachments/' + prefix + name;
+        const prop = isFolder
+          ? '<d:resourcetype><d:collection/></d:resourcetype>'
+          : '<d:resourcetype/><d:getetag>"e-' + name + '"</d:getetag>';
+        return '<d:response><d:href>' + href + '</d:href><d:propstat><d:prop>' + prop + '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>';
+      };
+      let xml = '<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">';
+      childFolders.forEach(function (name) { xml += entry(name, true); });
+      childFiles.forEach(function (name) { xml += entry(name, false); });
+      xml += '</d:multistatus>';
+      return new Response(xml, { status: 207 });
+    }
+    throw new Error('Unexpected request ' + init.method + ' ' + url);
+  };
+  return { state: state, fetch: fetch };
+}
+
+test('scan-assets 逐目录上报进度，且只下钻登记指向的目录（归档/残留树不列举）', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-scan-progress-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const pdf1 = Buffer.from('%PDF-one');
+  const pdf2 = Buffer.from('%PDF-two');
+  const snap = Buffer.from('PNG-snapshot');
+  const cloudLibrary = { syncVersion: 6, papers: [
+    { id: 'p1', title: 'T1', updatedAt: 2000, attachments: [{ id: 'a1', addedAt: 1000, kind: 'pdf', fileName: 'one.pdf',
+      cloudName: 'p1.pdf', cloudHash: sha256(pdf1), cloudSize: pdf1.length }],
+      pdfAnnotations: [{ id: 'snap1', type: 'snapshot', addedAt: 1000, cloudName: 'snapshots/p1/snap1.png', cloudHash: sha256(snap), cloudSize: snap.length }] },
+    { id: 'p2', title: 'T2', updatedAt: 2000, attachments: [{ id: 'a2', addedAt: 1000, kind: 'pdf', fileName: 'two.pdf',
+      cloudName: 'p2/a2.pdf', cloudHash: sha256(pdf2), cloudSize: pdf2.length }] }
+  ], folders: [] };
+  const dav = makeDepthOneDav(
+    [['p1.pdf', pdf1], ['p2/a2.pdf', pdf2], ['snapshots/p1/snap1.png', snap], ['archive/old/backup.pdf', Buffer.from('x')], ['old-structure/x.pdf', Buffer.from('y')]],
+    JSON.stringify(cloudLibrary));
+  const one = path.join(dir, 'one.pdf'), two = path.join(dir, 'two.pdf');
+  await fs.writeFile(one, pdf1);
+  await fs.writeFile(two, pdf2);
+  const integrations = createIntegrations({
+    baseDir: dir, homeDir: dir,
+    notify: function (channel, payload) { if (channel === 'integrations:sync-progress') dav.state.progress.push(payload); },
+    safeStorage: makeSafeStorage(), fetch: dav.fetch
+  });
+  await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
+  // 本地与云端同构：本地文件在、快照需从云端恢复（下载路径也走通）
+  const local = JSON.parse(JSON.stringify(cloudLibrary));
+  local.papers[0].attachments[0].path = one;
+  local.papers[1].attachments[0].path = two;
+  const result = await integrations.nutstoreSync(local);
+  assert.ok(result.assets, '稳态合并不应暂停：' + JSON.stringify(Object.keys(result)));
+  // 反馈环断言 1：读清单期间逐目录有进度事件，而不是一次静态文案后沉默数分钟
+  const scanEvents = dav.state.progress.filter(function (p) { return p.phase === 'scan-assets'; });
+  assert.ok(scanEvents.length >= 5, 'scan-assets 应逐目录上报（期望 ≥5 条，实际 ' + scanEvents.length + ' 条）');
+  assert.ok(scanEvents.some(function (p) { return /目录/.test(p.message || ''); }), '进度文案应带已列目录/文件计数');
+  // 反馈环断言 2：只有登记指向的目录才下钻（root + p2 + snapshots + snapshots/p1）
+  assert.deepEqual(dav.state.propfinds.sort(), ['', 'p2', 'snapshots', 'snapshots/p1']);
+});

@@ -1394,7 +1394,7 @@ function createIntegrations(options) {
    *  「多余文件」参与归档。null 语义同 propfindFolder。 */
   const PROPFIND_MAX_DEPTH = 8;     // 附件命名约定最深 2 级（<key>/<file>、notes/<id>/<file>），留足余量
   const PROPFIND_MAX_FOLDERS = 2000; // 防御失控服务端（软链/回环目录）
-  async function walkRemoteAssets(remoteOptions, verifyListing, onProgress) {
+  async function walkRemoteAssets(remoteOptions, verifyListing, onProgress, wantedFolders) {
     const files = new Map();
     const visited = new Set();
     const queue = [''];
@@ -1408,7 +1408,11 @@ function createIntegrations(options) {
       const listing = await propfindFolder(remoteOptions, folderUrl, verifyListing);
       if (listing === null) return null;
       listing.files.forEach(function (etag, name) { files.set(name, etag); });
-      listing.folders.forEach(function (name) { if (!visited.has(name)) queue.push(name); });
+      listing.folders.forEach(function (name) {
+        // 选择性下钻：同步流程只消费「登记名在不在云端」的证据，没有登记指向的
+        // 目录（整理归档树、外部残留）列了也不用；整理预览仍全量走（不带过滤器）
+        if (!visited.has(name) && (!wantedFolders || wantedFolders.has(name))) queue.push(name);
+      });
       // 逐层列举在节流档位下是分钟级过程：每列完一个目录报一次进度，UI 不能停在
       // 静态的「正在列出云端文件清单…」上让用户以为卡死。
       if (onProgress) onProgress({ folders: visited.size, files: files.size });
@@ -1417,9 +1421,10 @@ function createIntegrations(options) {
   }
 
   /** 真实列出云端 attachments/ 下的对象名（含子目录，分页 + 递归）。返回：
-   *  Set —— 实际清单；null —— 服务器不支持该 PROPFIND（403/405/501）。 */
-  async function listRemoteAssetNames(remoteOptions, verifyListing, onProgress) {
-    const files = await walkRemoteAssets(remoteOptions, verifyListing, onProgress);
+   *  Set —— 实际清单；null —— 服务器不支持该 PROPFIND（403/405/501）。
+   *  wantedFolders 给定时只下钻其中列出的目录（根目录恒列举）。 */
+  async function listRemoteAssetNames(remoteOptions, verifyListing, onProgress, wantedFolders) {
+    const files = await walkRemoteAssets(remoteOptions, verifyListing, onProgress, wantedFolders);
     return files === null ? null : new Set(files.keys());
   }
 
@@ -1433,12 +1438,26 @@ function createIntegrations(options) {
   /** 本会话的云端对象存在性证据。库 JSON 里的 cloudName 登记绝不能当存在性
    *  证明使用（正是「假元数据自证已上传、永不重传」事故的根源）：只要两侧
    *  出现任何登记名就做一次真实 PROPFIND。服务器不支持清单时退回登记名集合
-   *  （此时不做写前净化，见 sanitizeCloudAssets）。 */
-  async function resolveRemoteAssetNames(remoteWorkspace, localWorkspace, remoteOptions, onScan) {
+   *  （此时不做写前净化，见 sanitizeCloudAssets）。
+   *  onScan 在列举开始前回调一次；onProgress 每列完一个目录回调
+   *  （{ folders, files } 计数）——免费档限流 3.1s/请求，逐目录列举是分钟级
+   *  过程，静态文案期间 UI 与卡死无异。 */
+  async function resolveRemoteAssetNames(remoteWorkspace, localWorkspace, remoteOptions, onScan, onProgress) {
     const names = remoteAssetNames(remoteWorkspace);
-    if (!names.size && !remoteAssetNames(localWorkspace).size) return new Set();
+    const localNames = remoteAssetNames(localWorkspace);
+    if (!names.size && !localNames.size) return new Set();
     if (onScan) onScan();
-    const listed = await listRemoteAssetNames(remoteOptions);
+    // 选择性下钻：同步只判定「登记名是否在云端」（去重上传 + 悬空登记剥离），
+    // 登记指向的目录（含多级前缀，如 snapshots/<id>/）全列，其余目录不列——
+    // 无登记对象的上传凭据由台账（assetLedgerProof）担保，重传同内容是幂等 PUT。
+    const wantedFolders = new Set();
+    const addFolderPrefixes = function (name) {
+      const parts = String(name || '').split('/');
+      for (let i = 1; i < parts.length; i++) wantedFolders.add(parts.slice(0, i).join('/'));
+    };
+    names.forEach(addFolderPrefixes);
+    localNames.forEach(addFolderPrefixes);
+    const listed = await listRemoteAssetNames(remoteOptions, false, onProgress, wantedFolders.size ? wantedFolders : null);
     return listed === null ? names : listed;
   }
 
@@ -2752,6 +2771,9 @@ function createIntegrations(options) {
       }
       const knownRemoteAssets = await resolveRemoteAssetNames(current.remote, workspace, plan._options, function () {
         reportProgress('scan-assets', { message: '正在读取云端附件清单，避免重复上传…' });
+      }, function (scan) {
+        // 逐目录计数上报：分钟级列举期间界面必须看得见在动（2026-10 卡死投诉）
+        reportProgress('scan-assets', { message: '正在读取云端附件清单（已列 ' + scan.folders + ' 个目录 · ' + scan.files + ' 个文件）…' });
       });
       const firstPass = sanitizeCloudAssets(cloudWorkspace, null, knownRemoteAssets);
       const firstWrite = await writeCloudLibrary(plan._options, firstPass.workspace, current, function (phase, message) {
@@ -2851,6 +2873,8 @@ function createIntegrations(options) {
       // 从第一笔起就不带假元数据。
       const knownRemoteAssets = await resolveRemoteAssetNames(remote, merged, remoteOptions, function () {
         emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取云端附件清单，避免重复上传…' });
+      }, function (scan) {
+        emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取云端附件清单（已列 ' + scan.folders + ' 个目录 · ' + scan.files + ' 个文件）…' });
       });
       const firstPass = sanitizeCloudAssets(cloudWorkspace, null, knownRemoteAssets);
       const firstWrite = await writeCloudLibrary(remoteOptions, firstPass.workspace, library, function (phase, message) {

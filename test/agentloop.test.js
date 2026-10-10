@@ -532,6 +532,41 @@ test('R17: 溢出重试仍失败 → 如实失败，不无限重试；未注入 
   assert.equal(restored.lastInputTokens, 54321);
 });
 
+test('输出上限自救：端点报 max_tokens 超上限 → 按报文给出的上限降额重试一次；上限不低于当前下发值时不重试', async function () {
+  const seen = [];
+  const { hooks, calls } = makeHooks([
+    new Error('AI 服务返回 HTTP 400: {"error":{"message":"ZCode: [1210][max_tokens参数非法：限制数值范围[1,131072]]","type":"invalid_request_error"}}'),
+    { message: { content: '降额后的回答' } }
+  ]);
+  hooks.context = Context;
+  hooks.buildBody = function (run) {
+    const out = Number(run.forceMaxOutputTokens) > 0 ? Number(run.forceMaxOutputTokens) : 200000;
+    seen.push(out);
+    return Core.buildRequestBody(run.core, { system: 'SYS', maxOutputTokens: out });
+  };
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  Core.appendUser(run.core, '问');
+  const end = await runner.runTurn(run);
+  assert.equal(end, 'done');
+  assert.equal(calls.chat.length, 2, '重试了一次');
+  assert.deepEqual(seen, [200000, 131072], '第二次请求用端点报文给出的上限');
+  assert.ok(run.core.messages.some((m) => m.role === 'error' && String(m.content).indexOf('单次回复上限超过') === 0), '插入可见的错误卡说明发生了什么');
+  assert.equal(run.core.messages[run.core.messages.length - 1].content, '降额后的回答');
+
+  // 报文上限（131072）不低于当前下发值（12800）→ 不是「设大了」的问题，不重试，如实失败
+  const low = makeHooks([new Error("Invalid 'max_tokens': must be less than or equal to 131072")]);
+  low.hooks.context = Context;
+  low.hooks.buildBody = function (run) {
+    return Core.buildRequestBody(run.core, { system: 'SYS', maxOutputTokens: 12800 });
+  };
+  const runLow = makeRun();
+  Core.appendUser(runLow.core, '问');
+  const reasonLow = await Loop.createRunner(low.hooks).runTurn(runLow);
+  assert.equal(reasonLow, 'failed');
+  assert.equal(low.calls.chat.length, 1, '上限不低于当前下发值时不重试');
+});
+
 /* ---------------- A-followup #1：压缩摘要不得抢占重试/编辑重发的目标 ---------------- */
 
 test('A-followup #1: 压缩后重试当前轮，重跑的是真实提问而不是上下文摘要；retryLast 跳过合成 user 消息（工具注入截图），定位到真实提问', async function () {
@@ -733,4 +768,112 @@ test('image result checkpoint failure followed by successful final save retains 
   const run2 = makeRun(); Core.appendUser(run2.core, 'go');
   assert.equal(await Loop.createRunner(hooks2).runTurn(run2), 'stopped');
   assert.match(run2.core.messages.find(m => m.tool_call_id === 'not-run').content, /未执行/);
+});
+
+test('queued steering inputs are drained into the turn and broadcast queue_changed immediately', async () => {
+  const { hooks, calls } = makeHooks([{ message: { content: 'done' } }]);
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  run.doc.queuedInputs = [{ text: '再详细些', queuedAt: new Date().toISOString() }];
+  Core.appendUser(run.core, 'go');
+  assert.equal(await runner.runTurn(run), 'done');
+  assert.equal(run.doc.queuedInputs.length, 0);
+  assert.ok(run.core.messages.some((m) => m.role === 'user' && m.kind === 'steering' && m.content.includes('再详细些')));
+  // 队列被消费的瞬间就广播：渲染层的「已排队 n 条」不能等下一个流式增量才消失
+  assert.ok(calls.events.some((e) => e.type === 'queue_changed' && e.count === 0));
+});
+
+test('畸形工具参数（流式截断的坏 JSON）转为错误工具结果回喂模型重新发起，不让整轮失败', async () => {
+  const badCall = { id: 'bad1', type: 'function', function: { name: 'search_library', arguments: '{"query": "pinn' } };
+  const { hooks, calls } = makeHooks([
+    { message: { content: '我先查一下', tool_calls: [badCall, toolCall('ok1', 'search_library', { query: 'x' }).message.tool_calls[0]] } },
+    toolCall('retry1', 'search_library', { query: 'pinn' }),
+    { message: { content: '查到了' } }
+  ]);
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  Core.appendUser(run.core, 'go');
+  const end = await runner.runTurn(run);
+  assert.equal(end, 'done');
+  // 坏参数调用获得 error 工具结果（协议配对完整），好调用照常执行
+  const badResult = run.core.messages.find((m) => m.tool_call_id === 'bad1');
+  assert.ok(badResult, '坏参数调用有配对的 tool 消息');
+  assert.equal(badResult.error, true);
+  assert.match(badResult.content, /JSON/);
+  assert.equal(calls.tools.map((t) => t.name).join(','), 'search_library,search_library');
+  // 第二次模型请求带着坏调用的错误结果（模型据此重新发起）
+  assert.ok(calls.chat[1].messages.some((m) => m.role === 'tool' && m.tool_call_id === 'bad1'));
+  // 全部坏参数时同样回喂后继续（模型重新发起而不是整轮失败）
+  const { hooks: hooks2 } = makeHooks([
+    { message: { content: '', tool_calls: [{ id: 'bad2', type: 'function', function: { name: 't', arguments: 'not json at all' } }] } },
+    { message: { content: '改用文字回答' } }
+  ]);
+  const run2 = makeRun();
+  Core.appendUser(run2.core, 'q');
+  assert.equal(await Loop.createRunner(hooks2).runTurn(run2), 'done');
+  assert.equal(run2.core.messages.find((m) => m.tool_call_id === 'bad2').error, true);
+});
+
+test('停止时带畸形参数的调用同样补「已停止」占位，半截内容保留且整轮按 stopped 收尾', async () => {
+  const badCall = { id: 'bad1', type: 'function', function: { name: 'write', arguments: '{"q": ' } };
+  const { hooks } = makeHooks([{ aborted: true, message: { content: '半截回答', tool_calls: [badCall] } }]);
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  Core.appendUser(run.core, 'go');
+  const end = await runner.runTurn(run);
+  assert.equal(end, 'stopped');
+  const messages = run.core.messages;
+  assert.equal(messages[messages.length - 2].content, '半截回答', '半截输出保留');
+  assert.match(messages.find((m) => m.tool_call_id === 'bad1').content, /已停止/);
+});
+
+test('步数将尽注入收尾提示：模型据此给最终回答（done）；无视提示继续调工具时硬顶照常兜底', async () => {
+  // maxSteps=3：两轮工具后 steps=2 触发提示注入，第三轮模型收尾作答
+  const { hooks, calls } = makeHooks([
+    toolCall('c1', 't', { n: 1 }),
+    toolCall('c2', 't', { n: 2 }),
+    { message: { content: '基于以上结果，阶段性总结如下' } }
+  ]);
+  const runner = Loop.createRunner(hooks);
+  const run = makeRun();
+  run.core.maxSteps = 3;
+  Core.appendUser(run.core, 'go');
+  assert.equal(await runner.runTurn(run), 'done');
+  const notice = run.core.messages.find((m) => m.kind === 'step_notice');
+  assert.ok(notice, '注入了收尾提示');
+  assert.equal(notice.synthetic, true);
+  // 第三次请求携带提示（模型看到的是「不要再用工具，给最终回答」）
+  assert.ok(calls.chat[2].messages.some((m) => String(m.content || '').indexOf('步数即将用尽') !== -1));
+  assert.equal(run.core.messages.some((m) => m.role === 'error'), false, '体面收尾没有错误卡');
+  // 模型无视提示继续发起工具：到顶后按 max_steps 停止（硬顶兜底不变）
+  const { hooks: hooks2 } = makeHooks([toolCall('k1', 't', { n: 1 }), toolCall('k2', 't', { n: 2 }), toolCall('k3', 't', { n: 3 })]);
+  const run2 = makeRun();
+  run2.core.maxSteps = 3;
+  Core.appendUser(run2.core, 'go');
+  assert.equal(await Loop.createRunner(hooks2).runTurn(run2), 'max_steps');
+  assert.ok(run2.core.messages.some((m) => m.role === 'error' && String(m.content).indexOf('最大步数') !== -1));
+  assert.equal(run2.core.messages.filter((m) => m.kind === 'step_notice').length, 1, '单轮只提示一次');
+});
+
+test('model return clears all three stream buffers so the live bubble drops the stale tool card', async () => {
+  const holder = {};
+  const { hooks } = makeHooks([
+    async function () {
+      holder.runner.handleStreamEvent('r1', { type: 'tool_call', name: 'search_openalex' });
+      holder.duringStream = holder.run.streamToolName;
+      return toolCall('c1', 'search_openalex', {});
+    },
+    async function () {
+      holder.atSecondRequest = holder.run.streamToolName; // 下一次模型请求开始时必须已清空
+      return { message: { content: 'done' } };
+    }
+  ]);
+  const runner = Loop.createRunner(hooks);
+  holder.runner = runner;
+  const run = makeRun();
+  holder.run = run;
+  Core.appendUser(run.core, 'go');
+  assert.equal(await runner.runTurn(run), 'done');
+  assert.equal(holder.duringStream, 'search_openalex');
+  assert.equal(holder.atSecondRequest, '');
 });

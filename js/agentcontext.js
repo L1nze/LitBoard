@@ -324,20 +324,6 @@
     return view;
   }
 
-  /**
-   * 掩码（请求视图专用，不落盘）：仅替换较旧 tool 消息的 content 为占位行，
-   * tool_call_id / name 原样保留——工具配对不变，端点不会因孤儿调用报 400。
-   */
-  function maskOldToolResults(messages, keepLast) {
-    var list = Array.isArray(messages) ? messages : [];
-    var keep = Math.max(0, Number(keepLast) || 0);
-    if (!keep) return list;
-    return list.map(function (msg, index) {
-      if (!msg || msg.role !== 'tool' || index >= list.length - keep) return msg;
-      return Object.assign({}, msg, { content: maskToolMessage(msg.content, msg) });
-    });
-  }
-
   /** 端点「上下文超长」类报错识别（多家中英文措辞保守匹配；宁可漏判走正常错误路径，不误重试） */
   var OVERFLOW_RE = /context[_ ]length|context_length_exceeded|context window|maximum context|prompt is too long|too many tokens|request too large|reduce the length|exceeds? (?:the )?(?:maximum|context|model)|上下文.{0,8}(超|过长|超出)|输入.{0,8}(超|过长)|超过.{0,10}(上限|长度)/i;
 
@@ -349,6 +335,25 @@
   function emergencyBudget(previous) {
     var prev = Number(previous) || 0;
     return Math.max(EMERGENCY_BUDGET_MIN, Math.floor((prev > 0 ? prev : 256000) / 2));
+  }
+
+  /* 端点「max_tokens 超上限」报错中的上限解析：各模型输出上限不同（ZCode 网关封顶 131072，
+   * 有些端点更低），应用不猜模型上限，只在报文里明写出来时读出来供降额重试。
+   * 报文不提 max_tokens 或没给出数字上限 → 返回 0，走正常错误路径，绝不拿猜测值重试。 */
+  var MAX_TOKENS_PARAM_RE = /max[_ ]?(?:output[_ ]?|completion[_ ]?)?tokens/i;
+  // 「限制数值范围[1,131072]」「range [1, 131072]」这类显式区间（含中文逗号变体）
+  var MAX_TOKENS_RANGE_RE = /[[（(]\s*1\s*[,，、~～-]\s*(\d{1,9})\s*[\]）)]/;
+  // 「不超过 131072」「must be less than or equal to 131072」「maximum is 131072」这类文字上限
+  var MAX_TOKENS_BOUND_RE = /(?:不超过|不得超过|至多|上限(?:为|是)?|maximum(?: allowed)?(?: value)?(?: of| is)?|less than or equal to|at most|no (?:more|greater) than|<=|≤)\s*[:：]?\s*(\d{2,9})/i;
+
+  function maxOutputTokensLimit(text) {
+    var t = String(text == null ? '' : text);
+    if (!MAX_TOKENS_PARAM_RE.test(t)) return 0;
+    var range = t.match(MAX_TOKENS_RANGE_RE);
+    if (range) return Math.floor(Number(range[1])) || 0;
+    var bound = t.match(MAX_TOKENS_BOUND_RE);
+    if (bound) return Math.floor(Number(bound[1])) || 0;
+    return 0;
   }
 
   /* 划词上下文（阅读器选区 → agent 轮次冻结）：选中文字进系统提示前的唯一整形点。
@@ -399,9 +404,9 @@
     applyCompaction: applyCompaction,
     maskToolMessage: maskToolMessage,
     compactToolView: compactToolView,
-    maskOldToolResults: maskOldToolResults,
     isContextOverflowError: isContextOverflowError,
     emergencyBudget: emergencyBudget,
+    maxOutputTokensLimit: maxOutputTokensLimit,
     SELECTION_TEXT_MAX: SELECTION_TEXT_MAX,
     normalizeSelectionContext: normalizeSelectionContext
   };

@@ -582,9 +582,11 @@ function createWindow() {
                 // H2 端到端：悬停消息 →「编辑」可见 → 点击必须出现编辑输入框（此前只挂了
                 // 按钮没挂编辑组件，点了原文仍只读、编辑重发走不通）；合成消息不出现编辑钮。
                 // autohide 的 hover 态挂在 MessagePrimitive.Root 元素上（enter 类事件不冒泡，
-                // 模拟悬停要发到它本人而不是外层容器）
+                // 模拟悬停要发到它本人）：Root 自 v1.0.14 起就是最外层 .aui-msg.user 容器
+                // （气泡内层 div 只是老结构的兼容回退）
                 if (ok) {
-                  const userRoot = probe.querySelector('.aui-msg.user .aui-bubble > div') ||
+                  const userRoot = probe.querySelector('.aui-msg.user') ||
+                    probe.querySelector('.aui-msg.user .aui-bubble > div') ||
                     probe.querySelector('.aui-msg.user .aui-bubble');
                   if (userRoot) {
                     userRoot.dispatchEvent(new PointerEvent('pointerenter', { bubbles: false }));

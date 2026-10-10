@@ -16,13 +16,6 @@
 const LitAgentCore = require('../js/agentcore.js');
 const LitAgentProto = require('../js/agentproto.js');
 
-/** SSE 流累积器（OpenAI chat 形态，原实现）：逐行喂数据，产出事件与最终消息。
- * A02：同时捕获推理增量（reasoning_content / reasoning 两种字段命名），只用于展示与会话存档。
- * responses / messages 两种协议的等价累积器在 js/agentproto.js（事件词表与本函数一致）。 */
-function createStreamAccumulator() {
-  return LitAgentProto.createChatAccumulator();
-}
-
 function isLocalHost(hostname) {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
 }
@@ -40,15 +33,6 @@ function validateBaseUrl(raw) {
     throw new Error('AI 助手 Base URL 必须使用 https（本地服务可用 http）');
   }
   return input.replace(/\/+$/, '');
-}
-
-function chatUrl(base) {
-  return LitAgentProto.endpointFor(base, LitAgentProto.DIALECTS.CHAT);
-}
-
-/** 模型清单端点：OpenAI 兼容约定为 {base}/models（base 已含 /chat/completions 时替换掉） */
-function modelsUrl(base) {
-  return LitAgentProto.modelsEndpointFor(base, LitAgentProto.DIALECTS.CHAT);
 }
 
 /** 从 /models 响应中提取模型 id（兼容 OpenAI {data:[{id}]} 与裸数组两种形态） */
@@ -377,9 +361,6 @@ function createAgentNet(options) {
 }
 module.exports = {
   createAgentNet: createAgentNet,
-  createStreamAccumulator: createStreamAccumulator,
   validateBaseUrl: validateBaseUrl,
-  chatUrl: chatUrl,
-  modelsUrl: modelsUrl,
   extractModelIds: extractModelIds
 };

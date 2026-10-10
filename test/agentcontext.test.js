@@ -150,27 +150,26 @@ test('serializeForSummary 工具结果按字符封顶、超总预算时最旧部
   }
 });
 
-test('maskToolMessage / maskOldToolResults：只换 content，配对字段不动', () => {
-  const masked = Ctx.maskOldToolResults([
-    { role: 'tool', tool_call_id: 'a', name: 't', content: big(1000) },
-    { role: 'user', content: '问' },
-    { role: 'tool', tool_call_id: 'b', name: 't', content: big(1000) }
-  ], 1);
-  assert.equal(masked[0].tool_call_id, 'a');
-  assert.ok(masked[0].content.indexOf('旧工具结果已清除') !== -1);
-  assert.ok(masked[0].content.indexOf('1000') !== -1, '占位行注明原长度');
-  assert.equal(masked[2].content, big(1000), '最近 keepLast 条不掩码');
-  assert.equal(masked[1].content, '问');
-  // buildRequestBody 联动（注入 maskToolMessage）
+test('maskToolMessage：只换 content，配对字段不动（经 buildRequestBody 的 maskToolResults 生产路径）', () => {
+  // buildRequestBody 联动（注入 maskToolMessage）：较旧工具结果换占位行，最近 keepLast 条原样
   const state = Core.initState();
   Core.appendUser(state, 'q');
-  Core.appendAssistant(state, { content: '', tool_calls: [{ id: 'c1', function: { name: 't', arguments: '{}' } }] });
-  Core.appendToolResults(state, [{ callId: 'c1', name: 't', result: big(5000) }]);
+  Core.appendAssistant(state, { content: '', tool_calls: [
+    { id: 'c1', function: { name: 't', arguments: '{}' } },
+    { id: 'c2', function: { name: 't', arguments: '{}' } }
+  ] });
+  Core.appendToolResults(state, [
+    { callId: 'c1', name: 't', result: big(1000) },
+    { callId: 'c2', name: 't', result: big(1000) }
+  ]);
   Core.appendUser(state, 'q2');
-  const body = Core.buildRequestBody(state, { maskToolResults: 1, maskToolMessage: Ctx.maskToolMessage });
-  const toolOut = body.messages.find((m) => m.role === 'tool');
-  assert.ok(toolOut.content.indexOf('旧工具结果已清除') !== -1);
-  assert.equal(toolOut.tool_call_id, 'c1', 'tool_call_id 保留，配对不破坏');
+  const body = Core.buildRequestBody(state, { maskToolResults: 2, maskToolMessage: Ctx.maskToolMessage });
+  const toolOut = body.messages.filter((m) => m.role === 'tool');
+  assert.equal(toolOut.length, 2);
+  assert.ok(toolOut[0].content.indexOf('旧工具结果已清除') !== -1);
+  assert.ok(toolOut[0].content.indexOf('1000') !== -1, '占位行注明原长度');
+  assert.equal(toolOut[0].tool_call_id, 'c1', 'tool_call_id 保留，配对不破坏');
+  assert.equal(toolOut[1].content, big(1000), '窗口尾部 keepLast 条消息内的工具结果不掩码');
 });
 
 test('isContextOverflowError 多家中英文措辞命中、普通错误不误判；emergencyBudget 减半且有下限', () => {
@@ -187,6 +186,23 @@ test('isContextOverflowError 多家中英文措辞命中、普通错误不误判
   assert.equal(Ctx.emergencyBudget(10000), 5000 + 3000); // max(8000, 5000)
   assert.equal(Ctx.emergencyBudget(10000), 8000);
   assert.equal(Ctx.emergencyBudget(0), 128000);
+});
+
+test('maxOutputTokensLimit：报文明示 max_tokens 上限时解析出数字，未提及或无数字时返回 0', () => {
+  // ZCode 网关：「限制数值范围[1,131072]」
+  assert.equal(Ctx.maxOutputTokensLimit('AI 服务返回 HTTP 400: {"error":{"message":"ZCode: [1210][max_tokens参数非法：限制数值范围[1,131072]]","type":"invalid_request_error"}}'), 131072);
+  // OpenAI 系措辞
+  assert.equal(Ctx.maxOutputTokensLimit("Invalid 'max_tokens': must be less than or equal to 8192"), 8192);
+  assert.equal(Ctx.maxOutputTokensLimit('max_tokens is too large: maximum allowed value is 16384'), 16384);
+  assert.equal(Ctx.maxOutputTokensLimit('max_output_tokens 不得超过 64000'), 64000);
+  // max_completion_tokens 改写后的形态也认
+  assert.equal(Ctx.maxOutputTokensLimit('max_completion_tokens: at most 32768'), 32768);
+  // 不提 max_tokens / 没给出数字 → 0（不拿猜测值重试）
+  assert.equal(Ctx.maxOutputTokensLimit('AI 服务返回 HTTP 401：invalid api key'), 0);
+  assert.equal(Ctx.maxOutputTokensLimit('context_length_exceeded: prompt is too long'), 0);
+  assert.equal(Ctx.maxOutputTokensLimit('max_tokens 参数非法'), 0);
+  assert.equal(Ctx.maxOutputTokensLimit(''), 0);
+  assert.equal(Ctx.maxOutputTokensLimit(null), 0);
 });
 
 test('normalizeSelectionContext：无效输入返回 null、空白折叠 / 超长截断并如实标记、页码钳制 / EPUB 形态（cfi/章节/进度），无页码', () => {
@@ -425,9 +441,8 @@ test('微压缩和掩码完整保留写入/下载/收藏回执，缺失内容只
     assert.equal(view[i], protectedMessages[i], name + ' 回执不能丢失');
     assert.equal(Ctx.maskToolMessage(protectedMessages[i].content, protectedMessages[i]), protectedMessages[i].content);
   });
-  const masked = Ctx.maskOldToolResults([...protectedMessages, read, { role: 'user', content: '继续' }], 1);
-  names.forEach((name, i) => assert.equal(masked[i].content, protectedMessages[i].content, name));
-  for (const content of [view.at(-1).content, masked[5].content, Ctx.maskToolMessage('以前的读取结果')]) {
+  const maskedRead = Ctx.maskToolMessage(read.content, read);
+  for (const content of [view.at(-1).content, maskedRead, Ctx.maskToolMessage('以前的读取结果')]) {
     assert.match(content, /只读/);
     assert.match(content, /不得因此重复写入、下载或收藏/);
     assert.ok(!content.includes('请重新调用工具获取'));

@@ -39,14 +39,15 @@ function makeHarness(planOverride, inspection, overrides) {
     '#sync-remote-mirror', '#sync-mirror-options', '#sync-mirror-confirm', '#sync-mirror-cleanup-option', '#sync-mirror-cleanup', '#sync-mirror-cleanup-hint', '#sync-remote-plan-title',
     '#sync-conflict-list', '#sync-conflict-mask', '#sync-remote-plan-mask', '#sync-remote-plan-list',
     '#sync-remote-plan-filter', '#sync-remote-plan-summary', '#sync-remote-plan-apply',
-    '#sync-remote-plan-cancel', '#sync-remote-plan-progress', '#sync-remote-plan-progress-text',
-    '#sync-remote-plan-progress-percent', '#sync-remote-plan-progress-bar',
+    '#sync-remote-plan-cancel', '#sync-remote-plan-background', '#sync-remote-plan-progress', '#sync-remote-plan-progress-text',
+    '#sync-remote-plan-progress-percent', '#sync-remote-plan-progress-bar', '#sync-stop',
     '#sync-remote-choose-local', '#sync-remote-choose-remote', '#sync-remote-inspect',
     '#sync-remote-restore', '#sync-remote-merge', '#sync-conflict-close', '#sync-conflict-export'
   ];
   ids.forEach(function (id) {
     els[id] = makeNode(id === '#sync-remote-plan-list' ? 'div' : 'button');
     if (id === '#sync-conflict-mask' || id === '#sync-remote-plan-mask') els[id].hidden = true; // 遮罩默认不可见，断言才有意义
+    if (id === '#sync-remote-plan-background' || id === '#sync-stop') els[id].hidden = true; // 与 index.html 初始态一致
     if (id === '#sync-remote-plan-filter') {
       els[id].parentElement = makeNode('div');
     }
@@ -57,7 +58,7 @@ function makeHarness(planOverride, inspection, overrides) {
     createDocumentFragment: function () { return makeNode('fragment'); },
     querySelector: function () { return null; }
   };
-  const calls = { created: null, createdCount: 0, applied: null, appliedWorkspace: 0, indicator: [], statuses: [] };
+  const calls = { created: null, createdCount: 0, applied: null, appliedWorkspace: 0, indicator: [], statuses: [], toasts: [] };
   const PLAN = planOverride || {
     mode: 'merge', remoteCount: 5, remoteExists: true,
     conflicts: [
@@ -70,7 +71,7 @@ function makeHarness(planOverride, inspection, overrides) {
     T: function (s) { return s; },
     $: function (sel) { return els[sel] || null; },
     esc: function (s) { return String(s == null ? '' : s); },
-    toast: function () {},
+    toast: function (s) { calls.toasts.push(String(s)); },
     debounce: function (fn) { fn.flush = function () { fn(); }; return fn; },
     desktop: function () {
       return {
@@ -137,6 +138,61 @@ test('对照：渲染计划与决议应用全流程（未决禁用 → 批量补
   assert.strictEqual(h.els['#sync-remote-plan-mask'].hidden, true, '完成后可关闭');
   assert.strictEqual(h.api.stateForTest().plan, null, '关闭即清空计划');
   assert.deepStrictEqual(h.api.stateForTest().resolutions, {});
+});
+
+/* ---------- 后台运行：应用进行中弹窗可关，同步照跑 ---------- */
+
+test('应用可转入后台：关闭弹窗不中断同步，进度透出到同步图标，重新打开回到实时进度，完成后复位并提示', async () => {
+  let release;
+  const gate = new Promise(function (resolve) { release = resolve; });
+  const h = makeHarness(null, null, { applyPlan: function () { return gate; } });
+  h.els['#sync-remote-merge'].click();
+  await flush();
+  h.els['#sync-remote-choose-local'].click();
+  h.els['#sync-remote-plan-apply'].click();
+  await flush();
+  assert.strictEqual(h.api.stateForTest().applying, true);
+  assert.strictEqual(h.els['#sync-remote-plan-background'].hidden, false, '应用中显示「后台运行」入口');
+  assert.strictEqual(h.els['#sync-stop'].hidden, false, '应用中设置页「停止同步」可见');
+
+  // 关闭（Esc / 点遮罩 / 关闭按钮同语义）= 转后台：同步继续跑
+  h.api.close();
+  assert.strictEqual(h.api.stateForTest().applying, true, '转后台不中断应用');
+  assert.strictEqual(h.api.stateForTest().backgrounded, true);
+  assert.strictEqual(h.els['#sync-remote-plan-mask'].hidden, true, '弹窗收起，界面可操作');
+  assert.ok(h.calls.toasts.some(function (s) { return s.indexOf('后台运行') !== -1; }), '转后台有提示');
+
+  // 后台期间进度透出到同步图标
+  h.api.handleProgress({ scope: 'apply-plan', planId: '', phase: 'assets', message: '正在上传附件 3/10', done: 3, total: 10 });
+  assert.ok(h.calls.indicator.some(function (s) { return s === 'syncing'; }), '后台进度让同步图标转圈');
+
+  // 再点云端按钮 = 回到实时进度视图（而不是静默忽略）
+  h.els['#sync-remote-merge'].click();
+  assert.strictEqual(h.els['#sync-remote-plan-mask'].hidden, false, '重新打开回到进度视图');
+  assert.strictEqual(h.api.stateForTest().backgrounded, false);
+
+  // 完成：toast + 同步图标 ok + 后台/停止入口收起
+  release({ workspace: { papers: [] }, assets: { failures: [] } });
+  await flush(); await flush(); await flush();
+  assert.strictEqual(h.api.stateForTest().applying, false);
+  assert.ok(h.calls.indicator.indexOf('ok') !== -1, '完成后同步图标打勾');
+  assert.ok(h.calls.toasts.some(function (s) { return s.indexOf('同步对照已应用') !== -1; }), '完成有 toast');
+  assert.strictEqual(h.els['#sync-stop'].hidden, true, '完成后停止按钮收起');
+  assert.strictEqual(h.els['#sync-remote-plan-background'].hidden, true);
+});
+
+test('后台应用失败：弹窗不可见也有 toast 与同步图标报错', async () => {
+  const h = makeHarness(null, null, { applyPlan: function () { return Promise.reject(new Error('网络断开')); } });
+  h.els['#sync-remote-merge'].click();
+  await flush();
+  h.els['#sync-remote-choose-local'].click();
+  h.els['#sync-remote-plan-apply'].click();
+  h.api.close(); // 应用 Promise 尚未 settle 时转后台
+  assert.strictEqual(h.api.stateForTest().backgrounded, true);
+  await flush(); await flush();
+  assert.strictEqual(h.api.stateForTest().applying, false);
+  assert.ok(h.calls.indicator.indexOf('error') !== -1, '失败透出到同步图标');
+  assert.ok(h.calls.toasts.some(function (s) { return s.indexOf('网络断开') !== -1; }), '失败有 toast');
 });
 
 /* ---------- 防覆盖断路器与首传确认：强制确认项的渲染与门槛 ---------- */

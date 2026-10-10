@@ -54,8 +54,11 @@
     var used = new Set(), active = 0;
     var steps = input.steps.map(function (step, index) {
       if (!step || typeof step.content !== 'string' || !step.content.trim() || step.content.length > 180 || statuses.indexOf(step.status) < 0 || (step.note != null && (typeof step.note !== 'string' || step.note.length > 300))) fail('无效的计划步骤');
-      var id = step.id == null ? 'step-' + (index + 1) : step.id;
-      if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(id) || used.has(id)) fail('步骤 id 无效或重复');
+      var id = step.id == null ? 'step-' + (index + 1) : String(step.id).trim();
+      // id 只是会话内依赖/证据的关联键（JSON 编码传输），字符集不限——模型常用中文短语
+      // 当 id，此前只认 [a-zA-Z0-9_-] 会把整份计划更新拒之门外，面板于是永远停在旧进度。
+      // 仍要求：非空、≤64 字符、不含空白（保持 token 形态）、不重复。
+      if (!id || id.length > 64 || /\s/.test(id) || used.has(id)) fail('步骤 id 无效（需 1–64 个非空白字符且不重复）');
       used.add(id);
       if (step.status === 'in_progress') active++;
       return { id: id, content: step.content.trim(), status: step.status, note: step.note || '', dependsOn: strings(step.dependsOn, 'dependsOn'), evidenceCallIds: strings(step.evidenceCallIds, 'evidenceCallIds'), artifacts: strings(step.artifacts, 'artifacts') };
@@ -108,5 +111,10 @@
     });
     return current;
   }
-  return { normalizePlan: shape, validateResearchPlan: validateResearchPlan, validateProposal: validateProposal, getResearchPlan: getResearchPlan, successfulResult: successfulResult, evidenceIds: evidenceIds };
+  /** 计划是否已全部完成（UI 据此自动收起计划面板；数据保留在会话消息里不删） */
+  function isPlanCompleted(plan) {
+    return !!(plan && Array.isArray(plan.steps) && plan.steps.length &&
+      plan.steps.every(function (step) { return step && step.status === 'completed'; }));
+  }
+  return { normalizePlan: shape, validateResearchPlan: validateResearchPlan, validateProposal: validateProposal, getResearchPlan: getResearchPlan, isPlanCompleted: isPlanCompleted, successfulResult: successfulResult, evidenceIds: evidenceIds };
 });

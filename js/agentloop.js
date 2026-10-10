@@ -83,6 +83,8 @@
         run.core.messages.push({ role: 'user', content: '[补充要求]\n' + input.text, synthetic: true, kind: 'steering', turnId: run.core.turnId, ts: input.queuedAt });
       });
       await checkpoint(run);
+      // 队列被消费后立刻通知：否则「已排队 n 条」要等到下一个流式增量才消失
+      emit(run.id, { type: 'queue_changed', count: 0 });
     }
 
     function isStreaming(runId) {
@@ -200,6 +202,8 @@
       run.endReason = '';
       run.doc.streaming = true;   // 运行中标记：异常退出后据此判定「中断」（不能只看缓冲非空）
       run.forceContextTokens = 0; // 溢出减半预算只在本轮内生效，新一轮恢复用户设置的预算
+      run.forceMaxOutputTokens = 0; // 输出上限降额同理（端点报 max_tokens 超上限时按报文给的上限重试一次）
+      run.stepNoticeGiven = false; // 单轮只注入一次「步数将尽」收尾提示
       try {
         await checkpoint(run);
         while (true) {
@@ -219,6 +223,7 @@
           // 重试不再依赖另一次成功的模型请求，仍失败则如实走错误路径（不无限重试）
           var result = null;
           var overflowRetried = false;
+          var maxTokensRetried = false;
           while (true) {
             if (run.cancelRequested) { result = { aborted: true }; break; }
             try {
@@ -238,18 +243,38 @@
                 body = buildBody(run);
                 continue;
               }
+              // 输出上限自救：端点 400 明示 max_tokens 上限（各模型不同，应用不猜）时，
+              // 按报文里的上限降额重建请求体重试一次；只在报文给出的上限低于当前下发值时
+              // 重试，重试仍失败则如实走错误路径（不无限重试）
+              var maxTokensLimit = Context && !maxTokensRetried ? Context.maxOutputTokensLimit(errorText) : 0;
+              if (maxTokensLimit > 0 && maxTokensLimit < (Number(body.max_tokens) || Infinity)) {
+                maxTokensRetried = true;
+                run.forceMaxOutputTokens = maxTokensLimit;
+                run.core.messages.push({
+                  role: 'error',
+                  content: '单次回复上限超过该模型的最大值（' + maxTokensLimit + ' tokens），已按上限调低并重试一次；若仍失败，请在设置里调小「最大输出（tokens）」。',
+                  turnId: run.core.turnId || ''
+                });
+                await checkpoint(run);
+                body = buildBody(run);
+                continue;
+              }
               throw error;
             }
           }
           // 模型已返回：其输出即将落账为正式消息，流式缓冲使命结束——
-          // 立刻清空（而非等到 finally），避免「正式回答 + 同段缓冲」在同一份 doc 里并存
+          // 立刻清空（而非等到 finally），避免「正式回答 + 同段缓冲」在同一份 doc 里并存；
+          // 工具卡一并交还给正式消息（decorateToolCalls 标 running，UI 照常显示执行中）
           run.streamText = '';
           run.streamReasoning = '';
+          run.streamToolName = '';
           if (run.cancelRequested || (result && result.aborted)) {
             // 用户停止：保留已生成的半截内容（若有），保证 tool_calls/tool 配对不被破坏
             if (result && result.message && (result.message.content || result.message.reasoning_content || (result.message.tool_calls || []).length)) {
               Core.appendAssistant(run.core, result.message, result.usage);
-              Core.appendToolResults(run.core, Core.pendingToolCalls(run.core).map(function (call) { return { callId: call.callId, name: call.name, result: '（已停止，未执行）', error: true }; }));
+              // 停止路径同样用安全解析：坏参数调用（流式截断）不抛异常，占位结果照补
+              var stopParsed = Core.safePendingToolCalls(run.core);
+              Core.appendToolResults(run.core, stopParsed.calls.concat(stopParsed.invalid).map(function (call) { return { callId: call.callId, name: call.name, result: '（已停止，未执行）', error: true }; }));
             }
             run.endReason = 'stopped';
             break;
@@ -274,14 +299,35 @@
           // 压缩触发的估算偏差靠它纠正（估算值只会在没有真实值时兜底）
           var reportedIn = result && result.usage && Number(result.usage.prompt_tokens);
           if (isFinite(reportedIn) && reportedIn > 0) Core.recordInputUsage(run.core, result.usage, body);
-          var pending = Core.pendingToolCalls(run.core);
+          // 坏参数（流式截断产出非法 JSON）不执行残缺调用：以错误工具结果回喂，
+          // 模型看到后重新发起完整调用——不让整轮失败（用户重试整轮重计费）
+          var parsed = Core.safePendingToolCalls(run.core);
+          if (parsed.calls.length + parsed.invalid.length) {
+            var byId = {};
+            parsed.calls.forEach(function (call) { byId[call.callId] = call; });
+            parsed.invalid.forEach(function (call) { byId[call.callId] = call; });
+            Core.decorateToolCalls(run.core, ((result.message && result.message.tool_calls) || []).map(function (call) {
+              var item = byId[call && call.id] || {};
+              return item.args != null
+                ? { callId: item.callId, name: item.name, args: item.args }
+                : { callId: call && call.id, name: item.name || (call && call.function && call.function.name), args: {}, status: 'error', result: '参数不是合法 JSON，未执行' };
+            }));
+          }
+          if (parsed.invalid.length) {
+            Core.appendToolResults(run.core, parsed.invalid.map(function (call) {
+              return {
+                callId: call.callId, name: call.name, error: true,
+                result: '工具调用参数不是合法 JSON（可能被流式输出截断），本次未执行。请重新发起该调用并给出完整参数，不要沿用原参数。'
+              };
+            }));
+            await checkpoint(run);
+          }
+          var pending = parsed.calls;
           if (!pending.length) {
+            if (parsed.invalid.length) continue; // 本批全部坏参数：模型看完错误结果后重新发起
             if ((run.doc.queuedInputs || []).length) continue;
             run.endReason = 'done'; break;
           }
-          Core.decorateToolCalls(run.core, pending.map(function (call) {
-            return { callId: call.callId, name: call.name, args: call.args };
-          }));
           // 【关键事件点】执行工具之前先把 assistant 消息落盘：
           // 用户随时可能退出/崩溃，此刻不写就会连同已生成的回复一起丢
           // （Cline/Roo 源码注释里点名的同一条纪律）。R04：await 到磁盘提交
@@ -335,6 +381,21 @@
           if (!verdict.continue) {
             run.endReason = verdict.reason === 'done' ? 'done' : verdict.reason;
             break;
+          }
+          // 步数将尽的收尾提示（opencode MAX_STEPS_PROMPT 模式）：还有最后一步时注入
+          // 系统提示，让模型停止发起新工具、基于已有信息给出回答——比到顶硬停
+          // （工具链拦腰截断 + 错误卡）体面得多；模型若仍发起工具，硬顶照常兜底。
+          if (!run.stepNoticeGiven && run.core.steps >= run.core.maxSteps - 1) {
+            run.stepNoticeGiven = true;
+            run.core.messages.push({
+              role: 'user',
+              content: '[系统提示] 本轮工具步数即将用尽（这是最后一步）：请不要再发起新的工具调用，立即基于已获得的信息完成最终回答或给出阶段性总结；未完成的部分在回答中说明，用户可继续提问接力。',
+              synthetic: true,
+              kind: 'step_notice',
+              turnId: run.core.turnId || '',
+              ts: new Date().toISOString()
+            });
+            await checkpoint(run);
           }
         }
       } catch (error) {

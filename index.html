@@ -476,7 +476,7 @@
       <div class="agent-attachments" id="agent-attachments" hidden></div>
       <div class="agent-chips" id="agent-chips" hidden></div>
       <!-- 模型/推理/状态/token 的预备行：bundle 输入行挂载后由 agentui 把它们移进输入行插槽（发送按钮旁），
-           此行只是 bundle 未加载时的兜底位置，移空即移除 -->
+           此行只是 bundle 未加载时的兜底位置，移空后隐藏保留（插槽重挂载时控件先停回这里再移入） -->
       <div class="agent-composer-row">
         <button type="button" class="btn btn-ghost btn-icon" id="agent-upload-btn" title="上传参考文件（文本、PDF、Office、图片；单文件最多 20 MiB，图片 8 MiB）" aria-label="上传参考文件">📎</button>
         <button type="button" class="btn btn-ghost btn-icon agent-compact-btn" id="agent-compact-btn" title="压缩上下文：把较旧对话摘要成一条，腾出上下文空间（原文仍在会话存档）" aria-label="压缩上下文"><svg class="ic" aria-hidden="true"><use href="#lb-i-layers"/></svg></button>
@@ -1174,6 +1174,7 @@
       <section class="sync-section" data-sync-group="storage">
         <h3>全文索引（PDF / EPUB）</h3>
         <div class="sync-form-grid">
+          <p class="span-2 field-hint">为本地 PDF / EPUB 附件逐份提取正文，供全文检索与 AI 阅读。按附件文件计数：一篇文献挂多份全文（正文、补充材料、不同版本等）时各计一份，所以份数可能多于文献总数；笔记、网页快照等其余内容不建全文索引。</p>
           <p class="span-2 field-hint" id="pdf-index-stats"></p>
           <div class="span-2 sync-inline-actions">
             <button type="button" class="btn" id="sync-refresh-pdf-index">更新统计数字</button>
@@ -1361,9 +1362,23 @@
               <span class="sync-check-desc">接近上下文上限时，把较旧的对话摘要成一条继续（摘要调用计入 token 用量，会话里可见压了多少）；关闭后改用裁剪与旧工具结果清理。输入框旁的图层按钮可随时手动压缩</span>
             </span>
           </label>
+          <label class="sync-check-row span-2">
+            <input type="checkbox" id="sync-agent-suggestions">
+            <span class="sync-check-content">
+              <span class="sync-check-title">空会话显示引导建议</span>
+              <span class="sync-check-desc">新会话的空白对话页显示可点击的示例提问；关闭后只保留一行提示</span>
+            </span>
+          </label>
+          <label class="sync-check-row span-2">
+            <input type="checkbox" id="sync-agent-steering">
+            <span class="sync-check-content">
+              <span class="sync-check-title">生成中允许排队补充要求</span>
+              <span class="sync-check-desc">生成期间直接在输入框输入补充要求，按 Enter 或「加入队列」排到当前操作之后一并发给模型；关闭后生成期间不接受排队，已排队的仍可清空</span>
+            </span>
+          </label>
           <label>模型上下文（tokens）<input type="number" id="sync-agent-context-tokens" min="0" step="1000" placeholder="256000"></label>
           <label>最大输出（tokens）<input type="number" id="sync-agent-max-output-tokens" min="0" step="500" placeholder="12800"></label>
-          <p class="span-2 field-hint">上下文是整份请求（含系统提示与工具定义）的长度上限，超出时从最旧的整轮开始丢弃；最大输出是单轮回复上限。部分模型对输出上限另有要求（如 Kimi 思考模型做多步工具调用要求 ≥ 16000），若端点报错请据此调整。这两项对全部服务商生效。</p>
+          <p class="span-2 field-hint">上下文是整份请求（含系统提示与工具定义）的长度上限，超出时从最旧的整轮开始丢弃；最大输出是单轮回复上限。部分模型对输出上限另有要求（如 Kimi 思考模型做多步工具调用要求 ≥ 16000）；设大了时端点会报错，助手会按报错里给出的上限自动调低重试一次，仍失败再改小本项。这两项对全部服务商生效。</p>
         </div>
       </section>
       <section class="sync-section" data-sync-group="integrations" hidden>
@@ -1587,6 +1602,7 @@
     </div>
     <div class="modal-actions">
       <button class="btn" id="sync-remote-plan-cancel">取消</button>
+      <button class="btn" id="sync-remote-plan-background" hidden>后台运行</button>
       <button class="btn btn-primary" id="sync-remote-plan-apply">应用选择并同步</button>
     </div>
   </div>

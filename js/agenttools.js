@@ -149,7 +149,7 @@
       schema('update_research_plan', '创建或完整替换当前会话的调研计划（不修改文献库）。复杂任务先规划，再随进展更新；简单问答无需计划。一次只进行一个步骤。沿用 read_research_plan 的稳定 id，dependsOn 是前置步骤 id。只有依赖完成才可开始；完成必须提供 evidenceCallIds（本会话成功工具调用 id）或 artifacts（本会话已登记附件 file），程序会校验引用；note 记录来源 ID、页码或续读位置；受阻时标记 blocked 并说明原因，不能把尝试过当作完成。', {
         goal: { type: 'string', maxLength: 300, minLength: 1 },
         steps: { type: 'array', maxItems: 12, items: { type: 'object', properties: {
-          id: { type: 'string', description: '稳定步骤 id（首次可省略，更新时沿用）' },
+          id: { type: 'string', description: '稳定步骤 id（首次可省略，更新时沿用；1–64 个非空白字符，中文可用，不含空格）' },
           dependsOn: { type: 'array', items: { type: 'string' }, description: '前置步骤 id，完成后才可开始' },
           evidenceCallIds: { type: 'array', items: { type: 'string' }, description: '本会话成功的工具调用 id（读取或写入计划本身不算证据）' },
           artifacts: { type: 'array', items: { type: 'string' }, description: '本会话已登记的附件 file，如 附件/report.md' },

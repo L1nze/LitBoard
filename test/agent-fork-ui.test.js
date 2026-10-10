@@ -27,7 +27,7 @@ function harness(options) {
     persistRun: async (_run, checkpoint) => { calls.push(['persist', checkpoint]); return opts.saveFailed ? null : { ok: true }; },
     desk: { sessionFork: async (id, input) => { calls.push(['fork', id, input.messageIndex, input.title]); return { id: 'branch' }; } },
     openSession: (id) => calls.push(['open', id]), loadSessions: () => calls.push(['list']),
-    getSnapshot() {}, fillComposerSlot() {}, sendText() {}, turnIdAfterParent() {}, subscriber: null,
+    getSnapshot() {}, fillComposerSlot() {}, parkComposerControls() {}, sendText() {}, turnIdAfterParent() {}, subscriber: null,
     setTimeout() {}, runner: {}
   };
   const forkStart = source.indexOf('  function forkSession(');
@@ -68,4 +68,29 @@ test('生成、压缩或保存失败不创建分支', async () => {
     assert.equal(h.calls.some((call) => call[0] === 'toast'), true);
     assert.equal(h.context.forkBusy, false);
   }
+});
+
+test('流式期间 live 气泡整轮保持挂载：缓冲清空的间隙以「…」占位，不再中途消失', () => {
+  const h = harness({ streaming: true });
+  h.run.core.turnId = 't';
+  h.run.streamText = '';
+  h.run.streamReasoning = '';
+  h.run.streamToolName = '';
+  const out = h.context.convertRun(h.run);
+  const live = out[out.length - 1];
+  assert.equal(live.id, 't:live');
+  assert.equal(live.status.type, 'running');
+  assert.equal(live.content.length, 1); // vm 跨 realm：deepStrictEqual 会因原型不同误报，逐字段断言
+  assert.equal(live.content[0].type, 'text');
+  assert.equal(live.content[0].text, '…');
+  // 工具执行间隙（只有工具名、尚无文本）：工具卡占位而不是整个气泡消失
+  h.run.streamToolName = 'search_openalex';
+  assert.equal(h.context.convertRun(h.run).at(-1).content.some((p) => p.type === 'tool-call' && p.toolName === 'search_openalex'), true);
+  // 正常流式：显示已到达的增量文本
+  h.run.streamToolName = '';
+  h.run.streamText = '部分回答';
+  assert.equal(h.context.convertRun(h.run).at(-1).content.some((p) => p.type === 'text' && p.text === '部分回答'), true);
+  // 轮结束（streaming=false）：live 气泡卸载，正式消息仍在
+  h.run.streaming = false;
+  assert.equal(h.context.convertRun(h.run).some((m) => m.id === 't:live'), false);
 });

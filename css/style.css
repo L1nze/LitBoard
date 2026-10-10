@@ -3567,6 +3567,8 @@ button.onboard-step:hover { background: var(--hover); border-color: var(--accent
   max-height: 160px; min-height: 56px;
 }
 .agent-composer-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+/* 兜底行移空后隐藏保留（display:flex 会盖掉 UA 的 hidden 规则，需显式压掉） */
+.agent-composer-row[hidden] { display: none; }
 .agent-status { flex: 1; min-width: 0; font-size: 11.5px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-tokens { font-size: 11px; color: var(--text-secondary); flex: 0 1 auto; min-width: 0; line-height: 1.3; overflow-wrap: anywhere; }
 /* 模型与推理档位共用一个紧凑控件；服务商仍在模型菜单中分组。 */
@@ -3727,7 +3729,6 @@ button.onboard-step:hover { background: var(--hover); border-color: var(--accent
   font-size: 12px; padding: 2px 6px; border-radius: 6px; text-align: left;
 }
 .aui-act:hover { background: var(--surface-2, rgba(127,127,127,.12)); color: var(--text-primary); }
-.aui-act.left { justify-content: flex-start; }
 /* 思考/工具行：不套卡片边框，压缩为一行可点的紧凑行（悬停高亮），展开体才带框 */
 .aui-reasoning { margin: 0 0 6px; font-size: 12px; }
 .aui-reasoning summary {
@@ -3788,7 +3789,13 @@ button.onboard-step:hover { background: var(--hover); border-color: var(--accent
 }
 .aui-ic { width: 15px; height: 15px; display: block; }
 .aui-empty { text-align: center; color: var(--text-secondary); font-size: 13px; padding: 28px 10px; }
-.aui-suggest { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+/* 空态引导建议：居中紧凑 chips（不再是通栏竖排大按钮）；整体可在 设置 → AI 助手 关闭 */
+.aui-suggest { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-top: 14px; }
+.aui-suggest .aui-act {
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--text-secondary);
+  border-radius: 999px; padding: 3px 12px; font-size: 12px;
+}
+.aui-suggest .aui-act:hover { background: var(--surface-2, rgba(127,127,127,.12)); color: var(--text-primary); border-color: var(--accent); }
 .aui-jump {
   position: sticky; bottom: 8px; left: 50%; transform: translateX(-50%);
   margin: 0 auto; width: max-content;
@@ -3952,6 +3959,4 @@ body.reading-open .detail-sidebar .pdf-annotations {
 .agent-plan-step { padding-top: 6px; overflow-wrap: anywhere; }
 .agent-plan-note { opacity: .7; padding-left: 10px; white-space: pre-wrap; }
 
-.aui-steering { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
-.aui-steering textarea { flex: 1; min-width: 120px; }
 .aui-queued { width: 100%; font-size: 11px; color: var(--text-secondary); }

@@ -41,6 +41,8 @@ window.LitAgentUi = (function () {
   var scopusReady = false;         // Scopus 检索（Elsevier Key 已配置）
   var semanticscholarReady = false; // R16：Semantic Scholar 检索（开关开即注册；Key 可选，仅影响配额）
   var autoCompactEnabled = true;   // R17：上下文压缩（设置 → AI 助手；关闭则只走裁剪+旧工具结果掩码）
+  var showSuggestions = true;      // 空会话引导建议（同区设置；默认显示，可关）
+  var steeringEnabled = true;      // 生成中的「补充要求」排队栏（同上）
   var MASK_KEEP_LAST = 30;         // R17：掩码保留的最近消息条数（压缩关闭时的零成本降级）
   var compactBusy = false;         // H3：手动压缩进行中——与正常发送互斥（控制器按会话唯一，并发会互相顶掉）
   var recentGraphSessionId = null;
@@ -76,10 +78,12 @@ window.LitAgentUi = (function () {
       maybeCompact: function (run) { return maybeCompactRun(run); },
       // 循环的四个事件点（轮开始/工具前/工具后/轮收尾）都是 checkpoint：await 到磁盘提交（R04）
       persist: function (run) { return persistRun(run, true); },
-      emit: function (_id, event) {
+      emit: function (id, event) {
         if (event && event.type === 'run_end') {
-          var run = runs.get(current);
-          if (run) {
+          // 定位到「刚结束的会话」而非当前打开的会话：后台会话收尾时，
+          // 状态行/附件同步不得把别的会话的停止/失败标签写到界面上
+          var run = runs.get(id);
+          if (run && id === current) {
             var labels = {
               done: '', stopped: T('已停止'), failed: T('失败（可重试）'),
               max_steps: T('已达单轮步数上限'), stuck: T('检测到重复调用，已停止')
@@ -123,8 +127,10 @@ window.LitAgentUi = (function () {
         var frozen = run.frozen || {};
         var limits = agentLimits(frozen);
         // 溢出自救（R17）：agentloop 在端点报上下文超长后置 forceContextTokens，
-        // 下一次 buildBody 即用减半预算（确定性裁更多旧轮）重建请求体
+        // 下一次 buildBody 即用减半预算（确定性裁更多旧轮）重建请求体；
+        // max_tokens 超上限同理（forceMaxOutputTokens = 端点报文给出的上限）
         var contextBudget = Number(run.forceContextTokens) > 0 ? Number(run.forceContextTokens) : limits.contextTokens;
+        var outputBudget = Number(run.forceMaxOutputTokens) > 0 ? Number(run.forceMaxOutputTokens) : limits.maxOutputTokens;
         run.appliedContextTokens = contextBudget;
         // 推理强度按轮冻结（A11），参数按服务商/模型能力适配（js/agentreason.js）：
         // 官方不支持的档位不原样下发，避免静默降级或 400
@@ -136,7 +142,7 @@ window.LitAgentUi = (function () {
           // Base URL/Key 由主进程按轮固定（turnPins），渲染层不接触凭据
           model: frozen.model || '',
           maxContextTokens: contextBudget,
-          maxOutputTokens: limits.maxOutputTokens,
+          maxOutputTokens: outputBudget,
           historyMessageCap: window.LitAgentCore.historyCapFor(contextBudget),
           // R17：压缩关闭时的零成本降级——超阈值即把较旧工具结果换成占位行（存储不动）
           maskToolResults: shouldMaskToolResults(run, limits) ? MASK_KEEP_LAST : 0,
@@ -237,14 +243,20 @@ window.LitAgentUi = (function () {
       checks.push(desk.getSetting('webSearchEgressAcknowledged').catch(function () { return false; }));
       // R17：上下文压缩开关（默认开；关掉只影响自动压缩，手动按钮仍可用）
       checks.push(desk.getSetting('autoCompactEnabled').catch(function () { return true; }));
+      // 空态引导建议 / 生成中排队栏（默认开）：只影响展示，不改编排行为
+      checks.push(desk.getSetting('agentShowSuggestions').catch(function () { return true; }));
+      checks.push(desk.getSetting('agentSteeringQueue').catch(function () { return true; }));
     } else {
       checks.push(Promise.resolve(false), Promise.resolve(false), Promise.resolve(true));
+      checks.push(Promise.resolve(true), Promise.resolve(true));
     }
     return Promise.all(checks).then(function (values) {
       var config = values[0] || {};
       var webSearchEnabled = values[1] === true;
       var webSearchAcknowledged = values[2] === true;
       autoCompactEnabled = values[3] !== false;
+      showSuggestions = values[4] !== false;
+      steeringEnabled = values[5] !== false;
       // 端点 + Key 齐备即就绪（原「启用 AI 对话助手」开关已移除：配了就是要用）
       agentReady = !!config.agentBaseUrl && config.hasAgentApiKey === true;
       // 语义检索是 AI 助手的工具（文献库的 semantic: 搜索链与它的开关已移除）：向量模型
@@ -509,24 +521,24 @@ window.LitAgentUi = (function () {
   }
 
   /** 当前活上下文规模（估算 token）：估算值与端点回报的 lastInputTokens 取大——
-   *  真实值只在有用量回报后存在，此前用估算兜底（估算偏保守，宁可早压不可溢出） */
-  function contextBody(run, budgeted) {
-    if (budgeted) return buildAgentBody(run);
+   *  真实值只在有用量回报后存在，此前用估算兜底（估算偏保守，宁可早压不可溢出）。
+   *  估算视图不按预算裁剪（maxContextTokens=0、条数上限放开）：量的是「全部活历史」，
+   *  裁剪后的实发规模由 buildAgentBody 负责。 */
+  function contextBody(run) {
     var frozen = run.frozen || {}, limits = agentLimits(frozen), Core = window.LitAgentCore;
     var cap = window.LitAgentReason ? window.LitAgentReason.detect({ baseUrl: frozen.baseUrl, model: frozen.model }) : null;
     var schema = run.toolSnapshot || tools.tools;
     return Core.buildRequestBody(run.core, {
       system: systemPrompt(run), tools: schema, model: frozen.model || '',
-      maxContextTokens: budgeted ? (run.forceContextTokens || limits.contextTokens) : 0,
+      maxContextTokens: 0,
       maxOutputTokens: limits.maxOutputTokens,
-      historyMessageCap: budgeted ? Core.historyCapFor(limits.contextTokens) : 1000000,
-      compactToolView: budgeted && window.LitAgentContext ? window.LitAgentContext.compactToolView : null,
+      historyMessageCap: 1000000,
       replayReasoning: !!(cap && cap.provider === 'deepseek' && schema.length), sendImages: !!(cap && cap.vision)
     });
   }
 
   function liveContextTokens(run) {
-    return window.LitAgentCore.currentInputTokens(run.core, contextBody(run, false));
+    return window.LitAgentCore.currentInputTokens(run.core, contextBody(run));
   }
 
   function compactionThreshold(limits) {
@@ -1014,22 +1026,24 @@ window.LitAgentUi = (function () {
       }
       // role:'tool' 的结果已并入前一条 assistant 的 tool-call part
     });
-    // 流式中的 live assistant（A06/A07：由循环的流缓冲驱动）
-    if (run.streaming && (run.streamText || run.streamReasoning || run.streamToolName)) {
+    // 流式中的 live assistant（A06/A07：由循环的流缓冲驱动）。
+    // 整轮恒挂载（只看 run.streaming）：工具执行、等待下一句首个增量的间隙里缓冲
+    // 暂时为空，此前条件渲染会把气泡整个卸载——下一批增量再来又重新挂载，
+    // 表现为「对话到一半气泡消失/闪烁」。无内容时以「…」占位保持占位与滚动位置。
+    if (run.streaming) {
       var liveParts = [];
       if (run.streamReasoning) liveParts.push({ type: 'reasoning', text: run.streamReasoning });
       if (run.streamToolName && !run.streamText) {
         liveParts.push({ type: 'tool-call', toolCallId: 'live', toolName: run.streamToolName, args: {}, argsText: '' });
       }
       if (run.streamText) liveParts.push({ type: 'text', text: run.streamText });
-      if (liveParts.length) {
-        out.push({
-          id: (run.core.turnId || 'live') + ':live',
-          role: 'assistant',
-          content: liveParts,
-          status: { type: 'running' }
-        });
-      }
+      if (!liveParts.length) liveParts.push({ type: 'text', text: '…' });
+      out.push({
+        id: (run.core.turnId || 'live') + ':live',
+        role: 'assistant',
+        content: liveParts,
+        status: { type: 'running' }
+      });
     }
     return out;
   }
@@ -1044,7 +1058,10 @@ window.LitAgentUi = (function () {
       messages: run ? convertRun(run) : [],
       sessionId: current || '',
       queuedCount: run && (run.doc.queuedInputs || []).length || 0,
-      isRunning: !!(run && run.streaming)
+      isRunning: !!(run && run.streaming),
+      // 设置 → AI 助手：空态引导建议 / 生成中排队栏（bundle 按此条件渲染）
+      showSuggestions: showSuggestions,
+      queueEnabled: steeringEnabled
     };
   }
 
@@ -1070,7 +1087,7 @@ window.LitAgentUi = (function () {
     var run = current ? runs.get(current) : null;
     var node = $('agent-tokens');
     if (!node) return;
-    node.textContent = run ? T('当前上下文占用 ≈{n} tokens').replace('{n}', fmtTokensK(window.LitAgentCore.currentInputTokens(run.core, contextBody(run, true)))) : '';
+    node.textContent = run ? T('当前上下文占用 ≈{n} tokens').replace('{n}', fmtTokensK(window.LitAgentCore.currentInputTokens(run.core, buildAgentBody(run)))) : '';
   }
 
   /** token 数显示为 k 形式（17397 → 17.4k、17000 → 17k、999 → 999），长数字易读 */
@@ -1199,6 +1216,9 @@ window.LitAgentUi = (function () {
     var wrap = $('agent-plan');
     if (!wrap) return;
     var plan = run && window.LitAgent.getResearchPlan(run.core.messages, run.doc && run.doc.attachments);
+    // 计划全部完成即自动收起（数据仍随消息保留，模型后续再更新会重新出现）——
+    // 挂在输入区上方的进度面板在任务结束后不该一直占着位置
+    if (window.LitAgentPlan && window.LitAgentPlan.isPlanCompleted(plan)) plan = null;
     var signature = JSON.stringify([plan, run && run.streaming, run && run.endReason]);
     if (wrap.dataset.signature === signature) return;
     wrap.dataset.signature = signature;
@@ -1269,15 +1289,29 @@ window.LitAgentUi = (function () {
 
   /** bundle 输入行挂载好后（composerSlotReady）把模型/推理/状态/token 四个 plain-DOM 控件
    *  从底部预备行移进输入行插槽（发送按钮旁）。预备行只是 bundle 未加载时的兜底位置，
-   *  移空后移除；事件监听随节点走，不用重绑。 */
+   *  移空后隐藏保留——ComposerArea 按会话重挂载（key=sessionId）时 React 会销毁旧插槽
+   *  DOM，控件先停回预备行（composerSlotPark）再随新插槽移入，靠它才不丢。 */
+  var COMPOSER_SLOT_IDS = ['agent-upload-btn', 'agent-compact-btn', 'agent-model-control', 'agent-status', 'agent-tokens'];
   function fillComposerSlot(slot) {
     if (!slot) return;
-    ['agent-upload-btn', 'agent-compact-btn', 'agent-model-control', 'agent-status', 'agent-tokens'].forEach(function (id) {
+    COMPOSER_SLOT_IDS.forEach(function (id) {
       var node = $(id);
       if (node && node.parentNode !== slot) slot.appendChild(node);
     });
     var fallbackRow = document.querySelector('.agent-composer-row');
-    if (fallbackRow && !fallbackRow.children.length) fallbackRow.remove();
+    if (fallbackRow) fallbackRow.hidden = true;
+  }
+
+  /** 插槽卸载前的停车点（bundle 在 ComposerArea 卸载时回调）：把控件移回预备行。
+   *  不做的后果：旧插槽 DOM 被 React 销毁时连带把控件节点一起销毁，新插槽再也找不到它们。 */
+  function parkComposerControls() {
+    var fallbackRow = document.querySelector('.agent-composer-row');
+    if (!fallbackRow) return;
+    COMPOSER_SLOT_IDS.forEach(function (id) {
+      var node = $(id);
+      if (node && node.parentNode !== fallbackRow) fallbackRow.appendChild(node);
+    });
+    fallbackRow.hidden = false;
   }
 
   function bridge() {
@@ -1287,6 +1321,7 @@ window.LitAgentUi = (function () {
       T: T,
       sendSuggestion: function (text) { sendText(text); },
       composerSlotReady: fillComposerSlot,
+      composerSlotPark: parkComposerControls,
       retry: function (turnId) {
         if (forkBusy || compactBusy) return;
         var run = current ? runs.get(current) : null;
@@ -1304,6 +1339,7 @@ window.LitAgentUi = (function () {
       queueMessage: function (text) {
         var run = current ? runs.get(current) : null;
         if (!run || !run.streaming) return Promise.resolve(false);
+        if (!steeringEnabled) return Promise.resolve(false); // 设置关掉排队栏后不接受新排队（旧队列仍可清空）
         return runner.enqueue(run.id, text).then(function (queued) { if (queued) { setStatus(T('补充要求已排队，将在当前操作完成后处理')); bump(); } return queued; }, function (error) { toastText(String(error.message || error)); return false; });
       },
       onNew: function (a) { sendText(a && a.text); },
@@ -1564,6 +1600,15 @@ window.LitAgentUi = (function () {
       desk.getSetting('autoCompactEnabled').then(function (value) {
         var compactBox = document.getElementById('sync-agent-autocompact');
         if (compactBox) compactBox.checked = value !== false;
+      }).catch(function () {});
+      // 空态引导建议 / 生成中排队栏（默认开）
+      desk.getSetting('agentShowSuggestions').then(function (value) {
+        var box = document.getElementById('sync-agent-suggestions');
+        if (box) box.checked = value !== false;
+      }).catch(function () {});
+      desk.getSetting('agentSteeringQueue').then(function (value) {
+        var box = document.getElementById('sync-agent-steering');
+        if (box) box.checked = value !== false;
       }).catch(function () {});
       if (desk.sessionRoot) {
         desk.sessionRoot().then(function (fullRoot) {

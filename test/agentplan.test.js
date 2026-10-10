@@ -67,3 +67,27 @@ test('unsupported references and empty failed rendering are not successful evide
   for (const data of [{ status: 'unsupported' }, { status: 'binary' }, { status: 'too_large' }, { renderedPages: [], failures: [{ page: 1, error: 'bad' }] }]) assert.equal(P.successfulResult({ role: 'tool', name: 'read_session_file', content: JSON.stringify(data) }), false);
   assert.equal(P.successfulResult({ role: 'tool', name: 'search_library', content: '{"papers":[]}' }), true);
 });
+
+test('中文/非 ASCII 步骤 id 合法（模型常用中文短语当 id），空白、超长、重复仍拒绝', () => {
+  const chinese = plan({ id: '检索文献' });
+  assert.equal(P.validateProposal(chinese, { messages }).ok, true);
+  // 中文 id 的依赖与证据链路完整走通
+  const two = { goal: '调研', steps: [
+    { id: '检索文献', content: '检索', status: 'completed', evidenceCallIds: ['call1'] },
+    { id: '归纳结论', content: '归纳', status: 'in_progress', dependsOn: ['检索文献'] }
+  ] };
+  assert.equal(P.validateProposal(two, { messages }).ok, true);
+  assert.equal(P.getResearchPlan([...messages, { role: 'tool', name: 'update_research_plan', content: JSON.stringify(two) }]).steps[1].id, '归纳结论');
+  // 边界仍然生效
+  assert.equal(P.validateProposal(plan({ id: ' ' }), { messages }).ok, false, '纯空白 id');
+  assert.equal(P.validateProposal(plan({ id: 'a b' }), { messages }).ok, false, '含空格 id');
+  assert.equal(P.validateProposal(plan({ id: 'x'.repeat(65) }), { messages }).ok, false, '超长 id');
+});
+test('isPlanCompleted：全部完成才算完成，供 UI 自动收起面板', () => {
+  assert.equal(P.isPlanCompleted(null), false);
+  assert.equal(P.isPlanCompleted({ goal: 'g', steps: [] }), false);
+  assert.equal(P.isPlanCompleted(P.validateResearchPlan(plan(), { messages })), true);
+  const pending = plan(); pending.steps.push({ id: 'b', content: '阅读', status: 'pending' });
+  assert.equal(P.isPlanCompleted(P.validateResearchPlan(pending, { messages })), false);
+  assert.equal(P.isPlanCompleted(P.validateResearchPlan(plan({ status: 'blocked' }), { messages })), false);
+});

@@ -6,13 +6,17 @@
  * 复现构建：见同目录 build.js 与 README.md。
  *
  * 桥接契约（mount 时由 js/agentui.js 注入 bridge）：
- * - getSnapshot(): { messages: ThreadMessageLike[], isRunning: boolean, empty: boolean }
+ * - getSnapshot(): { messages: ThreadMessageLike[], isRunning: boolean, empty: boolean,
+ *                    showSuggestions: boolean, queueEnabled: boolean }
  * - subscribe(cb): 订阅快照更新，返回退订函数
  * - onNew({text}) / onEdit({turnId, text}) / onReload({turnId}) / onCancel()
  * - sendSuggestion(text): 空态建议点击直接发送
+ * - queueMessage(text) / clearQueue(): 生成中在**同一输入框**排队补充要求
+ *   （运行中的上箭头按钮与 Enter 都走这里；queueEnabled=false 时不显示排队按钮、不接受排队）
  * - retry(turnId): 错误卡重试
  * - onFork({messageId}): 从指定消息创建独立会话
  * - composerSlotReady(el): 输入行宿主插槽挂载完成，宿主把模型/推理等控件移入 el
+ * - composerSlotPark(el): 插槽即将随组件卸载销毁，宿主把控件移回预备行（否则被连带销毁）
  * - T(s): i18n；openPaper(id): 来源卡跳转
  */
 import React, { useEffect, useState } from 'react';
@@ -21,6 +25,7 @@ import {
   AssistantRuntimeProvider,
   useExternalStoreRuntime,
   useMessage,
+  useComposerRuntime,
   ThreadPrimitive,
   ComposerPrimitive,
   MessagePrimitive,
@@ -99,7 +104,10 @@ function ForkAction({ message }) {
   return <button className="aui-act aui-fork" title={T('保留此前对话，在新会话中继续')} onClick={() => bridge.onFork({ messageId: message.id })}>{T('从此处分叉')}</button>;
 }
 
-/** 消息组件：无 props 渲染，通过 useMessage() 取消息（assistant-ui 0.11 契约） */
+/** 消息组件：无 props 渲染，通过 useMessage() 取消息（assistant-ui 0.11 契约）。
+ *  外层容器直接用 MessagePrimitive.Root：autohide 操作栏的悬停态由 Root 元素上的
+ *  mouseenter/mouseleave 跟踪，操作栏必须在 Root 内部——否则鼠标从气泡移向按钮的
+ *  途中 hover 已解除、按钮被卸载，永远点不到。 */
 function UserMessage() {
   const bridge = bridgeRef;
   const message = useMessage();
@@ -107,11 +115,9 @@ function UserMessage() {
   // 合成消息（工具注入的截图/上下文摘要等）不是用户的发言：不给「编辑重发」入口
   const synthetic = !!(message.metadata && message.metadata.custom && message.metadata.custom.synthetic);
   return (
-    <div className="aui-msg user">
+    <MessagePrimitive.Root className="aui-msg user">
       <div className="aui-bubble">
-        <MessagePrimitive.Root>
-          <MessagePrimitive.Parts />
-        </MessagePrimitive.Root>
+        <MessagePrimitive.Parts />
       </div>
       <div className="aui-actions">
         <ActionBarPrimitive.Root hideWhenRunning autohide="not-last">
@@ -120,7 +126,7 @@ function UserMessage() {
           <ForkAction message={message} />
         </ActionBarPrimitive.Root>
       </div>
-    </div>
+    </MessagePrimitive.Root>
   );
 }
 
@@ -165,15 +171,13 @@ function AssistantMessage() {
     );
   }
   return (
-    <div className="aui-msg assistant">
+    <MessagePrimitive.Root className="aui-msg assistant">
       <div className="aui-bubble">
-        <MessagePrimitive.Root>
-          <MessagePrimitive.Parts components={{
-            Text: MarkdownText,
-            Reasoning: ReasoningBlock,
-            tools: { Fallback: ToolCard }
-          }} />
-        </MessagePrimitive.Root>
+        <MessagePrimitive.Parts components={{
+          Text: MarkdownText,
+          Reasoning: ReasoningBlock,
+          tools: { Fallback: ToolCard }
+        }} />
       </div>
       <div className="aui-actions">
         <ActionBarPrimitive.Root hideWhenRunning autohide="not-last">
@@ -182,31 +186,70 @@ function AssistantMessage() {
           <ForkAction message={message} />
         </ActionBarPrimitive.Root>
       </div>
-    </div>
+    </MessagePrimitive.Root>
   );
 }
 
-/** 底部输入区：发送与停止合并为**一个**图标按钮，不再出现「发送」文字。
- *  未运行 = 向上箭头（发送），运行中 = 方块（停止）——按钮形态与当前能做的事严格一一对应，
- *  避免两个按钮同时挂在行尾时「哪个能点」要靠猜。（编辑态 composer 仍保留文字按钮。）
- *  行内不再显示「Enter 发送」提示（占位符里已有）；aui-host-slot 是宿主插槽——
- *  agentui 挂载后把模型/推理/状态/token 等 plain-DOM 控件移进来（发送按钮旁），
- *  React 不接管槽内节点（槽自身无 React 子节点，重渲染不会清掉外部插入的 DOM）。 */
-function ComposerArea({ bridge, isRunning, queuedCount }) {
+/** 底部输入区：同一个输入框承担「提问」与「生成中的补充要求排队」——不再另开排队框。
+ *  未运行：向上箭头（发送，Enter 提交）；运行中：上箭头变「加入队列」（Enter 也排队，
+ *  经 bridge.queueMessage 进队列），旁边保留方块（停止）——输入位置不变、不多个框。
+ *  queueEnabled=false（设置关掉排队）时运行中只有停止按钮，输入不排队。
+ *  aui-host-slot 是宿主插槽——agentui 挂载后把模型/推理/状态/token 等 plain-DOM 控件
+ *  移进来（发送按钮旁），React 不接管槽内节点（槽自身无 React 子节点，重渲染不会清掉
+ *  外部插入的 DOM）；已排队的存量以计数条显示并可清空。 */
+function ComposerArea({ bridge, isRunning, queuedCount, queueEnabled }) {
   const T = makeT(bridge);
-  const [steering, setSteering] = useState('');
   const [queueBusy, setQueueBusy] = useState(false);
   const label = isRunning ? T('停止') : T('发送');
   const slotRef = React.useRef(null);
-  useEffect(() => {
-    if (slotRef.current && bridge.composerSlotReady) bridge.composerSlotReady(slotRef.current);
+  const composerRuntime = useComposerRuntime();
+  const canQueue = isRunning && queueEnabled;
+  const queueSubmit = async () => {
+    if (queueBusy) return;
+    const text = String(composerRuntime.getState().text || '').trim();
+    if (!text) return;
+    setQueueBusy(true);
+    try { if (await bridge.queueMessage(text)) await composerRuntime.reset(); }
+    finally { setQueueBusy(false); }
+  };
+  // useLayoutEffect：卸载清理跑在 React 移除插槽 DOM 之前——把控件停回宿主预备行，
+  // 否则旧插槽销毁时控件节点被连带销毁，新插槽（重挂载后 composerSlotReady）找不到它们
+  React.useLayoutEffect(() => {
+    const slot = slotRef.current;
+    if (slot && bridge.composerSlotReady) bridge.composerSlotReady(slot);
+    return () => { if (slot && bridge.composerSlotPark) bridge.composerSlotPark(slot); };
   }, []);
+  const sendIcon = (
+    <svg className="aui-ic" viewBox="0 0 16 16" aria-hidden="true">
+      <path
+        d="M8 13.1V3.5M8 3.5 4.3 7.2M8 3.5l3.7 3.7"
+        fill="none" stroke="currentColor" strokeWidth="1.7"
+        strokeLinecap="round" strokeLinejoin="round"
+      />
+    </svg>
+  );
   return (
     <div className="aui-composer-wrap">
       <ComposerPrimitive.Root className="aui-composer">
-        <ComposerPrimitive.Input className="aui-input" autoFocus rows={1} placeholder={T('问点什么…（Enter 发送，Shift+Enter 换行）')} />
+        <ComposerPrimitive.Input
+          className="aui-input" autoFocus rows={1}
+          placeholder={canQueue
+            ? T('补充要求（Enter 加入队列，当前操作完成后处理）')
+            : T('问点什么…（Enter 发送，Shift+Enter 换行）')}
+          onKeyDown={canQueue ? (e) => {
+            // Input 内部的 Enter 提交在 isRunning 时本就不动作；这里接管为排队提交
+            if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return;
+            e.preventDefault();
+            queueSubmit();
+          } : undefined}
+        />
         <div className="aui-composer-row">
           <div className="aui-host-slot" ref={slotRef} />
+          {canQueue && (
+            <button type="button" className="aui-send aui-icon-btn" onClick={queueSubmit} disabled={queueBusy} title={T('加入队列')} aria-label={T('加入队列')}>
+              {sendIcon}
+            </button>
+          )}
           {isRunning ? (
             <ComposerPrimitive.Cancel className="aui-send primary aui-icon-btn" title={label} aria-label={label}>
               <svg className="aui-ic" viewBox="0 0 16 16" aria-hidden="true">
@@ -215,26 +258,11 @@ function ComposerArea({ bridge, isRunning, queuedCount }) {
             </ComposerPrimitive.Cancel>
           ) : (
             <ComposerPrimitive.Send className="aui-send primary aui-icon-btn" title={label} aria-label={label}>
-              <svg className="aui-ic" viewBox="0 0 16 16" aria-hidden="true">
-                <path
-                  d="M8 13.1V3.5M8 3.5 4.3 7.2M8 3.5l3.7 3.7"
-                  fill="none" stroke="currentColor" strokeWidth="1.7"
-                  strokeLinecap="round" strokeLinejoin="round"
-                />
-              </svg>
+              {sendIcon}
             </ComposerPrimitive.Send>
           )}
         </div>
       </ComposerPrimitive.Root>
-      {isRunning && <form className="aui-steering" onSubmit={async (e) => {
-        e.preventDefault();
-        if (!steering.trim() || queueBusy) return;
-        setQueueBusy(true);
-        try { if (await bridge.queueMessage(steering)) setSteering(''); } finally { setQueueBusy(false); }
-      }}>
-        <textarea className="aui-input" rows={1} maxLength={10000} value={steering} onChange={(e) => setSteering(e.target.value)} placeholder={T('补充要求（当前操作完成后处理）')} aria-label={T('补充要求')} />
-        <button className="aui-send" type="submit" disabled={queueBusy || !steering.trim()}>{T('加入队列')}</button>
-      </form>}
       {queuedCount > 0 && <div className="aui-queued">
         {T('已排队 {n} 条；停止后保留，下次继续处理').replace('{n}', String(queuedCount))}
         <button type="button" className="aui-act" onClick={() => bridge.clearQueue()}>{T('清空队列')}</button>
@@ -247,6 +275,7 @@ function App({ bridge }) {
   const T = makeT(bridge);
   const [snap, setSnap] = useState(() => bridge.getSnapshot());
   useEffect(() => bridge.subscribe(setSnap), []);
+  const showSuggestions = snap.showSuggestions !== false; // 设置 → AI 助手：空态引导建议
   const runtime = useExternalStoreRuntime({
     isRunning: snap.isRunning,
     messages: snap.messages,
@@ -281,15 +310,17 @@ function App({ bridge }) {
             <ThreadPrimitive.Empty>
               <div className="aui-empty">
                 <div>{T('开始一段调研对话，或从历史会话继续。')}</div>
-                <div className="aui-suggest">
-                  {[
-                    T('帮我调研「」主题的近年文献'),
-                    T('在我库里找关于「」的文献并总结'),
-                    T('哪些论文的全文提到了「」？')
-                  ].map((tip) => (
-                    <button key={tip} className="aui-act left" onClick={() => bridge.sendSuggestion(tip.replace(/「」/g, ''))}>{tip}</button>
-                  ))}
-                </div>
+                {showSuggestions ? (
+                  <div className="aui-suggest">
+                    {[
+                      T('帮我调研「」主题的近年文献'),
+                      T('在我库里找关于「」的文献并总结'),
+                      T('哪些论文的全文提到了「」？')
+                    ].map((tip) => (
+                      <button key={tip} className="aui-act" onClick={() => bridge.sendSuggestion(tip.replace(/「」/g, ''))}>{tip}</button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             </ThreadPrimitive.Empty>
             <ThreadPrimitive.Messages components={{
@@ -299,7 +330,7 @@ function App({ bridge }) {
             }} />
             <ThreadPrimitive.ScrollToBottom className="aui-jump">{T('↓ 回到底部')}</ThreadPrimitive.ScrollToBottom>
           </ThreadPrimitive.Viewport>
-          <ComposerArea key={snap.sessionId} bridge={bridge} isRunning={snap.isRunning} queuedCount={snap.queuedCount} />
+          <ComposerArea key={snap.sessionId} bridge={bridge} isRunning={snap.isRunning} queuedCount={snap.queuedCount} queueEnabled={snap.queueEnabled !== false} />
         </ThreadPrimitive.Root>
       </div>
     </AssistantRuntimeProvider>

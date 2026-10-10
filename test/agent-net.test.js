@@ -2,11 +2,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createStreamAccumulator, validateBaseUrl, chatUrl, createAgentNet } = require('../electron/agent-net.js');
+const { validateBaseUrl, createAgentNet } = require('../electron/agent-net.js');
+const Proto = require('../js/agentproto.js');
 
 test('stream accumulator merges content deltas and tool call fragments, ignores junk lines, and surfaces upstream errors', function () {
   {
-    const acc = createStreamAccumulator();
+    const acc = Proto.createChatAccumulator();
     const all = [];
     const lines = [
       'data: {"choices":[{"delta":{"content":"你好"}}]}',
@@ -28,7 +29,7 @@ test('stream accumulator merges content deltas and tool call fragments, ignores 
     assert.equal(acc.getFinishReason(), 'tool_calls');
   }
   {
-    const acc = createStreamAccumulator();
+    const acc = Proto.createChatAccumulator();
     assert.deepEqual(acc.pushLine(''), []);
     assert.deepEqual(acc.pushLine(': keep-alive'), []);
     assert.deepEqual(acc.pushLine('data: not-json'), []);
@@ -38,7 +39,7 @@ test('stream accumulator merges content deltas and tool call fragments, ignores 
   }
 });
 
-test('validateBaseUrl enforces https except localhost; chatUrl appends path unless already complete', function () {
+test('validateBaseUrl enforces https except localhost; chat endpoint appends path unless already complete', function () {
   {
     assert.equal(validateBaseUrl('https://api.deepseek.com/'), 'https://api.deepseek.com');
     assert.equal(validateBaseUrl('http://localhost:11434/v1'), 'http://localhost:11434/v1');
@@ -48,6 +49,7 @@ test('validateBaseUrl enforces https except localhost; chatUrl appends path unle
     assert.throws(function () { validateBaseUrl(''); }, /未配置/);
   }
   {
+    const chatUrl = (base) => Proto.endpointFor(base, Proto.DIALECTS.CHAT);
     assert.equal(chatUrl('https://api.deepseek.com'), 'https://api.deepseek.com/chat/completions');
     assert.equal(chatUrl('https://x/v1/'), 'https://x/v1/chat/completions');
     assert.equal(chatUrl('https://x/v1/chat/completions'), 'https://x/v1/chat/completions');
@@ -216,10 +218,11 @@ test('A14: estimated usage scales with real input size, counts tools schema', as
   assert.ok(result.usage.prompt_tokens > 2000, '10000 ASCII chars + tools schema should estimate >2000 tokens, got ' + result.usage.prompt_tokens);
 });
 
-const { modelsUrl, extractModelIds } = require('../electron/agent-net.js');
+const { extractModelIds } = require('../electron/agent-net.js');
 
-test('modelsUrl derives /models from various base forms; extractModelIds handles OpenAI, bare array and {models} shapes; dedupes and sorts', function () {
+test('models endpoint derives /models from various base forms; extractModelIds handles OpenAI, bare array and {models} shapes; dedupes and sorts', function () {
   {
+    const modelsUrl = (base) => Proto.modelsEndpointFor(base, Proto.DIALECTS.CHAT);
     assert.equal(modelsUrl('https://api.moonshot.cn/v1'), 'https://api.moonshot.cn/v1/models');
     assert.equal(modelsUrl('https://api.deepseek.com/'), 'https://api.deepseek.com/models');
     assert.equal(modelsUrl('https://x/v1/chat/completions'), 'https://x/v1/models');

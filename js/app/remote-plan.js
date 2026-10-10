@@ -53,6 +53,9 @@
     var FIRST_UPLOAD_KEY = 'plan:first-upload';           // 云端无库、本机非空的首传确认
     var remotePlanApplying = false;
     var remotePlanStopping = false;
+    // 应用进行中用户可关闭弹窗转入后台（同步照跑）：只藏弹窗不清状态，
+    // 进度透出到工具栏同步图标，重开云同步设置即回到实时进度视图
+    var remotePlanBackgrounded = false;
     // 计划生成进行中：生成占用主进程同步槽位（runSyncTask 串行），渲染层必须
     // 同步置 busy——否则编辑防抖/15 分钟定时/限流续传的后台同步会插队，一边在
     // 主进程撞车报「已有同步任务正在进行」，一边递增 inspectionRevision 把刚
@@ -560,7 +563,9 @@
     }
 
     function createRemotePlan(mode) {
-      if (remotePlanApplying || remotePlanCreating) return;
+      // 应用在跑时，点这四个按钮的合理预期是「看看现在跑到哪了」——直接回到进度视图，不静默忽略
+      if (remotePlanApplying) { reopenRemotePlan(); return; }
+      if (remotePlanCreating) return;
       if (isSyncBusy()) { setSyncInlineStatus('sync-remote-status', T('后台同步正在进行，请稍后再试'), 'warning'); return; }
       if (!desktop || !desktop.createNutstoreSyncPlan) { setSyncInlineStatus('sync-remote-status', T('当前版本不支持云端恢复计划'), 'error'); return; }
       var requestRevision = ++inspectionRevision;
@@ -588,12 +593,30 @@
       }).finally(function () {
         remotePlanCreating = false;
         setSyncBusy(false);
+        setSyncIndicator(''); // 生成结束：指示器回到中性（应用阶段的转圈由 applyRemotePlan 自己负责）
         if (mode === 'mirror' && stopButton) stopButton.hidden = true;
       });
     }
 
+    function backgroundRemotePlan() {
+      if (!remotePlanApplying) return;
+      remotePlanBackgrounded = true;
+      $('#sync-remote-plan-mask').hidden = true;
+      var progressText = $('#sync-remote-plan-progress-text');
+      setSyncIndicator('syncing', progressText && progressText.textContent || T('正在同步…'));
+      toast(T('同步已转入后台运行：顶栏同步图标转圈表示进行中，点开它可回到进度或停止'));
+    }
+
+    function reopenRemotePlan() {
+      if (!remotePlanApplying || !remotePlanBackgrounded) return;
+      remotePlanBackgrounded = false;
+      $('#sync-remote-plan-mask').hidden = false;
+    }
+
     function closeRemotePlanDialog() {
-      if (remotePlanApplying) return; // 应用进行中不允许关闭，避免同步落库到一半丢 UI
+      // 应用进行中：关闭 = 转入后台继续跑（Esc / 点遮罩 / 关闭按钮同语义），不再把用户锁在弹窗里；
+      // 要中断用弹窗内的「停止同步」按钮
+      if (remotePlanApplying) { backgroundRemotePlan(); return; }
       $('#sync-remote-plan-mask').hidden = true;
       pendingRemotePlan = null;
       pendingRemoteResolutions = {};
@@ -619,6 +642,12 @@
       if (progress) progress.hidden = !applying;
       if (list) list.hidden = applying;
       if (toolbar) toolbar.hidden = applying;
+      // 转后台入口只在应用进行中存在；设置页的「停止同步」同步亮出——
+      // 转入后台后用户仍能在设置页中断（与立即同步的停止入口同一颗按钮）
+      var bgButton = $('#sync-remote-plan-background');
+      if (bgButton) bgButton.hidden = !applying;
+      var stopButton = $('#sync-stop');
+      if (stopButton) { stopButton.hidden = !applying; stopButton.disabled = false; }
     }
 
     function setRemotePlanProgress(payload) {
@@ -647,6 +676,7 @@
     function resetRemotePlanProgressUi() {
       setRemotePlanApplying(false);
       remotePlanStopping = false;
+      remotePlanBackgrounded = false;
       var cancelButton = $('#sync-remote-plan-cancel');
       if (cancelButton) {
         cancelButton.disabled = false;
@@ -662,6 +692,11 @@
     function setRemotePlanCompleted(message, incomplete) {
       remotePlanApplying = false;
       remotePlanStopping = false;
+      remotePlanBackgrounded = false;
+      var bgButton = $('#sync-remote-plan-background');
+      if (bgButton) bgButton.hidden = true;
+      var stopButton = $('#sync-stop');
+      if (stopButton) stopButton.hidden = true;
       $('#sync-mirror-options').hidden = true;
       var progress = $('#sync-remote-plan-progress');
       var list = $('#sync-remote-plan-list');
@@ -685,20 +720,27 @@
       if (remotePlanApplying) {
         if (payload.scope === 'apply-plan' && payload.planId === remotePlanId(pendingRemotePlan)) {
           setRemotePlanProgress(payload);
+          // 转后台后弹窗不可见：阶段进度透出到工具栏同步图标的提示里
+          if (remotePlanBackgrounded) setSyncIndicator('syncing', payload.message || '');
         }
         return;
       }
       // 计划生成中的只读预览可能长达数分钟（逐文件 HEAD 受节流间隔限制），
       // 阶段进度必须透到对照状态行，否则看起来与卡死无异。
       if (remotePlanCreating && payload.scope === 'plan') {
-        if (payload.message) setSyncInlineStatus('sync-remote-status', payload.message, 'pending');
+        if (payload.message) {
+          setSyncInlineStatus('sync-remote-status', payload.message, 'pending');
+          setSyncIndicator('syncing', payload.message);
+        }
         return;
       }
-      // 后台自动同步：设置弹窗开着时把阶段信息透出到状态行
+      // 后台自动同步：设置弹窗开着时把阶段信息透出到状态行；无论开不开都更新同步图标提示，
+      // 用户关掉设置后靠顶栏图标确认「还在跑、跑到哪一步」
       if (payload.message && isSyncBusy()) {
         var status = $('#sync-status');
         var mask = $('#sync-mask');
         if (status && mask && !mask.hidden) status.textContent = payload.message;
+        setSyncIndicator('syncing', payload.message);
       }
     }
 
@@ -724,6 +766,7 @@
       if (cancelButton) { cancelButton.disabled = false; cancelButton.textContent = T('停止同步'); }
       setRemotePlanApplying(true);
       setSyncBusy(true); // 应用同样占用主进程同步槽位，后台同步不得插队撞车
+      setSyncIndicator('syncing', T('正在校验云端版本…'));
       setRemotePlanProgress({ phase: 'verify', message: T('正在校验云端版本…') });
       setSyncInlineStatus('sync-remote-status', T('正在校验云端版本并应用…'), 'pending');
       var applyAssetFailures = 0;
@@ -763,6 +806,7 @@
           if (options.scheduleSyncResume) options.scheduleSyncResume(applyPaused.resumeAt);
           setSyncInlineStatus('sync-remote-status', pausedLabel, 'warning');
           setRemotePlanCompleted(pausedLabel);
+          setSyncIndicator('error', pausedLabel);
           toast('⚠ ' + pausedLabel);
           return;
         }
@@ -789,6 +833,9 @@
         $('#sync-remote-plan-progress').hidden = false;
         $('#sync-remote-plan-cancel').textContent = T('关闭');
         setSyncInlineStatus('sync-remote-status', message, stopped ? 'warning' : 'error');
+        // 转后台运行时弹窗不可见，失败/停止结果必须另有出口：同步图标 + toast
+        setSyncIndicator(stopped ? '' : 'error', message);
+        toast(message);
       }).finally(function () {
         setSyncBusy(false);
       });
@@ -822,6 +869,8 @@
         pendingRemoteResolutions['mirror:cleanup'] = this.checked ? 'local' : 'remote';
       });
       $('#sync-remote-plan-cancel').addEventListener('click', cancelOrCloseRemotePlan);
+      var backgroundButton = $('#sync-remote-plan-background');
+      if (backgroundButton) backgroundButton.addEventListener('click', backgroundRemotePlan);
       $('#sync-remote-plan-apply').addEventListener('click', api.apply);
       $('#sync-remote-choose-local').addEventListener('click', function () {
         batchSetRemotePlanChoices('local');
@@ -875,6 +924,7 @@
       createPlan: createRemotePlan,
       handleProgress: handleSyncProgress,
       inspect: inspectRemote,
+      reopen: reopenRemotePlan,
       invalidateInspection: function () {
         inspectionRevision++;
         setSyncInlineStatus('sync-remote-status', T('云端状态待刷新'), 'pending');
@@ -886,7 +936,7 @@
       shouldRefreshForm: function () { return refreshSyncFormAfterSync; },
       stateForTest: function () {
         return { model: remotePlanModel, plan: pendingRemotePlan, resolutions: pendingRemoteResolutions,
-          applying: remotePlanApplying, creating: remotePlanCreating };
+          applying: remotePlanApplying, creating: remotePlanCreating, backgrounded: remotePlanBackgrounded };
       }
     };
     return api;

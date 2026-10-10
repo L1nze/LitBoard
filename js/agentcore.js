@@ -15,7 +15,11 @@
   'use strict';
 
   var DEFAULTS = {
-    maxSteps: 12,           // 单轮对话内「模型→工具→模型」最大步数
+    // 单轮对话内「模型→工具→模型」步数上限。主流 agent（pi 无步数护栏、opencode 默认不限、
+    // Claude Code 以预算而非步数收束）都不过早硬停；真正的失控护栏是卡死检测 + token 预算，
+    // 这里保留偏高的硬顶只作最后保险。临近上限时编排层会注入收尾提示（见 agentloop），
+    // 让模型基于已有信息给出阶段性回答，而不是被拦腰截断。
+    maxSteps: 40,
     toolOutputCap: 12000,   // 单个工具结果进上下文的字符上限
     historyMessageCap: 40,  // 消息条数窗口下限（实际窗口见 historyCapFor）
     // 上下文预算与单轮输出上限（估算 token），可在 设置 → AI 助手 自定义；
@@ -211,6 +215,25 @@
         args: parseToolArgs(call.function.arguments)
       };
     });
+  }
+
+  /** 同 pendingToolCalls，但参数解析失败不抛：坏参数调用归入 invalid，由调用方以
+   *  错误工具结果回喂模型重新发起（流式截断产出坏 JSON 时不能让整轮失败——
+   *  对照 pi 的 failToolCallsFromTruncatedMessage：不执行残缺参数，要求重发完整调用）。 */
+  function safePendingToolCalls(state) {
+    var last = state.messages[state.messages.length - 1];
+    var out = { calls: [], invalid: [] };
+    if (!last || last.role !== 'assistant' || !Array.isArray(last.tool_calls)) return out;
+    last.tool_calls.forEach(function (call) {
+      var item = { callId: call.id, name: call.function && call.function.name };
+      try {
+        item.args = parseToolArgs(call.function && call.function.arguments);
+        out.calls.push(item);
+      } catch (error) {
+        out.invalid.push(item);
+      }
+    });
+    return out;
   }
 
   function signature(name, argsText) {
@@ -512,6 +535,7 @@
     appendToolResults: appendToolResults,
     decorateToolCalls: decorateToolCalls,
     pendingToolCalls: pendingToolCalls,
+    safePendingToolCalls: safePendingToolCalls,
     shouldContinue: shouldContinue,
     isStuck: isStuck,
     truncateOutput: truncateOutput,

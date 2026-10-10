@@ -3783,7 +3783,7 @@
       var btn = $(pair[1]);
       if (mask && btn) m.watch(mask, function () { btn.click(); });
     });
-    // 同步对照弹窗：应用进行中守卫会拒绝关闭，须把栈状态回填
+    // 同步对照弹窗：应用进行中关闭 = 转入后台（遮罩隐藏即转成功，无需回填）；守卫若拒绝才把栈状态回填
     var remotePlanMask = $('#sync-remote-plan-mask');
     if (remotePlanMask) m.watch(remotePlanMask, function () {
       closeRemotePlanDialog();
@@ -4176,7 +4176,7 @@
     toast(list.length > 1 ? T('正在构建 ') + list.length + T(' 篇全文索引…') : T('正在构建全文索引…'));
     window.LitPdfSearch.reindex(list).then(function (result) {
       if (!result || !result.stale) { toast(T('全文索引已是最新')); return; }
-      if (result.indexed) toast(T('✓ 已构建 ') + result.indexed + T(' 篇全文索引'));
+      if (result.indexed) toast(T('✓ 已构建 ') + result.indexed + T(' 份全文索引'));
       else toast(T('⚠ 未能提取 PDF 文本（可能没有文本层）'));
     }).catch(function (err) {
       toast(T('⚠ 构建失败：') + (err && err.message || err));
@@ -9037,6 +9037,8 @@
   function openSyncSettings(sectionId) {
     if (!desktop || !desktop.getIntegrationConfig) { toast(T('同步功能仅在桌面版可用')); return; }
     $('#sync-mask').hidden = false;
+    // 后台运行中的对照应用：重新打开设置即回到实时进度视图（含「停止同步」）
+    if (remotePlan && remotePlan.reopen) remotePlan.reopen();
     applyModalSize($('.sync-modal'), readModalSizes().settings, 560, 360);
     activateSyncGroup('storage');
     $('#sync-status').classList.remove('error');
@@ -9159,6 +9161,13 @@
           // R17：自动压缩上下文开关（与凭据同区，保存即生效）
           if ($('#sync-agent-autocompact')) {
             desktop.setSetting('autoCompactEnabled', $('#sync-agent-autocompact').checked).catch(function () {});
+          }
+          // 空态引导建议 / 生成中排队栏（只影响展示，保存即生效）
+          if ($('#sync-agent-suggestions')) {
+            desktop.setSetting('agentShowSuggestions', $('#sync-agent-suggestions').checked).catch(function () {});
+          }
+          if ($('#sync-agent-steering')) {
+            desktop.setSetting('agentSteeringQueue', $('#sync-agent-steering').checked).catch(function () {});
           }
           if (window.LitAgentUi) LitAgentUi.refreshConfig();
         }
@@ -9321,18 +9330,18 @@
     }).catch(function () {});
   }
 
-  /** 库内带本地全文文件（PDF/EPUB）的附件总数（与 LitPdfSearch 的索引单元口径一致） */
-  function localPdfUnitCount() {
-    var count = 0;
+  /** 库内带本地全文文件（PDF/EPUB）的附件数与所属文献数（与 LitPdfSearch 的索引单元口径一致） */
+  function localPdfUnitStats() {
+    var units = 0, papers = 0;
     state.papers.forEach(function (paper) {
       if (paper.deletedAt) return;
       var list = (paper.attachments || []).filter(function (attachment) {
         return attachment && (attachment.kind === 'pdf' || attachment.kind === 'epub') && attachment.path;
       });
-      if (list.length) count += list.length;
-      else if (paper.pdfPath) count++;
+      if (list.length) { units += list.length; papers++; }
+      else if (paper.pdfPath) { units++; papers++; }
     });
-    return count;
+    return { units: units, papers: papers };
   }
 
   function refreshPdfIndexStats() {
@@ -9342,12 +9351,13 @@
       if (!el) return;
       var mb = (stats.chars || 0) / 1024 / 1024;
       var indexed = stats.entries || 0;
-      var total = localPdfUnitCount();
+      var scope = localPdfUnitStats();
+      var total = scope.units;
       var missing = Math.max(0, total - indexed);
       var text = T('已索引 ') + indexed + ' / ' + total +
-        T(' 篇全文正文（约 ') + (mb >= 0.1 ? mb.toFixed(1) + ' MB' : '0 MB') + '）。';
+        T(' 份全文附件（约 ') + (mb >= 0.1 ? mb.toFixed(1) + ' MB' : '0 MB') + T('），分属 ') + scope.papers + T(' 篇文献。');
       if (!total) text = T('库内没有带本地全文文件（PDF/EPUB）的文献。');
-      else if (missing) text += T('其余 ') + missing + T(' 篇在首次全文检索时自动构建，也可点「构建索引」立即生成。');
+      else if (missing) text += T('其余 ') + missing + T(' 份在首次全文检索时自动构建，也可点「构建索引」立即生成。');
       el.textContent = text;
     }).catch(function () {});
   }
@@ -9501,7 +9511,7 @@
     el.innerHTML = svgUse('lb-i-sync');
     if (stateName === 'syncing') {
       el.classList.add('syncing');
-      el.title = T('正在同步…');
+      el.title = T('正在同步…') + (detail ? '\n' + detail : '');
     } else if (stateName === 'ok') {
       el.classList.add('ok');
       el.title = T('上次同步：') + (detail || new Date().toLocaleTimeString());
@@ -9755,7 +9765,7 @@
       'sync-openalex-email', 'sync-openalex-key', 'sync-elsevier-key', 'sync-tinyfish-key',
       'sync-embed-provider', 'sync-embed-base-url', 'sync-embed-model', 'sync-embed-api-key',
       'sync-agent-context-tokens', 'sync-agent-max-output-tokens', 'sync-agent-session-root',
-      'sync-agent-autocompact'
+      'sync-agent-autocompact', 'sync-agent-suggestions', 'sync-agent-steering'
     ].forEach(function (id) {
       $('#' + id).addEventListener('change', queueSyncAutoSave);
     });
@@ -9967,7 +9977,7 @@
       }).then(function (result) {
         refreshPdfIndexStats();
         if (!result || !result.stale) setSyncInlineStatus('sync-pdf-index-status', T('全文索引已是最新'), 'success');
-        else setSyncInlineStatus('sync-pdf-index-status', T('✓ 已构建 ') + result.indexed + T(' 篇全文索引'), 'success');
+        else setSyncInlineStatus('sync-pdf-index-status', T('✓ 已构建 ') + result.indexed + T(' 份全文索引'), 'success');
       }).catch(function (error) {
         refreshPdfIndexStats();
         setSyncInlineStatus('sync-pdf-index-status', T('构建失败：') + (error && error.message || error), 'error');
