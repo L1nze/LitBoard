@@ -1,6 +1,6 @@
 {
   "name": "litboard",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "本地优先的个人文献阅读仪表盘",
   "main": "electron/main.js",
   "author": "LitBoard",
