@@ -462,6 +462,10 @@
         if (selTimer) { clearTimeout(selTimer); selTimer = null; }
         Promise.resolve(openedPromise).then(function () {
           try { view.close(); } catch (e) {}
+          // book.destroy() 释放 foliate loader 为已加载章节/样式创建的 blob: URL
+          // （document 级 blob registry 持有，不调则反复开书跨书累积）
+          try { if (api.book) api.book.destroy(); } catch (e) {}
+          api.book = null;
         }).catch(function () {});
         if (view.parentNode) view.parentNode.removeChild(view);
       }

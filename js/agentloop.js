@@ -41,11 +41,25 @@
 
     async function checkpoint(run) {
       var saved = await persist(run);
-      if (saved === null || saved === false) throw new Error('会话检查点保存失败，本轮已停止');
+      if (saved === null || saved === false) throw run.persistenceError || new Error('会话检查点保存失败，本轮已停止');
       return saved;
     }
 
     function register(run) { runners.set(run.id, run); }
+
+    /** 会话删除 / UI 侧 LRU 驱逐的出口：从注册表移除，整条 core.messages（含全部工具结果）
+     *  才能被 GC——注册表只进不出时，已删除会话的历史永不释放。
+     *  在飞的 run 拒绝驱逐（返回 false）：streaming 为真覆盖 _turnPromise 未收尾与确认门挂起
+     * （门开在轮次中途）；queuedInputs 非空说明还有未消费的排队输入。未注册视为可安全丢弃。
+     *  force 仅用于「删除会话」路径（调用方已先 cancel + waitIdle）：3s 超时如实继续时
+     *  注册表也不得再持有该会话。 */
+    function unregister(runId, force) {
+      var run = runners.get(String(runId || ''));
+      if (!run) return true;
+      if (!force && (run.streaming || (run.doc.queuedInputs || []).length)) return false;
+      runners.delete(run.id);
+      return true;
+    }
 
     function cancel(runId) {
       var run = runners.get(String(runId || ''));
@@ -184,6 +198,7 @@
      *  对外入口把轮次 Promise 记到 run._turnPromise——waitIdle（R08 删除会话前等待
      *  活动操作收尾）靠它等「确认链/工具写入」真正落地，而不是只看取消标记。 */
     function runTurn(run) {
+      if (run.streaming) return Promise.resolve('busy');
       var p = runTurnInner(run);
       run._turnPromise = p;
       return p;
@@ -493,8 +508,8 @@
         run.doc.turnMeta[run.core.turnId] = savedMeta;
       }
       run.frozen = savedMeta || null;
-      // persist 可能不返回 Promise（简版 mock），统一包一层再链 runTurn
-      return Promise.resolve(persist(run)).then(function () { return runTurn(run); });
+      // runTurn 同步占住运行态，再等待轮开始检查点；额外的异步预保存会留下重复重试窗口。
+      return runTurn(run);
     }
 
     /** 被截断历史的可恢复副本（按 turnId 存最近 20 份；toolCalls 展示元数据不入档减重） */
@@ -561,6 +576,7 @@
 
     return {
       register: register,
+      unregister: unregister,
       runTurn: runTurn,
       cancel: cancel,
       isStreaming: isStreaming,

@@ -624,6 +624,15 @@
   }
 
   /** 统一删除入口：软删除（置墓碑），toast 可撤销；回收站中可恢复或彻底清除 */
+  /** 删除/purge 时清理按文献驻留的运行时键：expandedRows（paperId→true）与
+   *  pdfReadingElapsed（paperId:attachmentId→ms）——两者都只写不删，不清理则键随库膨胀 */
+  function forgetPaperRuntimeState(id) {
+    delete state.expandedRows[id];
+    var prefix = id + ':';
+    Object.keys(pdfReadingElapsed).forEach(function (key) {
+      if (key === id || key.indexOf(prefix) === 0) delete pdfReadingElapsed[key];
+    });
+  }
   function removePapers(ids, label) {
     var idSet = {};
     ids.forEach(function (id) { idSet[id] = true; });
@@ -635,6 +644,7 @@
       p.deletedAt = now;
       p.updatedAt = now;
       delete state.selected[p.id];
+      forgetPaperRuntimeState(p.id);
     });
     commitUndo(T('移入回收站 ') + removed.length + T(' 篇'), undoBefore, { papers: removed.map(function (p) { return p.id; }) });
     state.lastDeleted = removed;
@@ -717,6 +727,7 @@
       p.updatedAt = now;
       state.hiddenPurged[p.id] = true;
       delete state.selected[p.id];
+      forgetPaperRuntimeState(p.id);
       if (window.LitPdfSearch) window.LitPdfSearch.invalidate(p.id);
       purged++;
     });

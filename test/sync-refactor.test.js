@@ -543,3 +543,24 @@ test('scan-assets 逐目录上报进度，且只下钻登记指向的目录（�
   // 反馈环断言 2：只有登记指向的目录才下钻（root + p2 + snapshots + snapshots/p1）
   assert.deepEqual(dav.state.propfinds.sort(), ['', 'p2', 'snapshots', 'snapshots/p1']);
 });
+
+test('待确认同步计划上限：超额 FIFO 淘汰最旧，最新计划仍可正常应用', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-plan-cap-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const dav = makeDavServer();
+  const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: dav.fetch });
+  await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
+  // 每次首传确认都产生一个 pendingPlan（持整库快照）：连续 9 次超过上限 8
+  const planIds = [];
+  for (let i = 0; i < 9; i++) {
+    const pending = await integrations.nutstoreSync({ papers: [{ id: 'p' + i, title: 'T' + i, updatedAt: 1000 + i }], folders: [] });
+    assert.ok(pending.pendingPlan && pending.pendingPlan.firstUploadSuspected, '第 ' + i + ' 次应停在首传确认');
+    planIds.push(pending.pendingPlan.planId);
+  }
+  // 最旧的计划已被淘汰：apply 走既有「不存在或已过期」报错
+  await assert.rejects(integrations.applyNutstoreSyncPlan({ planId: planIds[0], resolutions: { 'plan:first-upload': 'local' } }), /过期/);
+  // 最新计划不受影响：正常应用后云端出现对应文献
+  await integrations.applyNutstoreSyncPlan({ planId: planIds[8], resolutions: { 'plan:first-upload': 'local' } });
+  const cloud = JSON.parse(String(dav.state.files.get(dav.state.libraryUrl)));
+  assert.ok((cloud.papers || []).some(function (p) { return p.title === 'T8'; }), '最新计划应用后云端应含 T8');
+});

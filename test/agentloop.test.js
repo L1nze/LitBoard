@@ -40,6 +40,39 @@ function makeRun() {
 
 const toolCall = (id, name, args) => ({ message: { content: '', tool_calls: [{ id: id, function: { name: name, arguments: JSON.stringify(args) } }] } });
 
+test('double retry cannot start overlapping turns while the initial checkpoint is pending', async () => {
+  const run = makeRun();
+  Core.appendUser(run.core, 'question');
+  const turn = run.core.turnId;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { hooks, calls } = makeHooks([{ message: { content: 'answer' } }], { persist: () => gate });
+  const runner = Loop.createRunner(hooks);
+  const first = runner.rerunTurn(run, turn, 'edited');
+  const second = runner.retryLast(run);
+  release();
+  assert.deepEqual(await Promise.all([first, second]), ['done', 'busy']);
+  assert.equal(calls.chat.length, 1);
+  assert.equal(run.core.messages.filter(m => m.role === 'assistant').length, 1);
+});
+
+test('runTurn rejects duplicate starts instead of replacing the active turn promise', async () => {
+  const run = makeRun();
+  Core.appendUser(run.core, 'question');
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { hooks, calls } = makeHooks([{ message: { content: 'answer' } }], { persist: () => gate });
+  const runner = Loop.createRunner(hooks);
+  const first = runner.runTurn(run);
+  const active = run._turnPromise;
+  const second = runner.runTurn(run);
+  const preserved = run._turnPromise === active;
+  release();
+  assert.deepEqual(await Promise.all([first, second]), ['done', 'busy']);
+  assert.equal(preserved, true);
+  assert.equal(calls.chat.length, 1);
+});
+
 test('each tool result commits before the next side effect and recovers pending image refs; invalid tool image refs never remove their committed result', async () => {
   const snapshots = [];
   const { hooks } = makeHooks([{ message: { content: '', tool_calls: [toolCall('a', 't', {}).message.tool_calls[0], toolCall('b', 't2', {}).message.tool_calls[0]] } }, { message: { content: 'done' } }]);
@@ -876,4 +909,38 @@ test('model return clears all three stream buffers so the live bubble drops the 
   assert.equal(await runner.runTurn(run), 'done');
   assert.equal(holder.duringStream, 'search_openalex');
   assert.equal(holder.atSecondRequest, '');
+});
+
+test('unregister：运行中/排队输入未消费的 run 拒绝驱逐，空闲 run 移除后注册表不再持有（会话删除可 GC）', async () => {
+  const { hooks } = makeHooks([{ message: { content: 'done' } }]);
+  let release;
+  hooks.chat = function () {
+    return new Promise(function (resolve) { release = function () { resolve({ message: { content: 'done' } }); }; });
+  };
+  const runner = Loop.createRunner(hooks); // createRunner 按值捕获 chat，必须先换钩子再建 runner
+  assert.equal(runner.unregister('ghost'), true, '未注册视为可安全丢弃');
+  const run = makeRun();
+  Core.appendUser(run.core, 'go');
+  const turn = runner.runTurn(run);
+  // runTurn 同步前缀已 register + streaming=true：轮次在飞（含确认门挂起）拒绝驱逐
+  assert.equal(runner.unregister('r1'), false, '轮次在飞拒绝驱逐');
+  assert.equal(runner.isStreaming('r1'), true, '注册表仍持有运行中 run');
+  await new Promise(function (r) { setTimeout(r, 0); }); // 等 chat 被调用（release 就位）
+  release();
+  assert.equal(await turn, 'done');
+  // 取消后可能残留排队输入：未消费的补充要求不得随驱逐丢失
+  run.doc.queuedInputs = [{ text: '补充', queuedAt: '2026-01-01T00:00:00Z' }];
+  assert.equal(runner.unregister('r1'), false, '队列非空拒绝驱逐');
+  run.doc.queuedInputs = [];
+  assert.equal(runner.unregister('r1'), true, '空闲后允许驱逐');
+  run.streaming = true; // 若注册表仍持有该 run，isStreaming 会读到这个标记
+  assert.equal(runner.isStreaming('r1'), false, '驱逐后注册表不再持有该会话');
+  // force：删除会话路径（调用方已 cancel + waitIdle）3s 超时仍在飞也移除
+  const run2 = makeRun();
+  Core.appendUser(run2.core, 'go');
+  const turn2 = runner.runTurn(run2);
+  assert.equal(runner.unregister('r1', true), true, 'force 移除在飞 run');
+  await new Promise(function (r) { setTimeout(r, 0); }); // 等 chat 被调用（release 就位）
+  release();
+  assert.equal(await turn2, 'done');
 });

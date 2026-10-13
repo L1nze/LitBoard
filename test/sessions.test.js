@@ -306,3 +306,38 @@ test('R04: commit 立即写盘并等待完成（不等防抖），链住未落�
     assert.equal(final.attachments.length, 1);
   }
 });
+
+test('LRU cache: 超限驱逐最旧条目，dirty 条目驱逐前先落盘；驱逐后从磁盘回退读正常', async function () {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-sessions-lru-'));
+  const s = createSessions({ rootDir: path.join(root, '会话记录'), flushDelayMs: 60000, cacheLimit: 3 });
+  try {
+    const a = await s.create({ title: 'a' });
+    const b = await s.create({ title: 'b' });
+    const bData = await s.read(b.id);
+    bData.messages = [{ role: 'user', content: 'dirty-b' }];
+    await s.setData(b.id, bData); // 60s 防抖未到期：b 此刻是 dirty 的
+    // 缓存命中即刷新 LRU 顺序：a 被 touch 到最新，b 成为最旧
+    await s.read(a.id);
+    await s.create({ title: 'c' });
+    await s.create({ title: 'd' }); // 超上限：驱逐最旧 = b（dirty，必须先落盘再驱逐）
+    const bOnDisk = JSON.parse(await fs.readFile(
+      path.join(root, '会话记录', b.dir, 'session.json'), 'utf8'));
+    assert.equal(bOnDisk.messages[0].content, 'dirty-b',
+      'dirty 条目驱逐前必须落盘，否则未 flush 的修改丢失');
+    // a 刚被 touch 过，不应是本轮受害者：仍在缓存，内容可读
+    const aData = await s.read(a.id);
+    // 再插入两条把 a 也挤出缓存，验证 miss 时从磁盘 loadEntry 回退正常
+    await s.create({ title: 'e' });
+    await s.create({ title: 'f' });
+    const s2 = createSessions({ rootDir: path.join(root, '会话记录') });
+    try {
+      assert.equal((await s2.read(b.id)).messages[0].content, 'dirty-b', '驱逐落盘的内容可被新实例读回');
+      assert.equal((await s2.read(a.id)).title, aData.title);
+    } finally {
+      await s2.flushAll();
+    }
+  } finally {
+    await s.flushAll();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

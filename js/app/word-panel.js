@@ -333,18 +333,23 @@
         opt.textContent = (customs[key].title || key) + T('（自定义）');
         sel.appendChild(opt);
       });
-      sel.addEventListener('change', function () {
-        var path = $('#word-doc-select').value;
-        if (path) {
-          var map = wordStyleMap();
-          map[path] = sel.value;
-          store.setItem('litboard.wordStyles', JSON.stringify(map));
-          $('#word-style-hint').textContent = T('已切换（仅此文档）；已有引文点「刷新引文与参考文献表」按新格式重排。');
-        } else {
-          store.setItem('litboard.cslStyle', sel.value);
-          $('#word-style-hint').textContent = T('未选目标文档，已设为全局默认引文格式。');
-        }
-      });
+      // 常驻元素只绑定一次：本函数每导入一个自定义样式都会重跑重建 option，
+      // 不守卫的话 change 监听器逐次叠加（dispatchEvent 时 N 个监听器连发）
+      if (!sel.dataset.bound) {
+        sel.dataset.bound = '1';
+        sel.addEventListener('change', function () {
+          var path = $('#word-doc-select').value;
+          if (path) {
+            var map = wordStyleMap();
+            map[path] = sel.value;
+            store.setItem('litboard.wordStyles', JSON.stringify(map));
+            $('#word-style-hint').textContent = T('已切换（仅此文档）；已有引文点「刷新引文与参考文献表」按新格式重排。');
+          } else {
+            store.setItem('litboard.cslStyle', sel.value);
+            $('#word-style-hint').textContent = T('未选目标文档，已设为全局默认引文格式。');
+          }
+        });
+      }
       wordSyncStyleSelect();
     }
     function wordBibliography() {

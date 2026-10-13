@@ -421,3 +421,16 @@ test('mirror library body timeout and cancellation retain their cause instead of
     assert.ok(f.calls.every(c => ['GET', 'HEAD', 'PROPFIND'].includes(c.method)));
   }
 });
+
+test('mirror 计划上限：放弃的超额预览淘汰最旧计划，最新计划仍可正常执行', async t => {
+  const f = await fixture(t);
+  // 连续 9 次预览超过上限 8：每次预览的计划持有整库克隆，放弃不应用不得无限滞留
+  const plans = [];
+  for (let i = 0; i < 9; i++) plans.push(await f.preview());
+  // 最旧的计划已被 FIFO 淘汰：apply 走既有「不存在或已过期」报错
+  await assert.rejects(f.apply(plans[0]), /过期/);
+  // 最新计划不受影响：正常执行归档
+  const result = await f.apply(plans[8]);
+  assert.equal(result.mirror.complete, true);
+  assert.equal(result.mirror.moved, 2);
+});

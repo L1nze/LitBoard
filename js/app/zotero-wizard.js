@@ -69,6 +69,9 @@
     function close() {
       if (zoteroWiz.busy) return;
       if (zoteroWiz.offProgress) { zoteroWiz.offProgress(); zoteroWiz.offProgress = null; }
+      // 释放整库扫描快照/导入报告（大库 MB 级）——open() 会用全新状态重新填充
+      zoteroWiz.scan = null;
+      zoteroWiz.report = null;
       $('#zotero-import-mask').hidden = true;
     }
 

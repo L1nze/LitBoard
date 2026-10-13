@@ -2097,7 +2097,12 @@
     }
 
     handle.promise = getSourceBytes().then(function (bytes) {
-      return openDocument(file, new Uint8Array(bytes));
+      var docPromise = openDocument(file, new Uint8Array(bytes));
+      // 字节副本已交给 openDocument（LitMuPdf.open 把它 transfer 给 worker）；
+      // 本地缓存的整份字节此后无人消费（批注写回走 worker 独占文档，不依赖它），
+      // 打开完成（无论成败）即释放引用，避免整份 PDF 随标签常驻
+      docPromise.then(function () { sourceBytesPromise = null; }, function () { sourceBytesPromise = null; });
+      return docPromise;
     }).then(function (doc) {
       handle.doc = doc;
       handle.pageCount = doc.numPages;

@@ -91,6 +91,8 @@ docs/assets/gif/*.mp4
 !/test/agent-reference-ui.test.js
 !/test/agentfork.test.js
 !/test/agent-fork-ui.test.js
+!/test/agent-session-checkpoint.test.js
+!/test/agent-session-ui.test.js
 !/test/attachment-multipdf.test.js
 !/test/folder-delete.test.js
 !/test/folder-import-flow.test.js

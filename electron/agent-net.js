@@ -103,7 +103,12 @@ function createAgentNet(options) {
       ? turnPins.get(sessionId + '|' + turnId).apiKey
       : cfg.agentApiKey;
     const controller = new AbortController();
+    // 同会话新请求顶掉旧请求：先 set 再 abort 旧控制器——不 abort 的话旧流式请求失去
+    // 取消入口，accumulator 一直挂到流自然结束。旧请求的 finally 只删自己那条记录
+    // （H3 恒等比较），先 set 保证旧 finally 不会误删新控制器。
+    const previous = controllers.get(sessionId);
     controllers.set(sessionId, controller);
+    if (previous) previous.abort();
     const acc = LitAgentProto.createAccumulator(dialect);
     const requestBody = Object.assign({}, body);
     if (model) requestBody.model = model;

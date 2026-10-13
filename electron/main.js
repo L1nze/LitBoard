@@ -2098,7 +2098,17 @@ app.on('will-quit', function (event) {
     if (finished) return;
     finished = true;
     startupLog('will-quit: cleanup done, exiting');
-    const closeDb = function () { ctx.libraryDb.close().finally(function () { app.exit(0); }); };
+    const closeDb = function () {
+      // 调研库（research.db/vec.db）同步关闭，退出时正常 WAL checkpoint；
+      // try/catch 守卫不影响既有退出流程与 8s 强退兜底
+      if (ctx.researchDb) {
+        try { ctx.researchDb.close(); } catch (error) {
+          startupLog('will-quit: research db close failed: ' + (error && error.message || error));
+        }
+        ctx.researchDb = null;
+      }
+      ctx.libraryDb.close().finally(function () { app.exit(0); });
+    };
     // R04：等关闭窗口期启动的会话冲刷完成（有 8s 强退兜底，不会无限等）
     const afterSessions = function () {
       if (ctx.bridgeServer) ctx.bridgeServer.stop().then(closeDb, closeDb);

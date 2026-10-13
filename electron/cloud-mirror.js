@@ -6,6 +6,15 @@ const T = require('../js/i18n.js').t;
 // Explicit preview/apply only. Extra objects are moved to a recoverable archive, never deleted.
 function createCloudMirror(hooks) {
   const plans = new Map();
+  // 预览后放弃的计划（含整库克隆 workspace）会永久滞留：按 TTL + 条数上限淘汰。
+  // 过期的计划在 apply 时走既有「计划不存在或已过期」错误路径，不另造文案。
+  const PLAN_TTL_MS = 30 * 60 * 1000;
+  const PLAN_MAX = 8;
+  const planExpired = plan => Number(plan && plan.createdAt) > 0 && Date.now() - plan.createdAt > PLAN_TTL_MS;
+  const sweepPlans = () => {
+    for (const entry of plans) if (planExpired(entry[1])) plans.delete(entry[0]);
+    while (plans.size > PLAN_MAX) plans.delete(plans.keys().next().value); // FIFO：Map 保持插入序
+  };
   const clone = value => JSON.parse(JSON.stringify(value));
   const strong = etag => !!etag && !/^W\//i.test(etag);
   // PROPFIND getetag 与 HTTP ETag 在部分服务端引号形态不同，核对时按去引号等价比较
@@ -78,11 +87,12 @@ function createCloudMirror(hooks) {
       const missing = Mirror.activeAssets(built.workspace).filter(a => !a.cloudName || !inventory.has(a.cloudName))
         .map(a => ({ name: a.cloudName || a.fileName || a.id || '', hasLocalPath: !!(a.path || a.imagePath) }));
       const id = crypto.randomUUID();
-      const plan = { id: id, options: options, baseline: baseline, localSignature: Mirror.signature(input.workspace),
+      const plan = { id: id, createdAt: Date.now(), options: options, baseline: baseline, localSignature: Mirror.signature(input.workspace),
         workspace: built.workspace, inventory: inventory, extras: extras };
       await assertLocal(plan, input.workspace);
       await assertRemote(plan, baseline);
       plans.set(id, plan);
+      sweepPlans();
       return { planId: id, mode: 'mirror', remoteExists: baseline.exists, remoteCount: built.remoteCount,
         localCount: built.localCount, changes: built.changes, extras: extras.map(a => ({ name: a.name })), missing: missing,
         cleanupSupported: extras.every(a => strong(a.etag)), remoteEtag: baseline.etag,
@@ -90,7 +100,8 @@ function createCloudMirror(hooks) {
     });
   }
   async function apply(input) {
-    const plan = plans.get(input.planId);
+    let plan = plans.get(input.planId);
+    if (planExpired(plan)) { plans.delete(plan.id); plan = null; } // 淘汰扫不到的过期计划，走既有失效报错
     if (!plan) fail(T('整理计划不存在或已过期，请重新预览'));
     if (!input.resolutions || input.resolutions['mirror:confirm'] !== 'local') fail(T('请先明确确认以本机文献库为准'));
     const cleanup = input.resolutions['mirror:cleanup'];

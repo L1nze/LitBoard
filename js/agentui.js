@@ -22,8 +22,10 @@ window.LitAgentUi = (function () {
   var tools = null;
   var runner = null;
   var sessionsIndex = [];
-  var runs = new Map();      // sessionId → run（活跃会话，含流式状态）
+  var runs = new Map();      // sessionId → run（活跃会话，含流式状态）；驻留上限见 RUNS_LIMIT
+  var RUNS_LIMIT = 12;       // runs 的 LRU 上限：超出时驱逐最久未打开的空闲 run（防内存随会话数线性涨）
   var current = null;
+  var pendingNewSession = null;
   var activePane = 'detail';   // 当前右栏面板：detail | ai | anno
   var agentReady = false;    // 端点 + Key 配置齐 → 对话模式；否则显示配置引导
   var thinking = '';         // ''=默认 | off | low | medium | high | xhigh | max
@@ -765,14 +767,42 @@ window.LitAgentUi = (function () {
     };
   }
 
+  /** LRU 记录最近使用：把 run 挪到 Map 末尾（Map 迭代即插入序），驱逐从头部取。 */
+  function touchRun(id) {
+    var run = runs.get(id);
+    if (run) { runs.delete(id); runs.set(id, run); }
+  }
+
+  /** runs 上限控制：只驱逐空闲 run——当前打开的会话、生成中（streaming，含确认门挂起：
+   *  门开在轮次中途）永不驱逐；agentloop 侧 unregister 再兜一道（排队输入未消费等拒绝）。
+   *  被逐出的会话走既有回退：openSession 对未驻留会话从磁盘重新 deserialize（含
+   *  restoreInterrupted 恢复中断），功能无损，只是重开时多读一次盘。
+   *  全部在运行/当前会话时如实超限，不强逐。 */
+  function evictIdleRuns() {
+    if (runs.size <= RUNS_LIMIT) return;
+    var overflow = runs.size - RUNS_LIMIT;
+    runs.forEach(function (run, id) {
+      if (overflow <= 0) return;
+      if (id === current) return;
+      if (run && run.streaming) return;
+      if (run && run.persistenceError) return; // 保存失败的内存历史必须保留，不能被旧磁盘内容替换。
+      if (runner && runner.unregister && !runner.unregister(id)) return;
+      runs.delete(id);
+      delete persistWarned[id];
+      overflow--;
+    });
+  }
+
   function newSession() {
-    return desk.sessionCreate({ title: T('新会话') }).then(function (created) {
+    if (pendingNewSession) return pendingNewSession;
+    pendingNewSession = desk.sessionCreate({ title: T('新会话') }).then(function (created) {
       var run = makeRun(created.id, created.data);
       runs.set(created.id, run);
       openSession(created.id);
       loadSessions();
       return run;
-    }).catch(function (error) { toastError(error); return null; });
+    }).catch(function (error) { toastError(error); return null; }).finally(function () { pendingNewSession = null; });
+    return pendingNewSession;
   }
 
   function openSession(id) {
@@ -781,22 +811,20 @@ window.LitAgentUi = (function () {
       if (seq !== openSeq) return;
       if (!doc) { toastText(T('会话不存在或已删除')); loadSessions(); return; }
       var run = runs.get(id);
-      if (run && run.streaming) {
-        // 活跃运行不被磁盘快照回退（A09）
-        run.doc.title = doc.title || run.doc.title;
-      } else if (run) {
-        run.doc = doc;
-        run.core = window.LitAgentCore.deserialize(doc);
-      } else {
+      // 驻留 run 始终是内存权威：读盘请求发出后本轮可能已完成或保存失败，
+      // 不能只凭回调时 streaming=false 就用旧快照覆盖刚生成的内容。
+      if (!run) {
         run = makeRun(id, doc);
         runs.set(id, run);
         // A06：上次运行没收尾 → 恢复中断内容；恢复结果立即落盘（checkpoint），
         // 否则「运行标记」只在内存复位，再重启会被重复恢复一次
         if (runner && runner.restoreInterrupted(run)) persistRun(run, true);
       }
+      touchRun(id);
       current = id;
+      evictIdleRuns();
       $('agent-history').hidden = true;
-      $('agent-cur-title').textContent = doc.title || T('新会话');
+      $('agent-cur-title').textContent = run.doc.title || T('新会话');
       renderMode();
       renderAttachments(run);
       renderChips(); // 换了会话：chips 不能残留上一个会话的冻结/上下文显示
@@ -807,7 +835,7 @@ window.LitAgentUi = (function () {
 
   /** 会话持久化：普通路径走 1s 防抖 setData；checkpoint=true 走主进程 commit——
    *  立即写盘并等待完成（R04 关键事件），返回的附件登记回写本地副本（R05）。
-   *  永不 reject（保存失败以状态行提示，不打断对话循环）。 */
+   *  保存失败返回 null，并在 run 上保留具体原因供编排层的错误卡显示。 */
   function persistRun(run, checkpoint) {
     run.doc.messages = run.core.messages;
     run.doc.steps = run.core.steps;
@@ -826,12 +854,15 @@ window.LitAgentUi = (function () {
       ? desk.sessionCommit(run.id, run.doc)
       : desk.sessionSetData(run.id, run.doc);
     return task.then(function (result) {
+      run.persistenceError = null;
+      delete persistWarned[run.id];
       if (result && Array.isArray(result.attachments) && result.attachments.length) {
         run.doc.attachments = result.attachments;
         if (run.id === current) renderAttachments(run);
       }
       return result;
     }, function (error) {
+      run.persistenceError = new Error(T('会话保存失败：') + String(error && error.message || error));
       if (!persistWarned[run.id]) {
         persistWarned[run.id] = true;
         setStatus(T('会话保存失败：') + String(error && error.message || error));
@@ -896,6 +927,10 @@ window.LitAgentUi = (function () {
         return desk.sessionDelete(s.id);
       }).then(function () {
         runs.delete(s.id);
+        // 内存泄露出口：agentloop 注册表同步移除（settle 已等收尾；force 兜底 3s 超时
+        // 仍在飞的边缘），persistWarned 记账一并清
+        if (runner && runner.unregister) runner.unregister(s.id, true);
+        delete persistWarned[s.id];
         if (current === s.id) {
           current = null;
           $('agent-cur-title').textContent = T('AI 助手');
@@ -917,15 +952,16 @@ window.LitAgentUi = (function () {
     if (forkBusy) return;
     // H3：手动压缩进行中不接受发送——主进程控制器按会话唯一，并发请求会互相顶掉、停止失效
     if (compactBusy) { setStatus(T('正在压缩上下文，请稍候再发送')); return; }
-    var boot = current && runs.get(current) ? Promise.resolve() : newSession();
+    // 在点击发送时绑定目标，异步回调不得改用后来切换到的会话。
+    var boot = current && runs.get(current) ? Promise.resolve(runs.get(current)) : newSession();
     boot.then(async function (run) {
-      if (!run) run = runs.get(current);
       if (!run) return;
       if (runner.isStreaming(run.id)) return;
       if (forkBusy) return;
       if (compactBusy) { setStatus(T('正在压缩上下文，请稍候再发送')); return; }
       if ((run.doc.queuedInputs || []).length) {
         try { await runner.flushQueue(run); } catch (error) { toastText(String(error.message || error)); return; }
+        if (runner.isStreaming(run.id)) return;
       }
       var frozen = freezeContext();
       run.frozen = frozen;
@@ -945,11 +981,11 @@ window.LitAgentUi = (function () {
       if (run.doc.title === T('新会话')) {
         run.doc.title = window.LitResearch.sessionTitleFrom(text);
         desk.sessionRename(run.id, run.doc.title).then(function () {
-          $('agent-cur-title').textContent = run.doc.title;
+          if (current === run.id) $('agent-cur-title').textContent = run.doc.title;
           loadSessions();
         }).catch(function () {});
       }
-      persistRun(run);
+      // 轮开始的 checkpoint 会提交这份消息，避免额外的防抖保存与它并发。
       setStatus('');
       bump();
       runner.runTurn(run);
@@ -1431,6 +1467,8 @@ window.LitAgentUi = (function () {
         var deleted = (result && result.deleted) || [];
         deleted.forEach(function (id) {
           runs.delete(id);
+          if (runner && runner.unregister) runner.unregister(id, true); // 同单删：settle 后移除注册表
+          delete persistWarned[id];
           if (current === id) current = null;
         });
         if (current === null) {

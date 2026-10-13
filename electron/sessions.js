@@ -22,6 +22,8 @@ const LitResearch = require('../js/research.js');
 const LitAgentFork = require('../js/agentfork.js');
 
 const FLUSH_DELAY_MS = 1000;
+// 内存会话缓存上限（LRU）：条目含全量会话 data，无上限会随使用时长单调增长。
+const CACHE_LIMIT = 20;
 // 聚合索引的写盘防抖（真相源即时写、聚合数据防抖——Roo Code TaskHistoryStore 同策略）。
 // index.json 是「会话列表」这份聚合缓存的镜像，每次消息落盘都跟着全量重写纯属浪费；
 // 结构性变更（新建/改名/删除）仍强制立即写，且 list() 会滤掉磁盘上已消失的目录自愈。
@@ -32,10 +34,14 @@ function createSessions(options) {
   const rootDir = opts.rootDir;                       // <root>/会话记录
   const trashItem = opts.trashItem || null;           // async (dir) => void（shell.trashItem）
   const flushDelayMs = Number(opts.flushDelayMs) || FLUSH_DELAY_MS;
+  const cacheLimit = Math.max(1, Number(opts.cacheLimit) || CACHE_LIMIT);
   const indexWriteDelayMs = opts.indexWriteDelayMs == null ? INDEX_WRITE_DELAY_MS : Number(opts.indexWriteDelayMs);
   const log = opts.log || function () {};
-  const cache = new Map();                            // id → { data, dir, timer, dirty }
+  const cache = new Map();                            // id → { data, dir, timer, dirty }；LRU，上限 cacheLimit
+  const loading = new Map();                          // 冷加载并发请求共享同一个条目/写队列
   let indexCache = null;
+  let indexLoading = null;
+  let indexChain = Promise.resolve();
   let indexDirty = false;
   let indexTimer = null;
 
@@ -44,7 +50,7 @@ function createSessions(options) {
 
   async function atomicWrite(file, content) {
     await fs.mkdir(path.dirname(file), { recursive: true });
-    const temp = file + '.tmp-' + process.pid + '-' + Date.now();
+    const temp = file + '.tmp-' + crypto.randomUUID();
     await fs.writeFile(temp, content, 'utf8');
     try {
       await fs.rename(temp, file);
@@ -92,8 +98,23 @@ function createSessions(options) {
     await fs.mkdir(rootDir, { recursive: true });
   }
 
+  // 排他 mkdir 预留名字；先 access 再创建会让同时新建的会话覆盖同一个 session.json。
+  async function reserveDir(dateDir, title) {
+    for (;;) {
+      const name = await freeDirName(dateDir, title);
+      const dir = path.join(dateDir, name);
+      try { await fs.mkdir(path.join(rootDir, dir)); return dir; }
+      catch (error) { if (error.code !== 'EEXIST') throw error; }
+    }
+  }
+
   async function readIndex() {
     if (indexCache) return indexCache;
+    if (!indexLoading) indexLoading = loadIndex().finally(function () { indexLoading = null; });
+    return indexLoading;
+  }
+
+  async function loadIndex() {
     try {
       const parsed = JSON.parse(await fs.readFile(indexPath(), 'utf8'));
       if (parsed && parsed.version === 1 && Array.isArray(parsed.sessions)) {
@@ -101,7 +122,9 @@ function createSessions(options) {
         return parsed;
       }
     } catch (error) { /* 损坏则重建 */ }
-    indexCache = await rebuildIndex();
+    // rebuildIndex 在写盘前已发布 indexCache；等待期间其他会话可能已更新它，
+    // 不可在 await 返回后再用扫描时的旧对象覆盖。
+    await rebuildIndex();
     return indexCache;
   }
 
@@ -112,14 +135,18 @@ function createSessions(options) {
       clearTimeout(indexTimer);
       indexTimer = null;
     }
-    if (!indexDirty || !indexCache) return;
-    indexDirty = false;
-    try {
-      await atomicWrite(indexPath(), JSON.stringify(indexCache, null, 2));
-    } catch (error) {
-      indexDirty = true;                 // 写失败留脏，下次再试
-      throw error;
-    }
+    const write = indexChain.then(async function () {
+      if (!indexDirty || !indexCache) return;
+      indexDirty = false;
+      try {
+        await atomicWrite(indexPath(), JSON.stringify(indexCache, null, 2));
+      } catch (error) {
+        indexDirty = true;                 // 写失败留脏，下次再试
+        throw error;
+      }
+    });
+    indexChain = write.catch(function () {});
+    return write;
   }
 
   function scheduleIndexWrite() {
@@ -176,8 +203,9 @@ function createSessions(options) {
   /** 更新索引条目：immediate 只在结构变更（新建/改名）时为真；
    * 高频的消息落盘路径必须走防抖——否则每次落盘都强制写索引，防抖形同虚设。 */
   async function upsertIndexEntry(entry, immediate) {
-    const index = await readIndex();
-    const rest = index.sessions.filter(function (s) { return s.id !== entry.id; });
+    await readIndex();
+    // await 后读取最新索引，不能用并发调用在等待前拿到的旧对象互相覆盖。
+    const rest = indexCache.sessions.filter(function (s) { return s.id !== entry.id; });
     rest.unshift(entry);
     rest.sort(function (a, b) { return String(b.updatedAt).localeCompare(String(a.updatedAt)); });
     writeIndex({ version: 1, sessions: rest });
@@ -189,13 +217,12 @@ function createSessions(options) {
     const title = LitResearch.sessionTitleFrom(input && input.title);
     const dateDir = dateFolderName();
     await fs.mkdir(path.join(rootDir, dateDir), { recursive: true });
-    const dirName = await freeDirName(dateDir, title);
-    const dir = dateDir + path.sep + dirName;
+    const dir = await reserveDir(dateDir, title);
     const id = 's' + crypto.randomBytes(8).toString('hex');
     const data = newSessionData(id, title);
     if (input && input.model) data.model = String(input.model);
     await atomicWrite(sessionPath(dir), JSON.stringify(data, null, 2));
-    cache.set(id, { data: data, dir: dir, timer: null, dirty: false });
+    await cachePut(id, { data: data, dir: dir, timer: null, dirty: false });
     await upsertIndexEntry({
       id: id, title: data.title, dir: dir,
       createdAt: data.createdAt, updatedAt: data.updatedAt, msgCount: 0
@@ -205,6 +232,54 @@ function createSessions(options) {
 
   function entryOf(id) {
     return cache.get(String(id || ''));
+  }
+
+  /** LRU 命中即提到最新（Map 删除后重插到末尾）；不命中返回 undefined。 */
+  function touch(id) {
+    const key = String(id || '');
+    const entry = cache.get(key);
+    if (entry) {
+      cache.delete(key);
+      cache.set(key, entry);
+    }
+    return entry;
+  }
+
+  /** 超限驱逐最旧条目。驱逐前若条目 dirty 必须先落盘（复用 flush 的既有串行写盘路径）——
+   * 未 flush 的驱逐会丢未落盘的修改；落盘失败的条目保留在缓存（挪到末尾）继续试下一条，
+   * 宁可暂时超上限也不丢数据。 */
+  async function evictOverflow(protectedId) {
+    let guard = cache.size + 1;
+    while (cache.size > cacheLimit && guard-- > 0) {
+      const oldestId = cache.keys().next().value;
+      if (oldestId == null) break;
+      const entry = cache.get(oldestId);
+      // cachePut 返回后调用方还要使用这个条目，不能在返回前把它自己逐出。
+      if (oldestId === protectedId) { touch(oldestId); continue; }
+      // 改名/附件写入尚未完成时即使 dirty=false，也不能逐出并冷加载出第二条写队列。
+      if (entry && entry.pendingWrites) {
+        touch(oldestId);
+        continue;
+      }
+      if (entry && entry.timer) { clearTimeout(entry.timer); entry.timer = null; }
+      if (entry && entry.dirty) {
+        try {
+          await flush(oldestId);
+        } catch (error) {
+          log('session evict flush failed: ' + error);
+          cache.delete(oldestId);
+          cache.set(oldestId, entry);
+          continue;
+        }
+      }
+      if (entry && (entry.pendingWrites || entry.dirty)) { touch(oldestId); continue; }
+      if (cache.get(oldestId) === entry) cache.delete(oldestId);
+    }
+  }
+
+  async function cachePut(id, entry) {
+    cache.set(String(id), entry);
+    await evictOverflow(String(id));
   }
 
   /** 分支的附件与文档全部准备成功后才登记索引，源会话保持原样。 */
@@ -224,13 +299,11 @@ function createSessions(options) {
     if (!sourceRelative || sourceRelative.startsWith('..') || path.isAbsolute(sourceRelative)) throw new Error('Invalid session directory');
     const dateDir = dateFolderName(data.createdAt);
     await fs.mkdir(path.join(root, dateDir), { recursive: true });
-    const dirName = await freeDirName(dateDir, title);
-    const dir = dateDir + path.sep + dirName;
+    const dir = await reserveDir(dateDir, title);
     const targetDir = path.resolve(root, dir);
     const targetRelative = path.relative(root, targetDir);
     if (!targetRelative || targetRelative.startsWith('..') || path.isAbsolute(targetRelative)) throw new Error('Invalid fork directory');
-    // mkdir 不使用 recursive；只有本次成功创建的目录才允许在失败时清理。
-    await fs.mkdir(targetDir);
+    // reserveDir 已排他创建；只有本次成功创建的目录才允许在失败时清理。
     try {
       const sourceReal = await fs.realpath(sourceDir);
       const rootReal = await fs.realpath(root);
@@ -253,7 +326,7 @@ function createSessions(options) {
         id: newId, title: title, dir: dir,
         createdAt: data.createdAt, updatedAt: data.updatedAt, msgCount: data.messages.length
       }, true);
-      cache.set(newId, { data: data, dir: dir, timer: null, dirty: false });
+      await cachePut(newId, { data: data, dir: dir, timer: null, dirty: false });
       return { id: newId, dir: dir, data: JSON.parse(JSON.stringify(data)) };
     } catch (error) {
       if (indexCache) {
@@ -267,15 +340,23 @@ function createSessions(options) {
   }
 
   async function loadEntry(id) {
-    const cached = cache.get(String(id || ''));
+    const cached = touch(id);
     if (cached) return cached;
+    const key = String(id || '');
+    if (!loading.has(key)) {
+      loading.set(key, loadUncachedEntry(key).finally(function () { loading.delete(key); }));
+    }
+    return loading.get(key);
+  }
+
+  async function loadUncachedEntry(id) {
     const index = await readIndex();
     const meta = index.sessions.filter(function (s) { return s.id === String(id); })[0];
     if (!meta) return null;
     let data = null;
     try { data = JSON.parse(await fs.readFile(sessionPath(meta.dir), 'utf8')); } catch (error) { return null; }
     const entry = { data: data, dir: meta.dir, timer: null, dirty: false };
-    cache.set(data.id, entry);
+    await cachePut(data.id, entry);
     return entry;
   }
 
@@ -330,24 +411,32 @@ function createSessions(options) {
     entry.data = incoming;
   }
 
+  function enqueueWrite(entry, operation) {
+    entry.pendingWrites = (entry.pendingWrites || 0) + 1;
+    const write = (entry.chain || Promise.resolve()).then(operation).finally(function () { entry.pendingWrites--; });
+    entry.chain = write.catch(function (error) { log('session flush failed: ' + error); });
+    return write;
+  }
+
+  // 只在条目的写队列内调用；改名与检查点共用，避免 temp 写入期间目录被移动。
+  async function flushEntry(entry) {
+    if (!entry.dirty) return;
+    const rev = entry.revision || 0;
+    const clean = LitResearch.sanitizeSessionForDisk(entry.data);
+    await atomicWrite(sessionPath(entry.dir), JSON.stringify(clean, null, 2));
+    if ((entry.revision || 0) === rev) entry.dirty = false;
+    await upsertIndexEntry({
+      id: entry.data.id, title: entry.data.title || '未命名会话', dir: entry.dir,
+      createdAt: entry.data.createdAt, updatedAt: entry.data.updatedAt,
+      msgCount: Array.isArray(entry.data.messages) ? entry.data.messages.length : 0
+    });
+  }
+
   async function flush(id) {
     const entry = entryOf(id) || await loadEntry(id);
-    if (!entry || !entry.dirty) return;
-    // 同一会话的写盘严格串行；revision 快照保证「写盘期间又来了新修改」不会丢脏标
-    const write = (entry.chain || Promise.resolve()).then(async function () {
-      if (!entry.dirty) return;
-      const rev = entry.revision || 0;
-      const clean = LitResearch.sanitizeSessionForDisk(entry.data);
-      await atomicWrite(sessionPath(entry.dir), JSON.stringify(clean, null, 2));
-      if ((entry.revision || 0) === rev) entry.dirty = false;
-      await upsertIndexEntry({
-        id: entry.data.id, title: entry.data.title || '未命名会话', dir: entry.dir,
-        createdAt: entry.data.createdAt, updatedAt: entry.data.updatedAt,
-        msgCount: Array.isArray(entry.data.messages) ? entry.data.messages.length : 0
-      });
-    });
-    entry.chain = write.catch(function (error) { log('session flush failed: ' + error); });
-    await write;
+    if (!entry || (!entry.dirty && !entry.pendingWrites)) return;
+    // revision 快照保证「写盘期间又来了新修改」不会丢脏标。
+    await enqueueWrite(entry, function () { return flushEntry(entry); });
   }
 
   async function flushAll() {
@@ -383,21 +472,26 @@ function createSessions(options) {
   async function rename(id, newTitle) {
     const entry = await loadEntry(id);
     if (!entry) throw new Error('会话不存在：' + id);
-    await flush(id);
-    const dateDir = entry.dir.split(path.sep)[0];
-    const title = LitResearch.sessionTitleFrom(newTitle);
-    const dirName = await freeDirName(dateDir, title);
-    const oldDir = path.join(rootDir, entry.dir);
-    const newDirRel = dateDir + path.sep + dirName;
-    const newDir = path.join(rootDir, newDirRel);
-    await fs.mkdir(path.dirname(newDir), { recursive: true });
-    await fs.rename(oldDir, newDir);
-    entry.dir = newDirRel;
-    entry.data.title = title;
-    entry.dirty = true;
-    await flush(id);
-    await flushIndex(true); // 改名：结构变更，立即写索引
-    return { ok: true, dir: newDirRel, title: title };
+    // 首条消息会同时触发自动改名和轮开始检查点。整次改名必须占住写队列，
+    // 仅在改名前 await flush 无法阻止后到的 commit 向旧目录写入。
+    return enqueueWrite(entry, async function () {
+      await flushEntry(entry);
+      const dateDir = entry.dir.split(path.sep)[0];
+      const title = LitResearch.sessionTitleFrom(newTitle);
+      const dirName = await freeDirName(dateDir, title);
+      const oldDir = path.join(rootDir, entry.dir);
+      const newDirRel = dateDir + path.sep + dirName;
+      const newDir = path.join(rootDir, newDirRel);
+      await fs.mkdir(path.dirname(newDir), { recursive: true });
+      await fs.rename(oldDir, newDir);
+      entry.dir = newDirRel;
+      entry.data.title = title;
+      entry.revision = (entry.revision || 0) + 1;
+      entry.dirty = true;
+      await flushEntry(entry);
+      await flushIndex(true); // 改名：结构变更，立即写索引
+      return { ok: true, dir: newDirRel, title: title };
+    });
   }
 
   /** 删除 = 进系统回收站（trashItem 由 main 注入；未注入时报不支持） */
@@ -418,6 +512,10 @@ function createSessions(options) {
   async function saveAttachment(id, input) {
     const entry = await loadEntry(id);
     if (!entry) throw new Error('会话不存在：' + id);
+    return enqueueWrite(entry, function () { return writeAttachment(entry, input); });
+  }
+
+  async function writeAttachment(entry, input) {
     const rawName = String(input && input.name || 'file');
     const ext = (path.extname(rawName).match(/\.[A-Za-z0-9]{1,10}/) || [''])[0];
     const stem = LitResearch.sanitizeFileStem(path.basename(rawName, ext), 60);
@@ -442,7 +540,7 @@ function createSessions(options) {
     entry.data.attachments.push({ file: rel, label: String(input && input.label || '') });
     entry.revision = (entry.revision || 0) + 1;
     entry.dirty = true;
-    await flush(id);
+    await flushEntry(entry);
     return { file: rel, path: target };
   }
 

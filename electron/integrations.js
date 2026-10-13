@@ -1219,6 +1219,16 @@ function createIntegrations(options) {
   }
 
   const pendingSyncPlans = new Map();
+  // 待确认计划持有整库快照 + 解密远端配置 + WebDAV auth headers；用户关掉对照弹窗
+  // 不应用时永不清理会常驻内存。按 TTL + 条数上限（FIFO，Map 保持插入序）淘汰；
+  // 过期的计划在 apply 时走既有「计划不存在或已过期」错误路径。
+  const PENDING_PLAN_TTL_MS = 30 * 60 * 1000;
+  const PENDING_PLAN_MAX = 8;
+  const pendingPlanExpired = plan => Number(plan && plan.createdAt) > 0 && Date.now() - plan.createdAt > PENDING_PLAN_TTL_MS;
+  const sweepPendingSyncPlans = () => {
+    for (const entry of pendingSyncPlans) if (pendingPlanExpired(entry[1])) pendingSyncPlans.delete(entry[0]);
+    while (pendingSyncPlans.size > PENDING_PLAN_MAX) pendingSyncPlans.delete(pendingSyncPlans.keys().next().value);
+  };
   const SYNC_BASE_FILE = path.join(options.baseDir, 'sync-base.json');
   const SYNC_HISTORY_DIR = path.join(options.baseDir, 'sync-history');
   /** 对照弹窗里「本机为空疑似重置」总体决议的键（渲染层同名常量保持一致） */
@@ -2534,6 +2544,7 @@ function createIntegrations(options) {
       if (remoteOptions.configPassword) throw error;
     }
     pendingSyncPlans.set(planId, plan);
+    sweepPendingSyncPlans();
     return Object.assign({}, plan, { _options: undefined, _remoteConfig: undefined, corePlan: undefined });
   }
 
@@ -2693,7 +2704,8 @@ function createIntegrations(options) {
   async function applyNutstoreSyncPlan(input) {
     const value = input && typeof input === 'object' ? input : {};
     if (cloudMirror.has(value.planId)) return cloudMirror.apply(value);
-    const plan = pendingSyncPlans.get(String(value.planId || ''));
+    let plan = pendingSyncPlans.get(String(value.planId || ''));
+    if (pendingPlanExpired(plan)) { pendingSyncPlans.delete(plan.planId); plan = null; } // 淘汰扫不到的过期计划，走既有失效报错
     if (!plan) throw new Error('同步计划不存在或已过期，请重新检查云端');
     const reportProgress = function (phase, extra) {
       emitSyncProgress(Object.assign({ scope: 'apply-plan', planId: plan.planId, phase: phase }, extra || {}));

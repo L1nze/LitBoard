@@ -548,7 +548,12 @@ function register() {
           const response = await safePublicFetch(work.oaUrl, {
             signal: signal, headers: { Accept: 'application/pdf,*/*' }, maxBytes: 80 * 1024 * 1024
           });
-          if (!response.ok) { out[i] = { workId: work.id, file: '', error: ctx.T('下载失败（HTTP ') + response.status + '）' }; continue; }
+          if (!response.ok) {
+            // 非 2xx 也要丢弃响应流，否则 socket 悬挂（比照 bridge-server 的既有模式）
+            if (response.discard) response.discard();
+            out[i] = { workId: work.id, file: '', error: ctx.T('下载失败（HTTP ') + response.status + '）' };
+            continue;
+          }
           const bytes = Buffer.from(await response.arrayBuffer());
           operations.check(signal);
           if (bytes.length < 1000 || bytes[0] !== 0x25) { out[i] = { workId: work.id, file: '', error: ctx.T('返回内容不是 PDF') }; continue; }
@@ -624,7 +629,10 @@ function register() {
     const response = await safePublicFetch(work.oaUrl, {
       signal: signal, headers: { Accept: 'application/pdf,*/*' }, maxBytes: 80 * 1024 * 1024
     });
-    if (!response.ok) return { cached: false, error: '全文下载失败（HTTP ' + response.status + '）' };
+    if (!response.ok) {
+      if (response.discard) response.discard(); // 非 2xx 丢弃响应流，避免 socket 悬挂
+      return { cached: false, error: '全文下载失败（HTTP ' + response.status + '）' };
+    }
     const bytes = Buffer.from(await response.arrayBuffer());
     operations.check(signal);
     if (bytes.length > 80 * 1024 * 1024) return { cached: false, error: 'PDF 过大（>80MB），已跳过' };

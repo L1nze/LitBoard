@@ -559,3 +559,32 @@ test('transient HTTP rejection honors Retry-After with bounded retries and no to
     assert.equal(result.partial, true); assert.equal(result.message.reasoning_content, 'thinking');
   }
 });
+
+test('同会话新请求覆盖控制器时主动 abort 旧流：旧流按 aborted 收尾，新请求 cancel 仍有效（H3 不回归）', async function () {
+  const signals = [];
+  const net = createAgentNet({
+    // 挂住的流：只在 signal abort 时以 AbortError 收尾（不 abort 就永不释放）
+    fetch: function (url, options) {
+      signals.push(options.signal);
+      return new Promise(function (resolve, reject) {
+        options.signal.addEventListener('abort', function () {
+          const error = new Error('已停止'); error.name = 'AbortError'; reject(error);
+        });
+      });
+    },
+    getConfig: async function () { return { agentBaseUrl: 'https://api.test', agentApiKey: 'K', agentModel: 'm' }; },
+    notify: function () {}
+  });
+  const body = { messages: [{ role: 'user', content: 'q' }], stream: true };
+  const first = net.chatStream({ sessionId: 's', turnId: 't1', body: body });
+  const second = net.chatStream({ sessionId: 's', turnId: 't2', body: body });
+  await new Promise(function (r) { setTimeout(r, 0); });
+  assert.equal(signals.length, 2);
+  assert.equal(signals[0].aborted, true, '旧控制器被覆盖前主动 abort');
+  assert.equal(signals[1].aborted, false, '新控制器不受旧请求收尾影响');
+  const r1 = await first;
+  assert.equal(r1.aborted, true, '旧流按 aborted 收尾而非挂到自然结束');
+  assert.equal(net.cancel('s'), true, '新请求的停止入口仍在');
+  const r2 = await second;
+  assert.equal(r2.aborted, true);
+});
