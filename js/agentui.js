@@ -593,11 +593,24 @@ window.LitAgentUi = (function () {
       if (!info) {
         if (!manual) run.compactionFailedTurn = run.core.turnId || '';
         setStatus(T('摘要没有减少上下文，已保留原文'));
-        return persistRun(run, true).then(function () { return null; });
+        // persistRun 失败返回 null 而非 reject——不能把它当成功吞掉，但内存状态
+        // 本就未变，这里只需如实呈现（后续任意事件点的 checkpoint 自愈）
+        return persistRun(run, true).then(function (saved) {
+          if (!saved) setStatus(T('会话保存失败：压缩结果将在下次操作时重试'));
+          return null;
+        });
       }
       setStatus(T('已压缩上下文：≈{before} → ≈{after} tokens').replace('{before}', fmtTokensK(beforeTokens)).replace('{after}', fmtTokensK(liveContextTokens(run))));
       updateTokens();
-      return persistRun(run, true).then(function () { bump(); return info; });
+      return persistRun(run, true).then(function (saved) {
+        if (!saved) {
+          // 内存已压缩、磁盘未落：界面如实告知，后续 checkpoint 自愈，不再虚报成功
+          setStatus(T('已压缩上下文，但会话保存失败，将在下次操作时自动重试'));
+          return info;
+        }
+        bump();
+        return info;
+      });
     });
   }
 
@@ -817,8 +830,15 @@ window.LitAgentUi = (function () {
         run = makeRun(id, doc);
         runs.set(id, run);
         // A06：上次运行没收尾 → 恢复中断内容；恢复结果立即落盘（checkpoint），
-        // 否则「运行标记」只在内存复位，再重启会被重复恢复一次
-        if (runner && runner.restoreInterrupted(run)) persistRun(run, true);
+        // 否则「运行标记」只在内存复位，再重启会被重复恢复一次。
+        // persistRun 失败返回 null（不 reject）——重试一次，仍失败则留给后续
+        // 事件点自愈，但不静默（persistRun 内部已设 persistenceError 状态）
+        if (runner && runner.restoreInterrupted(run)) {
+          persistRun(run, true).then(function (saved) {
+            if (!saved) return persistRun(run, true);
+            return saved;
+          });
+        }
       }
       touchRun(id);
       current = id;
@@ -956,7 +976,9 @@ window.LitAgentUi = (function () {
     var boot = current && runs.get(current) ? Promise.resolve(runs.get(current)) : newSession();
     boot.then(async function (run) {
       if (!run) return;
-      if (runner.isStreaming(run.id)) return;
+      // 生成中不再静默吞掉发送（调研计划的「继续任务」按钮曾因此点了没反应）：
+      // 提示用户稍候或用输入行的排队通道
+      if (runner.isStreaming(run.id)) { setStatus(T('正在生成回复，稍候自动继续；也可用输入行排队补充')); return; }
       if (forkBusy) return;
       if (compactBusy) { setStatus(T('正在压缩上下文，请稍候再发送')); return; }
       if ((run.doc.queuedInputs || []).length) {
@@ -1151,7 +1173,7 @@ window.LitAgentUi = (function () {
     if (agentReady && !chatRoot.dataset.mounted && window.LitAgentChat) {
       window.LitAgentChat.mount(chatRoot, bridge());
       chatRoot.dataset.mounted = '1';
-      watchChatMath(chatRoot); // 公式渲染观察器随挂载建立（流式/切会话的 DOM 重建都由它驱动）
+      watchChatRich(chatRoot); // 公式/mermaid 后处理观察器随挂载建立（流式/切会话的 DOM 重建都由它驱动）
     }
     var run = current ? runs.get(current) : null;
     setStatus(!agentReady ? '' : (run && run.streaming ? T('生成中…（切换会话不会中断）') : ''));
@@ -1675,13 +1697,52 @@ window.LitAgentUi = (function () {
   function toastText(text) { if (deps.toast) deps.toast(text); }
   function toastError(error) { toastText(T('AI 助手：') + String(error && error.message || error)); }
 
-  /* ---------------- 聊天公式渲染（MathJax tex-svg，懒加载） ----------------
+  /* ---------------- 聊天富内容后处理（公式 / mermaid，均懒加载） ----------------
    * 正文经 LitMarkdown 渲染：$...$ / $$...$$ 已被摘成 .lb-math / .lb-math-block
-   * 节点（内容 = 转义后的原始 LaTeX，textContent 即 TeX 源）。独占行的块公式为 div，
-   * 其余为 span。这里对聊天容器里的
-   * 这些节点逐个 tex2svgPromise 类型化——不扫全文定界符，不会误伤普通文本里的 $；
-   * 失败（LaTeX 语法错等）保留原文，绝不打断消息显示。MathJax 只在首次出现公式时
-   * 才注入（vendor/mathjax/tex-svg.js 单文件、SVG 输出无字体依赖），无公式的会话零开销。 */
+   * 节点（内容 = 转义后的原始 LaTeX，textContent 即 TeX 源）；```mermaid 围栏落成
+   * div.lb-mermaid 占位（data-mmd-src 带源码）。聊天是 React 侧渲染——流式增量每个
+   * chunk 都会整条消息重设 innerHTML，把已排版的 SVG 一并销毁。因此这里做三件事：
+   * 1) 渲染结果缓存（TeX → SVG / mermaid 源码 → SVG）：DOM 重建后在 MutationObserver
+   *    回调（微任务，先于绘制）里同步回填缓存命中，用户看不到公式闪回源码；
+   * 2) 节流扫描（先导沿 + 尾随）替代旧防抖——高频 chunk 会把纯防抖无限重置，
+   *    公式要等流式结束才出现（饿死）；节流保证流式期间每 ~0.7s 就排版一轮新增公式；
+   * 3) mermaid 流式语义：解析失败不标记成功，保留源码展示；源码随 chunk 变长后
+   *    DOM 重建、自然重试，直到能 parse 才成图。
+   * MathJax（tex-svg 单文件）与 mermaid（vendor/mermaid UMD）都只在首次出现
+   * 对应内容时才注入，没有公式/图的会话零开销。 */
+  function escapeHtml(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  /* 先导沿 + 尾随节流：冷却窗口内只排队一次，窗口到期补跑；首触发立即执行 */
+  function makeThrottle(ms) {
+    var cooldown = null, queued = null;
+    return function (fn) {
+      if (cooldown) { queued = fn; return; }
+      cooldown = setTimeout(function () {
+        cooldown = null;
+        if (queued) { var run = queued; queued = null; run(); }
+      }, ms);
+      fn();
+    };
+  }
+
+  function cachePut(map, key, value, max) {
+    if (map.has(key)) map.delete(key); // 重置插入序，做简单 LRU
+    map.set(key, value);
+    if (map.size > max) {
+      var oldest = map.keys().next().value;
+      map.delete(oldest);
+    }
+  }
+
+  var MATH_SWEEP_MS = 700, MERMAID_SWEEP_MS = 1200;
+  var MATH_CACHE_MAX = 400, MERMAID_CACHE_MAX = 100;
+  var mathSvgCache = new Map();     // (display?'B':'I')+\0+TeX → mjx-container outerHTML
+  var mermaidSvgCache = new Map();  // mermaid 源码 → svg 串
+  var mmdSeq = 0;
   var mathjaxPromise = null;
   function ensureMathJax() {
     if (window.MathJax && window.MathJax.startup && window.MathJax.startup.promise) {
@@ -1710,9 +1771,27 @@ window.LitAgentUi = (function () {
     return mathjaxPromise;
   }
 
-  /** 对 root 内尚未处理的公式节点做类型化；无公式返回 false，有则处理完返回 true */
+  /** 同步回填缓存命中的公式（微任务时机调用可先于绘制，消除源码闪烁）；返回命中数 */
+  function restoreCachedMath(root) {
+    var pending = root.querySelectorAll('.lb-math:not([data-math-typeset]), .lb-math-block:not([data-math-typeset])');
+    var hits = 0;
+    Array.prototype.forEach.call(pending, function (span) {
+      var tex = span.textContent;
+      var cached = mathSvgCache.get((span.classList.contains('lb-math-block') ? 'B\u0000' : 'I\u0000') + tex);
+      if (cached == null) return;
+      span.setAttribute('data-math-typeset', '1');
+      span.innerHTML = cached;
+      hits++;
+    });
+    return hits;
+  }
+
+  /** 对 root 内尚未处理的公式做类型化；缓存命中同步回填，未命中走 MathJax。
+   * 无（新）公式返回 false，处理了返回 true。失败（LaTeX 语法错等）保留原文，
+   * 绝不打断消息显示。 */
   function typesetMath(root) {
     if (!root || !root.querySelectorAll) return Promise.resolve(false);
+    restoreCachedMath(root);
     var pending = Array.prototype.slice.call(
       root.querySelectorAll('.lb-math:not([data-math-typeset]), .lb-math-block:not([data-math-typeset])'));
     if (!pending.length) return Promise.resolve(false);
@@ -1723,10 +1802,17 @@ window.LitAgentUi = (function () {
       pending.forEach(function (span) {
         var tex = span.textContent;
         var display = span.classList.contains('lb-math-block');
+        var key = (display ? 'B\u0000' : 'I\u0000') + tex;
+        var cached = mathSvgCache.get(key);
+        if (cached != null) {
+          span.innerHTML = cached;
+          return;
+        }
         chain = chain.then(function () {
           return MathJax.tex2svgPromise(tex, { display: display }).then(function (node) {
             span.textContent = '';
             span.appendChild(node);
+            cachePut(mathSvgCache, key, node.outerHTML, MATH_CACHE_MAX);
           }).catch(function () {
             // 单条公式失败（LaTeX 语法错误等）：还原为原文继续展示
             span.removeAttribute('data-math-typeset');
@@ -1741,17 +1827,149 @@ window.LitAgentUi = (function () {
     });
   }
 
+  /* ---------------- mermaid 渲染（vendor/mermaid UMD，懒加载） ----------------
+   * div.lb-mermaid 占位（markdown.js 的 fence 拦截产出）→ mermaid.parse 校验 →
+   * mermaid.render 成图。流式期间源码不完整、parse 会失败：保留源码块展示、
+   * 不标记成功；源码随 chunk 变长后 React 重建 DOM、节点状态归零，自然重试。
+   * securityLevel 固定 strict（模型输出不可信，标签一律转义）；主题跟随应用
+   * 明暗（data-theme 前缀，auto 时看 colorScheme），切换时清缓存并重排已成的图。 */
+  var mermaidLibPromise = null;
+  var mermaidTheme = null;
+
+  function mermaidThemeNow() {
+    var doc = document.documentElement;
+    var v = doc.getAttribute('data-theme') || '';
+    if (/^dark/i.test(v)) return 'dark';
+    if (/^light/i.test(v)) return 'default';
+    try { return /dark/i.test(getComputedStyle(doc).colorScheme || '') ? 'dark' : 'default'; }
+    catch (e) { return 'default'; }
+  }
+
+  function ensureMermaid() {
+    if (window.mermaid && window.mermaid.initialize) return Promise.resolve(window.mermaid);
+    if (mermaidLibPromise) return mermaidLibPromise;
+    mermaidLibPromise = new Promise(function (resolve, reject) {
+      var script = document.createElement('script');
+      script.src = 'vendor/mermaid/mermaid.min.js';
+      script.onload = function () {
+        window.mermaid && window.mermaid.initialize
+          ? resolve(window.mermaid) : reject(new Error('mermaid 不可用'));
+      };
+      script.onerror = function () { reject(new Error('mermaid 加载失败')); };
+      document.head.appendChild(script);
+    });
+    // 加载失败后允许重试（下次出现 mermaid 块再试一次）
+    mermaidLibPromise.catch(function () { mermaidLibPromise = null; });
+    return mermaidLibPromise;
+  }
+
+  /** 拿到按当前主题初始化好的 mermaid；主题变了就重新 initialize 并清空 SVG 缓存 */
+  function mermaidReady() {
+    return ensureMermaid().then(function (mm) {
+      var theme = mermaidThemeNow();
+      if (theme !== mermaidTheme) {
+        mermaidTheme = theme;
+        mm.initialize({ startOnLoad: false, securityLevel: 'strict', theme: theme });
+        mermaidSvgCache.clear();
+      }
+      return mm;
+    });
+  }
+
+  /** 同步回填缓存命中的图（与公式同一时机，先于绘制）；返回命中数 */
+  function restoreCachedMermaid(root) {
+    var pending = root.querySelectorAll('.lb-mermaid:not([data-mmd-ok])');
+    var hits = 0;
+    Array.prototype.forEach.call(pending, function (node) {
+      var src = node.getAttribute('data-mmd-src') || '';
+      var cached = src && mermaidSvgCache.get(src);
+      if (cached == null) return;
+      node.setAttribute('data-mmd-ok', '1');
+      node.innerHTML = cached;
+      hits++;
+    });
+    return hits;
+  }
+
+  /** 主题切换：清缓存、把已成的图还原成源码占位，交由下一轮扫描按新主题重排 */
+  function resetMermaidForTheme(root) {
+    var now = mermaidThemeNow();
+    if (mermaidTheme == null || now === mermaidTheme) return;
+    var nodes = root.querySelectorAll('.lb-mermaid[data-mmd-ok]');
+    Array.prototype.forEach.call(nodes, function (node) {
+      var src = node.getAttribute('data-mmd-src') || '';
+      node.removeAttribute('data-mmd-ok');
+      node.removeAttribute('data-mmd-tried');
+      node.innerHTML = src
+        ? '<pre class="lb-mermaid-src"><code>' + escapeHtml(src) + '</code></pre>' : '';
+    });
+  }
+
+  /** 对 root 内未处理的 mermaid 占位做 parse + render；失败保留源码展示 */
+  function renderMermaidNodes(root) {
+    var nodes = root.querySelectorAll('.lb-mermaid:not([data-mmd-ok]):not([data-mmd-tried])');
+    if (!nodes.length) return Promise.resolve(false);
+    return mermaidReady().then(function (mm) {
+      var chain = Promise.resolve(false);
+      Array.prototype.forEach.call(nodes, function (node) {
+        var src = node.getAttribute('data-mmd-src') || '';
+        if (!src.trim()) { node.setAttribute('data-mmd-tried', '1'); return; }
+        var cached = mermaidSvgCache.get(src);
+        if (cached != null) {
+          node.setAttribute('data-mmd-ok', '1');
+          node.innerHTML = cached;
+          chain = chain.then(function () { return true; });
+          return;
+        }
+        chain = chain.then(function (did) {
+          // 离屏测量容器（对照 CherryStudio MermaidPreview）：按占位实际宽度出图，
+          // 避免 mermaid 按默认宽渲染后再被 CSS 压扁、字小难读
+          var probe = document.createElement('div');
+          var width = node.clientWidth || (node.parentElement && node.parentElement.clientWidth) || 0;
+          probe.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden;width:' +
+            Math.max(240, Math.min(1600, width)) + 'px';
+          document.body.appendChild(probe);
+          return Promise.resolve().then(function () { return mm.parse(src); })
+            .then(function () { return mm.render('lb-mmd-' + (++mmdSeq), src, probe); })
+            .then(function (out) {
+              var svg = out && out.svg || '';
+              node.setAttribute('data-mmd-ok', '1');
+              node.innerHTML = svg;
+              cachePut(mermaidSvgCache, src, svg, MERMAID_CACHE_MAX);
+              return true;
+            })
+            .catch(function () {
+              // 解析/渲染失败（流式中途或源码本就非法）：保留源码块；节点不再重试，
+              // 流式续写后 React 重建的节点（源码更长）会自然再试
+              node.setAttribute('data-mmd-tried', '1');
+              return did;
+            })
+            .then(function (value) { probe.remove(); return value; });
+        });
+      });
+      return chain;
+    }).catch(function () {
+      // mermaid 库加载失败：不标记任何节点，下一轮扫描自动重试
+      return false;
+    });
+  }
+
   /** 聊天是 React 侧渲染（流式增量 + 会话切换都会重建 DOM），用 MutationObserver
-   *  防抖驱动类型化；只在挂载时建立一次。 */
-  function watchChatMath(root) {
-    var timer = null;
-    var sweep = function () {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(function () { typesetMath(root); }, 250);
-    };
-    var observer = new MutationObserver(sweep);
+   *  驱动富内容后处理；只在挂载时建立一次。Observer 回调（微任务）里同步回填
+   *  缓存命中的公式/图——先于绘制，重建后不闪源码；未命中的走节流扫描。 */
+  function watchChatRich(root) {
+    var mathSweep = makeThrottle(MATH_SWEEP_MS);
+    var mmdSweep = makeThrottle(MERMAID_SWEEP_MS);
+    function onMutations() {
+      restoreCachedMath(root);
+      restoreCachedMermaid(root);
+      mathSweep(function () { typesetMath(root); });
+      // 主题探测（auto 主题要 getComputedStyle）只在节流回调里做，不进每次 mutation
+      mmdSweep(function () { resetMermaidForTheme(root); renderMermaidNodes(root); });
+    }
+    var observer = new MutationObserver(onMutations);
     observer.observe(root, { childList: true, subtree: true });
-    sweep();
+    onMutations();
   }
 
   return {

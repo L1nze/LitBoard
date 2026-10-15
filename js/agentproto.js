@@ -463,7 +463,10 @@
           }
           var slot = state.toolCalls[index];
           if (fragment.id) slot.id = str(fragment.id);
-          if (fragment.function && fragment.function.name) slot.name += str(fragment.function.name);
+          // 整段赋值而非拼接：官方端点 name 只出现在首个 delta；部分 OpenAI 兼容
+          // 网关在每个 delta 重发完整 name，拼接会把它叠成 searchsearch… 导致
+          // 工具名非法、整轮工具调用报废。与 responses/messages 累加器同款写法。
+          if (fragment.function && fragment.function.name) slot.name = str(fragment.function.name);
           if (fragment.function && typeof fragment.function.arguments === 'string') {
             slot.args += fragment.function.arguments;
           }

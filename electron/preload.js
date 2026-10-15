@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   inspectNutstoreRemote: function (value) { return ipcRenderer.invoke('integrations:inspect-nutstore', value); },
   createNutstoreSyncPlan: function (value) { return ipcRenderer.invoke('integrations:create-sync-plan', value); },
   applyNutstoreSyncPlan: function (value) { return ipcRenderer.invoke('integrations:apply-sync-plan', value); },
+  confirmSyncApplied: function (token) { return ipcRenderer.invoke('integrations:confirm-sync-applied', token); },
   cancelNutstoreSync: function () { return ipcRenderer.invoke('integrations:cancel-sync'); },
   testNutstoreConnection: function (config) { return ipcRenderer.invoke('integrations:test-nutstore', config); },
   translateSelection: function (value) { return ipcRenderer.invoke('integrations:translate', value); },

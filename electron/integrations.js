@@ -193,10 +193,23 @@ function createIntegrations(options) {
     try { return await syncContext.run(controller, task); }
     finally { if (activeSync === controller) activeSync = null; }
   }
+  /* 只读的云端检查/计划生成（inspectNutstoreRemote / createNutstoreSyncPlan）不占
+   * 同步串行锁（与正在进行的同步交错读取是既有语义），但必须登记进取消注册表：
+   * 「停止同步」此前只能中止同步任务本身，检查/计划生成阶段的在途请求收不到
+   * 中止信号。runSyncReader 给它们各自的 AbortController + syncContext，请求
+   * 层（dispatchRequest）照常消费 signal，取消即刻生效。 */
+  const syncReaders = new Set();
+  async function runSyncReader(task) {
+    const controller = new AbortController();
+    syncReaders.add(controller);
+    try { return await syncContext.run(controller, task); }
+    finally { syncReaders.delete(controller); }
+  }
   function cancelNutstoreSync() {
-    if (!activeSync) return false;
-    activeSync.abort();
-    return true;
+    let cancelled = false;
+    if (activeSync) { activeSync.abort(); cancelled = true; }
+    for (const reader of syncReaders) { reader.abort(); cancelled = true; }
+    return cancelled;
   }
   const configuredTimeout = Number(options.requestTimeoutMs);
   const REQUEST_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 30000;
@@ -257,7 +270,9 @@ function createIntegrations(options) {
       if (typeof response[method] !== 'function') continue;
       const read = response[method];
       response[method] = function () {
-        return timed(function () { return read.call(response); }, readTimeoutMs - (Date.now() - startedAt), readTimeoutMs);
+        // 响应头耗时长时剩余预算可能为负：下限 250ms——1ms 下限会让已到达的
+        // 响应体读取出假超时，大附件在慢头场景下整批失败
+        return timed(function () { return read.call(response); }, Math.max(250, readTimeoutMs - (Date.now() - startedAt)), readTimeoutMs);
       };
     }
     return response;
@@ -423,7 +438,13 @@ function createIntegrations(options) {
   }
   async function loadRawConfig() {
     let raw = {};
-    try { raw = JSON.parse(await fs.readFile(configFile, 'utf8')); } catch (error) { return {}; }
+    try { raw = JSON.parse(await fs.readFile(configFile, 'utf8')); }
+    catch (error) {
+      // 主文件损坏（copyFile 兜底被中途打断等）→ 先试同目录 .bak 再放弃：
+      // 直接回 {} 会让下一次 saveConfig 以默认值整写，已存凭据全部丢失
+      try { raw = JSON.parse(await fs.readFile(configFile + '.bak', 'utf8')); }
+      catch (bakError) { return {}; }
+    }
     if (raw.translatorProvider && !translators[raw.translatorProvider]) {
       // 已移除或未知的翻译服务商：回退默认服务商并丢弃其凭据，
       // 避免残留的 Key 被其他服务商误用。
@@ -432,18 +453,36 @@ function createIntegrations(options) {
     }
     return raw;
   }
-  async function writeRawConfig(value) {
-    await fs.mkdir(options.baseDir, { recursive: true });
-    const temp = configFile + '.tmp-' + process.pid + '-' + Date.now();
-    await fs.writeFile(temp, JSON.stringify(value, null, 2), 'utf8');
+  /** 配置/基线/台账共用的原子写：temp + rename（带退避重试，AV 短暂锁文件是
+   *  rename 失败的主因）；重试仍失败才走 copyFile 覆盖兜底——覆盖前先把活文件
+   *  备份成 .bak（读侧 loadRawConfig/readSyncBase 会回退），覆盖后读回校验，
+   *  校验失败用 .bak 还原并抛错。全程尽力把「崩溃截断活文件」的窗口收到最小。 */
+  async function atomicStateWrite(file, content) {
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    const temp = file + '.tmp-' + process.pid + '-' + Date.now();
+    await fs.writeFile(temp, content, 'utf8');
     try {
-      await fs.rename(temp, configFile);
-    } catch (error) {
-      // Windows cannot always replace an existing file with rename; retain a
-      // complete temp payload and use overwrite-copy as the compatibility path.
-      try { await fs.copyFile(temp, configFile); }
-      finally { await fs.rm(temp, { force: true }).catch(function () {}); }
+      let renamed = false;
+      for (const delay of [0, 60, 200, 500]) {
+        if (delay) await new Promise(function (resolve) { setTimeout(resolve, delay); });
+        try { await fs.rename(temp, file); renamed = true; break; } catch (error) { /* 重试 */ }
+      }
+      if (!renamed) {
+        let backup = null;
+        try { await fs.copyFile(file, file + '.bak'); backup = file + '.bak'; } catch (error) { /* 活文件可能不存在 */ }
+        await fs.copyFile(temp, file);
+        const written = await fs.readFile(file, 'utf8');
+        if (written !== content) {
+          if (backup) { try { await fs.copyFile(backup, file); } catch (error) {} }
+          throw new Error('写入 ' + path.basename(file) + ' 后校验失败，已还原备份；请重试');
+        }
+      }
+    } finally {
+      await fs.rm(temp, { force: true }).catch(function () {});
     }
+  }
+  async function writeRawConfig(value) {
+    await atomicStateWrite(configFile, JSON.stringify(value, null, 2));
   }
   async function getConfig() {
     const raw = await loadRawConfig();
@@ -1233,6 +1272,7 @@ function createIntegrations(options) {
   const SYNC_HISTORY_DIR = path.join(options.baseDir, 'sync-history');
   /** 对照弹窗里「本机为空疑似重置」总体决议的键（渲染层同名常量保持一致） */
   const LOCAL_EMPTY_RESET_KEY = 'plan:local-empty-reset';
+  const COLLECTION_RESET_KEY = 'plan:collection-reset';
   /** 「合并会大批移除云端词条」与「云端无库将首次上传」两个强制确认项的键 */
   const MASS_DROP_RESET_KEY = 'plan:mass-drop-reset';
   const FIRST_UPLOAD_KEY = 'plan:first-upload';
@@ -1794,7 +1834,7 @@ function createIntegrations(options) {
     // 只有这些（或真实清单确认存在）的附件元数据才允许保留（sanitizeCloudAssets）。
     const verifiedNames = config.verifiedNames instanceof Set ? config.verifiedNames : new Set();
     const missingRemotely = function (cloudName) {
-      return !!knownRemoteAssets && !knownRemoteAssets.has(cloudName);
+      return !!knownRemoteAssets && !cloudNameInSet(knownRemoteAssets, cloudName);
     };
     await fs.mkdir(downloadDir, { recursive: true });
     // 附件上传台账：记住哪些云端对象已成功 PUT 过，同步中断后下一轮续传。
@@ -2095,10 +2135,21 @@ function createIntegrations(options) {
       }
     }
 
-    /** 笔记资产（单文件）：上传 / 校验 / 下载到 note-assets/<noteId>/<fileName> */
-    async function processNoteAsset(note, asset, noteAssetsDir) {
+    /** 笔记资产（单文件）：上传 / 校验 / 下载到 note-assets/<noteId>/<fileName>。
+     *  文件名走 model.sanitizeNoteAssetFileName（云端 JSON 可能被控/损坏，落盘
+     *  名必须无路径语义）+ 落盘前包含校验（必须在 noteAssetsDir 之内）双保险；
+     *  seenNames 记录本 note 已占用的小写名，大小写不敏感同名追加内容哈希
+     *  前缀分名（确定性后缀，跨轮稳定，避免 Windows 大小写不敏感互踩重下）。 */
+    async function processNoteAsset(note, asset, noteAssetsDir, seenNames) {
       const item = { paperId: note.paperId || '', id: note.id, snapshot: false, message: '' };
-      const safeName = String(asset.fileName || 'file').replace(/[?#\\:*"<>\u0000-\u001f-]/g, '_');
+      const baseName = LitModel.sanitizeNoteAssetFileName(asset.fileName);
+      let safeName = baseName;
+      if (seenNames) {
+        if (seenNames.has(safeName.toLowerCase())) {
+          safeName = baseName + '-' + String(asset.cloudHash || '').slice(0, 8);
+        }
+        seenNames.add(safeName.toLowerCase());
+      }
       const localPath = String(asset.path || '');
       let cloudName = safeCloudName(asset.cloudName) || ('notes/' + note.id + '/' + safeName);
       if (localPath) {
@@ -2136,6 +2187,14 @@ function createIntegrations(options) {
       }
       asset.cloudName = cloudName;
       const target = path.join(noteAssetsDir, note.id, safeName);
+      const containmentRoot = path.resolve(noteAssetsDir) + path.sep;
+      if (!path.resolve(target).startsWith(containmentRoot)) {
+        // 双保险：消毒后的名字理论上不可能带路径语义，仍校验落点必须留在
+        // note-assets/ 内，越界一律跳过并如实上报
+        failures.push(assetError('笔记资产文件名越界，已跳过：' + String(asset.fileName || ''), item, null));
+        missingOnCloud++;
+        return;
+      }
       const expectedHash = String(asset.cloudHash || '').toLowerCase();
       const expectedSize = asset.cloudSize == null ? null : Number(asset.cloudSize);
       try {
@@ -2226,10 +2285,11 @@ function createIntegrations(options) {
       throwIfSyncCancelled();
       if (!note || note.deletedAt) continue;
       if (skipped('notes', note.id)) continue;
+      const seenNames = new Set();
       for (const noteAsset of Array.isArray(note.assets) ? note.assets : []) {
         throwIfSyncCancelled();
         beginAsset(noteAsset);
-        await processNoteAsset(note, noteAsset, noteAssetsDir);
+        await processNoteAsset(note, noteAsset, noteAssetsDir, seenNames);
         tickAsset(noteAsset);
       }
     }
@@ -2260,7 +2320,7 @@ function createIntegrations(options) {
     const visit = function (asset) {
       if (!asset) return;
       const name = safeCloudName(asset.cloudName);
-      if (name && !verified.has(name) && !knownRemoteAssets.has(name)) {
+      if (name && !cloudNameInSet(verified, name) && !cloudNameInSet(knownRemoteAssets, name)) {
         delete asset.cloudName;
         delete asset.cloudHash;
         delete asset.cloudSize;
@@ -2281,19 +2341,40 @@ function createIntegrations(options) {
   }
 
   async function writeSyncBase(value) {
-    await fs.mkdir(options.baseDir, { recursive: true });
-    const temp = SYNC_BASE_FILE + '.part-' + process.pid + '-' + Date.now();
-    await fs.writeFile(temp, JSON.stringify(value, null, 2), 'utf8');
-    try {
-      await fs.rename(temp, SYNC_BASE_FILE);
-    } catch (error) {
-      try { await fs.copyFile(temp, SYNC_BASE_FILE); }
-      finally { await fs.rm(temp, { force: true }).catch(function () {}); }
-    }
+    await atomicStateWrite(SYNC_BASE_FILE, JSON.stringify(value, null, 2));
   }
 
   async function readSyncBase() {
-    try { return JSON.parse(await fs.readFile(SYNC_BASE_FILE, 'utf8')); } catch (error) { return null; }
+    try { return JSON.parse(await fs.readFile(SYNC_BASE_FILE, 'utf8')); }
+    catch (error) {
+      // 主文件损坏 → .bak 回退（与 loadRawConfig 同策略）；两级都读不到才当无基线
+      try { return JSON.parse(await fs.readFile(SYNC_BASE_FILE + '.bak', 'utf8')); }
+      catch (bakError) { return null; }
+    }
+  }
+
+  /* 基线确认制：同步结果先带回渲染层，SQLite 落库成功之前基线只进暂存——
+   * confirmSyncApplied(token) 之后才真正落盘。两个失败方向都自愈：
+   * 落库失败/崩溃 → 基线保持旧值，下次同步把云端内容重新拉回；
+   * 确认丢失（渲染层崩在确认前）→ 下次同步把本地当新编辑重传（PUT 幂等）。
+   * 修复的旧序：基线先落、渲染层落库失败被吞 → base=合并值/local=旧值，
+   * 下次同步把他机内容静默回滚、把本轮收到的实体从云端删除。 */
+  const pendingSyncBases = new Map();
+  let syncBaseTokenSeq = 0;
+  function stashSyncBase(payload) {
+    const token = 'sb-' + Date.now().toString(36) + '-' + (++syncBaseTokenSeq);
+    pendingSyncBases.set(token, payload);
+    while (pendingSyncBases.size > 16) pendingSyncBases.delete(pendingSyncBases.keys().next().value);
+    return token;
+  }
+
+  async function confirmSyncApplied(token) {
+    const key = String(token || '');
+    const payload = pendingSyncBases.get(key);
+    if (!payload) return false;
+    pendingSyncBases.delete(key);
+    await writeSyncBase(payload);
+    return true;
   }
 
   const ASSET_LEDGER_FILE = path.join(options.baseDir, 'sync-asset-ledger.json');
@@ -2305,14 +2386,7 @@ function createIntegrations(options) {
   }
 
   async function saveAssetLedger(ledger) {
-    const temp = ASSET_LEDGER_FILE + '.part-' + process.pid + '-' + Date.now();
-    await fs.writeFile(temp, JSON.stringify(ledger), 'utf8');
-    try {
-      await fs.rename(temp, ASSET_LEDGER_FILE);
-    } catch (error) {
-      try { await fs.copyFile(temp, ASSET_LEDGER_FILE); }
-      finally { await fs.rm(temp, { force: true }).catch(function () {}); }
-    }
+    await atomicStateWrite(ASSET_LEDGER_FILE, JSON.stringify(ledger));
   }
 
   async function inspectNutstoreRemote(input) {
@@ -2469,6 +2543,25 @@ function createIntegrations(options) {
     // 首传确认：云端没有库文件而本机非空。多数是正常的新库初始化，但也可能是
     // 账号/同步目录名填错（大小写不同即另一个目录）。写之前让用户看一眼。
     const firstUploadSuspected = mode === 'merge' && !inspected.exists && !base && localPaperCount > 0;
+    // 集合级断路器（键存在但为空）：papers 的整库变空已由 remoteResetSuspected
+    // 覆盖；其余集合「键在、长度 0、基线与本机双侧都有内容」只可能是云端库被
+    // 旧版本端/损坏备份清掉了这个集合（正常删除走墓碑不会整集合消失）——强
+    // 制人工二选一：以本机恢复重传，或接受清空。键整体缺失（v3 旧格式）不算，
+    // 那是「远端零知识」，createSyncPlan 已按 local-only 重传处理。
+    const collectionResetCounts = {};
+    if (mode === 'merge' && inspected.exists && inspected.remote && typeof inspected.remote === 'object') {
+      ['notes', 'folders', 'savedSearches', 'tagColorRecords'].forEach(function (name) {
+        const remoteList = inspected.remote[name];
+        if (!Array.isArray(remoteList) || remoteList.length > 0) return;
+        const activeCount = function (list) {
+          return (Array.isArray(list) ? list : []).filter(function (item) { return item && !item.deletedAt; }).length;
+        };
+        const baseCount = activeCount(base && base.workspace && base.workspace[name]);
+        const localCount = activeCount(localValue && localValue[name]);
+        if (baseCount > 0 && localCount > 0) collectionResetCounts[name] = { base: baseCount, local: localCount };
+      });
+    }
+    const collectionResetSuspected = Object.keys(collectionResetCounts).length > 0;
     const conflicts = (corePlan.conflicts || []).map(function (conflict) {
       return Object.assign({}, conflict, { choice: null });
     });
@@ -2524,6 +2617,8 @@ function createIntegrations(options) {
       massDropCount: massDropSuspected ? droppedRemoteCount : 0,
       remoteActiveCount: remoteActiveIds.size,
       firstUploadSuspected: firstUploadSuspected,
+      collectionResetSuspected: collectionResetSuspected,
+      collectionResetCounts: collectionResetCounts,
       localPaperCount: localPaperCount,
       corePlan: corePlan,
       config: inspected.config,
@@ -2531,7 +2626,7 @@ function createIntegrations(options) {
       remoteKey: baseKey,
       portableSettings: cloneJson(value.portableSettings || {}),
       requiresConfirmation: mode === 'restore' || conflicts.length > 0 || remoteResetSuspected ||
-        massDropSuspected || firstUploadSuspected,
+        massDropSuspected || firstUploadSuspected || collectionResetSuspected,
       _options: remoteOptions,
       _remoteConfig: inspected.config && inspected.config.value ? null : null
     };
@@ -2755,6 +2850,25 @@ function createIntegrations(options) {
         throw new Error('云端还没有文献库文件：如确认以本机内容新建云端库，请在对照顶部选择「确认上传」；否则请检查账号与同步目录名是否正确');
       }
     }
+    // 集合级清空断路器：云端某集合「键在但为空」且基线/本机双侧都有内容——
+    // 'local'=以本机为准，把受影响集合按渲染层随计划传入的新鲜工作区覆盖合并
+    // 结果（重传恢复云端）；'remote'=接受清空、按计划传播删除；未选择不得应用。
+    if (plan.collectionResetSuspected) {
+      const resetChoice = planKeyChoice(value.resolutions, COLLECTION_RESET_KEY);
+      const resetNames = Object.keys(plan.collectionResetCounts || {});
+      if (resetChoice === 'local') {
+        if (!value.workspace || typeof value.workspace !== 'object') {
+          throw new Error('云端集合疑似被清空：以本机恢复需要随计划传入本机工作区，请重新生成对照');
+        }
+        workspace = Object.assign({}, workspace);
+        resetNames.forEach(function (name) {
+          if (Array.isArray(value.workspace[name])) workspace[name] = cloneJson(value.workspace[name]);
+        });
+      }
+      else if (resetChoice !== 'remote') {
+        throw new Error('云端的 ' + resetNames.join('、') + ' 集合被清空：请先在对照顶部选择「以本机恢复」或「接受清空」');
+      }
+    }
     // 云端保留结果：普通同步里用户选「采用本机版本」的实体在云端保持远端
     // 值（本机只保留自己的，不上传覆盖远端），两侧快照登记进 sync base；
     // 任一侧之后发生变化即解除登记、回到正常合并。恢复模式远端权威，不登记。
@@ -2822,22 +2936,23 @@ function createIntegrations(options) {
       });
       const etag = finalWrite.current.etag || '';
       throwIfSyncCancelled();
-      await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: plan.remoteKey, etag: etag,
+      const syncToken = stashSyncBase({ version: 1, savedAt: Date.now(), remoteKey: plan.remoteKey, etag: etag,
         workspace: LitSync.syncWorkspace(finalPass.workspace), pins: pins });
       pendingSyncPlans.delete(plan.planId);
       reportProgress('done', { message: '同步完成', uploaded: uploaded, pinned: Object.keys(pins).length });
       return { workspace: finalLocal.workspace, conflicts: plan.conflicts || [], uploaded: uploaded, assets: assetResult,
-        pinned: Object.keys(pins).length, config: await getConfig() };
+        pinned: Object.keys(pins).length, config: await getConfig(), syncToken: syncToken };
     } catch (error) {
       // 限流软暂停：已决议的工作区照常带回渲染层落库（决议不丢），附件在台账
       // 里，恢复续传由「立即同步」按普通合并完成。
       if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_RATE_PAUSED')) {
         if (session.pacer && session.pacer.flush) await session.pacer.flush();
         if (firstWriteForPause) {
-          try {
-            await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: plan.remoteKey, etag: firstWriteForPause.current.etag || '',
-              workspace: LitSync.syncWorkspace(pausedBaseWorkspace), pins: pins });
-          } catch (baseError) {}
+          const pausedToken = stashSyncBase({ version: 1, savedAt: Date.now(), remoteKey: plan.remoteKey, etag: firstWriteForPause.current.etag || '',
+            workspace: LitSync.syncWorkspace(pausedBaseWorkspace), pins: pins });
+          const paused = pausedSyncResult(error, workspace);
+          paused.syncToken = pausedToken;
+          return paused;
         }
         return pausedSyncResult(error, workspace);
       }
@@ -2864,7 +2979,7 @@ function createIntegrations(options) {
         portableSettings: localValue && localValue.portableSettings
       });
       if (plan.conflicts && plan.conflicts.length || plan.remoteResetSuspected ||
-          plan.massDropSuspected || plan.firstUploadSuspected) {
+          plan.massDropSuspected || plan.firstUploadSuspected || plan.collectionResetSuspected) {
         return { pendingPlan: plan, workspace: plan.workspace, conflicts: plan.conflicts, uploaded: false };
       }
       pendingSyncPlans.delete(plan.planId);
@@ -2876,7 +2991,9 @@ function createIntegrations(options) {
       }
       const remote = library.remote || { papers: [], folders: [] };
       const merged = plan.workspace;
-      const conflicts = [];
+      // 计划已确保无未决冲突才会走到这里（有冲突在上方提前返回 pendingPlan）；
+      // 冲突日志与结果字段如实带出计划里的冲突列表，不再恒为空。
+      const conflicts = plan.conflicts || [];
       const pins = plan.pins || {};
       mergedForPause = merged;
       pinsForPause = pins;
@@ -2927,12 +3044,12 @@ function createIntegrations(options) {
         await fs.appendFile(path.join(options.baseDir, 'sync-conflicts.jsonl'), lines, 'utf8').catch(function () {});
       }
       throwIfSyncCancelled();
-      await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: remoteOptions.user + '\n' + remoteOptions.fileUrl,
+      const syncToken = stashSyncBase({ version: 1, savedAt: Date.now(), remoteKey: remoteOptions.user + '\n' + remoteOptions.fileUrl,
         etag: finalWrite.current.etag || '',
         workspace: LitSync.syncWorkspace(finalPass.workspace), pins: pins });
       emitSyncProgress({ scope: 'sync', phase: 'done', message: '同步完成', uploaded: uploaded, pinned: Object.keys(pins).length });
       return { workspace: finalLocal.workspace, conflicts: conflicts, uploaded: uploaded, assets: assetResult,
-        pinned: Object.keys(pins).length, config: await getConfig() };
+        pinned: Object.keys(pins).length, config: await getConfig(), syncToken: syncToken };
     } catch (error) {
       // 限流不是失败：软暂停 + 恢复时刻。已上传的附件在台账里，下一轮免重传。
       // firstWrite 已完成时，云端已是合并结果——把它同时落成基线并随结果带回
@@ -2940,12 +3057,12 @@ function createIntegrations(options) {
       if (error && (error.code === 'WEBDAV_RATE_LIMITED' || error.code === 'SYNC_RATE_PAUSED')) {
         if (session.pacer && session.pacer.flush) await session.pacer.flush();
         if (mergedForPause && firstWriteForPause) {
-          try {
-            await writeSyncBase({ version: 1, savedAt: Date.now(), remoteKey: remoteOptions.user + '\n' + remoteOptions.fileUrl,
-              etag: firstWriteForPause.current.etag || '',
-              workspace: LitSync.syncWorkspace(mergedForPause), pins: pinsForPause });
-          } catch (baseError) {}
-          return pausedSyncResult(error, mergedForPause);
+          const pausedToken = stashSyncBase({ version: 1, savedAt: Date.now(), remoteKey: remoteOptions.user + '\n' + remoteOptions.fileUrl,
+            etag: firstWriteForPause.current.etag || '',
+            workspace: LitSync.syncWorkspace(mergedForPause), pins: pinsForPause });
+          const paused = pausedSyncResult(error, mergedForPause);
+          paused.syncToken = pausedToken;
+          return paused;
         }
         return pausedSyncResult(error, localValue);
       }
@@ -3603,9 +3720,14 @@ function createIntegrations(options) {
 
   return { getConfig, saveConfig, getResearchRuntimeConfig, getAgentProviderRuntime, revealSecret, setAgentSelection,
     nutstoreSync: function (value) { return runSyncTask(function () { return nutstoreSync(value); }); }, cancelNutstoreSync,
-    inspectNutstoreRemote, createNutstoreSyncPlan,
+    // 检查/计划生成走「可取消的读侧」而非串行锁：允许与进行中的同步交错（既有语义），
+    // 但「停止同步」能即刻中止它们的在途请求（见 runSyncReader 注释）
+    inspectNutstoreRemote: function (value) { return runSyncReader(function () { return inspectNutstoreRemote(value); }); },
+    createNutstoreSyncPlan: function (value) { return runSyncReader(function () { return createNutstoreSyncPlan(value); }); },
     applyNutstoreSyncPlan: function (value) { return runSyncTask(function () { return applyNutstoreSyncPlan(value); }); },
-    inspectRemote, createSyncPlan,
+    confirmSyncApplied: confirmSyncApplied,
+    inspectRemote: function (value) { return runSyncReader(function () { return inspectRemote(value); }); },
+    createSyncPlan: function (value) { return runSyncReader(function () { return createSyncPlan(value); }); },
     applySyncPlan: function (value) { return runSyncTask(function () { return applySyncPlan(value); }); },
     testNutstoreConnection, translateText, testTranslationConnection, getScigreatRank, testScigreatConnection, getJournalRank, testJournalRankConnection, detectZoteroDataDir, setZoteroDataDir,
     importZoteroLocal, scanZoteroLibrary, importZoteroLibrary, migrateZoteroCloudAttachments };
@@ -3652,14 +3774,27 @@ function loadAssetLedgerValue(value, remoteKey) {
   return { version: 1, remoteKey: remoteKey, assets: assets, pacing: loadPacingValue(value.pacing) };
 }
 
+/** cloudName 的清单成员判断（%XX 容错）：PROPFIND 清单里的名字经过
+ *  decodeURIComponent，而资产登记名可能是未编码原文（文件名含 % 等字符时
+ *  两侧形态不同）。查询侧同时尝试原始串与解码串，避免「每轮幻影重传」。 */
+function cloudNameInSet(set, name) {
+  if (!set || typeof set.has !== 'function') return false;
+  if (typeof name !== 'string' || !name) return false;
+  if (set.has(name)) return true;
+  try {
+    const decoded = decodeURIComponent(name);
+    return decoded !== name && set.has(decoded);
+  } catch (error) { return false; }
+}
+
 /** 台账能否证明该对象已在远端（同一字节流成功 PUT 过）。只要有真实/派生的
- * 远端清单且其中没有该对象，一律不采信台账、照常上传——包括清单为空的
- * 情况（对象确实都不在了）。只有拿不到清单（null）时才退回台账断点续传。 */
+ *  远端清单且其中没有该对象，一律不采信台账、照常上传——包括清单为空的
+ *  情况（对象确实都不在了）。只有拿不到清单（null）时才退回台账断点续传。 */
 function assetLedgerProof(ledger, cloudName, hash, size, knownRemoteAssets) {
   const entry = ledger && ledger.assets && ledger.assets[String(cloudName || '')];
   if (!entry || entry.hash !== String(hash || '').toLowerCase()) return false;
   if (entry.size != null && size != null && entry.size !== size) return false;
-  if (knownRemoteAssets && !knownRemoteAssets.has(cloudName)) return false;
+  if (knownRemoteAssets && !cloudNameInSet(knownRemoteAssets, cloudName)) return false;
   return true;
 }
 

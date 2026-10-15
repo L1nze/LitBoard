@@ -24,6 +24,7 @@
 | MathJax（tex-svg 组件及 boldsymbol 扩展） | 3.2.2 | https://github.com/mathjax/MathJax （官方 es5 产物） | Apache-2.0（完整文本随 `vendor/mathjax/LICENSE`） | `tex-svg.js` d4295dc337448369；`input/tex/extensions/boldsymbol.js` d6771fee0772db26 |
 | pinyin-pro（中文转拼音） | 3.29.4 | https://github.com/zh-lx/pinyin-pro （npm 官方发布产物） | MIT（完整文本随 `vendor/pinyin-pro/LICENSE`） | `pinyin-pro.js` 1f660d2a52b762a |
 | markdown-it | 14.3.2 | https://github.com/markdown-it/markdown-it （官方 npm 产物 `dist/markdown-it.min.js`） | MIT（完整文本见 `vendor/markdown-it/LICENSE`） | `markdown-it.min.js` e32488403e2e565a |
+| mermaid（AI 助手聊天内的 ```mermaid 图表渲染，懒加载） | 11.12.2 | https://github.com/mermaid-js/mermaid （官方 npm 产物 `dist/mermaid.min.js`，classic script 末尾挂 globalThis.mermaid；内联 dagre-d3-es、cytoscape、dompurify 等上游依赖，许可随 bundle 内声明） | MIT（完整文本见 `vendor/mermaid/LICENSE.mermaid`；内联依赖许可见 NOTICE 第 5 条） | `mermaid.min.js` d0830a6c05546e9e（完整值见 SHA256SUMS） |
 | LitGraph 图谱计算内核（**自研**，非第三方：Rust/napi-rs 预编译，源码随仓库） | 0.1.0 | 源码 `scripts/litgraph-bundle/rust/`（复现构建：`node scripts/litgraph-bundle/build.js`，需 Rust stable-msvc 工具链） | 本项目许可证（同仓库 LICENSE） | `litgraph.win32-x64-msvc.node`（完整值见 SHA256SUMS；构建期引入 napi-rs（MIT/Apache-2.0），产物静态自包含） |
 
 ## 界面图标（内嵌于 index.html 的 SVG sprite）
@@ -52,6 +53,7 @@ LitBoard 文献Agent调研模块的核心工作流以 [PAPER-SQL](https://github
 2. **PaddleOCR.js SDK / PP-OCRv5 模型**：SDK 的 Apache-2.0 标识见 `vendor/paddleocr/package.paddleocr-js.json`；模型运行时下载，不在安装包中。
 3. **citeproc-js**：CPAL-1.0 文本与 Frank Bennett 署名见 `vendor/citeproc/LICENSE.CPAL`。
 4. **其他随包组件**：MIT、BSD-3-Clause、Apache-2.0 和 CC BY-SA 3.0 等许可分别适用；对应声明和文件位置见上表。
+5. **mermaid**：`vendor/mermaid/LICENSE.mermaid` 为 MIT 文本（© Knut Sveidqvist）。`mermaid.min.js` 为官方单文件产物，内联打包了 dagre-d3-es、cytoscape、dompurify、khroma 等上游依赖，各依赖的许可声明以注释形式保留在产物内；若需逐项核对，以 bundle 内嵌声明为准。
 
 ## 版本漂移与升级流程
 

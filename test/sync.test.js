@@ -536,6 +536,7 @@ test('nutstore sync excludes local paths and ignores path-only differences', asy
     resolutions: { 'plan:first-upload': 'local' }
   });
   assert.equal(applied.uploaded, true);
+  await integrations.confirmSyncApplied(applied.syncToken);
   const remoteText = Array.from(cloud.entries()).find(function (entry) { return entry[0].endsWith('litboard-library.json'); })[1];
   assert.doesNotMatch(remoteText, /Alice|paper\.pdf"\s*,\s*"path|imagePath/);
   const changedPath = JSON.parse(JSON.stringify(applied.workspace.papers[0]));
@@ -1267,6 +1268,9 @@ test('choosing local keeps the remote copy untouched and keeps both sides split'
   const conflictId = plan.conflicts[0].conflictId;
 
   const applied = await integrations.applyNutstoreSyncPlan({ planId: plan.planId, resolutions: { [conflictId]: 'local' } });
+  // 基线确认制：apply 只暂存基线，落库确认（confirmSyncApplied）后才写盘
+  assert.equal(typeof applied.syncToken, 'string');
+  assert.equal(await integrations.confirmSyncApplied(applied.syncToken), true);
   // 本机保留本地标题；云端保持远端标题（不因「选本机」而被覆盖）
   assert.equal(applied.workspace.papers[0].title, '本地标题');
   assert.equal(applied.pinned, 1);
@@ -1324,6 +1328,7 @@ test('choosing local after the remote library was cleared repopulates the remote
   const initial = { papers: [{ id: 'p1', title: '初始标题', updatedAt: 100 }], folders: [] };
   const first = await integrations.nutstoreSync(initial);
   assert.equal(first.uploaded, false);
+  await integrations.confirmSyncApplied(first.syncToken); // 基线确认制：确认后 base 才落盘
 
   remoteBody = JSON.stringify({ syncVersion: 6, papers: [], folders: [] });
   etag = '"v2"';
@@ -1366,7 +1371,8 @@ test('keeping an unchanged local-only item after the remote library was cleared 
   const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: fetch });
   await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
   const local = { papers: [{ id: 'p1', title: '本地标题', updatedAt: 100 }], folders: [] };
-  await integrations.nutstoreSync(local);
+  const firstSync = await integrations.nutstoreSync(local);
+  await integrations.confirmSyncApplied(firstSync.syncToken);
 
   remoteBody = JSON.stringify({ syncVersion: 6, papers: [], folders: [] });
   etag = '"v2"';
@@ -1407,7 +1413,8 @@ test('an unexpected empty remote library pauses automatic sync for local recover
   };
   const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: fetch });
   await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
-  await integrations.nutstoreSync(local);
+  const seeded = await integrations.nutstoreSync(local);
+  await integrations.confirmSyncApplied(seeded.syncToken);
 
   remoteBody = JSON.stringify({ syncVersion: 6, papers: [], folders: [] });
   etag = '"cleared"';
@@ -1790,6 +1797,7 @@ test('editing a pinned entity locally releases the pin and resumes propagation',
     planId: plan.planId, resolutions: { [plan.conflicts[0].conflictId]: 'local' }
   });
   assert.equal(applied.pinned, 1);
+  await integrations.confirmSyncApplied(applied.syncToken); // 基线确认制：pin 登记随 base 落盘
 
   // 用户再次编辑本条目 → 登记解除，恢复正常同步（本地修改上云）
   const edited = JSON.parse(JSON.stringify(applied.workspace));
@@ -2135,6 +2143,7 @@ test('empty local workspace against a non-empty sync base pauses and requires an
   const first = await integrations.nutstoreSync({ papers: localPapers, folders: [] });
   assert.ok(!first.pendingPlan);
   assert.equal(first.uploaded, true);
+  await integrations.confirmSyncApplied(first.syncToken);
   puts.length = 0;
 
   // 模拟事故：本机工作区突然为空（读取失败/数据目录被切换），自动同步必须暂停
@@ -2159,6 +2168,7 @@ test('empty local workspace against a non-empty sync base pauses and requires an
     resolutions: { 'plan:local-empty-reset': 'remote' }
   });
   assert.deepEqual(adopted.workspace.papers.map(function (p) { return p.id; }).sort(), ['p1', 'p2']);
+  await integrations.confirmSyncApplied(adopted.syncToken);
   const base = JSON.parse(await fs.readFile(path.join(dir, 'sync-base.json'), 'utf8'));
   assert.equal(base.workspace.papers.length, 2);
   for (const body of puts) assert.equal(body.papers.length, 2, 'remote must never be emptied');
@@ -2197,7 +2207,8 @@ test('both empty sides can recover metadata from a non-empty sync base', async f
   const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: fetch });
   await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
   const original = { papers: [{ id: 'p1', title: '基线可恢复', updatedAt: 10 }], folders: [] };
-  await integrations.nutstoreSync(original);
+  const seeded = await integrations.nutstoreSync(original);
+  await integrations.confirmSyncApplied(seeded.syncToken);
 
   remoteBody = JSON.stringify({ syncVersion: 6, papers: [], folders: [] });
   etag = '"empty"';
@@ -2290,3 +2301,159 @@ test('remote inspection excludes tombstones and checks only current attachment r
       assert.equal(plan.remote.papers[0].addedAt, 1700000000999);
     } finally { Date.now = realNow; }
   });
+
+/* ---------- 基线确认制（S1）：base 只在 confirmSyncApplied 后落盘 ---------- */
+
+test('sync base is stashed until confirmSyncApplied and self-heals both ways', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-base-confirm-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  let remoteBody = '';
+  let etag = 'v0';
+  const fetch = async function (url, init) {
+    if (init.method === 'GET' && url.endsWith('litboard-library.json')) {
+      return remoteBody ? new Response(remoteBody, { status: 200, headers: { ETag: etag } }) : new Response('', { status: 404 });
+    }
+    if (init.method === 'GET') return new Response('', { status: 404 });
+    if (init.method === 'MKCOL') return new Response('', { status: 201 });
+    if (init.method === 'PUT' && url.endsWith('litboard-library.json')) {
+      remoteBody = init.body; etag = '"put-1"';
+      return new Response('', { status: 201, headers: { ETag: '"put-1"' } });
+    }
+    if (init.method === 'PUT') return new Response('', { status: 201 });
+    throw new Error('Unexpected request ' + init.method + ' ' + url);
+  };
+  const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: fetch });
+  await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
+  const pending = await integrations.nutstoreSync({ papers: [{ id: 'p1', title: '首传' }], folders: [] });
+  const applied = await integrations.applyNutstoreSyncPlan({
+    planId: pending.pendingPlan.planId, resolutions: { 'plan:first-upload': 'local' }
+  });
+  assert.ok(applied.syncToken, '结果携带 syncToken');
+  // 落库确认前：sync-base.json 不得存在（渲染层落库失败 → base 保持缺席，下次同步重新拉回）
+  await assert.rejects(fs.readFile(path.join(dir, 'sync-base.json'), 'utf8'), /ENOENT/);
+  assert.equal(await integrations.confirmSyncApplied('sb-not-exist'), false, '未知 token 如实返回 false');
+  assert.equal(await integrations.confirmSyncApplied(applied.syncToken), true);
+  const base = JSON.parse(await fs.readFile(path.join(dir, 'sync-base.json'), 'utf8'));
+  assert.equal(base.workspace.papers.length, 1);
+  assert.equal(await integrations.confirmSyncApplied(applied.syncToken), false, '确认幂等：重复确认返回 false');
+});
+
+/* ---------- 集合级防线（S2）：缺键 ≠ 清空；清空必须人工二选一 ---------- */
+
+test('missing remote collection keys keep local entities as local-only, not tombstones', function () {
+  // v3 旧格式云端：只有 papers/folders，没有 notes 键——本地笔记按「本机独有」重传，
+  // 绝不按 deleted-remote 墓碑化清空
+  const base = { papers: [], notes: [{ id: 'n1', title: '旧', updatedAt: 100 }], folders: [] };
+  const local = { papers: [], notes: [{ id: 'n1', title: '新', updatedAt: 200 }], folders: [] };
+  const remote = { papers: [], folders: [] }; // 键缺失
+  const plan = LitSync.createSyncPlan({ base: base, local: local, remote: remote, now: 300 });
+  assert.deepEqual(plan.remoteCollectionMissing.sort(), ['notes', 'savedSearches', 'tagColorRecords']);
+  const note = plan.entities.find(function (e) { return e.collection === 'notes'; });
+  assert.equal(note.status, 'local-only');
+  assert.ok(note.merged, '合并结果保留本机笔记（上传补全云端结构）');
+  // 键存在但为空 ≠ 缺键：本地改过的实体落入 deleted-remote-conflict（需人工决议），
+  // 未改过的实体是 deleted-remote——清空语义不变，由断路器负责拦截
+  const remoteEmpty = { papers: [], notes: [], folders: [] };
+  const planEmpty = LitSync.createSyncPlan({ base: base, local: local, remote: remoteEmpty, now: 300 });
+  const noteEmpty = planEmpty.entities.find(function (e) { return e.collection === 'notes'; });
+  assert.equal(noteEmpty.status, 'deleted-remote-conflict');
+  const unchanged = LitSync.createSyncPlan({
+    base: { papers: [], notes: [{ id: 'n1', title: '同', updatedAt: 100 }], folders: [] },
+    local: { papers: [], notes: [{ id: 'n1', title: '同', updatedAt: 100 }], folders: [] },
+    remote: remoteEmpty, now: 300
+  });
+  assert.equal(unchanged.entities.find(function (e) { return e.collection === 'notes'; }).status, 'deleted-remote');
+});
+
+test('emptied remote collection triggers a required plan:collection-reset choice', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-collection-reset-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  let remoteBody = '';
+  const fetch = async function (url, init) {
+    if (init.method === 'GET' && url.endsWith('litboard-library.json')) {
+      return remoteBody ? new Response(remoteBody, { status: 200 }) : new Response('', { status: 404 });
+    }
+    if (init.method === 'GET') return new Response('', { status: 404 });
+    if (init.method === 'MKCOL') return new Response('', { status: 201 });
+    if (init.method === 'PUT' && url.endsWith('litboard-library.json')) {
+      remoteBody = init.body;
+      return new Response('', { status: 201 });
+    }
+    if (init.method === 'PUT') return new Response('', { status: 201 });
+    throw new Error('Unexpected request ' + init.method + ' ' + url);
+  };
+  const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: fetch });
+  await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
+  // 首传：1 篇 + 1 条笔记，确认基线
+  const seeded = { papers: [{ id: 'p1', title: 'P' }], notes: [{ id: 'n1', title: 'N' }], folders: [] };
+  const first = await integrations.nutstoreSync(seeded);
+  const firstApplied = await integrations.applyNutstoreSyncPlan({
+    planId: first.pendingPlan.planId, resolutions: { 'plan:first-upload': 'local' }
+  });
+  await integrations.confirmSyncApplied(firstApplied.syncToken);
+  // 云端库被旧版本端覆盖：notes 集合被清空（键在、长度 0）
+  const parsed = JSON.parse(remoteBody);
+  parsed.notes = [];
+  remoteBody = JSON.stringify(parsed);
+  // 自动同步必须暂停（pendingPlan），不能把本地笔记静默墓碑化后清空云端
+  const paused = await integrations.nutstoreSync(seeded);
+  assert.ok(paused.pendingPlan, '集合级清空触发断路器');
+  assert.equal(paused.pendingPlan.collectionResetSuspected, true);
+  assert.deepEqual(Object.keys(paused.pendingPlan.collectionResetCounts), ['notes']);
+  // 未选择不得应用（同时补齐实体冲突决议：本地与云端都动过的笔记 → deleted-remote-conflict）
+  const entityChoice = {};
+  (paused.pendingPlan.conflicts || []).forEach(function (conflict) {
+    entityChoice[conflict.conflictId] = 'local';
+  });
+  await assert.rejects(
+    integrations.applyNutstoreSyncPlan({
+      planId: paused.pendingPlan.planId, resolutions: Object.assign({}, entityChoice), workspace: seeded
+    }),
+    /集合被清空/
+  );
+  // 选「以本机恢复」：以渲染层传入的新鲜工作区覆盖受影响集合并重传
+  const applied = await integrations.applyNutstoreSyncPlan({
+    planId: paused.pendingPlan.planId,
+    resolutions: Object.assign({}, entityChoice, { 'plan:collection-reset': 'local' }),
+    workspace: seeded
+  });
+  await integrations.confirmSyncApplied(applied.syncToken);
+  assert.equal(JSON.parse(remoteBody).notes.length, 1, '云端笔记被本机内容恢复');
+  assert.equal(applied.workspace.notes.length, 1);
+});
+
+/* ---------- pin 补插（S4）：本机缺失 + remote 快照 → 上传列表保住云端实体 ---------- */
+
+test('applyPinsToWorkspace inserts remote snapshots missing from the local result', function () {
+  const pins = {
+    'papers:p1': { savedAt: 300, local: null, remote: { id: 'p1', title: '远端版本', updatedAt: 250 } }
+  };
+  const upload = LitSync.applyPinsToWorkspace({ papers: [], notes: [], folders: [], savedSearches: [], tagColorRecords: [] }, pins);
+  assert.equal(upload.papers.length, 1, '本机结果缺失时补回 remote 快照——云端不因「选本机」被整条删除');
+  assert.equal(upload.papers[0].title, '远端版本');
+  // 已在列表中的实体仍按 remote 快照替换（原语义不变）
+  const replace = LitSync.applyPinsToWorkspace({ papers: [{ id: 'p1', title: '本机' }], notes: [], folders: [], savedSearches: [], tagColorRecords: [] }, pins);
+  assert.equal(replace.papers.length, 1);
+  assert.equal(replace.papers[0].title, '远端版本');
+});
+
+/* ---------- 原子写加固（R1）：主文件损坏 → .bak 回退，凭据不丢 ---------- */
+
+test('corrupted integrations.json falls back to the .bak copy instead of wiping credentials', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-config-bak-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const integrations = createIntegrations({
+    baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(),
+    fetch: async function () { throw new Error('no network in this test'); }
+  });
+  await integrations.saveConfig({ nutstoreUser: 'u@example.com', nutstorePassword: 'secret-pw' });
+  // 模拟 copyFile 兜底被中途打断：主文件截断损坏，.bak 是上次成功写入的完整副本
+  const main = path.join(dir, 'integrations.json');
+  const full = await fs.readFile(main, 'utf8');
+  await fs.writeFile(main + '.bak', full, 'utf8');
+  await fs.writeFile(main, full.slice(0, Math.floor(full.length / 3)), 'utf8');
+  const config = await integrations.getConfig();
+  assert.equal(config.nutstoreUser, 'u@example.com', '主文件损坏时从 .bak 恢复，不再回空配置');
+  assert.equal(config.hasNutstorePassword, true);
+  assert.equal(config.nutstorePassword, undefined, '密文仍不出主进程');
+});

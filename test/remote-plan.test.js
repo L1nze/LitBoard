@@ -88,7 +88,7 @@ function makeHarness(planOverride, inspection, overrides) {
       };
     },
     syncFormValue: function () { return { user: 'u' }; },
-    workspacePayload: function () { return { papers: [] }; },
+    workspacePayload: extra.workspacePayload || function () { return { papers: [] }; },
     setSyncInlineStatus: function (id, text, kind) { calls.statuses.push({ id: id, text: text, kind: kind }); },
     applySyncedWorkspace: function (ws) { calls.appliedWorkspace++; return Promise.resolve(); },
     applyPortableConfigRuntime: function () {},
@@ -428,4 +428,28 @@ test('metadata-only mirror applies the workspace but keeps missing attachments v
   assert.match(h.els['#sync-remote-plan-progress-text'].textContent, /文献清单已更新，未归档多余文件.*missing-source\.pdf/);
   assert.equal(h.els['#sync-remote-plan-progress-percent'].textContent, '');
   assert.equal(h.calls.statuses.find(s => s.text.includes('missing-source.pdf')).kind, 'warning');
+});
+
+/* ---------- 应用前快照守卫（全模式）：对照期间本机有修改则阻断 ---------- */
+
+test('应用守卫：对照弹窗期间本机有新修改，merge 模式也必须阻断并要求重开对照', async () => {
+  let payload = { papers: [{ id: 'p1', title: '计划时刻' }] };
+  const h = makeHarness(null, null, {
+    workspacePayload: function () { return payload; }
+  });
+  // 生成对照（快照 = 计划时刻的工作区）
+  h.els['#sync-remote-merge'].click();
+  await flush();
+  assert.strictEqual(h.els['#sync-remote-plan-mask'].hidden, false);
+  // 弹窗期间（生成→应用窗口）本地又被修改
+  payload = { papers: [{ id: 'p1', title: '用户刚改的' }] };
+  // 补齐决议后点应用：必须被守卫挡下，不调后端、不落库
+  h.els['#sync-remote-choose-local'].click();
+  h.els['#sync-remote-plan-apply'].click();
+  await flush();
+  assert.strictEqual(h.calls.applied, null, '不得拿旧快照的合并结果覆盖同步期间的新修改');
+  const blocked = h.calls.statuses.some(function (s) {
+    return s.text && s.text.indexOf('本机文献库已变化，请重新预览整理计划') !== -1;
+  });
+  assert.ok(blocked, '状态行明确要求重开对照');
 });

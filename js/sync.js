@@ -295,10 +295,11 @@
   function workspaceParts(value, now) {
     var input = value && typeof value === 'object' ? value : {};
     var papersInput = Array.isArray(input) ? input : input.papers;
-    var records = model.normalizeTagColorRecords(input.tagColorRecords, input.tagColors);
+    // now：字段缺失时的时间戳兜底统一取计划时刻——两侧分别 normalize 各取各的
+    // Date.now()，跨毫秒即出现"同内容不同 addedAt"的幻影冲突（2026-10 排查）；
+    // tagColorRecords 同理（此前漏传，记录兜底时间各取各的）
+    var records = model.normalizeTagColorRecords(input.tagColorRecords, input.tagColors, now);
     return {
-      // now：字段缺失时的时间戳兜底统一取计划时刻——两侧分别 normalize 各取各的
-      // Date.now()，跨毫秒即出现"同内容不同 addedAt"的幻影冲突（2026-10 排查）
       papers: model.normalizeLibrary(papersInput || [], undefined, now),
       notes: model.normalizeNotes(input.notes, undefined, now),
       folders: model.normalizeFolders(input.folders, now),
@@ -458,7 +459,7 @@
     return cloneValue(merged);
   }
 
-  function makeEntityPlan(collection, id, baseEntity, localEntityValue, remoteEntity, mode, now, baseProvided) {
+  function makeEntityPlan(collection, id, baseEntity, localEntityValue, remoteEntity, mode, now, baseProvided, collectionRemoteMissing) {
     var hasBase = baseEntity !== undefined && baseEntity !== null;
     var hasLocal = localEntityValue !== undefined && localEntityValue !== null;
     var hasRemote = remoteEntity !== undefined && remoteEntity !== null;
@@ -505,6 +506,13 @@
       return entry;
     }
     if (!hasRemote) {
+      if (collectionRemoteMissing) {
+        // 远端库 JSON 没有这个集合的键（v3 旧格式互操作）：远端对该集合零知识，
+        // 本地内容按本机独有处理——重传补全云端，绝不按 deleted-remote 墓碑化
+        entry.status = entry.state = 'local-only';
+        entry.merged = cloneValue(localEntityValue);
+        return entry;
+      }
       if (!hasBase || equalContent(localCloud, baseCloud)) {
         entry.status = entry.state = hasBase ? 'deleted-remote' : 'local-only';
         // 远端删除且本地未改动时，两种模式都应尊重远端删除；没有
@@ -570,6 +578,15 @@
     var localValue = hasOwn.call(options, 'localWorkspace') ? options.localWorkspace : options.local;
     var remoteInput = hasOwn.call(options, 'remoteWorkspace') ? options.remoteWorkspace : options.remote;
     var remoteValue = unwrapWorkspace(remoteInput);
+    /* 集合键缺失 ≠ 键存在但为空：v3 旧格式云端文件不含 notes/savedSearches/
+     * tagColorRecords，属「远端没有该集合的知识」——本地内容按 local-only 重传
+     * （下次写入补全云端结构），绝不按 deleted-remote 墓碑化清空本地。 */
+    var remoteCollectionMissing = Object.create(null);
+    if (remoteValue && typeof remoteValue === 'object') {
+      COLLECTIONS.forEach(function (collection) {
+        if (!hasOwn.call(remoteValue, collection.name)) remoteCollectionMissing[collection.name] = true;
+      });
+    }
     var baseParts = workspaceParts(baseValue, now);
     var localParts = workspaceParts(localValue, now);
     var remoteParts = workspaceParts(remoteValue, now);
@@ -589,6 +606,7 @@
       remoteEtag: options.remoteEtag || options.etag || (remoteInput && (remoteInput.etag || remoteInput.ETag)) || null,
       entities: [],
       byCollection: {},
+      remoteCollectionMissing: Object.keys(remoteCollectionMissing),
       conflicts: [],
       onlyLocal: [],
       onlyRemote: [],
@@ -619,7 +637,8 @@
       });
       var list = [];
       Object.keys(ids).sort().forEach(function (id) {
-        var entry = makeEntityPlan(collection, id, baseMap[id], localMap[id], remoteMap[id], mode, now, hasExplicitBase);
+        var entry = makeEntityPlan(collection, id, baseMap[id], localMap[id], remoteMap[id], mode, now, hasExplicitBase,
+          !!remoteCollectionMissing[collection.name]);
         if (entry.status === 'absent') return;
         list.push(entry);
         plan.entities.push(entry);
@@ -786,7 +805,10 @@
     return result;
   }
 
-  /** 按登记调整上传工作区：被登记实体替换为远端快照（快照为 null 则剔除） */
+  /** 按登记调整上传工作区：被登记实体替换为远端快照（快照为 null 则剔除）。
+   * 本机结果里缺失但登记了 remote 快照的实体（deleted-local 冲突选「本机」后
+   * 本地删除、云端应保留远端值）要补回上传列表——只替换已有实体不补插的话，
+   * 上传工作区不含该实体，云端对象会被整条删除，「云端保持远端值」落空。 */
   function applyPinsToWorkspace(workspace, pins) {
     if (!pins) return workspace;
     var hasPins = false;
@@ -796,15 +818,28 @@
     PIN_COLLECTIONS.forEach(function (name) {
       var key = collectionKeyOf(name);
       var list = [];
+      var present = Object.create(null);
       ((workspace && workspace[name]) || []).forEach(function (entity) {
         if (!entity) return;
         var id = entity[key];
         var pin = id === undefined || id === null ? null : pins[pinKey(name, id)];
         if (pin) {
-          if (pin.remote) list.push(cloneValue(pin.remote));
+          if (pin.remote) {
+            var remoteId = pin.remote[key];
+            if (remoteId !== undefined && remoteId !== null) present[String(remoteId)] = true;
+            list.push(cloneValue(pin.remote));
+          }
           return;
         }
+        if (id !== undefined && id !== null) present[String(id)] = true;
         list.push(entity);
+      });
+      Object.keys(pins).forEach(function (pinKeyStr) {
+        if (pinKeyStr.indexOf(name + ':') !== 0) return;
+        var pin = pins[pinKeyStr];
+        var id = pinKeyStr.slice(name.length + 1);
+        if (!pin || !pin.remote || present[id]) return;
+        list.push(cloneValue(pin.remote));
       });
       output[name] = list;
     });
@@ -880,8 +915,11 @@
   }
 
   function findChoice(map, conflict, options) {
-    var keys = [conflict.conflictId, conflict.id];
-    if (conflict.field) keys.push(conflict.collection + ':' + conflict.id + ':' + conflict.field);
+    // 字段冲突键（collection:id:field）优先于裸 id：两者共享实体 id，
+    // 裸 id 在前会让「按 id 的实体决议」串选到同实体的字段冲突上
+    var keys = conflict.field
+      ? [conflict.conflictId, conflict.collection + ':' + conflict.id + ':' + conflict.field, conflict.id]
+      : [conflict.conflictId, conflict.id];
     for (var i = 0; i < keys.length; i++) {
       if (hasOwn.call(map, keys[i])) return map[keys[i]];
     }

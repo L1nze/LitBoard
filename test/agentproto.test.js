@@ -312,3 +312,24 @@ test('providerLabel: 服务商展示名（OpenCode 分 Go/Zen，未知回落真�
   assert.equal(P.providerLabel(null), '');
   assert.equal(P.providerLabel(undefined), '');
 });
+
+test('chat 累积器：网关在每个 delta 重发完整工具名不拼接叠加', function () {
+  const lines = [
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"search_library","arguments":"{\\"q\\":"}}]}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"search_library","arguments":"\\"锌\\"}"}}]}}]}',
+    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+    'data: [DONE]'
+  ];
+  const acc = P.createAccumulator('chat');
+  const events = [];
+  for (const line of lines) {
+    for (const item of acc.pushLine(line)) events.push(item);
+  }
+  const message = acc.message();
+  assert.equal(message.tool_calls.length, 1);
+  // 整段赋值：重复回发的 name 不再叠成 search_librarysearch_library
+  assert.equal(message.tool_calls[0].function.name, 'search_library');
+  assert.deepEqual(JSON.parse(message.tool_calls[0].function.arguments), { q: '锌' });
+  const toolEvents = events.filter(function (e) { return e.type === 'tool_call'; });
+  assert.equal(toolEvents.length, 1, 'announced 只发一次');
+});

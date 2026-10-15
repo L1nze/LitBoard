@@ -85,7 +85,14 @@
       var run = runners.get(String(runId || ''));
       if (!run) return false;
       run.doc.queuedInputs = [];
-      await checkpoint(run);
+      try {
+        await checkpoint(run);
+      } catch (error) {
+        // 与 enqueue 同款标记：checkpoint 失败让轮级 catch 停轮并如实呈现，
+        // 后续事件点的 checkpoint 再自愈（不留静默的内存/磁盘队列分叉）
+        run.persistenceFailed = true;
+        throw error;
+      }
       emit(run.id, { type: 'queue_changed', count: 0 });
       return true;
     }
@@ -96,7 +103,12 @@
       queue.splice(0).forEach(function (input) {
         run.core.messages.push({ role: 'user', content: '[补充要求]\n' + input.text, synthetic: true, kind: 'steering', turnId: run.core.turnId, ts: input.queuedAt });
       });
-      await checkpoint(run);
+      try {
+        await checkpoint(run);
+      } catch (error) {
+        run.persistenceFailed = true;
+        throw error;
+      }
       // 队列被消费后立刻通知：否则「已排队 n 条」要等到下一个流式增量才消失
       emit(run.id, { type: 'queue_changed', count: 0 });
     }

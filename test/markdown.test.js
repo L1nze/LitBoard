@@ -148,3 +148,31 @@ test('公式：行内 $$、\\[ \\] 块与强调混排不吃字', function () {
   assert.match(mixed, /<strong>加粗<\/strong>/);
   assert.doesNotMatch(mixed, /<em>/);
 });
+
+test('mermaid 围栏落成占位 div，源码双存（属性 + 兜底 pre）', function () {
+  const html = LitMarkdown.render('```mermaid\ngraph TD\n  A-->B\n```');
+  // 围栏内容保持字面（含尾随换行）；属性与 pre 双存同一份源码
+  assert.match(html, /<div class="lb-mermaid" data-mmd-src="graph TD\n {2}A--&gt;B\n">/);
+  assert.match(html, /<pre class="lb-mermaid-src"><code>graph TD\n {2}A--&gt;B\n<\/code><\/pre>/);
+  // 不再走默认代码块通道
+  assert.doesNotMatch(html, /<pre><code/);
+  // 大小写不敏感、语言后缀只认第一个词
+  const upper = LitMarkdown.render('```Mermaid\npie\n```');
+  assert.match(upper, /class="lb-mermaid"/);
+});
+
+test('mermaid 围栏边界：普通代码块不受影响，超长源码退回代码块', function () {
+  // 非 mermaid 语言照旧
+  const plain = LitMarkdown.render('```js\nconsole.log(1)\n```');
+  assert.match(plain, /<pre><code class="language-js">/);
+  // 空 mermaid 块（流式刚开始只有围栏头）也落占位，渲染层会跳过空源码
+  const empty = LitMarkdown.render('```mermaid\n```');
+  assert.match(empty, /class="lb-mermaid"/);
+  // 超长源码（>100KB）按普通代码块渲染，防止病态输出把 DOM 撑爆
+  const huge = '```mermaid\n' + 'a'.repeat(100001) + '\n```';
+  assert.doesNotMatch(LitMarkdown.render(huge), /lb-mermaid/);
+  assert.match(LitMarkdown.render(huge), /<pre><code/);
+  // 源码里的引号等特殊字符在属性里被转义，不会逃出属性（围栏内容保持字面，含反斜杠）
+  const tricky = LitMarkdown.render('```mermaid\nA["x\\"y"]-->B\n```');
+  assert.match(tricky, /data-mmd-src="A\[&quot;x\\&quot;y&quot;\]--&gt;B/);
+});

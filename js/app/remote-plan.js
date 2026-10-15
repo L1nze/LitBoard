@@ -46,11 +46,13 @@
     }
     var pendingConflictExport = [];
     var pendingRemotePlan = null;
-    var mirrorLocalSnapshot = null;
+    var planLocalSnapshot = null;
     var pendingRemoteResolutions = {};
     var LOCAL_EMPTY_RESET_KEY = 'plan:local-empty-reset'; // 与主进程 integrations.js 保持一致
+    var COLLECTION_RESET_KEY = 'plan:collection-reset';    // 云端集合被清空的强制二选一
     var MASS_DROP_RESET_KEY = 'plan:mass-drop-reset';     // 合并将大批移除云端词条的强制确认
     var FIRST_UPLOAD_KEY = 'plan:first-upload';           // 云端无库、本机非空的首传确认
+    var COLLECTION_LABELS = { notes: T('笔记'), folders: T('文件夹'), savedSearches: T('智能文件夹'), tagColorRecords: T('标签颜色') };
     var remotePlanApplying = false;
     var remotePlanStopping = false;
     // 应用进行中用户可关闭弹窗转入后台（同步照跑）：只藏弹窗不清状态，
@@ -437,6 +439,29 @@
         });
       }
 
+      // 「云端集合被清空」断路器：某集合键在但为空、基线与本机双侧都有内容——
+      // 正常删除走墓碑不会整集合消失，只可能是云端库被旧版本端/损坏备份清掉。
+      // 强制二选一：以本机恢复（重传该集合）或接受清空（传播删除）。
+      if (plan.collectionResetSuspected && plan.collectionResetCounts) {
+        var resetNames = Object.keys(plan.collectionResetCounts);
+        var resetDetail = resetNames.map(function (name) {
+          var counts = plan.collectionResetCounts[name] || {};
+          return COLLECTION_LABELS[name] + '（' + T('本机 ') + counts.local + T(' 条）');
+        }).join('、');
+        remotePlanModel.requiredKeys.add(COLLECTION_RESET_KEY);
+        remotePlanModel.items.push({
+          key: COLLECTION_RESET_KEY,
+          kind: 'conflict',
+          label: T('⚠ 云端的以下集合被清空：') + resetDetail,
+          hint: T('正常删除会留下占位记录、不会整集合消失。常见原因：云端库被旧版本覆盖或备份损坏。'),
+          localVal: T('以本机恢复：把本机该集合内容重新上传到云端'),
+          remoteVal: T('接受清空：按云端现状移除本机该集合内容'),
+          localText: T('以本机恢复'),
+          remoteText: T('接受清空'),
+          isRequired: true
+        });
+      }
+
       // 「云端无库 + 本机非空」首传确认：防账号/目录填错建出第二个空库。
       if (plan.firstUploadSuspected) {
         remotePlanModel.requiredKeys.add(FIRST_UPLOAD_KEY);
@@ -584,8 +609,10 @@
           setSyncInlineStatus('sync-remote-status', T('云端状态已变化，本次对照已作废，请重试'), 'warning');
           return;
         }
-        if (mode === 'mirror' && JSON.stringify(workspacePayload()) !== snapshot) throw new Error(T('本机文献库已变化，请重新预览整理计划'));
-        mirrorLocalSnapshot = mode === 'mirror' ? snapshot : null;
+        // 计划创建窗口内本地又有修改 → 计划生而陈旧，所有模式都要求重开对照
+        // （旧实现只挡 mirror：merge/restore 会拿旧快照的合并结果覆盖同步期间的新修改）
+        if (JSON.stringify(workspacePayload()) !== snapshot) throw new Error(T('本机文献库已变化，请重新预览整理计划'));
+        planLocalSnapshot = snapshot;
         renderRemotePlan(plan || {});
         setSyncInlineStatus('sync-remote-status', T('已生成对照，请完成选择后应用'), 'warning');
       }).catch(function (error) {
@@ -756,7 +783,13 @@
         return;
       }
       var planMode = pendingRemotePlan.mode;
-      if (planMode === 'mirror' && (pendingRemoteResolutions['mirror:confirm'] !== 'local' || mirrorLocalSnapshot !== JSON.stringify(workspacePayload()))) {
+      // 应用前快照守卫（全模式）：对照弹窗期间（生成→应用窗口）本地有过修改就阻断，
+      // 必须重开对照——旧实现只护 mirror，merge/restore 会用旧快照覆盖同步期间的新修改
+      if (planLocalSnapshot !== JSON.stringify(workspacePayload())) {
+        setSyncInlineStatus('sync-remote-status', T('本机文献库已变化，请重新预览整理计划'), 'warning');
+        return;
+      }
+      if (planMode === 'mirror' && pendingRemoteResolutions['mirror:confirm'] !== 'local') {
         setSyncInlineStatus('sync-remote-status', T('请核对确认；本机内容变化后需重新预览整理计划'), 'warning');
         return;
       }
@@ -772,15 +805,18 @@
       var applyAssetFailures = 0;
       var applyPaused = null;
       var mirrorResult = null;
+      var applyLocalStale = false;
       Promise.resolve().then(function () {
         return desktop.applyNutstoreSyncPlan({ planId: remotePlanId(pendingRemotePlan), resolutions: pendingRemoteResolutions, workspace: workspacePayload() });
       }).then(function (result) {
         var workspace = result && result.workspace ? result.workspace : result;
         mirrorResult = result && result.mirror;
-        if (mirrorResult && mirrorLocalSnapshot !== JSON.stringify(workspacePayload())) {
+        // 后端应用窗口内本地又有修改（全模式）：不用旧快照的合并结果覆盖本地。
+        // 云端已写入、基线未确认（S1 确认制），下次同步按正常合并把云端拉回，自愈
+        if (workspace && workspace.papers && planLocalSnapshot !== JSON.stringify(workspacePayload())) {
           workspace = null;
-          mirrorResult.complete = false;
-          mirrorResult.message = T('本机已有新修改，未用整理结果覆盖；请重新对照');
+          applyLocalStale = true;
+          if (mirrorResult) { mirrorResult.complete = false; mirrorResult.message = T('本机已有新修改，未用整理结果覆盖；请重新对照'); }
         }
         var assets = result && result.assets || {};
         applyAssetFailures = (assets.failures || []).length;
@@ -789,6 +825,12 @@
         if (workspace && workspace.papers) {
           // 暂停时也落库：用户已经做出的决议不能丢，附件续传交给限流调度
           return applySyncedWorkspace(workspace, true).then(function () {
+            // 基线确认制：落库成功才让主进程提交同步基线；确认失败自愈不打断流程
+            if (result.syncToken && desktop.confirmSyncApplied) {
+              return desktop.confirmSyncApplied(result.syncToken).catch(function () { return null; });
+            }
+            return null;
+          }).then(function () {
             setSyncIndicator('ok');
             if (desktop.getIntegrationConfig) return desktop.getIntegrationConfig().catch(function () { return null; });
             return null;
@@ -820,7 +862,8 @@
           if (!mirrorResult.complete) applyAssetFailures++;
         }
         if (applyAssetFailures && !mirrorResult) label += '（' + applyAssetFailures + T(' 个附件未完成，下次同步自动续传）');
-        setSyncInlineStatus('sync-remote-status', label, applyAssetFailures ? 'warning' : 'success');
+        if (applyLocalStale) label += '（' + T('本地在应用期间有新修改，结果未覆盖本地；下次同步自动合并') + '）';
+        setSyncInlineStatus('sync-remote-status', label, applyAssetFailures || applyLocalStale ? 'warning' : 'success');
         setRemotePlanCompleted(label, mirrorResult && (!mirrorResult.complete || mirrorResult.pendingAttachments > 0));
         toast(label);
         if (!mirrorResult || mirrorResult.complete) inspectRemote();

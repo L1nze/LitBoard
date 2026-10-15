@@ -492,3 +492,22 @@ test('researchIds: normalizePaper keeps valid ids and merge unions them as a set
   const r = LitMerge.mergeEntity(base, local, remote, LitMerge.PAPER_SPEC);
   assert.deepEqual(r.merged.researchIds.slice().sort(), ['W1', 'W2', 'W3']);
 });
+
+test('sanitizeNoteAssetFileName: 过滤路径语义，落盘名单文件名化', function () {
+  // 路径穿越被折叠/替换：不允许携带任何路径语义
+  assert.equal(LitModel.sanitizeNoteAssetFileName('../../evil.png'), '._._evil.png');
+  assert.equal(LitModel.sanitizeNoteAssetFileName('a/b\\c.png'), 'a_b_c.png');
+  assert.equal(LitModel.sanitizeNoteAssetFileName('..\\..\\x'), '._._x');
+  // 文件系统/URL 保留字符替换；合法名字（含连字符）原样保留
+  assert.equal(LitModel.sanitizeNoteAssetFileName('my-file_v2.png'), 'my-file_v2.png');
+  assert.equal(LitModel.sanitizeNoteAssetFileName('a?b#c$d:e*f"g<h>i|j'), 'a_b_c$d_e_f_g_h_i_j');
+  // 尾部点与空白（Windows 习惯）去除；空值回退
+  assert.equal(LitModel.sanitizeNoteAssetFileName('name.png. . '), 'name.png');
+  assert.equal(LitModel.sanitizeNoteAssetFileName('   '), 'file');
+  assert.equal(LitModel.sanitizeNoteAssetFileName(''), 'file');
+  assert.equal(LitModel.sanitizeNoteAssetFileName(null), 'file');
+  // normalizeNoteAsset：消毒后的 fileName 进权威字段；全空资产仍被丢弃（不被 'file' 兜底保留）
+  const asset = LitModel.normalizeNote({ id: 'n1', content: 'c', assets: [{ fileName: '../x.png', path: 'P' }] }, undefined, 5).assets[0];
+  assert.equal(asset.fileName, '._x.png');
+  assert.equal(LitModel.normalizeNote({ id: 'n1', content: 'c', assets: [{ fileName: '', path: '', cloudName: '' }] }, undefined, 5).assets.length, 0);
+});

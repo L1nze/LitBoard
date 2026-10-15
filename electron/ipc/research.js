@@ -133,13 +133,22 @@ function ingestCandidates(rows) {
     if (!workId && row.pageUrl) workId = ctx.researchDb.findByExtId('url', row.pageUrl) || '';
     if (!workId) workId = ctx.researchDb.findIdByNormalizedTitle(row.title) || '';
     if (!workId) workId = 'local:' + require('node:crypto').randomBytes(8).toString('hex');
+    const freshLocal = workId.indexOf('local:') === 0;
     const draft = Object.assign({}, row, { id: workId });
     delete draft.s2Id;
-    ctx.researchDb.upsertWorks([draft]);
-    const exts = LitResearch.extIdsForRow({ id: workId, doi: draft.doi, s2Id: row.s2Id, pageUrl: draft.pageUrl });
-    if (exts.length) ctx.researchDb.addExtIds(workId, exts);
+    // 身份纪律（同 research:register）：新建 local: 行不把 DOI 绑进 ext_ids——
+    // doi→local: 会挡住日后的真实身份解析（ext_ids 主键 kind,value 被 INSERT OR
+    // IGNORE 永久占坑）。DOI 只留 works.doi 列，等 upsertWorks 的归属汇聚认领。
+    const result = ctx.researchDb.upsertWorks([draft], freshLocal ? { suppressDoiExt: true } : undefined);
+    const finalId = (result && result.redirects && result.redirects[workId]) || workId;
+    const exts = LitResearch.extIdsForRow({
+      id: finalId,
+      doi: finalId === workId && freshLocal ? '' : draft.doi,
+      s2Id: row.s2Id, pageUrl: draft.pageUrl
+    });
+    if (exts.length) ctx.researchDb.addExtIds(finalId, exts);
     out.push({
-      workId: workId, id: workId, doi: draft.doi || '', title: draft.title,
+      workId: finalId, id: finalId, doi: draft.doi || '', title: draft.title,
       year: draft.year == null ? null : draft.year,
       sourceName: draft.sourceName || '', venue: draft.sourceName || '',
       abstract: draft.abstract || '', snippet: draft.snippet || '',
@@ -327,19 +336,29 @@ function register() {
     const resolvedDoi = {};
     resolved.forEach(function (row) { if (row.doi) resolvedDoi[row.doi] = row; });
     if (resolved.length) ctx.researchDb.upsertWorks(resolved);
-    // OpenAlex 也没有的（无 DOI 或反查未命中）：local 身份兜底，标题/来源/Scopus 引用数入库
-    const locals = hits.filter(function (hit) {
-      if (hit.doi && (byDoi[hit.doi] || resolvedDoi[hit.doi])) return false;
-      return !!(hit.title);
-    }).map(function (hit) {
-      return {
-        id: 'local:' + require('node:crypto').createHash('sha1').update(hit.eid || hit.doi || hit.title).digest('hex').slice(0, 12),
+    // OpenAlex 也没有的（无 DOI 或反查未命中）：local 身份兜底，标题/来源/Scopus 引用数入库。
+    // 身份纪律（同 research:register）：先按规范化标题认领既有身份（带 DOI 反查不到也先试，
+    // 零分裂风险）；新建 local: 行不把 DOI 绑进 ext_ids（会挡住日后的真实身份解析），
+    // DOI 只留 works.doi 列，等 upsertWorks 的归属汇聚认领。入库后按 redirects 校正回传 id。
+    const localIdMap = {};
+    const locals = [];
+    hits.forEach(function (hit) {
+      if (hit.doi && (byDoi[hit.doi] || resolvedDoi[hit.doi])) return;
+      if (!hit.title) return;
+      const fallbackId = 'local:' + require('node:crypto').createHash('sha1').update(hit.eid || hit.doi || hit.title).digest('hex').slice(0, 12);
+      const claimed = ctx.researchDb.findIdByNormalizedTitle(hit.title) || '';
+      const useId = claimed || fallbackId;
+      localIdMap[fallbackId] = useId;
+      locals.push({
+        id: useId,
         doi: hit.doi || '', title: hit.title, year: hit.year,
         sourceName: hit.source, citedBy: hit.citedByScopus,
         isOa: false, authors: hit.authors, refs: []
-      };
+      });
     });
-    if (locals.length) ctx.researchDb.upsertWorks(locals);
+    let localResult = null;
+    if (locals.length) localResult = ctx.researchDb.upsertWorks(locals, { suppressDoiExt: true });
+    const localApplied = (localResult && localResult.redirects) || {};
     scheduleAutoBackfill(resolved.concat(locals)); // 本批缺摘要条目自动回填（后台）
     ctx.researchDb.recordSearch({ q: req.query, filters: { source: 'scopus', yearFrom: req.yearFrom, yearTo: req.yearTo }, count: result.count });
     // A-followup #3：正式库收藏状态必须来自**正式库反查**——此前工具层拿「调研库已有」
@@ -349,8 +368,12 @@ function register() {
       count: result.count,
       stored: resolved.length + locals.length,
       works: hits.map(function (hit) {
-        const workId = (hit.doi && (byDoi[hit.doi] || (resolvedDoi[hit.doi] && resolvedDoi[hit.doi].id))) ||
-          (hit.title && 'local:' + require('node:crypto').createHash('sha1').update(hit.eid || hit.doi || hit.title).digest('hex').slice(0, 12)) || '';
+        let workId = (hit.doi && (byDoi[hit.doi] || (resolvedDoi[hit.doi] && resolvedDoi[hit.doi].id))) || '';
+        if (!workId && hit.title) {
+          const fallback = 'local:' + require('node:crypto').createHash('sha1').update(hit.eid || hit.doi || hit.title).digest('hex').slice(0, 12);
+          workId = localIdMap[fallback] || fallback;
+          workId = localApplied[workId] || workId; // 归属汇聚重定向后的真实 id
+        }
         return {
           id: workId, doi: hit.doi, title: hit.title, year: hit.year,
           sourceName: hit.source, citedBy: hit.citedByScopus, isOa: false,
@@ -682,8 +705,10 @@ function register() {
       // 时不该再建一个新的 local: 身份
       if (!workId && r.url) workId = ctx.researchDb.findByExtId('url', r.url);
       if (!workId) workId = ctx.researchDb.findIdByNormalizedTitle(r.title);
-      const exts = [{ kind: 'url', value: r.url }].concat(r.doi ? [{ kind: 'doi', value: r.doi }] : []);
+      const exts = [{ kind: 'url', value: r.url }];
       if (workId) {
+        // 认领既有身份：这次拿到的 DOI/URL 标识如实补登记（既有身份绑 DOI 不分裂）
+        if (r.doi) exts.push({ kind: 'doi', value: r.doi });
         ctx.researchDb.addExtIds(workId, exts);
         matched++;
         // 已存在的身份也要补这次才拿到的元数据（PDF 直链 / venue / snippet）
@@ -692,8 +717,13 @@ function register() {
         workId = 'local:' + require('node:crypto').randomBytes(8).toString('hex');
         const draft = LitWebFetch.workFromSearchResult(r);
         draft.id = workId;
-        ctx.researchDb.upsertWorks([draft]);
-        ctx.researchDb.addExtIds(workId, exts);
+        // 身份纪律（同 research:register）：新建 local: 不把 DOI 绑进 ext_ids——
+        // doi→local: 会占住 ext_ids 主键挡住日后的真实身份解析；DOI 只留 works.doi
+        // 列，等 upsertWorks 的归属汇聚认领。归属重定向后按真实 id 回传。
+        const result = ctx.researchDb.upsertWorks([draft], { suppressDoiExt: true });
+        const finalId = (result && result.redirects && result.redirects[workId]) || workId;
+        ctx.researchDb.addExtIds(finalId, exts);
+        workId = finalId;
         isNew = true;
       }
       out.push({

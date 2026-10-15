@@ -9577,16 +9577,31 @@
     return chain.then(function (result) {
       if (result && result.paused) {
         // 限流软暂停：firstWrite 的合并结果随结果带回（云端已是这份内容），
-        // 本地先落库对齐，再到点自动续传——不落库会让恢复同步产生伪冲突
+        // 本地先落库对齐，再到点自动续传——不落库会让恢复同步产生伪冲突。
+        // 同步运行期间本地有过修改时不能用旧快照的合并结果覆盖（S3 守卫）：
+        // 跳过落库，续传时按新鲜本地重新合并。
         var resumeAt = Number(result.resumeAt) || (Date.now() + 15 * 60 * 1000);
         var resumeText = new Date(resumeAt).toLocaleTimeString();
         var pausedMsg = T('坚果云限流额度用尽，同步已暂停，') + resumeText + T(' 自动续传（可保持应用开着）');
-        var pausedApply = result.workspace && result.workspace.papers && result.workspace !== current
-          ? applySyncedWorkspace(result.workspace, true).catch(function () {})
+        var pausedNote = '';
+        var localChangedDuringSync = workspaceStore.getRevision() !== syncRevision;
+        var pausedApply = !localChangedDuringSync && result.workspace && result.workspace.papers && result.workspace !== current
+          ? applySyncedWorkspace(result.workspace, true).then(function () {
+              // 基线确认制：落库成功才让主进程提交同步基线；落库失败不确认——
+              // 基线保持旧值，续传会把云端内容重新拉回，不产生静默回滚。
+              // 确认本身失败（写盘故障）静默自愈：基线留在暂存，下次同步补写
+              if (result.syncToken && desktop.confirmSyncApplied) {
+                return desktop.confirmSyncApplied(result.syncToken).catch(function () {});
+              }
+            }).catch(function () {
+              pausedNote = T('同步结果未能写入本地，暂停结果未应用；续传时将重新合并。');
+            })
           : Promise.resolve();
+        if (localChangedDuringSync) pausedNote = T('检测到新的本地修改，暂停结果未应用，续传时重新合并。');
         return pausedApply.then(function () {
-          setSyncIndicator('error', pausedMsg);
-          if (!silent) $('#sync-status').textContent = pausedMsg;
+          var finalMsg = pausedNote ? pausedNote + pausedMsg : pausedMsg;
+          setSyncIndicator('error', finalMsg);
+          if (!silent) $('#sync-status').textContent = finalMsg;
           scheduleSyncResume(resumeAt);
           return true;
         });
@@ -9604,6 +9619,11 @@
         return true;
       }
       return applySyncedWorkspace(workspace, true).then(function () {
+        // 基线确认制：本地已落库，主进程此刻才提交同步基线。确认本身失败不打断
+        // 成功状态——基线留在暂存，下次同步按本地新编辑重传（PUT 幂等，自愈）
+        if (result.syncToken && desktop.confirmSyncApplied) {
+          desktop.confirmSyncApplied(result.syncToken).catch(function () {});
+        }
         if (result && result.config && remotePlan && remotePlan.shouldRefreshForm()) {
           integrationConfig = result.config;
           applyPortableConfigRuntime(result.config);
@@ -10048,10 +10068,17 @@
             planError.softPause = true;
             throw planError;
           }
-          return { workspace: synced, stats: result };
+          // eb284e5 重构后 syncNutstore 返回 {workspace, conflicts, …, syncToken}：
+          // 这里必须解包取 merged workspace——旧写法把整个结果对象当 workspace，
+          // normalizeWorkspace 会得到空工作区，迁移成功路径反而清空本地库
+          return { workspace: synced.workspace, syncToken: synced.syncToken, stats: result };
         });
       }).then(function (result) {
         return applySyncedWorkspace(result.workspace).then(function () {
+          // 基线确认制：迁移工作区已落库，主进程此刻才提交同步基线（失败自愈，不打断迁移完成状态）
+          if (result.syncToken && desktop.confirmSyncApplied) {
+            desktop.confirmSyncApplied(result.syncToken).catch(function () {});
+          }
           $('#sync-status').textContent = T('迁移完成：下载 ') + result.stats.downloaded + T('，本地已有 ') +
             result.stats.existing + T('，云端缺失 ') + result.stats.missing + T('，失败 ') + result.stats.failed;
           toast(T('Zotero 云附件迁移完成'));

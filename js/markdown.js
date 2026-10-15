@@ -12,7 +12,11 @@
  *   md → html → md 往返不丢出处；
  * - 数学公式只「原样保住 + 标明边界」：$...$ → span.lb-math，行内 $$…$$ →
  *   span.lb-math.lb-math-block，独立行 $$…$$（可跨行）与 \[…\] → div.lb-math.lb-math-block
- *   （样式在 css/style.css；AI 对话层由 MathJax 排版）。
+ *   （样式在 css/style.css；AI 对话层由 MathJax 排版）；
+ * - ```mermaid 围栏 → div.lb-mermaid 占位（data-mmd-src 带源码，内部先落一个
+ *   pre.lb-mermaid-src 源码兜底）；排版交给渲染层 ensureMermaid（mermaid 11，流式
+ *   期间解析失败就保持源码展示，源码完整后自动成图）。超长源码（>100KB）按普通代码块渲染，
+ *   不进占位通道。
  */
 (function (root, factory) {
   var MarkdownIt = root && root.markdownit;
@@ -274,6 +278,23 @@
     };
     md.renderer.rules.lbex = function (tokens, idx) {
       return tokens[idx].content + '\n';
+    };
+
+    /* ---------------- mermaid 围栏拦截 ----------------
+     * ```mermaid 不走默认代码块，落成 div.lb-mermaid 占位：源码同时存 data-mmd-src
+     * （属性，供渲染层读）与 pre.lb-mermaid-src（可见兜底——流式期间或渲染失败时
+     * 用户看到的就是源码块）。源码超大时退回普通代码块，防止病态输出把 DOM 撑爆。 */
+    var defaultFence = md.renderer.rules.fence;
+    md.renderer.rules.fence = function (tokens, idx, options, env, self) {
+      var token = tokens[idx];
+      var lang = String(token.info || '').trim().split(/\s+/)[0].toLowerCase();
+      var src = token.content || '';
+      if (lang === 'mermaid' && src.length <= 100000) {
+        return '<div class="lb-mermaid" data-mmd-src="' + esc(src) + '">' +
+          '<pre class="lb-mermaid-src"><code>' + esc(src) + '</code></pre></div>\n';
+      }
+      return defaultFence ? defaultFence(tokens, idx, options, env, self)
+        : '<pre><code>' + esc(src) + '</code></pre>\n';
     };
 
     md.renderer.rules.table_open = function () {

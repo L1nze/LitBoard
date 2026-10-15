@@ -121,16 +121,19 @@ function makeDavServer() {
   return { state: state, fetch: fetch };
 }
 
-/** 首传确认 + 应用的便捷封装 */
+/** 首传确认 + 应用的便捷封装（基线确认制：应用后随即确认，base 落盘） */
 async function syncWithFirstUpload(integrations, workspace) {
   const pending = await integrations.nutstoreSync(workspace);
   if (pending && pending.pendingPlan) {
     assert.equal(pending.pendingPlan.firstUploadSuspected, true, '预期是首传确认而非其他暂停');
-    return integrations.applyNutstoreSyncPlan({
+    const applied = await integrations.applyNutstoreSyncPlan({
       planId: pending.pendingPlan.planId,
       resolutions: { 'plan:first-upload': 'local' }
     });
+    if (applied && applied.syncToken) await integrations.confirmSyncApplied(applied.syncToken);
+    return applied;
   }
+  if (pending && pending.syncToken) await integrations.confirmSyncApplied(pending.syncToken);
   return pending;
 }
 
@@ -283,10 +286,14 @@ test('备份链：内容变化覆盖云端前先 COPY 到 backups/，超量裁�
   await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
   let papers = [{ id: 'p1', title: 'v0', updatedAt: 1000 }];
   await syncWithFirstUpload(integrations, { papers: papers, folders: [] });
-  // 连续 10 次内容变化：每次覆盖前都应有备份，最终保留最近 5 份
+  // 连续 10 次内容变化：每次覆盖前都应有备份，最终保留最近 5 份。
+  // 基线确认制：真实应用里渲染层每次落库后都确认，这里对齐该语义，
+  // 否则 base 停在首传版本、后续每轮都变成「双侧修改」冲突弹对照。
   for (let i = 1; i <= 10; i++) {
     papers = [{ id: 'p1', title: 'v' + i, updatedAt: 1000 + i }];
-    await integrations.nutstoreSync({ papers: papers, folders: [] });
+    const round = await integrations.nutstoreSync({ papers: papers, folders: [] });
+    assert.ok(!round.pendingPlan, '第 ' + i + ' 轮不应弹对照');
+    if (round && round.syncToken) await integrations.confirmSyncApplied(round.syncToken);
   }
   const backupNames = Array.from(dav.state.files.keys())
     .filter(function (url) { return url.includes('/backups/library-'); })
@@ -325,12 +332,17 @@ test('限流暂停（节流器启用）：429 软暂停 + pacing 状态持久化
   assert.ok(paused.resumeAt > clock.now(), '恢复时刻在未来（Retry-After=60s）');
   const ledger = JSON.parse(await fs.readFile(path.join(dir, 'sync-asset-ledger.json'), 'utf8'));
   assert.ok(ledger.pacing && ledger.pacing.resumeAt > clock.now(), 'pacing 暂停状态持久化到台账');
+  // 渲染层语义（基线确认制）：暂停带回的合并工作区先落库、再确认基线，
+  // 续传以落库后的工作区继续——不确认会让 base 缺席、续传变成双侧冲突
+  const appliedWorkspace = paused.workspace && paused.workspace.papers ? paused.workspace : workspace;
+  if (paused.syncToken) await integrations.confirmSyncApplied(paused.syncToken);
   // 未到恢复时刻：再同步立即暂停
-  const still = await integrations.nutstoreSync(workspace);
+  const still = await integrations.nutstoreSync(appliedWorkspace);
   assert.equal(still.paused, true);
+  if (still.syncToken) await integrations.confirmSyncApplied(still.syncToken);
   // 时钟推进过恢复时刻：续传完成
   nowMs = paused.resumeAt + 10000;
-  const resumed = await integrations.nutstoreSync(workspace);
+  const resumed = await integrations.nutstoreSync(appliedWorkspace);
   assert.ok(!resumed.paused, '恢复时刻已过：同步完成');
   assert.equal(resumed.assets.uploaded, 1);
   assert.equal(dav.state.attachmentPuts.length, 1);
@@ -563,4 +575,34 @@ test('待确认同步计划上限：超额 FIFO 淘汰最旧，最新计划仍�
   await integrations.applyNutstoreSyncPlan({ planId: planIds[8], resolutions: { 'plan:first-upload': 'local' } });
   const cloud = JSON.parse(String(dav.state.files.get(dav.state.libraryUrl)));
   assert.ok((cloud.papers || []).some(function (p) { return p.title === 'T8'; }), '最新计划应用后云端应含 T8');
+});
+
+test('停止同步可中止云端检查/计划生成阶段的在途请求（runSyncReader）', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-reader-cancel-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  let entered = null;
+  const gate = function () { return new Promise(function (r) { entered = r; }); };
+  const integrations = createIntegrations({
+    baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(),
+    fetch: async function (url, init) {
+      if (init.method === 'GET' && url.endsWith('litboard-library.json')) {
+        await gate(); // 挂起直到收到中止
+        return new Response('{}', { status: 200 });
+      }
+      if (init.method === 'GET') return new Response('', { status: 404 });
+      throw new Error('Unexpected request ' + init.method + ' ' + url);
+    }
+  });
+  await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
+  const creating = integrations.createNutstoreSyncPlan({ workspace: { papers: [{ id: 'p1', title: 'x' }], folders: [] }, mode: 'merge' });
+  // 等请求真正在途（fetch 已进入挂起门），再取消——此前读侧不在取消注册表里，
+  // 「停止同步」中止不了这一阶段的请求
+  let enteredSeen = false;
+  for (let i = 0; i < 100 && !enteredSeen; i++) {
+    await new Promise(function (r) { setTimeout(r, 5); });
+    enteredSeen = !!entered;
+  }
+  assert.ok(enteredSeen, '请求已进入在途挂起');
+  assert.equal(integrations.cancelNutstoreSync(), true);
+  await assert.rejects(creating, /同步已停止|aborted/);
 });

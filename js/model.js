@@ -637,12 +637,26 @@
   }
 
   /* ---- 独立笔记实体（v12）：顶层同步集合，可挂文献（paperId）或作主题笔记（paperId=''） ---- */
+
+  /** 笔记资产文件名消毒：过滤路径分隔符与文件系统/URL 保留字符、折叠 ..、
+   * 去尾部点与空白（Windows 习惯）。云端 JSON 可能被控/损坏，落盘文件名必须
+   * 只做「单文件名」用，绝不允许携带路径语义（../ 穿越）。空值回退 'file'。 */
+  function sanitizeNoteAssetFileName(value) {
+    var name = String(value == null ? '' : value)
+      .replace(/[?#\\/:*"<>|\u0000-\u001f]/g, '_')
+      .replace(/\.{2,}/g, '.')
+      .replace(/[\s.]+$/, '');
+    name = name.trim();
+    return name || 'file';
+  }
+
   function normalizeNoteAsset(value, now) {
     var a = value && typeof value === 'object' ? value : {};
-    var fileName = text(a.fileName).trim().slice(0, 200);
+    var rawName = text(a.fileName).trim().slice(0, 200);
     var path = text(a.path).slice(0, 500);
     var cloudName = text(a.cloudName).trim();
-    if (!fileName && !path && !cloudName) return null;
+    if (!rawName && !path && !cloudName) return null;
+    var fileName = sanitizeNoteAssetFileName(rawName);
     var cloudHash = text(a.cloudHash).trim().toLowerCase();
     var size = finiteNumber(a.cloudSize);
     return {
@@ -749,7 +763,7 @@
     return out;
   }
 
-  function normalizeTagColorRecord(value) {
+  function normalizeTagColorRecord(value, now) {
     var record = value && typeof value === 'object' ? value : {};
     var tag = text(record.tag).trim();
     var color = text(record.color);
@@ -758,16 +772,16 @@
     return {
       tag: tag,
       color: /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : '',
-      updatedAt: timestampOrNull(record.updatedAt) || Date.now(),
+      updatedAt: timestampOrNull(record.updatedAt) || normalizeStamp(now),
       deletedAt: deletedAt
     };
   }
 
-  function normalizeTagColorRecords(value, legacyColors) {
+  function normalizeTagColorRecords(value, legacyColors, now) {
     var records = Array.isArray(value) ? value : [];
     var seen = {}, result = [];
     records.forEach(function (raw) {
-      var record = normalizeTagColorRecord(raw);
+      var record = normalizeTagColorRecord(raw, now);
       if (!record || seen[record.tag]) return;
       seen[record.tag] = true;
       result.push(record);
@@ -925,6 +939,7 @@
     normalizeDate: normalizeDate,
     normalizeNote: normalizeNote,
     normalizeNotes: normalizeNotes,
+    sanitizeNoteAssetFileName: sanitizeNoteAssetFileName,
     citationKeyBase: citationKeyBase,
     assignCitationKeys: assignCitationKeys,
     normalizeJournalRank: normalizeJournalRank,

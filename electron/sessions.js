@@ -53,10 +53,34 @@ function createSessions(options) {
     const temp = file + '.tmp-' + crypto.randomUUID();
     await fs.writeFile(temp, content, 'utf8');
     try {
-      await fs.rename(temp, file);
-    } catch (error) {
-      try { await fs.copyFile(temp, file); }
-      finally { await fs.rm(temp, { force: true }).catch(function () {}); }
+      let renamed = false;
+      for (const delay of [0, 60, 200, 500]) {
+        if (delay) await new Promise(function (resolve) { setTimeout(resolve, delay); });
+        try { await fs.rename(temp, file); renamed = true; break; } catch (error) { /* AV 锁文件，退避重试 */ }
+      }
+      if (!renamed) {
+        // rename 重试仍失败：copyFile 覆盖前备份 .bak（读侧会回退），覆盖后读回校验，
+        // 失败还原——session.json 是唯一事实源，不能被截断的覆盖打断
+        let backup = null;
+        try { await fs.copyFile(file, file + '.bak'); backup = file + '.bak'; } catch (error) { /* 目标可能不存在 */ }
+        await fs.copyFile(temp, file);
+        const written = await fs.readFile(file, 'utf8');
+        if (written !== content) {
+          if (backup) { try { await fs.copyFile(backup, file); } catch (error) {} }
+          throw new Error('会话文件写入后校验失败：' + path.basename(file));
+        }
+      }
+    } finally {
+      await fs.rm(temp, { force: true }).catch(function () {});
+    }
+  }
+
+  /** 读取 session.json / index.json：主文件损坏（覆盖被中途打断等）先回退 .bak */
+  async function readJsonWithBackup(file) {
+    try { return JSON.parse(await fs.readFile(file, 'utf8')); }
+    catch (error) {
+      try { return JSON.parse(await fs.readFile(file + '.bak', 'utf8')); }
+      catch (bakError) { throw error; }
     }
   }
 
@@ -116,7 +140,7 @@ function createSessions(options) {
 
   async function loadIndex() {
     try {
-      const parsed = JSON.parse(await fs.readFile(indexPath(), 'utf8'));
+      const parsed = await readJsonWithBackup(indexPath());
       if (parsed && parsed.version === 1 && Array.isArray(parsed.sessions)) {
         indexCache = parsed;
         return parsed;
@@ -178,7 +202,7 @@ function createSessions(options) {
       for (const title of titles) {
         const file = path.join(rootDir, dateDir, title, 'session.json');
         try {
-          const data = JSON.parse(await fs.readFile(file, 'utf8'));
+          const data = await readJsonWithBackup(file);
           if (data && data.id) {
             sessions.push({
               id: String(data.id),
@@ -354,7 +378,7 @@ function createSessions(options) {
     const meta = index.sessions.filter(function (s) { return s.id === String(id); })[0];
     if (!meta) return null;
     let data = null;
-    try { data = JSON.parse(await fs.readFile(sessionPath(meta.dir), 'utf8')); } catch (error) { return null; }
+    try { data = await readJsonWithBackup(sessionPath(meta.dir)); } catch (error) { return null; }
     const entry = { data: data, dir: meta.dir, timer: null, dirty: false };
     await cachePut(data.id, entry);
     return entry;

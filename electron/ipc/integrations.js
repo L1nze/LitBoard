@@ -83,6 +83,12 @@ function register() {
   ctx.handle('integrations:cancel-sync', function () {
     return ctx.integrations.cancelNutstoreSync();
   });
+  // 基线确认制：同步结果的 syncToken 在渲染层 SQLite 落库成功后回传，
+  // 主进程此刻才把暂存的同步基线落盘（详见 integrations.js pendingSyncBases 注释）
+  ctx.handle('integrations:confirm-sync-applied', function (_event, token) {
+    if (!ctx.integrations.confirmSyncApplied) throw new Error(ctx.T('当前版本不支持同步确认'));
+    return ctx.integrations.confirmSyncApplied(token);
+  });
   ctx.handle('integrations:test-nutstore', function (_event, value) { return ctx.integrations.testNutstoreConnection(value || {}); });
   ctx.handle('integrations:translate', function (_event, value) { return ctx.integrations.translateText(value || {}); });
   ctx.handle('integrations:test-translation', function (_event, value) { return ctx.integrations.testTranslationConnection(value || {}); });

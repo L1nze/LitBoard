@@ -3720,6 +3720,18 @@ button.onboard-step:hover { background: var(--hover); border-color: var(--accent
 .aui-bubble pre { background: rgba(127,127,127,.14); border-radius: 6px; padding: 8px; overflow-x: auto; font-size: 12px; }
 .aui-md > :first-child { margin-top: 0; }
 .aui-md > :last-child { margin-bottom: 0; }
+/* mermaid 占位（markdown.js fence 拦截产出）：未成图（流式中途 / 源码非法）时
+ * pre.lb-mermaid-src 就是兜底代码块，观感对齐 .aui-bubble pre；成图后
+ * [data-mmd-ok] 内换 SVG，只管居中与横向滚动（mermaid 自带 max-width） */
+.lb-mermaid { margin: 8px 0; }
+.lb-mermaid-src {
+  background: rgba(127, 127, 127, .14); border-radius: 6px; padding: 8px;
+  overflow-x: auto; font-size: 12px; margin: 0; white-space: pre;
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+}
+.lb-mermaid-src code { background: none; padding: 0; font-family: inherit; }
+.lb-mermaid[data-mmd-ok] { text-align: center; overflow-x: auto; }
+.lb-mermaid[data-mmd-ok] svg { max-width: 100%; height: auto; }
 .aui-actions { display: flex; gap: 6px; margin-top: 4px; height: 22px; }
 /* assistant-ui 的 autohide 只卸载按钮不收容器（项目不带它的样式表），
  * 空操作栏会白占 22px+4px——每段助手段尾部各一份，行距因此被撑大 */

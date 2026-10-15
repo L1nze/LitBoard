@@ -156,7 +156,8 @@ test('vec layer: put, pending by hash/model/recipe, cosine search with year filt
   try {
     db.upsertWorks([
       Object.assign({}, W1, { id: 'W10', title: 'Alpha study', abstract: 'alpha', year: 2020 }),
-      Object.assign({}, W1, { id: 'W11', title: 'Beta study', abstract: 'beta', year: 2023 })
+      // 夹具注意：DOI 归属汇聚会把「同 DOI 的不同 id」并成一行——两条独立论文必须各给各的 DOI
+      Object.assign({}, W1, { id: 'W11', doi: '10.1000/b', title: 'Beta study', abstract: 'beta', year: 2023 })
     ]);
     const model = 'm1';
     const recipe = 2;
@@ -550,6 +551,9 @@ test('R19: v2 → v3 迁移：旧库数据保留、works_fulltext 建表、FTS �
     authors_json TEXT DEFAULT '[]', refs_json TEXT DEFAULT '[]', concepts_json TEXT DEFAULT '[]',
     keywords_json TEXT DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
   raw.exec(`CREATE VIRTUAL TABLE works_fts USING fts5(work_id UNINDEXED, title, abstract, snippet, tokenize='trigram')`);
+  // v1 起就有的身份表（getWorks 的 merge_log 重定向依赖它；真实 v2 库由 v0 迁移而来必含）
+  raw.exec(`CREATE TABLE ext_ids(work_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind, value))`);
+  raw.exec(`CREATE TABLE merge_log(old_id TEXT PRIMARY KEY, new_id TEXT NOT NULL, at INTEGER NOT NULL)`);
   raw.prepare(`INSERT INTO works(id, title, abstract, created_at, updated_at) VALUES('W300', 'legacy work', 'legacy abstract', 1, 1)`).run();
   raw.prepare(`INSERT INTO works_fts(work_id, title, abstract, snippet) VALUES('W300', 'legacy work', 'legacy abstract', '')`).run();
   raw.close();
@@ -715,4 +719,114 @@ test('cosineSearch 缓存：同 (model,recipe) 冷热路径结果逐位一致，
       assert.equal(db.cosineSearch(q, { limit: 5, model, recipe }).length, 0);
     } finally { db.close(); }
   }
+});
+
+test('upsertWorks DOI 归属汇聚：local 只留 doi 列不绑 ext_ids，W 行到达合流单行', async function () {
+  const { db } = await makeDb();
+  try {
+    // 创建侧纪律：新建 local: 带 DOI 但 suppressDoiExt——works.doi 列有值、ext_ids 无 doi
+    const created = db.upsertWorks([{ id: 'local:abc123', doi: '10.9999/x', title: '离线兜底收录', year: 2024 }], { suppressDoiExt: true });
+    assert.deepEqual(created.redirects, {});
+    assert.equal(db.findByExtId('doi', '10.9999/x'), null, 'DOI 未绑进 ext_ids（不挡日后的真实身份解析）');
+    // 之后 OpenAlex 检索命中同一 DOI 的 W 行：按 doi 列归属重定向进 local 行，不开新行
+    const merged = db.upsertWorks([{ id: 'W4321', doi: '10.9999/x', title: '离线兜底收录', year: 2024, citedBy: 77 }]);
+    assert.equal(merged.redirects['W4321'], 'local:abc123');
+    assert.equal(db.stats().total, 1, '同一论文只有一行（代理键不变）');
+    assert.equal(db.findByExtId('doi', '10.9999/x'), 'local:abc123', '汇聚后 DOI 绑到保留行');
+    assert.equal(db.findByExtId('openalex', 'W4321'), 'local:abc123', 'W-id 也解析到同一行');
+    const [row] = db.getWorks(['local:abc123']);
+    assert.equal(row.citedBy, 77, '元数据并入保留行');
+  } finally { db.close(); }
+});
+
+test('upsertWorks DOI 归属汇聚：存量分裂库（doi 已绑 local:）不新增 W 行', async function () {
+  const { db } = await makeDb();
+  try {
+    // 旧版本造成的分裂现场：local 行已占住 doi ext_id
+    db.upsertWorks([{ id: 'local:old', doi: '10.8888/y', title: '旧分裂行', year: 2020 }]);
+    assert.equal(db.findByExtId('doi', '10.8888/y'), 'local:old');
+    // 新的 W 行进来：并入 local 行（不 INSERT OR IGNORE 后再开一行），标识补登记
+    const merged = db.upsertWorks([{ id: 'W9999', doi: '10.8888/y', title: '旧分裂行', year: 2020, abstract: '补上的摘要' }]);
+    assert.equal(merged.redirects['W9999'], 'local:old');
+    assert.equal(db.stats().total, 1);
+    assert.equal(db.findByExtId('openalex', 'W9999'), 'local:old');
+    const [row] = db.getWorks(['local:old']);
+    assert.equal(row.abstract, '补上的摘要');
+  } finally { db.close(); }
+});
+
+test('queryWorks: 全短词保持逐词 AND（不再退化为整串连续子串）', async function () {
+  const { db } = await makeDb();
+  try {
+    db.upsertWorks([
+      { id: 'WA', doi: '', title: 'AI camera model', abstract: '' },
+      { id: 'WB', doi: '', title: 'AI 模型综述', abstract: '' },
+      { id: 'WC', doi: '', title: 'camera tricks', abstract: 'AI 模型 not adjacent' }
+    ]);
+    // 两个 <3 码点词：要求各自命中，而不是「AI 模型」连续出现
+    const hits = db.queryWorks({ q: 'AI 模型' });
+    const ids = hits.works.map(function (row) { return row.id; });
+    assert.ok(ids.includes('WB'), '标题两词都有的命中');
+    assert.ok(ids.includes('WC'), '跨 title/abstract 两词各命中也算 AND');
+    assert.ok(!ids.includes('WA'), '只含一个词的不命中');
+  } finally { db.close(); }
+});
+
+test('works 事务中途失败回滚：works 与 vecs 双侧一致，向量不丢（R3）', async function () {
+  const { db, dir } = await makeDb();
+  try {
+    db.upsertWorks([{ id: 'W20', doi: '', title: 'Stable title', abstract: 'stable abstract' }]);
+    const model = 'm1';
+    const recipe = 2;
+    const pending = db.pendingEmbeddings({ model, recipe, limit: 10 });
+    const mine = pending.find(function (p) { return p.work.id === 'W20'; });
+    db.vecPut([{ workId: 'W20', model, dim: 1, recipe, hash: mine.hash, vec: Buffer.from(new Float32Array([1]).buffer) }]);
+    assert.equal(db.pendingEmbeddings({ model, recipe, limit: 10 }).length, 0, '向量已就位');
+    // 第二连接在背后抽掉 works_fts：下一次 upsert 在事务内的 FTS 语句处失败 → 走 ROLLBACK 路径
+    const second = new DatabaseSync(path.join(dir, 'research.db'));
+    second.exec('DROP TABLE works_fts');
+    second.close();
+    assert.throws(function () {
+      db.upsertWorks([{ id: 'W20', doi: '', title: 'Stable title v2', abstract: 'stable abstract v2' }]);
+    }, /works_fts|no such table/i);
+    // works 回滚：标题未被半改
+    const [row] = db.getWorks(['W20']);
+    assert.equal(row.title, 'Stable title');
+    // vec 侧仍完整（跨库删除未发生或已被快照回填），不产生「内容没变却待重嵌」的假待办
+    assert.equal(db.pendingEmbeddings({ model, recipe, limit: 10 }).length, 0, '事务失败后向量不丢');
+  } finally { db.close(); }
+});
+
+test('v5 迁移：存量同 DOI 分裂行一次性合流 + merge_log 重定向（R4）', async function () {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-dedupe-v5-'));
+  let db = createResearchDb({ dir: dir });
+  try {
+    await db.open();
+    db.close();
+    // 用裸 SQL 构造修复前的历史分裂现场（upsertWorks 已有 DOI 归属汇聚，插不进双行）：
+    // local 行先绑 doi ext，W 行另开一行、持有更全的元数据
+    const second = new DatabaseSync(path.join(dir, 'research.db'));
+    second.exec("INSERT INTO works(id, doi, title, created_at, updated_at) VALUES('local:dup1', '10.7777/z', '同一篇论文', 1, 1)");
+    second.exec("INSERT INTO works(id, doi, title, abstract, cited_by, created_at, updated_at) VALUES('W7777', '10.7777/z', '同一篇论文', '更全的摘要', 88, 1, 1)");
+    second.exec("INSERT INTO ext_ids(work_id, kind, value) VALUES('local:dup1', 'doi', '10.7777/z')");
+    second.exec("INSERT INTO ext_ids(work_id, kind, value) VALUES('W7777', 'openalex', 'W7777')");
+    second.exec('PRAGMA user_version = 4'); // 伪装 v4 旧库，重开时重跑 v5 迁移
+    second.close();
+    db = createResearchDb({ dir: dir });
+    await db.open();
+    assert.equal(db.stats().total, 1, '同 DOI 双行合流成单行');
+    // ext 归属者（local:dup1 先绑 doi）为存活者，W 行字段按非空优先并入
+    assert.equal(db.findByExtId('doi', '10.7777/z'), 'local:dup1');
+    assert.equal(db.findByExtId('openalex', 'W7777'), 'local:dup1', 'W-id 标识随行搬家');
+    const rows = db.getWorks(['local:dup1']);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].abstract, '更全的摘要');
+    assert.equal(rows[0].citedBy, 88);
+    // merge_log 重定向：旧 W7777 引用照常取到合流行
+    const viaOld = db.getWorks(['W7777']);
+    assert.equal(viaOld.length, 1);
+    assert.equal(viaOld[0].id, 'local:dup1');
+    // 合流后检索（FTS 重建）仍可命中并入的摘要
+    assert.ok(db.queryWorks({ q: '更全的摘要' }).works.some(function (w) { return w.id === 'local:dup1'; }));
+  } finally { db.close(); try { await fs.rm(dir, { recursive: true, force: true }); } catch (e) {} }
 });

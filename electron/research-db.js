@@ -17,7 +17,7 @@ const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const LitResearch = require('../js/research.js');
 
-const RESEARCH_DB_VERSION = 4;
+const RESEARCH_DB_VERSION = 5;
 
 function createResearchDb(options) {
   const dir = options.dir;
@@ -173,12 +173,101 @@ function createResearchDb(options) {
           if (norm) setNorm.run(norm, row.id);
         });
       }
+      if (version < 5) {
+        // v5：存量身份分裂一次性清理（同 DOI 双行合流，详见 dedupeWorksByIdentity）
+        dedupeWorksByIdentity(db);
+      }
       db.exec('PRAGMA user_version = ' + RESEARCH_DB_VERSION);
       db.exec('COMMIT');
     } catch (error) {
       db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  /** v5 迁移：清理历史身份分裂——同一 DOI（大小写不敏感）在 works 落了两行
+   *  （DOI 归属汇聚上线前，三处「带 DOI 建 local:」+ W-id 直插造成的存量）。
+   *  存活者选择：ext_ids 里该 DOI 的归属行优先（身份可解析），其次非 local: 行，
+   *  最后按 id 排序取首个。被并行按「非空字段优先」并入存活者，ext_ids / 全文 /
+   *  溯源随行搬家，FTS 重建，旧 id → 新 id 写入 merge_log（getWorks 查询按它
+   *  重定向，旧引用不断链）。吸收可能改变存活者文本 → 向量 hash 自然失配，走
+   *  既有后台重嵌；被并行在 vec.db 的孤儿向量查不到 works 行，惰性无害。 */
+  function dedupeWorksByIdentity(db) {
+    // 手搓的旧版本夹具库可能只建了部分表：身份相关表缺任一张就无从合流，跳过
+    const tableExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?");
+    const required = ['works', 'ext_ids', 'works_fulltext', 'field_provenance', 'works_fts', 'merge_log'];
+    if (required.some(function (name) { return !tableExists.get(name); })) return;
+    const groups = new Map();
+    db.prepare("SELECT id, doi FROM works WHERE doi != ''").all().forEach(function (row) {
+      const key = String(row.doi).toLowerCase();
+      if (!groups.has(key)) groups.set(key, new Set());
+      groups.get(key).add(row.id);
+    });
+    db.prepare("SELECT work_id, value FROM ext_ids WHERE kind = 'doi'").all().forEach(function (ext) {
+      const key = String(ext.value).toLowerCase();
+      if (groups.has(key)) groups.get(key).add(ext.work_id);
+    });
+    const extOwnerOf = db.prepare("SELECT work_id FROM ext_ids WHERE kind = 'doi' AND lower(value) = ? LIMIT 1");
+    const absorb = db.prepare(`
+      UPDATE works AS s SET
+        doi = CASE WHEN s.doi = '' AND d.doi != '' THEN d.doi ELSE s.doi END,
+        title = CASE WHEN s.title = '' AND d.title != '' THEN d.title ELSE s.title END,
+        title_norm = CASE WHEN s.title_norm = '' AND d.title_norm != '' THEN d.title_norm ELSE s.title_norm END,
+        year = CASE WHEN s.year IS NULL THEN d.year ELSE s.year END,
+        pubdate = CASE WHEN s.pubdate = '' AND d.pubdate != '' THEN d.pubdate ELSE s.pubdate END,
+        type = CASE WHEN s.type = '' AND d.type != '' THEN d.type ELSE s.type END,
+        source_id = CASE WHEN s.source_id = '' AND d.source_id != '' THEN d.source_id ELSE s.source_id END,
+        source_name = CASE WHEN s.source_name = '' AND d.source_name != '' THEN d.source_name ELSE s.source_name END,
+        abstract = CASE WHEN s.abstract = '' AND d.abstract != '' THEN d.abstract ELSE s.abstract END,
+        snippet = CASE WHEN s.snippet = '' AND d.snippet != '' THEN d.snippet ELSE s.snippet END,
+        page_url = CASE WHEN s.page_url = '' AND d.page_url != '' THEN d.page_url ELSE s.page_url END,
+        lang = CASE WHEN s.lang = '' AND d.lang != '' THEN d.lang ELSE s.lang END,
+        cited_by = MAX(s.cited_by, d.cited_by),
+        is_oa = MAX(s.is_oa, d.is_oa),
+        oa_url = CASE WHEN s.oa_url = '' AND d.oa_url != '' THEN d.oa_url ELSE s.oa_url END,
+        authors_json = CASE WHEN s.authors_json = '[]' AND d.authors_json != '[]' THEN d.authors_json ELSE s.authors_json END,
+        refs_json = CASE WHEN s.refs_json = '[]' AND d.refs_json != '[]' THEN d.refs_json ELSE s.refs_json END,
+        concepts_json = CASE WHEN s.concepts_json = '[]' AND d.concepts_json != '[]' THEN d.concepts_json ELSE s.concepts_json END,
+        keywords_json = CASE WHEN s.keywords_json = '[]' AND d.keywords_json != '[]' THEN d.keywords_json ELSE s.keywords_json END
+      FROM works AS d WHERE s.id = ? AND d.id = ?`);
+    // ext 行搬家是「改指向」不是复制：PK(kind, value) 下同键插入会被 IGNORE，
+    // 旧指向留着会指向已删除的并行（findByExtId 解析回死 id）
+    const moveExts = db.prepare('UPDATE ext_ids SET work_id = ? WHERE work_id = ?');
+    const moveFulltext = db.prepare(`INSERT OR IGNORE INTO works_fulltext(work_id, content, chars, fetched_at)
+      SELECT ?, content, chars, fetched_at FROM works_fulltext WHERE work_id = ?`);
+    const moveProvenance = db.prepare(`INSERT OR REPLACE INTO field_provenance(work_id, field, source, fetched_at)
+      SELECT ?, field, source, fetched_at FROM field_provenance WHERE work_id = ?`);
+    const dropFts = db.prepare('DELETE FROM works_fts WHERE work_id = ?');
+    const rebuildFts = db.prepare(`INSERT INTO works_fts(work_id, title, abstract, snippet, fulltext)
+      SELECT w.id, w.title, w.abstract, w.snippet, COALESCE(f.content, '') FROM works w
+      LEFT JOIN works_fulltext f ON f.work_id = w.id WHERE w.id = ?`);
+    const dropWork = db.prepare('DELETE FROM works WHERE id = ?');
+    const logMerge = db.prepare('INSERT OR REPLACE INTO merge_log(old_id, new_id, at) VALUES(?, ?, ?)');
+    const now = Date.now();
+    groups.forEach(function (members, key) {
+      if (members.size < 2) return;
+      const list = Array.from(members);
+      const extOwner = (extOwnerOf.get(key) || {}).work_id;
+      const survivor = (extOwner && list.indexOf(extOwner) >= 0 ? extOwner : '') ||
+        list.find(function (id) { return id.indexOf('local:') !== 0; }) ||
+        list.slice().sort()[0];
+      const touchedFts = new Set([survivor]);
+      list.forEach(function (dup) {
+        if (dup === survivor) return;
+        absorb.run(survivor, dup);
+        moveExts.run(survivor, dup);
+        moveFulltext.run(survivor, dup);
+        moveProvenance.run(survivor, dup);
+        dropFts.run(dup);
+        dropWork.run(dup);
+        logMerge.run(dup, survivor, now);
+        touchedFts.add(survivor);
+      });
+      touchedFts.forEach(function (id) {
+        dropFts.run(id);
+        rebuildFts.run(id);
+      });
+    });
   }
 
   function migrateVec(db) {
@@ -273,10 +362,45 @@ function createResearchDb(options) {
     };
   }
 
-  function upsertWorks(rows) {
+  /** vec 整行快照 / 回填：works 事务回滚时恢复跨库已删的向量（见 upsertWorks
+   *  内 vecBackup 注释）。回填用 ON CONFLICT DO NOTHING——回滚路径上 vec 行
+   *  若仍在（删除语句本身失败），保持原行不动。 */
+  function snapshotVecRows(ids) {
+    if (!vec || !ids || !ids.length) return [];
+    const stmt = vec.prepare('SELECT work_id, model, dim, recipe, content_hash, vec, updated_at FROM vecs WHERE work_id = ?');
+    return ids.map(function (id) { return stmt.get(id); }).filter(Boolean);
+  }
+
+  function restoreVecRows(rows) {
+    if (!vec || !rows || !rows.length) return;
+    const stmt = vec.prepare(`INSERT INTO vecs(work_id, model, dim, recipe, content_hash, vec, updated_at)
+      VALUES(@work_id, @model, @dim, @recipe, @content_hash, @vec, @updated_at)
+      ON CONFLICT(work_id) DO NOTHING`);
+    vec.exec('BEGIN');
+    try {
+      rows.forEach(function (row) { stmt.run(row); });
+      vec.exec('COMMIT');
+    } catch (error) {
+      vec.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /** 身份纪律（代理键永不变更）的入库汇聚侧：行带 DOI 时先解析归属——
+   *  ext_ids 已绑定的 owner 或 works.doi 列先到者。归属存在且不是自己 → 该行
+   *  并入 owner（以 owner 为 id 更新字段、DOI 与原 W-id 注册为 owner 的 ext_ids），
+   *  不另开新行。效果：新纪律下「DOI 只进列不进 ext_ids」的 local 行，与存量
+   *  已分裂的库（doi 已绑 local:）在下次 OpenAlex/S2 入库时都合流到单行。
+   *  opts.suppressDoiExt：创建侧专用——新建 local: 行不把 DOI 绑进 ext_ids
+   *  （绑了会挡住日后的真实身份解析），DOI 只留在 works.doi 列等待汇聚。
+   *  返回 { count, redirects }：redirects[原id] = 归并后的 id，创建侧据此回传真实身份。 */
+  function upsertWorks(rows, opts) {
     ensureOpen();
+    const options = opts && typeof opts === 'object' ? opts : {};
     const list = (Array.isArray(rows) ? rows : []).filter(function (row) { return row && row.id; });
-    if (!list.length) return { count: 0 };
+    if (!list.length) return { count: 0, redirects: {} };
+    const redirects = {}; // try 块外声明：return 在 catch 之后仍可见
+    let vecBackup = null; // vec 删除前的整行快照，works 回滚时回填
     works.exec('BEGIN');
     try {
       const upsert = works.prepare(`
@@ -319,9 +443,30 @@ function createResearchDb(options) {
       const readPrevious = works.prepare('SELECT title, abstract, snippet FROM works WHERE id = ?');
       const vecHashRead = vec ? vec.prepare('SELECT content_hash FROM vecs WHERE work_id = ?') : null;
       const extInsert = works.prepare('INSERT OR IGNORE INTO ext_ids(work_id, kind, value) VALUES(?, ?, ?)');
+      const doiOwnerByExt = works.prepare("SELECT work_id AS wid FROM ext_ids WHERE kind = 'doi' AND lower(value) = lower(?) LIMIT 1");
+      const doiOwnerByColumn = works.prepare("SELECT id AS wid FROM works WHERE doi != '' AND lower(doi) = lower(?) AND id != ? LIMIT 1");
       const staleVecIds = [];
       list.forEach(function (row) {
-        const c = workToColumns(row);
+        // DOI 归属重定向（见函数头注释）：同一论文绝不落两行。
+        // ext_ids / works.doi 存的都是调用方给的原始串——裸 DOI 与 URL 形式
+        // （https://doi.org/…）、大小写差异都会让 lower() 直比落空，两种形态各试一次
+        let target = row;
+        const doi = String(row.doi || '').trim();
+        if (doi) {
+          const normDoi = LitResearch.normalizeDoi(doi);
+          const variants = normDoi && normDoi !== doi.toLowerCase() ? [doi, normDoi] : [doi];
+          let owner = '';
+          for (const candidate of variants) {
+            owner = (doiOwnerByExt.get(candidate) || {}).wid ||
+              (doiOwnerByColumn.get(candidate, row.id) || {}).wid || '';
+            if (owner) break;
+          }
+          if (owner && owner !== row.id) {
+            target = Object.assign({}, row, { id: owner });
+            redirects[row.id] = owner;
+          }
+        }
+        const c = workToColumns(target);
         const previous = readPrevious.get(c.id) || null;
         upsert.run(c);
         // R09：FTS 用「UPSERT 后数据库实际保留的合并行」重建——UPSERT 是非空补齐语义，
@@ -342,11 +487,23 @@ function createResearchDb(options) {
         });
         const before = vecHashRead ? vecHashRead.get(c.id) : null;
         if (before && before.content_hash !== hash) staleVecIds.push(c.id);
-        LitResearch.extIdsForRow({ id: c.id, doi: c.doi }).forEach(function (ext) {
+        // ext_ids：重定向发生时说明 owner 实际存在，DOI 如实绑定（不受 suppress 影响），
+        // 原身份（OpenAlex W-id）也登记到 owner 供日后按 W-id 反查；suppressDoiExt
+        // 只对「没有 owner 的新建 local 行」生效——DOI 留在列上等未来汇聚认领
+        const bindDoi = c.doi && (!options.suppressDoiExt || redirects[row.id]);
+        const exts = LitResearch.extIdsForRow({ id: c.id, doi: bindDoi ? c.doi : '' });
+        if (redirects[row.id] && String(row.id).indexOf('local:') !== 0) {
+          exts.push({ kind: 'openalex', value: String(row.id) });
+        }
+        exts.forEach(function (ext) {
           extInsert.run(c.id, ext.kind, ext.value);
         });
       });
       if (vec && staleVecIds.length) {
+        // vec 与 works 是两个独立 SQLite 连接：vec 删除无法随 works 事务回滚。
+        // 删前快照整行，works ROLLBACK 时原样回填——否则 COMMIT 失败会把
+        // 「内容没变」的向量也丢掉，下次构建白付一次嵌入计费
+        vecBackup = snapshotVecRows(staleVecIds);
         const vecDeleteStmt = vec.prepare('DELETE FROM vecs WHERE work_id = ?');
         staleVecIds.forEach(function (id) { vecDeleteStmt.run(id); });
       }
@@ -355,9 +512,13 @@ function createResearchDb(options) {
       invalidateVecCache(true);
     } catch (error) {
       works.exec('ROLLBACK');
+      if (vecBackup && vecBackup.length) {
+        try { restoreVecRows(vecBackup); invalidateVecCache(true); }
+        catch (restoreError) { /* 回填失败保持旧语义：下次构建重新嵌入 */ }
+      }
       throw error;
     }
-    return { count: list.length };
+    return { count: list.length, redirects: redirects };
   }
 
   function workSummary(row) {
@@ -420,20 +581,24 @@ function createResearchDb(options) {
       const likeTokens = [];
       tokens.forEach(function (t) {
         const norm = '"' + t.replace(/"/g, '""') + '"';
-        ([...t].length >= 3 ? ftsTokens : likeTokens).push(norm);
+        // LIKE 用裸词（不带 FTS 引号）——旧写法从带引号的 norm 反剥，无内嵌引号时
+        // 反剥不动，'%\"词\"%' 永远匹配不上（混词分支的潜伏 bug，短词一多即现形）
+        ([...t].length >= 3 ? ftsTokens : likeTokens).push({ norm: norm, bare: t });
       });
       if (!ftsTokens.length && likeTokens.length) {
-        // 全是短词：退 LIKE（与 <3 字符整查询的旧路径一致）
-        where.push("(works.title LIKE @like OR works.abstract LIKE @like)");
-        params.like = '%' + q + '%';
+        // 全是短词：同样保持逐词 AND（S3 语义声明），只是全部走 LIKE——
+        // 旧写法对整串 q 做单个 %q%，"AI 模型" 会要求连续子串而非两词各命中
+        likeTokens.forEach(function (token, idx) {
+          where.push("(works.title LIKE @likeS" + idx + " OR works.abstract LIKE @likeS" + idx + ")");
+          params['likeS' + idx] = '%' + token.bare + '%';
+        });
       } else {
         from = 'works JOIN works_fts ON works.id = works_fts.work_id';
         where.push('works_fts MATCH @fts');
-        params.fts = ftsTokens.join(' AND ');
-        likeTokens.forEach(function (t, idx) {
-          const bare = t.replace(/""/g, '"');
+        params.fts = ftsTokens.map(function (token) { return token.norm; }).join(' AND ');
+        likeTokens.forEach(function (token, idx) {
           where.push("(works.title LIKE @likeS" + idx + " OR works.abstract LIKE @likeS" + idx + ")");
-          params['likeS' + idx] = '%' + bare + '%';
+          params['likeS' + idx] = '%' + token.bare + '%';
         });
       }
     } else if (q) {
@@ -465,9 +630,21 @@ function createResearchDb(options) {
     // 卡在 50 会让「>120 篇按被引/PageRank 择优截取」这条可读性路径永远无法触发
     const list = (Array.isArray(ids) ? ids : []).map(String).filter(Boolean).slice(0, 500);
     if (!list.length) return [];
-    const placeholders = list.map(function () { return '?'; }).join(',');
+    // 旧 id 先经 merge_log 重定向（v5 身份合流后，会话/历史里存的旧 id 仍可用）
+    const redirect = works.prepare('SELECT new_id FROM merge_log WHERE old_id = ?');
+    const resolve = function (id) {
+      let current = id;
+      for (let hops = 0; hops < 8; hops++) {
+        const row = redirect.get(current);
+        if (!row) break;
+        current = row.new_id;
+      }
+      return current;
+    };
+    const resolved = list.map(resolve);
+    const placeholders = resolved.map(function () { return '?'; }).join(',');
     const stmt = works.prepare(`SELECT works.*, (SELECT chars FROM works_fulltext f WHERE f.work_id = works.id) AS fulltext_chars FROM works WHERE works.id IN (${placeholders})`);
-    const rows = stmt.all(...list);
+    const rows = stmt.all(...resolved);
     return rows.map(rowToWork);
   }
 
@@ -608,6 +785,7 @@ function createResearchDb(options) {
     if (titleUnchanged && abstractUnchanged) return { updated: 0 };
     sets.push('updated_at = @now');
     works.exec('BEGIN');
+    let vecBackup = null;
     try {
       const result = works.prepare('UPDATE works SET ' + sets.join(', ') + ' WHERE id = @id').run(params);
       const changed = Number(result.changes) || 0;
@@ -625,13 +803,21 @@ function createResearchDb(options) {
         `);
         if (params.title) prov.run({ id: id, field: 'title', source: String(source || ''), now: params.now });
         if (params.abstract) prov.run({ id: id, field: 'abstract', source: String(source || ''), now: params.now });
-        if (vec) vec.prepare('DELETE FROM vecs WHERE work_id = ?').run(id);
+        // vec 删除同样跨库：删前快照，works 回滚时回填（同 upsertWorks）
+        if (vec) {
+          vecBackup = snapshotVecRows([id]);
+          vec.prepare('DELETE FROM vecs WHERE work_id = ?').run(id);
+        }
       }
       works.exec('COMMIT');
       invalidateVecCache(true);
       return { updated: changed };
     } catch (error) {
       works.exec('ROLLBACK');
+      if (vecBackup && vecBackup.length) {
+        try { restoreVecRows(vecBackup); invalidateVecCache(true); }
+        catch (restoreError) { /* 回填失败保持旧语义：下次构建重新嵌入 */ }
+      }
       throw error;
     }
   }
