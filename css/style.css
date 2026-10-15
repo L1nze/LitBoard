@@ -3570,7 +3570,25 @@ button.onboard-step:hover { background: var(--hover); border-color: var(--accent
 /* 兜底行移空后隐藏保留（display:flex 会盖掉 UA 的 hidden 规则，需显式压掉） */
 .agent-composer-row[hidden] { display: none; }
 .agent-status { flex: 1; min-width: 0; font-size: 11.5px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.agent-tokens { font-size: 11px; color: var(--text-secondary); flex: 0 1 auto; min-width: 0; line-height: 1.3; overflow-wrap: anywhere; }
+/* token 用量指示器：进度环 + 数字（无文字标签）。容器可压缩，数字省略号截断，
+ * 环固定不缩——绝不换行（曾因逐字换行显示成竖排）。悬停 title 有完整数值与百分比。 */
+.agent-tokens {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; color: var(--text-secondary);
+  flex: 0 1 auto; min-width: 0; line-height: 1.3; white-space: nowrap; overflow: hidden;
+}
+.agent-token-ring { width: 12px; height: 12px; flex: none; }
+.agent-token-ring-track { fill: none; stroke: var(--border); stroke-width: 2.5; }
+.agent-token-ring-bar {
+  fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round;
+  transform: rotate(-90deg); transform-origin: 7px 7px;
+  transition: stroke-dasharray .25s ease;
+}
+.agent-tokens.warn { color: var(--amber-text); }
+.agent-tokens.warn .agent-token-ring-bar { stroke: var(--amber); }
+.agent-tokens.full { color: var(--danger); }
+.agent-tokens.full .agent-token-ring-bar { stroke: var(--danger); }
+.agent-token-num { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* 模型与推理档位共用一个紧凑控件；服务商仍在模型菜单中分组。 */
 .agent-model-control {
   display: inline-flex; align-items: center; min-width: 0; max-width: 70%; flex: none;

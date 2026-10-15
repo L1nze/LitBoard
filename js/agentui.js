@@ -1141,11 +1141,31 @@ window.LitAgentUi = (function () {
     if (node) node.textContent = text || '';
   }
 
+  /** 输入行尾的上下文占用指示器：进度环 + token 数（无文字标签，紧凑不挤行）。
+   *  分母与自动压缩同一口径（usableInputTokens，扣掉输出预留后的可用输入预算）；
+   *  环色分级：<75% 常规、≥75% 琥珀（逼近自动压缩阈值 80%）、≥92% 红（将触发裁剪/压缩）。 */
   function updateTokens() {
     var run = current ? runs.get(current) : null;
     var node = $('agent-tokens');
     if (!node) return;
-    node.textContent = run ? T('当前上下文占用 ≈{n} tokens').replace('{n}', fmtTokensK(window.LitAgentCore.currentInputTokens(run.core, buildAgentBody(run)))) : '';
+    if (!run) { node.innerHTML = ''; node.title = ''; node.classList.remove('warn', 'full'); return; }
+    var Context = window.LitAgentContext;
+    var limits = agentLimits(run.frozen);
+    var usable = Context ? Context.usableInputTokens(limits.contextTokens, limits.maxOutputTokens) : limits.contextTokens;
+    var used = window.LitAgentCore.currentInputTokens(run.core, buildAgentBody(run));
+    var ratio = usable > 0 ? Math.max(0, Math.min(1, used / usable)) : 0;
+    var pct = Math.round(ratio * 100);
+    var C = 31.42; // r=5 的周长（2πr）
+    var dash = (C * ratio).toFixed(2);
+    node.classList.toggle('warn', ratio >= 0.75 && ratio < 0.92);
+    node.classList.toggle('full', ratio >= 0.92);
+    // 全部内容为本地计算的数字与静态 SVG，无外部输入，innerHTML 安全
+    node.innerHTML =
+      '<svg class="agent-token-ring" viewBox="0 0 14 14" aria-hidden="true">' +
+      '<circle class="agent-token-ring-track" cx="7" cy="7" r="5"/>' +
+      '<circle class="agent-token-ring-bar" cx="7" cy="7" r="5" stroke-dasharray="' + dash + ' ' + C.toFixed(2) + '"/></svg>' +
+      '<span class="agent-token-num">' + fmtTokensK(used) + '</span>';
+    node.title = T('当前上下文占用 ≈{n} tokens').replace('{n}', fmtTokensK(used)) + ' · ' + pct + '%';
   }
 
   /** token 数显示为 k 形式（17397 → 17.4k、17000 → 17k、999 → 999），长数字易读 */
