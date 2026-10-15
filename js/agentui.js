@@ -1141,7 +1141,7 @@ window.LitAgentUi = (function () {
     if (node) node.textContent = text || '';
   }
 
-  /** 输入行尾的上下文占用指示器：进度环 + token 数（无文字标签，紧凑不挤行）。
+  /** 输入行尾的上下文占用指示器：只有进度环（数字与说明悬停 title 显示，行内零占位）。
    *  分母与自动压缩同一口径（usableInputTokens，扣掉输出预留后的可用输入预算）；
    *  环色分级：<75% 常规、≥75% 琥珀（逼近自动压缩阈值 80%）、≥92% 红（将触发裁剪/压缩）。 */
   function updateTokens() {
@@ -1159,12 +1159,11 @@ window.LitAgentUi = (function () {
     var dash = (C * ratio).toFixed(2);
     node.classList.toggle('warn', ratio >= 0.75 && ratio < 0.92);
     node.classList.toggle('full', ratio >= 0.92);
-    // 全部内容为本地计算的数字与静态 SVG，无外部输入，innerHTML 安全
+    // 全部内容为本地计算的静态 SVG，无外部输入，innerHTML 安全
     node.innerHTML =
       '<svg class="agent-token-ring" viewBox="0 0 14 14" aria-hidden="true">' +
       '<circle class="agent-token-ring-track" cx="7" cy="7" r="5"/>' +
-      '<circle class="agent-token-ring-bar" cx="7" cy="7" r="5" stroke-dasharray="' + dash + ' ' + C.toFixed(2) + '"/></svg>' +
-      '<span class="agent-token-num">' + fmtTokensK(used) + '</span>';
+      '<circle class="agent-token-ring-bar" cx="7" cy="7" r="5" stroke-dasharray="' + dash + ' ' + C.toFixed(2) + '"/></svg>';
     node.title = T('当前上下文占用 ≈{n} tokens').replace('{n}', fmtTokensK(used)) + ' · ' + pct + '%';
   }
 
