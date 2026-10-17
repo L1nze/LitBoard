@@ -897,3 +897,256 @@ test('A-followup #2: 显式附件查询不越界回退到该文献其它附件�
   const legacyRange = await db.pdfTextGetRange('p1', 'supp-2', 1, 1, 3500, 0, { legacyFallback: true });
   assert.equal(legacyRange.pages[0].text, 'MAIN PDF PAGE 1');
 });
+
+/* ---------- 签名直传（渲染层已算好的 nextSignatures） ---------- */
+
+test('saveState 接受直传 nextSignatures：校验通过时跳过本地重算，结果与重算逐实体一致', async function (t) {
+  const db = await tempDb(t);
+  const first = await db.saveState({
+    papers: [{ id: 'p1', title: 'One' }, { id: 'p2', title: 'Two' }],
+    notes: [{ id: 'n1', paperId: 'p1', content: 'note' }],
+    folders: [{ id: 'f1', name: 'F' }],
+    savedSearches: [{ id: 's1', name: 'S', query: 'year>=2020' }],
+    tagColorRecords: [{ tag: 'x', color: '#ffffff', updatedAt: 1 }]
+  });
+  // 渲染层同口径：对要发送的工作区 normalize 后签名
+  const workspace = LitModel.normalizeWorkspace({
+    papers: [{ id: 'p1', title: 'One' }, { id: 'p2', title: 'Two Edited' }],
+    notes: [{ id: 'n1', paperId: 'p1', content: 'note' }],
+    folders: [{ id: 'f1', name: 'F' }],
+    savedSearches: [{ id: 's1', name: 'S', query: 'year>=2020' }],
+    tagColorRecords: [{ tag: 'x', color: '#ffffff', updatedAt: 1 }]
+  });
+  const next = LitModel.workspaceSignatures(workspace);
+  const saved = await db.saveState(Object.assign({}, workspace, {
+    baseSignatures: first.signatures, nextSignatures: next
+  }));
+  assert.equal(saved.signaturesFromCaller, true, '直传签名应被采信');
+  assert.equal(saved.papersWritten, 1, '只写真正变化的 p2');
+  assert.equal(saved.conflicts.length, 0);
+  // 采信的签名与「本地重算」逐实体一致（渲染层写后校验依赖这一点）
+  const recomputed = LitModel.workspaceSignatures(LitModel.normalizeWorkspace(workspace));
+  for (const collection of ['papers', 'notes', 'folders', 'savedSearches', 'tagColorRecords']) {
+    assert.deepEqual(saved.signatures[collection], recomputed[collection], collection);
+  }
+  assert.equal((await db.loadState()).papers.find(function (p) { return p.id === 'p2'; }).title, 'Two Edited');
+});
+
+test('直传 nextSignatures 校验失败时回退本地重算，绝不为传参错误写坏库', async function (t) {
+  const db = await tempDb(t);
+  const first = await db.saveState({
+    papers: [{ id: 'p1', title: 'One' }, { id: 'p2', title: 'Two' }, { id: 'p3', title: 'Three' }],
+    folders: [{ id: 'f1', name: 'F' }]
+  });
+  const base = { papers: [{ id: 'p1', title: 'One' }, { id: 'p2', title: 'Two Edited' }], folders: [{ id: 'f1', name: 'F' }] };
+  const workspace = LitModel.normalizeWorkspace(base);
+  const good = LitModel.workspaceSignatures(workspace);
+
+  const variants = [
+    ['形状错误（数组）', { papers: [], notes: {}, folders: {}, savedSearches: {}, tagColorRecords: {} }],
+    ['缺集合字段', { papers: good.papers, notes: good.notes, folders: good.folders, savedSearches: good.savedSearches }],
+    ['覆盖不完整（缺 p2 签名）', (function () {
+      const copy = JSON.parse(JSON.stringify(good));
+      delete copy.papers.p2;
+      return copy;
+    })()],
+    ['夹带工作区里不存在的实体 id', (function () {
+      const copy = JSON.parse(JSON.stringify(good));
+      copy.papers.p9 = 'sig';
+      return copy;
+    })()],
+    ['签名值不是字符串', (function () {
+      const copy = JSON.parse(JSON.stringify(good));
+      copy.papers.p2 = 123;
+      return copy;
+    })()],
+    ['抽样复核不过（首实体签名与工作区内容不符）', (function () {
+      const copy = JSON.parse(JSON.stringify(good));
+      copy.papers.p1 = 'definitely-not-the-real-signature';
+      return copy;
+    })()]
+  ];
+  for (let vi = 0; vi < variants.length; vi++) {
+    const label = variants[vi][0];
+    const bad = variants[vi][1];
+    const saved = await db.saveState(Object.assign({}, workspace, {
+      baseSignatures: first.signatures, nextSignatures: bad
+    }));
+    assert.equal(saved.signaturesFromCaller, false, label + '：应回退本地重算');
+    // 第一个变体把 p2 真正写入库；后续变体库里已是编辑后内容（decide 判「双方已一致」skip）
+    assert.equal(saved.papersWritten, vi === 0 ? 1 : 0, label + '：回退后写入语义不变');
+    assert.equal(saved.conflicts.length, 0);
+    const recomputed = LitModel.workspaceSignatures(LitModel.normalizeWorkspace(workspace));
+    // 库侧签名还含 payload 之外的库内实体（如 p3，保存语义是保留），只对 payload 内实体比对
+    for (const key of Object.keys(recomputed.papers)) {
+      assert.equal(saved.signatures.papers[key], recomputed.papers[key], label + '：签名与本地重算一致');
+    }
+  }
+  const state = await db.loadState();
+  assert.equal(state.papers.length, 3);
+  assert.equal(state.papers.find(function (p) { return p.id === 'p2'; }).title, 'Two Edited');
+});
+
+/* ---------- deletePaper 清理 settings 的阅读位置行 ---------- */
+
+test('硬删除文献时清理其 readpos 设置行（PDF/EPUB/旧单附件形态），他篇与无关键不动', async function (t) {
+  const db = await tempDb(t);
+  await db.saveState({
+    papers: [
+      { id: 'p1', title: 'Gone', attachments: [{ id: 'a1', kind: 'pdf', fileName: 'x.pdf', path: 'D:\\x.pdf' }] },
+      { id: 'p2', title: 'Stay' }
+    ]
+  });
+  await db.setSetting('readpos:p1:a1', { page: 3, scale: 1.5 });
+  await db.setSetting('readpos:p1', { page: 2 });            // 旧单附件形态（app.js 读取兜底）
+  await db.setSetting('readpos:epub:p1:a1', { cfi: 'epubcfi(/6/4)' });
+  await db.setSetting('readpos:p2:a9', { page: 7 });          // 另一篇：必须保留
+  await db.setSetting('readpos:epub:p2:a9', { cfi: 'x' });    // 另一篇 EPUB：必须保留
+  await db.setSetting('uiLang', 'en');                        // 无关键：必须保留
+
+  await db.replaceState({ papers: [{ id: 'p2', title: 'Stay' }] }); // 整库替换 = 硬删除 p1
+
+  assert.equal(await db.getSetting('readpos:p1:a1'), null, 'PDF 阅读位置随文献删除');
+  assert.equal(await db.getSetting('readpos:p1'), null, '旧单附件阅读位置随文献删除');
+  assert.equal(await db.getSetting('readpos:epub:p1:a1'), null, 'EPUB 阅读位置随文献删除');
+  assert.deepEqual(await db.getSetting('readpos:p2:a9'), { page: 7 }, '他篇阅读位置不受影响');
+  assert.deepEqual(await db.getSetting('readpos:epub:p2:a9'), { cfi: 'x' }, '他篇 EPUB 阅读位置不受影响');
+  assert.equal(await db.getSetting('uiLang'), 'en', '无关设置键不受影响');
+});
+
+/* ---------- pdfTextPut 分块提交与写入侧让出护栏 ---------- */
+
+test('pdfTextPut 多块重建：旧行清除、新行完整、内容可检索', async function (t) {
+  const db = await tempDb(t);
+  const pagesA = [];
+  const pagesB = [];
+  for (let i = 0; i < 100; i++) {
+    pagesA.push('marker-alpha page ' + i + ' ' + 'word'.repeat(60));
+    pagesB.push('marker-beta page ' + i + ' ' + 'term'.repeat(60));
+  }
+  await db.pdfTextPut({ paperId: 'p1', attachmentId: 'a1', fingerprint: 'fa', pages: pagesA });
+  await db.pdfTextPut({ paperId: 'p1', attachmentId: 'a1', fingerprint: 'fb', pages: pagesB });
+  assert.equal((await db.pdfTextQuery('marker-alpha')).length, 0, '旧块不得残留');
+  const beta = await db.pdfTextQuery('marker-beta');
+  assert.equal(beta.length, 1);
+  assert.equal(beta[0].count, 100, '跨块页全部进索引');
+  assert.deepEqual(beta[0].pages.slice(0, 3), [0, 1, 2]);
+  const entry = await db.pdfTextGet('p1', 'a1');
+  assert.equal(entry.pages.length, 100);
+  assert.equal(entry.fingerprint, 'fb');
+  // 空页数组：保持「清空该篇索引 + 写空行」的旧语义
+  await db.pdfTextPut({ paperId: 'p1', attachmentId: 'a1', fingerprint: 'fc', pages: [] });
+  assert.equal((await db.pdfTextQuery('marker-beta')).length, 0);
+  assert.equal((await db.pdfTextGet('p1', 'a1')).pages.length, 0);
+});
+
+test('pdfTextPut 并发调用按序串行执行，同一篇的重建语义不被交错破坏', async function (t) {
+  const db = await tempDb(t);
+  const pagesA = [];
+  const pagesB = [];
+  for (let i = 0; i < 80; i++) {
+    pagesA.push('concurrent-alpha payload ' + i + ' ' + 'word'.repeat(60));
+    pagesB.push('concurrent-beta payload ' + i + ' ' + 'term'.repeat(60));
+  }
+  // 不 await 第一个就发起第二个：内部队列必须保证后发者完整覆盖先发者
+  const [ra, rb] = await Promise.all([
+    db.pdfTextPut({ paperId: 'p1', attachmentId: 'a1', fingerprint: 'fa', pages: pagesA }),
+    db.pdfTextPut({ paperId: 'p1', attachmentId: 'a1', fingerprint: 'fb', pages: pagesB })
+  ]);
+  assert.equal(ra.pages, 80);
+  assert.equal(rb.pages, 80);
+  assert.equal((await db.pdfTextQuery('concurrent-alpha')).length, 0, '先完成的写入不得残留');
+  const beta = await db.pdfTextQuery('concurrent-beta');
+  assert.equal(beta.length, 1);
+  assert.equal(beta[0].count, 80, '后完成的写入完整落索引');
+});
+
+test('性能回归：pdfTextPut 分块提交让出事件循环，大书入库不冻住主进程', async function (t) {
+  const db = await tempDb(t);
+  // ~1.6MB 高熵正文（400 页 × 4KB）：trigram 索引实测 ~0.5ms/KB——不分块的旧实现
+  // 是一次 800ms 级同步事务；分块后每块 ≤32 页且 ≤256KB，单块 ~100ms 量级。
+  let rngState = 42;
+  const rnd = function () { rngState = (rngState * 1103515245 + 12345) % 2147483648; return rngState / 2147483648; };
+  const pages = [];
+  for (let p = 0; p < 400; p++) {
+    let s = 'needlepage' + p + ' ';
+    while (s.length < 4000) s += Math.floor(rnd() * 1e12).toString(36) + ' ';
+    pages.push(s);
+  }
+  let maxGap = 0;
+  let last = Date.now();
+  const heartbeat = setInterval(function () {
+    const now = Date.now();
+    if (now - last > maxGap) maxGap = now - last;
+    last = now;
+  }, 10);
+  let result = null;
+  try {
+    result = await db.pdfTextPut({ paperId: 'book', attachmentId: 'main', fingerprint: 'fp', pages: pages });
+    // 收尾再让出一个 tick：promise resolve 与 clearInterval 之间若不隔一次心跳，
+    // 最后一个同步块的时长永远不会被观测到（去分块回归就会漏检）
+    await new Promise(function (resolve) { setTimeout(resolve, 20); });
+  } finally {
+    clearInterval(heartbeat);
+  }
+  assert.equal(result.pages, 400);
+  assert.ok(maxGap < 300, '最长同步块 ' + maxGap + 'ms（分块提交后应远小于整篇重建）');
+  // 写完真的可检索（跨块页都在）
+  const hits = await db.pdfTextQuery('needlepage399');
+  assert.equal(hits.length, 1);
+  assert.deepEqual(hits[0].pages, [399]);
+});
+
+/* ---------- quick_check 延后（deferIntegrityCheck） ---------- */
+
+test('quick_check 延后：默认 open 仍做检查，defer 打开后显式调用才检查', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-db-defer-'));
+  t.after(async function () { await fs.rm(dir, { recursive: true, force: true }); });
+  const file = path.join(dir, 'litboard.sqlite');
+
+  // 先造一个有真实数据页的健康库并正常关闭（close 会 checkpoint，全部内容落在主文件）
+  const seed = createLibraryDb(dir);
+  await seed.open();
+  const papers = [];
+  for (let i = 0; i < 40; i++) papers.push({ id: 'p' + i, title: 'Paper ' + i + ' ' + '填充内容'.repeat(50), abstract: 'x'.repeat(2000) });
+  await seed.saveState({ papers: papers });
+  await seed.close();
+
+  // 破坏中间的数据页（保留页 1 头页与紧随的 schema 页）：sqlite 仍能打开（懒读），
+  // quick_check 全页扫描才暴露——这正是「延后检查」要兜的场景
+  const fh = await fs.open(file, 'r+');
+  await fh.write(Buffer.from('Z'.repeat(4096)), 0, 4096, 3 * 4096);
+  await fh.write(Buffer.from('Z'.repeat(4096)), 0, 4096, 5 * 4096);
+  await fh.close();
+
+  // 默认路径（不传选项）：打开前的同步 quick_check 拦下损坏 —— 与历史行为完全一致
+  const dbDefault = createLibraryDb(dir);
+  await assert.rejects(dbDefault.open(), function (error) {
+    assert.equal(error.code, 'LITBOARD_DB_CORRUPT');
+    return true;
+  });
+
+  // defer 路径：open 不做检查、成功返回；显式调用 runDeferredIntegrityCheck 才抛
+  const dbDefer = createLibraryDb(dir);
+  await dbDefer.open({ deferIntegrityCheck: true });
+  await assert.rejects(dbDefer.runDeferredIntegrityCheck(), function (error) {
+    assert.equal(error.code, 'LITBOARD_DB_CORRUPT');
+    return true;
+  });
+  await dbDefer.close();
+});
+
+test('defer 打开的健康库：延迟检查通过，读写一切照常', async function (t) {
+  const db = await tempDb(t);
+  const dir = path.dirname(db.paths.file);
+  await db.saveState({ papers: [{ id: 'p1', title: 'Fine' }] });
+  await db.close();
+
+  const reopened = createLibraryDb(dir);
+  const info = await reopened.open({ deferIntegrityCheck: true });
+  assert.equal(info.created, false);
+  assert.deepEqual(await reopened.runDeferredIntegrityCheck(), { ok: true });
+  await reopened.saveState({ papers: [{ id: 'p1', title: 'Fine' }, { id: 'p2', title: 'Also Fine' }] });
+  assert.equal((await reopened.loadState()).papers.length, 2);
+  await reopened.close();
+});

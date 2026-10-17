@@ -258,11 +258,25 @@
     return searchBrowser(needle, candidates, onProgress);
   }
 
+  /** 失效缓存条目：附件级清单键；文献级（无 attachmentId）清该文献全部
+   *  `paperId:*` 附件键 + 旧版 paperId 裸键。主进程 FTS 行随 deletePaper 清，
+   *  这里负责渲染层 metaCache 镜像与浏览器版会话缓存，并转发主进程失效通道。 */
   function invalidate(paperId, attachmentId) {
     var key = paperId + ':' + (attachmentId || '');
-    delete memoryCache[key];
-    delete memoryFailed[key];
-    if (metaCache) { delete metaCache[key]; if (!attachmentId) delete metaCache[paperId]; }
+    var drop = function (cache) {
+      if (!cache) return;
+      delete cache[key];
+      if (!attachmentId) {
+        delete cache[paperId];
+        var prefix = paperId + ':';
+        Object.keys(cache).forEach(function (k) {
+          if (k.indexOf(prefix) === 0) delete cache[k];
+        });
+      }
+    };
+    drop(memoryCache);
+    drop(memoryFailed);
+    drop(metaCache);
     if (DESKTOP && window.litboardDesktop.pdfSearchInvalidate) {
       window.litboardDesktop.pdfSearchInvalidate({ paperId: paperId, attachmentId: attachmentId || '' }).catch(function () {});
     }

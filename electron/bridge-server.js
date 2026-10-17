@@ -5,7 +5,22 @@
  * 监听 127.0.0.1 的本地 HTTP 端口，接收浏览器扩展的「一键保存」请求：
  *   GET  /ping           存活探测（无需令牌）
  *   POST /save           保存文献 { doi?, title?, url?, pdfUrl?, authors?, year?, venue? }
+ *                        —— 同步段只做本地查重 + 入库，立即响应；联网元数据补全与
+ *                           PDF 下载转后台任务，完成后经 onSaved 事件通知渲染层刷新。
+ *                        响应字段 { ok, id, title, duplicated, pdfAttached } 为超集扩展：
+ *                           enrichPending: boolean（新增，旧扩展忽略）——还有后台任务在跑
+ *                           pdfAttached ——如实反映「条目当前是否已带 PDF」：新保存且
+ *                                           下载转后台时为 false（后台完成后经 onSaved 可见），
+ *                                           重复命中且已有 PDF 时为 true
+ *   POST /attach-pdf     浏览器下载好的 PDF 落盘挂附件。两种形态：
+ *                        a) Content-Type: application/pdf —— 原始字节直传（新扩展优先走这条，
+ *                           避免 64MB base64 JSON）；paperId/fileName 走查询参数
+ *                           （?paperId=…&fileName=…），上限 64MB
+ *                        b) Content-Type: application/json —— { paperId, pdfBase64, fileName }
+ *                           （旧扩展兼容路径，行为不变）
  * 令牌鉴权（X-LitBoard-Token），首次启动随机生成并持久化在 SQLite settings 中。
+ * 协议兼容约束：应用与扩展独立更新，响应形状只增不改——删字段/改语义都会打断
+ * 「旧扩展 ↔ 新服务」或「新扩展 ↔ 旧服务」组合。
  */
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -85,6 +100,111 @@ function createBridgeServer(options) {
     });
   }
 
+  /** /attach-pdf 原始字节直传用：与 readBody 同限流，但保留 Buffer 不转字符串 */
+  function readBodyRaw(req, maxBytes) {
+    const limit = maxBytes || 1024 * 1024;
+    return new Promise(function (resolve, reject) {
+      const chunks = [];
+      let size = 0;
+      req.on('data', function (chunk) {
+        size += chunk.length;
+        if (size > limit) { reject(new Error('请求体过大')); req.destroy(); return; }
+        chunks.push(chunk);
+      });
+      req.on('end', function () { resolve(Buffer.concat(chunks)); });
+      req.on('error', reject);
+    });
+  }
+
+  // ---------- 后台补全任务（保存响应已提前返回，这里静默完成联网富化与 PDF 下载） ----------
+  // 小并发（2）：批量保存时既不让 20 个 OpenAlex/PDF 请求同时打到网上，也不会串行到分钟级。
+  const BACKGROUND_CONCURRENCY = 2;
+  const backgroundQueue = [];
+  let backgroundActive = 0;
+  let backgroundIdleWaiters = [];
+
+  function pumpBackground() {
+    while (backgroundActive < BACKGROUND_CONCURRENCY && backgroundQueue.length) {
+      const task = backgroundQueue.shift();
+      backgroundActive++;
+      Promise.resolve().then(task).catch(function () { /* 后台任务失败只影响本次补全，不打断服务 */ })
+        .then(function () {
+          backgroundActive--;
+          pumpBackground();
+          if (backgroundActive === 0 && backgroundQueue.length === 0) {
+            const waiters = backgroundIdleWaiters;
+            backgroundIdleWaiters = [];
+            waiters.forEach(function (resolve) { resolve(); });
+          }
+        });
+    }
+  }
+
+  function scheduleBackground(task) {
+    backgroundQueue.push(task);
+    pumpBackground();
+  }
+
+  /** 测试钩子：等所有后台补全任务落定（生产路径不用） */
+  function whenIdle() {
+    if (backgroundActive === 0 && backgroundQueue.length === 0) return Promise.resolve();
+    return new Promise(function (resolve) { backgroundIdleWaiters.push(resolve); });
+  }
+
+  // 本次会话内已联网补全成功的 DOI（跳过重复富化；失败不记，网络恢复后的下次保存仍会重试）。
+  // 会话级缓存不落库：重启后对无 abstract 的条目会再补一次，属可接受的保守行为。
+  const enrichedDois = new Map();
+  const ENRICHED_DOI_CAP = 2000;
+
+  function markEnriched(doi) {
+    const key = String(doi || '').toLowerCase();
+    if (!key) return;
+    if (enrichedDois.has(key)) enrichedDois.delete(key);
+    enrichedDois.set(key, Date.now());
+    if (enrichedDois.size > ENRICHED_DOI_CAP) {
+      enrichedDois.delete(enrichedDois.keys().next().value);
+    }
+  }
+
+  function enrichedRecently(doi) {
+    return enrichedDois.has(String(doi || '').toLowerCase());
+  }
+
+  /** 条目是否已带 PDF 附件（pdfPath 是 attachments 的兼容投影，双保险都查） */
+  function hasPdfAttachment(paper) {
+    if (!paper) return false;
+    if (paper.pdfPath) return true;
+    return (paper.attachments || []).some(function (a) { return a && a.kind === 'pdf' && a.path; });
+  }
+
+  /** 知网 PDF 需要登录会话，主进程直连拿不到 cookie，跳过下载 */
+  function isCnkiSessionUrl(pdfUrl) {
+    return /(^|\.)cnki\.net$/i.test(function () {
+      try { return new URL(pdfUrl).hostname; } catch (e) { return ''; }
+    }());
+  }
+
+  /** 富化字段并入输入（页面提取优先，仅补缺）；返回是否真的并入了任何字段 */
+  function mergeEnriched(target, enriched) {
+    if (!enriched) return false;
+    let merged = false;
+    ['abstract', 'venue', 'oaUrl', 'openalexId', 'volume', 'issue', 'pages', 'issn'].forEach(function (f) {
+      if (!target[f] && enriched[f]) { target[f] = enriched[f]; merged = true; }
+    });
+    if (!target.title && enriched.title) { target.title = enriched.title; merged = true; }
+    if (target.year == null && enriched.year != null) { target.year = enriched.year; merged = true; }
+    if (!(target.authors && target.authors.length) && enriched.authors && enriched.authors.length) {
+      target.authors = enriched.authors; merged = true;
+    }
+    if (target.citations == null && enriched.citations != null) {
+      target.citations = enriched.citations;
+      target.citationSource = enriched.citationSource || '';
+      merged = true;
+    }
+    return merged;
+  }
+
+
   /** 给补全/下载请求加超时兜底，网络挂起时快速失败而不是无限等待 */
   function withTimeout(init, ms) {
     return Object.assign({}, init, { signal: AbortSignal.timeout(ms || 12000) });
@@ -113,6 +233,21 @@ function createBridgeServer(options) {
         if (w.biblio.first_page) paper.pages = String(w.biblio.first_page) + (w.biblio.last_page ? '-' + w.biblio.last_page : '');
       }
       if (w.doi) paper.doi = String(w.doi).replace(/^https?:\/\/doi\.org\//i, '');
+      // OpenAlex 的摘要是倒排索引（{词: [位置]}），重建为正文；兼容直接给字符串的形态
+      const inverted = w.abstract_inverted_index;
+      if (typeof w.abstract === 'string' && w.abstract) {
+        paper.abstract = w.abstract.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      } else if (inverted && typeof inverted === 'object') {
+        const slots = [];
+        Object.keys(inverted).forEach(function (word) {
+          (inverted[word] || []).forEach(function (pos) {
+            if (Number.isInteger(pos) && pos >= 0 && pos < 10000) slots[pos] = word;
+          });
+        });
+        const text = [];
+        for (let i = 0; i < slots.length; i++) if (slots[i] != null) text.push(slots[i]);
+        if (text.length) paper.abstract = text.join(' ');
+      }
       if (typeof w.cited_by_count === 'number') {
         paper.citations = w.cited_by_count;
         paper.citationSource = 'OpenAlex';
@@ -203,12 +338,11 @@ function createBridgeServer(options) {
     }
   }
 
-  /** 扩展在浏览器端下载好的 PDF（base64）落盘并挂附件；知网等需要登录会话的 PDF 走这里 */
-  async function attachPdfBase64(paperId, base64, fileName) {
+  /** 扩展在浏览器端下载好的 PDF 字节落盘并挂附件；知网等需要登录会话的 PDF 走这里 */
+  async function attachPdfBytes(paperId, bytes, fileName) {
     try {
-      if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(String(base64 || ''))) return false;
-      const bytes = Buffer.from(base64, 'base64');
-      if (bytes.length < 1024 || bytes.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) return false;
+      if (!Buffer.isBuffer(bytes) || bytes.length < 1024 ||
+          bytes.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) return false;
       const dir = await resolveDownloadDir(paperId);
       await fs.mkdir(dir, { recursive: true });
       const safeName = String(fileName || '').replace(/[^\w\u4e00-\u9fff\-. ]/g, '_').slice(-120).trim();
@@ -221,10 +355,58 @@ function createBridgeServer(options) {
     }
   }
 
+  /** base64 老路径（旧扩展兼容）：校验后转字节复用 attachPdfBytes */
+  async function attachPdfBase64(paperId, base64, fileName) {
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(String(base64 || ''))) return false;
+    return attachPdfBytes(paperId, Buffer.from(base64, 'base64'), fileName);
+  }
+
   /** 共享的附件登记逻辑：把磁盘上的 PDF 挂到 paper.attachments 首位（db 原子事务） */
   function attachPdfFile(paperId, filePath) {
     const paper = libraryDb.bridgeAttachPdf(paperId, filePath, path.basename(filePath));
     return paper ? true : false;
+  }
+
+  /**
+   * 后台收尾：联网富化（OpenAlex → Crossref 兼底）+ PDF 候选下载。
+   * 响应早已返回，这里静默完成；有实际变更时再发一次 onSaved 让渲染层刷新。
+   */
+  async function finishSaveInBackground(paperId, input, needsEnrich, requestDuplicated) {
+    const enrichedInput = Object.assign({}, input);
+    let changed = false;
+    if (needsEnrich) {
+      const enriched = await fetchOpenAlexByDoi(input.doi) || await fetchCrossrefByDoi(input.doi);
+      if (enriched) markEnriched(input.doi); // 失败不记：下次保存仍会重试
+      if (mergeEnriched(enrichedInput, enriched)) {
+        try { await upsertPaper(enrichedInput); changed = true; } catch (e) { return; }
+      }
+    }
+    let paper;
+    try { paper = libraryDb.getPaper(paperId); } catch (e) { paper = null; }
+    if (!paper) return; // 保存后被并发硬删除：放弃补全
+    let pdfAttached = false;
+    if (!hasPdfAttachment(paper)) {
+      // PDF 下载候选：页面直链优先（知网会话链除外），其次开放获取 oaUrl
+      const pdfCandidates = [];
+      if (input.pdfUrl && !isCnkiSessionUrl(input.pdfUrl)) pdfCandidates.push(input.pdfUrl);
+      const oaUrl = enrichedInput.oaUrl || paper.oaUrl;
+      if (oaUrl) pdfCandidates.push(oaUrl);
+      for (let i = 0; i < pdfCandidates.length && !pdfAttached; i++) {
+        pdfAttached = await attachPdf(paperId, pdfCandidates[i]);
+      }
+      // 附加附件（translator 多附件）：尽力逐个下载挂靠（F02）
+      const seenUrls = {};
+      if (input.pdfUrl) seenUrls[input.pdfUrl] = true;
+      for (const extra of input.attachments) {
+        if (seenUrls[extra.url]) continue;
+        seenUrls[extra.url] = true;
+        try { if (await attachPdf(paperId, extra.url)) changed = true; } catch (e) { /* 单个附件失败不阻塞 */ }
+      }
+    }
+    if (changed || pdfAttached) {
+      // duplicated 沿用本次请求的判定（渲染层 toast 据此区分「已保存/已合并」）
+      onSaved({ paperId: paperId, paper: libraryDb.getPaper(paperId) || paper, duplicated: !!requestDuplicated, pdfAttached: pdfAttached });
+    }
   }
 
   async function handleSave(req, res) {
@@ -265,62 +447,73 @@ function createBridgeServer(options) {
         return { url: url.slice(0, 2000), fileName: String(a.fileName || '').slice(0, 200) };
       }).filter(Boolean)
     };
-    // 有 DOI 先联网补全（OpenAlex → Crossref 兼底，主进程直连）；已有字段以页面提取（如知网）为准，仅补缺
-    if (input.doi) {
-      const enriched = await fetchOpenAlexByDoi(input.doi) || await fetchCrossrefByDoi(input.doi);
-      if (enriched) {
-        ['abstract', 'venue', 'oaUrl', 'openalexId', 'volume', 'issue', 'pages', 'issn'].forEach(function (f) {
-          if (!input[f] && enriched[f]) input[f] = enriched[f];
-        });
-        if (!input.title && enriched.title) input.title = enriched.title;
-        if (input.year == null && enriched.year != null) input.year = enriched.year;
-        if (!(input.authors && input.authors.length) && enriched.authors && enriched.authors.length) input.authors = enriched.authors;
-        if (input.citations == null && enriched.citations != null) {
-          input.citations = enriched.citations;
-          input.citationSource = enriched.citationSource || '';
-        }
-      }
-    }
     if (!input.title && !input.doi) {
       send(res, 422, { ok: false, error: '缺少标题或 DOI' });
       return;
     }
-    const result = await upsertPaper(input);
-    let pdfAttached = false;
-    // 知网等需要会话 cookie 的 PDF 由扩展在浏览器上下文下载后走 /attach-pdf，
-    // 主进程直连拿不到登录 cookie，直接跳过避免无效请求。
-    const needsSessionPdf = /(^|\.)cnki\.net$/i.test(function () {
-      try { return new URL(input.pdfUrl).hostname; } catch (e) { return ''; }
-    }());
-    // PDF 下载候选：页面直链优先，其次 OpenAlex 给出的开放获取链接（oaUrl）
-    const wantsPdf = !result.duplicated || (result.paper && !result.paper.pdfPath);
-    if (wantsPdf && result.paper) {
-      const pdfCandidates = [];
-      if (input.pdfUrl && !needsSessionPdf) pdfCandidates.push(input.pdfUrl);
-      if (input.oaUrl) pdfCandidates.push(input.oaUrl);
-      for (let i = 0; i < pdfCandidates.length && !pdfAttached; i++) {
-        pdfAttached = await attachPdf(result.paper.id, pdfCandidates[i]);
-      }
-      // 附加附件（translator 多附件）：尽力逐个下载挂靠（F02）
-      const seenUrls = {};
-      if (input.pdfUrl) seenUrls[input.pdfUrl] = true;
-      for (const extra of input.attachments) {
-        if (seenUrls[extra.url]) continue;
-        seenUrls[extra.url] = true;
-        try { await attachPdf(result.paper.id, extra.url); } catch (e) { /* 单个附件失败不阻塞 */ }
-      }
+    // 无标题但带 DOI 的罕见路径：条目标题只能来自联网补全（bridgeUpsertPaper 不回填
+    // 已有条目的标题，先入库会卡死在「(未命名)」），保留旧的「先补全再入库」——响应慢
+    // 但正确；本会话已补全过的 DOI 直接跳过。
+    if (!input.title && input.doi && !enrichedRecently(input.doi)) {
+      const enriched = await fetchOpenAlexByDoi(input.doi) || await fetchCrossrefByDoi(input.doi);
+      if (enriched) markEnriched(input.doi);
+      mergeEnriched(input, enriched);
     }
-    onSaved({ paperId: result.paper.id, paper: result.paper, duplicated: result.duplicated, pdfAttached: pdfAttached });
+    // —— 同步段：只做本地查重 + 入库（指纹/DOI 去重在 db 层事务里），零联网 ——
+    const result = await upsertPaper(input);
+    const paper = result.paper;
+    const alreadyHasPdf = hasPdfAttachment(paper);
+    const fieldsComplete = !!(paper.abstract && String(paper.abstract).trim()) || enrichedRecently(input.doi);
+    // 后台任务判定：重复命中且字段齐全（有 abstract 或近期已补全）时完全跳过联网。
+    const needsEnrich = !!input.doi && !fieldsComplete;
+    const mayGainPdf = !alreadyHasPdf && (
+      (input.pdfUrl && !isCnkiSessionUrl(input.pdfUrl)) ||
+      input.oaUrl || paper.oaUrl ||
+      needsEnrich // 富化可能带出 oaUrl
+    );
+    const wantsExtras = !alreadyHasPdf && input.attachments.length > 0;
+    const pending = needsEnrich || mayGainPdf || wantsExtras;
+    if (pending) {
+      scheduleBackground(function () { return finishSaveInBackground(paper.id, input, needsEnrich, result.duplicated); });
+    }
+    onSaved({ paperId: paper.id, paper: paper, duplicated: result.duplicated, pdfAttached: alreadyHasPdf });
     send(res, 200, {
       ok: true,
-      id: result.paper.id,
-      title: result.paper.title,
+      id: paper.id,
+      title: paper.title,
       duplicated: result.duplicated,
-      pdfAttached: pdfAttached
+      pdfAttached: alreadyHasPdf,
+      // 新增字段：旧扩展忽略；新扩展据此展示「后台补全中」而不是误报 PDF 失败
+      enrichPending: pending
     });
   }
 
   async function handleAttachPdf(req, res) {
+    const contentType = String(req.headers['content-type'] || '');
+    // 新路径：原始 PDF 字节直传（paperId/fileName 走查询参数），省掉 base64 JSON 的膨胀与解码
+    if (/^application\/pdf\b/i.test(contentType)) {
+      let bytes;
+      try {
+        bytes = await readBodyRaw(req, 64 * 1024 * 1024);
+      } catch (error) {
+        send(res, 400, { ok: false, error: '请求体过大或 PDF 无效' });
+        return;
+      }
+      const url = new URL(req.url, 'http://127.0.0.1');
+      const paperId = String(url.searchParams.get('paperId') || '');
+      const fileName = String(url.searchParams.get('fileName') || '');
+      if (!paperId) { send(res, 422, { ok: false, error: '缺少 paperId' }); return; }
+      const attached = await attachPdfBytes(paperId, bytes, fileName);
+      if (!attached) {
+        send(res, 200, { ok: false, attached: false, error: 'PDF 字节无效' });
+        return;
+      }
+      const paper = libraryDb.getPaper(paperId);
+      onSaved({ paperId: paperId, paper: paper || null, duplicated: false, pdfAttached: true });
+      send(res, 200, { ok: true, attached: true });
+      return;
+    }
+    // 老路径：base64 JSON（旧扩展兼容，行为不变）
     let body;
     try {
       body = JSON.parse(await readBody(req, 64 * 1024 * 1024));
@@ -452,8 +645,8 @@ function createBridgeServer(options) {
     start: start,
     stop: stop,
     getToken: getToken,
+    whenIdle: whenIdle,
     setCurrentFolder: function (id) { currentFolderId = String(id || ''); },
-    currentFolder: function () { return currentFolderId; },
     status: function () { return { running: !!server && actualPort != null, port: actualPort }; }
   };
 }

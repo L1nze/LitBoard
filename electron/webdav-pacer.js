@@ -26,10 +26,6 @@ const WINDOW_MS = 30 * 60 * 1000;
  *  云端备份留出请求数，避免附件传完却写不回元数据的尴尬。 */
 const TAIL_RESERVE = 24;
 
-function pacingProfile(name) {
-  return name === 'pro' ? PACING_PROFILES.pro : PACING_PROFILES.free;
-}
-
 /** 载入持久化限流状态；结构无效时返回空白窗口（老台账文件没有 pacing 字段）。 */
 function loadPacingValue(value) {
   const requests = Array.isArray(value && value.requests)
@@ -145,4 +141,4 @@ function createRequestPacer(pacerOptions) {
   };
 }
 
-module.exports = { createRequestPacer, loadPacingValue, pacingProfile, WINDOW_MS, TAIL_RESERVE };
+module.exports = { createRequestPacer, loadPacingValue, WINDOW_MS, TAIL_RESERVE };

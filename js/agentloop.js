@@ -372,7 +372,10 @@
             cancelActive: function () { if (opts.cancelTools) return opts.cancelTools(run.id, run.core.turnId); },
             execute: async function (call) {
               startedCallIds.add(call.callId);
-              if (call.name === 'summarize_paper') run.core.maxSteps = Math.max(run.core.maxSteps, 48);
+              // 长任务工具可声明更高的单轮步数预算（agenttools.TOOL_STEP_BUDGET 经
+              // opts.toolStepBudgets 注入）——编排层不硬编码具体工具名
+              var stepBudget = opts.toolStepBudgets ? Number(opts.toolStepBudgets[call.name]) : 0;
+              if (stepBudget > 0) run.core.maxSteps = Math.max(run.core.maxSteps, stepBudget);
               var out = await executeTool(call.name, call.args, run), record = { callId: call.callId, name: call.name };
               if (out && typeof out === 'object' && !Array.isArray(out) && (out.text != null || Array.isArray(out.images))) {
                 record.result = out.text; record.images = out.images || [];

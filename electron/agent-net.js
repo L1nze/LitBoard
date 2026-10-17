@@ -11,10 +11,17 @@
  * - Base URL 校验：https 必须；仅 localhost / 127.0.0.1 / [::1] 豁免 http（给 ollama）；
  * - 流式 delta 经 notify('agent:event') 增量推送，最终消息作为 invoke 返回值；
  * - AbortController 按 sessionId 记账，渲染层可随时停止；
+ * - fetch 阶段（连接 + 响应头返回前）有 60s 首字节超时兜底，拿到 response 后回到
+ *   流空闲超时（120s）；两段超时都不重试——请求可能已被计费；
  * - 只对明确 HTTP 暂态拒绝或连接建立前失败有限重试；已流出内容绝不自动重发。
  */
 const LitAgentCore = require('../js/agentcore.js');
 const LitAgentProto = require('../js/agentproto.js');
+
+/** 首字节超时的等待时长文案（测试可注入毫秒级小值，此时不能显示「0 秒」） */
+function firstByteTimeoutText(ms) {
+  return ms >= 1000 ? Math.round(ms / 1000) + ' 秒' : ms + ' 毫秒';
+}
 
 function isLocalHost(hostname) {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
@@ -109,13 +116,36 @@ function createAgentNet(options) {
     const previous = controllers.get(sessionId);
     controllers.set(sessionId, controller);
     if (previous) previous.abort();
+    // 首字节超时：fetch 阶段（TCP 连接 + 响应头返回前）挂兜底计时——连接连上了
+    // 但 headers 迟迟不回时，对话轮不再无限停在「生成中」。桥接出的 guard 信号
+    // 覆盖整个请求生命周期（fetch 与 body 读取共用，与原先单一 signal 同构）：
+    // 用户取消即时转发（优先于计时器），fetch 一 settle 就撤计时器——之后的慢流
+    // 交给既有的 120s 流空闲超时，长流式回复不会被首字节超时拦腰掐断（所以不能
+    // 用 AbortSignal.any + AbortSignal.timeout：后者无法撤销，到点会误杀在读流）。
+    // 超时按错误上抛、不自动重试——请求可能已被计费（opts.firstByteTimeoutMs 供测试注入）。
+    const FIRST_BYTE_TIMEOUT_MS = Number(opts.firstByteTimeoutMs) > 0 ? Number(opts.firstByteTimeoutMs) : 60000;
+    const guard = new AbortController();
+    let firstByteTimedOut = false;
+    let firstByteTimer = null;
+    const forwardAbort = function () { guard.abort(); };
+    if (controller.signal.aborted) guard.abort();
+    controller.signal.addEventListener('abort', forwardAbort, { once: true });
+    const armFirstByteTimer = function () {
+      clearTimeout(firstByteTimer);
+      firstByteTimer = setTimeout(function () {
+        firstByteTimedOut = true;
+        guard.abort();
+      }, FIRST_BYTE_TIMEOUT_MS);
+    };
     const acc = LitAgentProto.createAccumulator(dialect);
     const requestBody = Object.assign({}, body);
     if (model) requestBody.model = model;
     try {
       let response;
       for (let attempt = 0; ; attempt++) {
-        try { response = await fetchImpl(LitAgentProto.endpointFor(base, dialect), {
+        try {
+          armFirstByteTimer();
+          response = await fetchImpl(LitAgentProto.endpointFor(base, dialect), {
         method: 'POST',
         headers: LitAgentProto.buildHeaders({
           dialect: dialect,
@@ -125,8 +155,15 @@ function createAgentNet(options) {
           userAgent: userAgent
         }),
         body: JSON.stringify(LitAgentProto.convertBody(requestBody, dialect)),
-        signal: controller.signal
-        }); } catch (connectError) {
+        signal: guard.signal
+        });
+          clearTimeout(firstByteTimer);
+        } catch (connectError) {
+          clearTimeout(firstByteTimer);
+          // 首字节超时：明确报错且不进重试（请求可能已被计费）；用户取消仍按取消收尾
+          if (firstByteTimedOut && !controller.signal.aborted) {
+            throw new Error('等待响应超时（' + firstByteTimeoutText(FIRST_BYTE_TIMEOUT_MS) + '内未返回响应头）');
+          }
           const code = connectError && (connectError.code || connectError.cause && connectError.cause.code);
           if (attempt >= 2 || !['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED'].includes(code) || controller.signal.aborted) throw connectError;
           await retryDelay(500 * Math.pow(2, attempt), controller.signal);
@@ -233,6 +270,8 @@ function createAgentNet(options) {
       throw error;
     } finally {
       // H3：只删自己的控制器——被后写者顶掉的旧请求不得删掉别人的停止入口
+      clearTimeout(firstByteTimer);
+      controller.signal.removeEventListener('abort', forwardAbort);
       if (controllers.get(sessionId) === controller) controllers.delete(sessionId);
     }
   }

@@ -170,20 +170,6 @@
     };
   }
 
-  /** 合并两组外部标识（去重，kind+value 为键）——身份合并时把被并方的标识并给保留方 */
-  function mergeExtIdLists(a, b) {
-    var seen = {};
-    var out = [];
-    (Array.isArray(a) ? a : []).concat(Array.isArray(b) ? b : []).forEach(function (item) {
-      if (!item || !item.kind || !item.value) return;
-      var key = item.kind + ':' + item.value;
-      if (seen[key]) return;
-      seen[key] = true;
-      out.push({ kind: item.kind, value: item.value });
-    });
-    return out;
-  }
-
   /* ---------------- Windows 文件名 / 目录名消毒 ---------------- */
 
   var RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
@@ -409,7 +395,6 @@
     normalizeOpenAlexWork: normalizeOpenAlexWork,
     normalizeSemanticScholarPaper: normalizeSemanticScholarPaper,
     extIdsForRow: extIdsForRow,
-    mergeExtIdLists: mergeExtIdLists,
     sanitizeFileStem: sanitizeFileStem,
     sessionDirName: sessionDirName,
     sessionTitleFrom: sessionTitleFrom,

@@ -248,19 +248,24 @@ async function recallForClaim(claim, recallCtx) {
       }
     }
   ];
-  for (const route of remoteRoutes) {
-    if (!route.enabled) continue;
-    // 同一路线的多个语言版本合并成一条 route 记录（成败按最后一次为准，count 累加）
+  // 远端各路线并行发起（allSettled：一路失败不拖垮其余）。限流纪律不受影响：
+  // 同主机的请求仍被 research-net 的每主机队列串行化（OpenAlex 3 并发/≥200ms、
+  // S2 单并发/≥1.2s），语义端点另有 1 req/s 闸门——真正并行的是跨主机路线
+  // （S2 / 网页与 OpenAlex 互不等待）。每路线内部多个语言版本仍串行；
+  // routes/groups 按路线定义顺序收口，跨路线合并结果保持确定性。
+  const enabledRoutes = remoteRoutes.filter(function (route) { return route.enabled; });
+  const outcomes = await Promise.allSettled(enabledRoutes.map(async function (route) {
     let ok = true;
     let count = 0;
     let total = 0;
     let error = '';
+    const batches = [];
     for (const q of queries) {
       try {
         const r = await route.run(q);
         const candidates = ingestCandidates(r.rows);
         const works = candidates.filter(Boolean);
-        groups.push({ provider: route.id, works: works });
+        batches.push({ provider: route.id, works: works });
         count += works.length;
         total = Math.max(total, Number(r.total) || 0);
       } catch (err) {
@@ -268,10 +273,18 @@ async function recallForClaim(claim, recallCtx) {
         error = String(err && err.message || err);
       }
     }
-    routes.push(ok
-      ? { id: route.id, ok: true, count: count, total: total }
-      : { id: route.id, ok: false, count: count, total: total, error: error });
-  }
+    return { id: route.id, ok: ok, count: count, total: total, error: error, batches: batches };
+  }));
+  outcomes.forEach(function (outcome, index) {
+    const info = outcome.status === 'fulfilled' ? outcome.value : {
+      id: enabledRoutes[index].id, ok: false, count: 0, total: 0,
+      error: String(outcome.reason && outcome.reason.message || outcome.reason), batches: []
+    };
+    info.batches.forEach(function (batch) { groups.push(batch); });
+    routes.push(info.ok
+      ? { id: info.id, ok: true, count: info.count, total: info.total }
+      : { id: info.id, ok: false, count: info.count, total: info.total, error: info.error });
+  });
   return { candidates: LitLitSearch.mergeCandidates(groups), routes: routes };
 }
 

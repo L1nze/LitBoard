@@ -163,7 +163,8 @@ test('maskToolMessage：只换 content，配对字段不动（经 buildRequestBo
     { callId: 'c2', name: 't', result: big(1000) }
   ]);
   Core.appendUser(state, 'q2');
-  const body = Core.buildRequestBody(state, { maskToolResults: 2, maskToolMessage: Ctx.maskToolMessage });
+  const body = Core.buildRequestBody(state, { maskToolResults: 2, maskToolMessage: Ctx.maskToolMessage,
+    toolAliasMap: require('../js/agentplan.js').toolAliasMap });
   const toolOut = body.messages.filter((m) => m.role === 'tool');
   assert.equal(toolOut.length, 2);
   assert.ok(toolOut[0].content.indexOf('旧工具结果已清除') !== -1);

@@ -29,6 +29,11 @@
     return String(t || '').toLowerCase().replace(/[^a-z0-9一-鿿]+/g, '');
   }
 
+  /** DOI 清洗：剥掉 https://dx.doi.org/ 一类前缀，留裸 DOI（空串表示没有） */
+  function cleanDoi(doi) {
+    return String(doi || '').replace(/^(https?:\/\/)?(dx\.)?doi\.org\//i, '').trim();
+  }
+
   /**
    * 出版商名黑名单（整串匹配）：Semantic Scholar / OpenAlex 会把 publisher
    * 填进 venue（如 "Elsevier"、"Springer"），清洗为空以避免期刊栏显示出版商。
@@ -62,29 +67,66 @@
     return s.replace(/[.。]+$/, '');
   }
 
-  function fetchJson(url, retried) {
+  /* 端到端请求取消：调用方可传 AbortSignal（经各入口的 opts.signal / 尾参）。
+   * 桌面链路里 AbortSignal 不能过 IPC——每个请求分配 requestId 登记，abort 时经
+   * api:fetch-abort 跨进程中止主进程在飞请求；同时本地立即以 aborted 拒绝，
+   * 不等 IPC 往返，链条即刻停止消费结果。浏览器链路直接把 signal 交给 fetch。 */
+  var requestSeq = 0;
+  function abortError() { var err = new Error('aborted'); err.aborted = true; return err; }
+  function isAborted(signal) { return !!(signal && signal.aborted); }
+
+  function fetchJson(url, retried, signal) {
+    if (isAborted(signal)) return Promise.reject(abortError());
     var target = withMailto(url);
-    var request = window.litboardDesktop
-      ? window.litboardDesktop.fetchJson(target).then(function (result) {
+    var request;
+    var onAbort = null;
+    function cleanup() {
+      if (onAbort && signal) {
+        try { signal.removeEventListener('abort', onAbort); } catch (e) {}
+        onAbort = null;
+      }
+    }
+    var bridge = window.litboardDesktop;
+    if (bridge && typeof bridge.fetchJson === 'function') {
+      var requestId = 'enr-' + (++requestSeq) + '-' + String(Date.now() % 1e9);
+      var rejectLocal = null;
+      var localAbort = new Promise(function (_resolve, reject) { rejectLocal = reject; });
+      request = Promise.race([
+        bridge.fetchJson(target, requestId).then(function (result) {
           return {
             status: result.status,
             ok: result.ok,
             json: function () { return Promise.resolve(result.data); }
           };
-        })
-      : fetch(target, { headers: { 'Accept': 'application/json' } });
+        }),
+        localAbort
+      ]);
+      if (signal) {
+        onAbort = function () {
+          if (bridge.abortFetch) bridge.abortFetch(requestId).catch(function () {});
+          rejectLocal(abortError());
+        };
+        try { signal.addEventListener('abort', onAbort); } catch (e) { onAbort = null; }
+      }
+      request.then(cleanup, cleanup);
+    } else {
+      request = fetch(target, { headers: { Accept: 'application/json' }, signal: signal || undefined });
+    }
     return request.then(function (r) {
       if (r.status === 404) return null;
       if (r.status === 429) {
-        if (!retried) {
-          // 限流：等 2 秒重试一次
+        if (!retried && !isAborted(signal)) {
+          // 限流：等 2 秒重试一次（已中止则不再重试）
           return new Promise(function (res) { setTimeout(res, 2000); })
-            .then(function () { return fetchJson(url, true); });
+            .then(function () { return fetchJson(url, true, signal); });
         }
         throw new Error('rate-limited');
       }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
+    }).catch(function (err) {
+      if (err && (err.aborted === true || err.name === 'AbortError')) throw abortError();
+      throw err;
     });
   }
 
@@ -131,12 +173,12 @@
   }
 
   // ============ 数据源 1：OpenAlex ============
-  function oaByDoi(doi) {
-    return fetchJson(API + '/works/https://doi.org/' + encodeURIComponent(doi)).then(workToPatch);
+  function oaByDoi(doi, signal) {
+    return fetchJson(API + '/works/https://doi.org/' + encodeURIComponent(doi), false, signal).then(workToPatch);
   }
-  function oaByTitle(t) {
+  function oaByTitle(t, signal) {
     var url = API + '/works?filter=title.search:' + encodeURIComponent(t.replace(/[,:;]/g, ' ')) + '&per-page=3';
-    return fetchJson(url).then(function (data) {
+    return fetchJson(url, false, signal).then(function (data) {
       if (!data || !data.results) return null;
       for (var i = 0; i < data.results.length; i++) {
         if (titleMatches(t, data.results[i].title || data.results[i].display_name)) {
@@ -144,6 +186,32 @@
         }
       }
       return null;
+    });
+  }
+
+  // 批量 DOI 端点的分批参数：单请求 ≤50 DOI（与主进程 fetchWorksByDois 的 25/批同端点、
+  // 上限放宽到 50），批间小间隔避免突发（逐条链的 250ms 节奏仍由 worker 保持）
+  var BATCH_DOI_SIZE = 50;
+  var BATCH_GAP_MS = 500;
+
+  /**
+   * 批量按 DOI 反查（enrichBatch 第一步）：filter=doi:a|b|…，单请求 ≤50 个 DOI
+   * （与主进程 research-net 的 fetchWorksByDois 同一端点，这里走渲染层 api:fetch-json）。
+   * 返回 { 规范化小写 DOI → OpenAlex work }；响应形状不对（没有 results 数组）时
+   * 返回 null——不把畸形响应当成「查无此 DOI」的证据，调用方会退回逐条链全量重查。
+   * 限流/网络错误原样上抛（fetchJson 已内置一次 429 重试），由调用方熔断降级。
+   */
+  function oaBatchByDois(dois, signal) {
+    var url = API + '/works?filter=doi:' + encodeURIComponent(dois.join('|')) + '&per-page=' + BATCH_DOI_SIZE;
+    return fetchJson(url, false, signal).then(function (data) {
+      if (!data || !Array.isArray(data.results)) return null;
+      var map = {};
+      for (var i = 0; i < data.results.length; i++) {
+        var w = data.results[i];
+        var key = w && cleanDoi(w.doi).toLowerCase();
+        if (key) map[key] = w;
+      }
+      return map;
     });
   }
 
@@ -174,12 +242,12 @@
     if (w.title) patch.titleFromApi = w.title;
     return patch;
   }
-  function s2ByDoi(doi) {
-    return fetchJson(S2 + '/paper/DOI:' + encodeURIComponent(doi) + '?fields=' + S2_FIELDS).then(s2ToPatch);
+  function s2ByDoi(doi, signal) {
+    return fetchJson(S2 + '/paper/DOI:' + encodeURIComponent(doi) + '?fields=' + S2_FIELDS, false, signal).then(s2ToPatch);
   }
-  function s2ByTitle(t) {
+  function s2ByTitle(t, signal) {
     var url = S2 + '/paper/search?query=' + encodeURIComponent(t) + '&limit=3&fields=' + S2_FIELDS;
-    return fetchJson(url).then(function (data) {
+    return fetchJson(url, false, signal).then(function (data) {
       if (!data || !data.data) return null;
       for (var i = 0; i < data.data.length; i++) {
         if (titleMatches(t, data.data[i].title)) return s2ToPatch(data.data[i]);
@@ -221,14 +289,14 @@
     if (m.title && m.title[0]) patch.titleFromApi = m.title[0];
     return patch;
   }
-  function crByDoi(doi) {
-    return fetchJson('https://api.crossref.org/works/' + encodeURIComponent(doi)).then(function (d) {
+  function crByDoi(doi, signal) {
+    return fetchJson('https://api.crossref.org/works/' + encodeURIComponent(doi), false, signal).then(function (d) {
       return d && d.message ? crToPatch(d.message) : null;
     });
   }
-  function crByTitle(t) {
+  function crByTitle(t, signal) {
     var url = 'https://api.crossref.org/works?rows=3&query.bibliographic=' + encodeURIComponent(t);
-    return fetchJson(url).then(function (d) {
+    return fetchJson(url, false, signal).then(function (d) {
       var items = d && d.message && d.message.items;
       if (!items) return null;
       for (var i = 0; i < items.length; i++) {
@@ -250,9 +318,10 @@
   function isDown(name) { return providerDownUntil[name] && Date.now() < providerDownUntil[name]; }
   function markDown(name) { providerDownUntil[name] = Date.now() + 10 * 60 * 1000; }
 
-  function tryProviders(call) {
+  function tryProviders(call, signal) {
     var i = 0, lastError = null, hadCleanMiss = false;
     function next() {
+      if (signal && signal.aborted) return Promise.reject(abortError());
       if (i >= PROVIDERS.length) {
         if (lastError && !hadCleanMiss) return Promise.reject(lastError);
         return Promise.resolve(null);
@@ -272,39 +341,60 @@
     return next();
   }
 
-  function byDoi(doi) {
-    var clean = String(doi || '').replace(/^(https?:\/\/)?(dx\.)?doi\.org\//i, '').trim();
+  function byDoi(doi, skipOpenAlex, opts) {
+    var clean = cleanDoi(doi);
+    var signal = opts && opts.signal;
     if (!clean) return Promise.resolve(null);
-    return tryProviders(function (p) { return p.byDoi(clean); });
+    return tryProviders(function (p) {
+      // skipOpenAlex：批量端点已确认 miss 的 DOI 不再单发 OpenAlex 查询；
+      // 返回 null 走「干净未命中」语义，续查下一数据源（S2 / Crossref 可能仍有）
+      if (skipOpenAlex && p.name === 'OpenAlex') return Promise.resolve(null);
+      return p.byDoi(clean, signal);
+    }, signal);
   }
 
-  function byTitle(title) {
+  function byTitle(title, opts) {
     var t = String(title || '').trim();
+    var signal = opts && opts.signal;
     if (t.length < 8) return Promise.resolve(null);
-    return tryProviders(function (p) { return p.byTitle(t); });
+    return tryProviders(function (p) { return p.byTitle(t, signal); }, signal);
   }
 
-  /** 补全一条：优先 DOI，退回标题 */
-  function enrichPaper(paper) {
-    var p = paper.doi ? byDoi(paper.doi) : Promise.resolve(null);
+  /**
+   * 补全一条：DOI 与标题回退**并行发起、竞速但 DOI 优先**——
+   * DOI 命中即采用 DOI 结果（标题结果作废），DOI 落空（返回 null）才消费
+   * 早已在跑的标题结果。miss 条目的等待时间从「DOI 链 + 标题链」两段串行
+   * 合为一段。DOI 链整体出错（如限流）仍按旧语义上抛，交给调用方重试，
+   * 不拿标题结果冒充（标题命中 ≠ DOI 那篇）。
+   * opts.skipOaDoi：批量端点已确认 miss 的 DOI，逐条链里跳过 OpenAlex 单查。
+   * opts.signal：端到端取消——abort 后在飞请求经跨进程通道中止，链条立即以
+   * aborted 拒绝（enrichBatch 内会收敛为该条未命中，不中断整批）。 */
+  function enrichPaper(paper, opts) {
+    var titleReady = byTitle(paper.title, opts);
+    titleReady.catch(function () {}); // DOI 命中时标题结果作废——防悬挂拒绝漏成 unhandledRejection
+    if (!paper.doi) return titleReady;
+    var p = byDoi(paper.doi, !!(opts && opts.skipOaDoi), opts);
     return p.then(function (patch) {
-      if (patch) return patch;
-      return byTitle(paper.title);
+      return patch || titleReady;
     });
   }
 
   /**
-   * 批量补全（串行 + 间隔，尊重 OpenAlex 限速；约 10 req/s 上限，这里取 250ms）
-   * onProgress(done, total, paper, patch)
+   * 批量补全：第一步按 DOI 分桶走 OpenAlex 批量端点（≤50 DOI/请求、批间小间隔），
+   * 命中直接产出 patch；批量 miss 的 DOI 在逐条链里跳过 OpenAlex 单查（已确认查无）。
+   * 第二步对剩余条目（批量 miss / 无 DOI / 批量请求失败回退）跑原有逐条链——
+   * 串行 worker + 250ms 间隔（约 10 req/s 上限，尊重 OpenAlex 限速）。
+   * onProgress(done, total, paper, patch)，total 恒为传入条目总数。
    * ctl（可选）：调用方持有的控制句柄，随时可改——
-   *   ctl.paused = true  暂停（在取任务前生效，在飞的请求不打断，结果照常落地）；
+   *   ctl.paused = true  暂停（在取任务/取批次前生效，在飞的请求不打断，结果照常落地）；
    *   ctl.aborted = true 中断（不再取新任务，Promise 以已完成的部分结果 resolve）；
+   *   ctl.signal      可选 AbortSignal：abort 时在飞请求也一并跨进程中止（不再等 15s 兜底）；
    *   两者置回后须调 ctl.wake()（批量挂起时自动附上）唤醒等在暂停门上的 worker。
-   * 不传 ctl 则行为与旧版完全一致。
+   * 不传 ctl 则行为与旧版一致（完成语义不变，进度次序按实际完成先后）。
    */
   function enrichBatch(papers, onProgress, ctl) {
     var cursor = 0, done = 0, results = [];
-    var WORKERS = Math.min(3, papers.length);
+    var runSignal = ctl && ctl.signal;
     var pauseGate = null, openGate = null;
 
     function waitWhilePaused() {
@@ -319,33 +409,89 @@
 
     function delay(ms) { return new Promise(function (res) { setTimeout(res, ms); }); }
 
-    function enrichOne(paper) {
-      return enrichPaper(paper)
+    function settle(paper, patch) {
+      results.push({ paper: paper, patch: patch });
+      done++;
+      if (onProgress) onProgress(done, papers.length, paper, patch);
+    }
+
+    /** 第一步：DOI 分桶批量反查。返回 { pending: 待逐条补全的条目, batchMissed: 批量确认 miss 的 DOI 集 } */
+    function batchByDoi() {
+      var withDoi = [], noDoi = [];
+      for (var i = 0; i < papers.length; i++) {
+        if (papers[i] && cleanDoi(papers[i].doi)) withDoi.push(papers[i]);
+        else noDoi.push(papers[i]);
+      }
+      var state = { pending: noDoi.slice(), batchMissed: {} };
+      var idx = 0;
+      function nextChunk() {
+        if (idx >= withDoi.length || (ctl && ctl.aborted)) return undefined;
+        return waitWhilePaused().then(function () {
+          if (idx >= withDoi.length || (ctl && ctl.aborted)) return undefined;
+          var chunk = withDoi.slice(idx, idx + BATCH_DOI_SIZE);
+          idx += chunk.length;
+          function afterChunk() {
+            if (idx < withDoi.length && !(ctl && ctl.aborted)) return delay(BATCH_GAP_MS).then(nextChunk);
+            return undefined;
+          }
+          var dois = [];
+          for (var j = 0; j < chunk.length; j++) dois.push(cleanDoi(chunk[j].doi));
+          return oaBatchByDois(dois, runSignal).then(function (map) {
+            for (var k = 0; k < chunk.length; k++) {
+              var paper = chunk[k];
+              var key = cleanDoi(paper.doi).toLowerCase();
+              var patch = map ? workToPatch(map[key]) : null;
+              if (patch) {
+                patch.source = 'OpenAlex';
+                settle(paper, patch);
+              } else {
+                if (map) state.batchMissed[key] = true; // 仅有效 envelope 下的 miss 才算数
+                state.pending.push(paper);
+              }
+            }
+            return afterChunk();
+          }, function (err) {
+            // 批量请求失败：429 计入现有 provider 熔断台账（10 分钟内逐条链也跳过 OpenAlex），
+            // 其余错误同样整片退回逐条链全量重查——批量是优化，失败不阻断补全
+            if (err && err.message === 'rate-limited') markDown('OpenAlex');
+            for (var k = 0; k < chunk.length; k++) state.pending.push(chunk[k]);
+            return afterChunk();
+          });
+        });
+      }
+      return Promise.resolve().then(nextChunk).then(function () { return state; });
+    }
+
+    function enrichOne(paper, skipOaDoi) {
+      return enrichPaper(paper, { skipOaDoi: skipOaDoi, signal: runSignal })
         .catch(function (err) {
           if (err && err.message === 'rate-limited') {
-            return delay(3000).then(function () { return enrichPaper(paper); })
+            return delay(3000).then(function () { return enrichPaper(paper, { skipOaDoi: skipOaDoi, signal: runSignal }); })
               .catch(function () { return null; });
           }
           return null;
         });
     }
 
-    function worker() {
+    function worker(queue, batchMissed) {
       return waitWhilePaused().then(function () {
-        if ((ctl && ctl.aborted) || cursor >= papers.length) return undefined;
-        var paper = papers[cursor++];
-        return enrichOne(paper).then(function (patch) {
-          results.push({ paper: paper, patch: patch });
-          done++;
-          if (onProgress) onProgress(done, papers.length, paper, patch);
-          return delay(250).then(worker);
+        if ((ctl && ctl.aborted) || cursor >= queue.length) return undefined;
+        var paper = queue[cursor++];
+        var skip = !!batchMissed[cleanDoi(paper.doi).toLowerCase()];
+        return enrichOne(paper, skip).then(function (patch) {
+          settle(paper, patch);
+          return delay(250).then(function () { return worker(queue, batchMissed); });
         });
       });
     }
 
-    var workers = [];
-    for (var w = 0; w < WORKERS; w++) workers.push(worker());
-    return Promise.all(workers).then(function () { return results; });
+    return batchByDoi().then(function (state) {
+      var queue = state.pending;
+      var WORKERS = Math.min(3, queue.length);
+      var workers = [];
+      for (var w = 0; w < WORKERS; w++) workers.push(worker(queue, state.batchMissed));
+      return Promise.all(workers).then(function () { return results; });
+    });
   }
 
   /**
@@ -446,14 +592,14 @@
     return m ? ['https://arxiv.org/pdf/' + m[1]] : [];
   }
 
-  function findOaPdfByDoi(doi) {
-    return fetchJson(API + '/works/https://doi.org/' + encodeURIComponent(doi)).then(function (w) {
+  function findOaPdfByDoi(doi, signal) {
+    return fetchJson(API + '/works/https://doi.org/' + encodeURIComponent(doi), false, signal).then(function (w) {
       return oaPdfUrlsFromWork(w);
     }).catch(function () { return []; });
   }
-  function findOaPdfByTitle(t) {
+  function findOaPdfByTitle(t, signal) {
     var url = API + '/works?filter=title.search:' + encodeURIComponent(t.replace(/[,:;]/g, ' ')) + '&per-page=5';
-    return fetchJson(url).then(function (data) {
+    return fetchJson(url, false, signal).then(function (data) {
       if (!data || !data.results) return [];
       for (var i = 0; i < data.results.length; i++) {
         var w = data.results[i];
@@ -465,14 +611,14 @@
       return [];
     }).catch(function () { return []; });
   }
-  function findS2PdfByDoi(doi) {
-    return fetchJson(S2 + '/paper/DOI:' + encodeURIComponent(doi) + '?fields=openAccessPdf,title').then(function (w) {
+  function findS2PdfByDoi(doi, signal) {
+    return fetchJson(S2 + '/paper/DOI:' + encodeURIComponent(doi) + '?fields=openAccessPdf,title', false, signal).then(function (w) {
       return s2PdfUrlsFromWork(w);
     }).catch(function () { return []; });
   }
-  function findS2PdfByTitle(t) {
+  function findS2PdfByTitle(t, signal) {
     var url = S2 + '/paper/search?query=' + encodeURIComponent(t) + '&limit=5&fields=openAccessPdf,title';
-    return fetchJson(url).then(function (data) {
+    return fetchJson(url, false, signal).then(function (data) {
       if (!data || !data.data) return [];
       for (var i = 0; i < data.data.length; i++) {
         var w = data.data[i];
@@ -484,14 +630,14 @@
       return [];
     }).catch(function () { return []; });
   }
-  function findCrPdfByDoi(doi) {
-    return fetchJson('https://api.crossref.org/works/' + encodeURIComponent(doi)).then(function (d) {
+  function findCrPdfByDoi(doi, signal) {
+    return fetchJson('https://api.crossref.org/works/' + encodeURIComponent(doi), false, signal).then(function (d) {
       return d && d.message ? crPdfUrlsFromMessage(d.message) : [];
     }).catch(function () { return []; });
   }
-  function findCrPdfByTitle(t) {
+  function findCrPdfByTitle(t, signal) {
     var url = 'https://api.crossref.org/works?rows=5&query.bibliographic=' + encodeURIComponent(t);
-    return fetchJson(url).then(function (d) {
+    return fetchJson(url, false, signal).then(function (d) {
       var items = d && d.message && d.message.items;
       if (!items) return [];
       for (var i = 0; i < items.length; i++) {
@@ -507,9 +653,11 @@
   /**
    * 为一条文献查找开放获取 PDF 直链
    * 优先按 DOI 精确匹配，找不到再按标题匹配；返回 [{ source, url }]，按来源去重
+   * opts.signal：可选端到端取消（abort 后各源请求跨进程中止，catch 归一为空结果）
    */
-  function findPdfUrls(paper) {
+  function findPdfUrls(paper, opts) {
     var p = paper || {};
+    var signal = opts && opts.signal;
     var doi = String(p.doi || '').replace(/^(https?:\/\/)?(dx\.)?doi\.org\//i, '').trim();
     var title = String(p.title || '').trim();
     function run(tasks) {
@@ -534,23 +682,23 @@
     if (doi) {
       return run([
         { source: 'arXiv', p: Promise.resolve(arxivPdfUrlsFromDoi(doi)) },
-        { source: 'OpenAlex', p: findOaPdfByDoi(doi) },
-        { source: 'Semantic Scholar', p: findS2PdfByDoi(doi) },
-        { source: 'Crossref', p: findCrPdfByDoi(doi) }
+        { source: 'OpenAlex', p: findOaPdfByDoi(doi, signal) },
+        { source: 'Semantic Scholar', p: findS2PdfByDoi(doi, signal) },
+        { source: 'Crossref', p: findCrPdfByDoi(doi, signal) }
       ]).then(function (list) {
         if (list.length || title.length < 8) return list;
         return run([
-          { source: 'OpenAlex', p: findOaPdfByTitle(title) },
-          { source: 'Semantic Scholar', p: findS2PdfByTitle(title) },
-          { source: 'Crossref', p: findCrPdfByTitle(title) }
+          { source: 'OpenAlex', p: findOaPdfByTitle(title, signal) },
+          { source: 'Semantic Scholar', p: findS2PdfByTitle(title, signal) },
+          { source: 'Crossref', p: findCrPdfByTitle(title, signal) }
         ]);
       });
     }
     if (title.length >= 8) {
       return run([
-        { source: 'OpenAlex', p: findOaPdfByTitle(title) },
-        { source: 'Semantic Scholar', p: findS2PdfByTitle(title) },
-        { source: 'Crossref', p: findCrPdfByTitle(title) }
+        { source: 'OpenAlex', p: findOaPdfByTitle(title, signal) },
+        { source: 'Semantic Scholar', p: findS2PdfByTitle(title, signal) },
+        { source: 'Crossref', p: findCrPdfByTitle(title, signal) }
       ]);
     }
     return Promise.resolve([]);
@@ -567,11 +715,12 @@
   }
 
   // ============ 数据源 4：PubMed（PMID）============
-  function byPmid(pmid) {
+  function byPmid(pmid, opts) {
     var id = String(pmid || '').replace(/\D/g, '');
+    var signal = opts && opts.signal;
     if (!id) return Promise.resolve(null);
     var url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&retmode=json&id=' + id;
-    return fetchJson(url).then(function (data) {
+    return fetchJson(url, false, signal).then(function (data) {
       var rec = data && data.result && data.result[id];
       if (!rec || rec.error) return null;
       var patch = { source: 'PubMed', citations: null, enrichedAt: new Date().toISOString() };
@@ -596,11 +745,12 @@
   }
 
   // ============ 数据源 5：OpenLibrary（ISBN）============
-  function byIsbn(isbn) {
+  function byIsbn(isbn, opts) {
     var id = String(isbn || '').replace(/[-\s]/g, '');
+    var signal = opts && opts.signal;
     if (!/^\d{10}(\d{3})?$/.test(id)) return Promise.resolve(null);
     var url = 'https://openlibrary.org/api/books?bibkeys=ISBN:' + id + '&format=json&jscmd=data';
-    return fetchJson(url).then(function (data) {
+    return fetchJson(url, false, signal).then(function (data) {
       var rec = data && data['ISBN:' + id];
       if (!rec) return null;
       var patch = { source: 'OpenLibrary', citations: null, enrichedAt: new Date().toISOString() };
@@ -625,11 +775,12 @@
    * ISTIC 而非 Crossref），但期刊本身的 source 记录大多有——PDF 导入时联网
    * 补全全落空，就用文章编号里解析出的 ISSN 兜底填 venue。
    */
-  function venueByIssn(issn) {
+  function venueByIssn(issn, opts) {
     var clean = String(issn || '').replace(/[^0-9Xx]/g, '').toUpperCase();
+    var signal = opts && opts.signal;
     if (!/^\d{7}[\dX]$/.test(clean)) return Promise.resolve('');
     var url = API + '/sources?filter=issn:' + clean.slice(0, 4) + '-' + clean.slice(4) + '&per-page=5';
-    return fetchJson(url).then(function (data) {
+    return fetchJson(url, false, signal).then(function (data) {
       var results = (data && data.results) || [];
       for (var i = 0; i < results.length; i++) {
         var source = results[i] || {};

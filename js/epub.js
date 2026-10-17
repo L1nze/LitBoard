@@ -244,7 +244,7 @@
    * opts = { container, onRelocated(cfi, href), onSelected(cfiRange, range, contents) }
    * 同步返回 api（内核 makeBook 是异步的——display/goTo/next/toc 等方法内部先等打开完成）：
    *   { book, rendition, destroyed, display(target), goTo(cfi, textAnchor), next(), prev(), resize(),
-   *     toc(), setFontSize(px), setTheme(name), fontSize, theme, currentCfi(), currentHref(),
+   *     toc(), setFontSize(px), setTheme(name), fontSize, theme, currentHref(),
    *     visibleText(), progress(), seek(percent), enableLocations(cap), destroy() }
    * 内核差异：progress 为字节加权精确值（旧 locations 机制废弃，
    * enableLocations 退为恒就绪 no-op）；visibleText 粒度从整章升到当前可见页（TTS 受益）；
@@ -407,7 +407,6 @@
       destroyed: false,
       fontSize: function () { return state.fontSize; },
       theme: function () { return state.theme; },
-      currentCfi: function () { return state.cfi; },
       currentHref: function () { return state.href; },
       display: function (target) {
         return ensureOpen().then(function () {

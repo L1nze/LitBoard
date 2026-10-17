@@ -43,7 +43,12 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   organizeItemAttachments: function (options) { return ipcRenderer.invoke('files:organize-item', options); },
   scanFolder: function (options) { return ipcRenderer.invoke('files:scan-folder', options); },
   copyText: function (value) { return ipcRenderer.invoke('clipboard:write', value); },
-  fetchJson: function (url) { return ipcRenderer.invoke('api:fetch-json', url); },
+  // requestId：渲染层 AbortSignal 不能过 IPC，带上即登记进主进程取消台账，
+  // abort 时经 abortFetch(requestId) 跨进程中止在飞请求
+  fetchJson: function (url, requestId) {
+    return ipcRenderer.invoke('api:fetch-json', requestId ? { url: url, requestId: requestId } : url);
+  },
+  abortFetch: function (requestId) { return ipcRenderer.invoke('api:fetch-abort', requestId); },
   getIntegrationConfig: function () { return ipcRenderer.invoke('integrations:get-config'); },
   saveIntegrationConfig: function (value) { return ipcRenderer.invoke('integrations:save-config', value); },
   revealIntegrationSecret: function (value) { return ipcRenderer.invoke('integrations:reveal-secret', value || {}); },
@@ -181,22 +186,31 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   pdfSearchGetPageRange: function (input) { return ipcRenderer.invoke('pdfsearch:get-page-range', input); },
   fetchCslStyle: function (styleId) { return ipcRenderer.invoke('csl:fetch-style', styleId); },
   downloadPdf: function (options) { return ipcRenderer.invoke('pdf:download', options); },
+  // 旧式订阅 API 曾返回 ipcRenderer 本体（Renderer 侧等于拿到整个 IPC 原语，且无法退订）；
+  // 统一改为与文件内新式 API 同款：返回反订阅函数。现有调用点（app.js 一次性 init）
+  // 不接收返回值，行为兼容。
   onDownloadProgress: function (callback) {
-    return ipcRenderer.on('pdf:download-progress', function (_event, data) {
+    var listener = function (_event, data) {
       if (typeof callback === 'function') callback(data);
-    });
+    };
+    ipcRenderer.on('pdf:download-progress', listener);
+    return function () { ipcRenderer.removeListener('pdf:download-progress', listener); };
   },
   onBeforeQuit: function (callback) {
-    return ipcRenderer.on('app:before-quit', function () {
+    var listener = function () {
       if (typeof callback === 'function') callback();
-    });
+    };
+    ipcRenderer.on('app:before-quit', listener);
+    return function () { ipcRenderer.removeListener('app:before-quit', listener); };
   },
   quitAck: function () { ipcRenderer.send('app:quit-ack'); },
   /* M1 关闭收尾：主进程拦截窗口 close 后请求渲染层保存收尾，closeAck 回报「已持久化/失败」 */
   onCloseRequest: function (callback) {
-    return ipcRenderer.on('app:close-request', function () {
+    var listener = function () {
       if (typeof callback === 'function') callback();
-    });
+    };
+    ipcRenderer.on('app:close-request', listener);
+    return function () { ipcRenderer.removeListener('app:close-request', listener); };
   },
   closeAck: function (result) { ipcRenderer.send('app:close-ack', result || { ok: true }); },
   windowMinimize: function () { return ipcRenderer.invoke('window:minimize'); },
@@ -204,17 +218,21 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   windowClose: function () { return ipcRenderer.invoke('window:close'); },
   windowIsMaximized: function () { return ipcRenderer.invoke('window:is-maximized'); },
   onWindowMaximizeChanged: function (callback) {
-    return ipcRenderer.on('window:maximize-changed', function (_event, maximized) {
+    var listener = function (_event, maximized) {
       if (typeof callback === 'function') callback(!!maximized);
-    });
+    };
+    ipcRenderer.on('window:maximize-changed', listener);
+    return function () { ipcRenderer.removeListener('window:maximize-changed', listener); };
   },
   bridgeStatus: function () { return ipcRenderer.invoke('bridge:status'); },
   bridgeSetEnabled: function (enabled) { return ipcRenderer.invoke('bridge:set-enabled', enabled); },
   bridgeSetCurrentFolder: function (folderId) { return ipcRenderer.invoke('bridge:set-current-folder', folderId); },
   onLibraryUpdated: function (callback) {
-    return ipcRenderer.on('library:externally-updated', function (_event, info) {
+    var listener = function (_event, info) {
       if (typeof callback === 'function') callback(info || {});
-    });
+    };
+    ipcRenderer.on('library:externally-updated', listener);
+    return function () { ipcRenderer.removeListener('library:externally-updated', listener); };
   },
   /* 沙箱渲染进程没有 process.env，smoke 标志经此暴露（i18n 用它强制中文，见 js/i18n.js） */
   isSmokeTest: !!(process.env && process.env.LITBOARD_SMOKE_TEST),

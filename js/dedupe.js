@@ -6,14 +6,6 @@
 })(typeof window !== 'undefined' ? window : null, function () {
   'use strict';
 
-  function normTitle(t) {
-    return String(t || '').toLowerCase().replace(/[^a-z0-9一-鿿]+/g, '');
-  }
-
-  function normAuthor(name) {
-    return String(name || '').toLowerCase().replace(/[^a-z0-9一-鿿]+/g, '');
-  }
-
   function normDoi(value) {
     return String(value || '').trim().replace(/^(https?:\/\/)?(dx\.)?doi\.org\//i, '').toLowerCase();
   }
@@ -34,29 +26,6 @@
       if (att && att.kind === 'pdf') add(att.fingerprint);
     });
     return result;
-  }
-
-  function isDuplicate(a, b) {
-    var fpsA = pdfFingerprints(a), fpsB = pdfFingerprints(b);
-    for (var i = 0; i < fpsA.length; i++) {
-      if (fpsB.indexOf(fpsA[i]) !== -1) return true;
-    }
-    var doiA = normDoi(a && a.doi);
-    var doiB = normDoi(b && b.doi);
-    if (doiA && doiB && doiA === doiB) return true;
-    return false;
-  }
-
-  function isTitleCandidate(a, b) {
-    var doiA = normDoi(a && a.doi);
-    var doiB = normDoi(b && b.doi);
-    if (doiA && doiB) return false;
-    var titleA = normTitle(a && a.title), titleB = normTitle(b && b.title);
-    if (!titleA || titleA.length < 6 || titleA !== titleB) return false;
-    if (a && b && a.year != null && b.year != null && a.year !== b.year) return false;
-    var authorA = normAuthor((a && a.authors || [])[0]);
-    var authorB = normAuthor((b && b.authors || [])[0]);
-    return !(authorA && authorB && authorA !== authorB);
   }
 
   var STATUS_RANK = { unread: 0, reading: 1, read: 2 };
@@ -295,18 +264,8 @@
     return { attachments: keptIncoming.concat(keptExisting), aliases: aliases, added: keptIncoming };
   }
 
-  /**
-   * 把 candidate 的附件并入 target（Zotero 式导入：命中已有条目时挂 PDF）。
-   * 按指纹 > 路径（忽略大小写）> id 合并 target 自身和新附件中的副本，
-   * 返回新数组，不改动入参；candidate 无附件且 target 无副本时保持原样。
-   */
-  function mergeAttachments(target, candidate) {
-    return mergeAttachmentsDetailed(target, candidate).attachments;
-  }
-
-  return { findGroups: findGroups, merge: merge, completeness: completeness, isDuplicate: isDuplicate,
+  return { findGroups: findGroups, merge: merge, completeness: completeness,
     createMatchIndex: createMatchIndex, indexPaper: indexPaper, findMatch: findMatch,
-    mergeAttachments: mergeAttachments, mergeAttachmentsDetailed: mergeAttachmentsDetailed,
-    pdfFingerprints: pdfFingerprints, normDoi: normDoi,
-    isTitleCandidate: isTitleCandidate };
+    mergeAttachmentsDetailed: mergeAttachmentsDetailed,
+    pdfFingerprints: pdfFingerprints, normDoi: normDoi };
 });

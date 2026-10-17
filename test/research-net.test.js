@@ -282,6 +282,33 @@ test('fetchWorksByDois batches 25 with doi: filter and normalizes', async functi
   assert.equal(rows[0].id, 'W7');
 });
 
+test('超时兜底：无 signal 的请求统一挂 AbortSignal.timeout，超时按传输错误退避重试后上抛；调用方自带 signal 不被覆盖', async function () {
+  // timeoutMs 注入为 5ms：假 fetch 挂起等 abort——真触发超时信号才 reject，验证信号确实接上了请求
+  const recorded = [];
+  const q = createThrottleQueue(function (url, init) {
+    recorded.push(init && init.signal);
+    return new Promise(function (resolve, reject) {
+      const signal = init && init.signal;
+      if (!signal || typeof signal.addEventListener !== 'function') {
+        reject(new Error('请求未挂 AbortSignal'));
+        return;
+      }
+      signal.addEventListener('abort', function () { reject(new Error('timeout-sim')); });
+    });
+  }, { sleep: async function () {}, timeoutMs: 5 });
+  await assert.rejects(function () { return q.requestJson('https://api.test/hang'); }, /网络请求失败/);
+  assert.equal(recorded.length, 3, '三次尝试各挂一份新的超时信号');
+  recorded.forEach(function (signal) { assert.equal(typeof signal.aborted, 'boolean'); });
+
+  // 调用方自带 signal：原样透传，不被兜底信号顶掉
+  const own = new AbortController().signal;
+  const q2 = createThrottleQueue(async function (url, init) {
+    return jsonResponse({ kept: init.signal === own });
+  }, {});
+  const data = await q2.requestJson('https://api.test/own', { signal: own });
+  assert.equal(data.kept, true);
+});
+
 test('R16: createEndpointGate 串行化并保证最小间隔；OpenAlex 语义模式走 search.semantic 且受 1req/s 闸门约束，关键词模式仍用 search', async function () {
   {
     const N = require('../electron/research-net.js');

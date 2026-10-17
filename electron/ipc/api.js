@@ -26,23 +26,37 @@ function openAccessPdfDir() {
   return path.join(ctx.dataPathState.configDir, 'open-access-pdf');
 }
 
+/* 跨进程取消台账：requestId → AbortController。渲染层的 AbortSignal 不能过 IPC，
+ * 所以 api:fetch-json 允许带 requestId 登记，渲染层 abort 时经 api:fetch-abort
+ * 按 id 中止主进程在飞请求（socket 一并丢弃，不再占着 15s 超时兜底跑空转）。 */
+const inflightFetchAborts = new Map();
+
 function register() {
-  ctx.handle('api:fetch-json', async function (_event, rawUrl) {
+  ctx.handle('api:fetch-json', async function (_event, payload) {
+    // payload 兼容两种形态：历史纯 URL 字符串；{ url, requestId }（带取消登记）
+    const rawUrl = typeof payload === 'string' ? payload : String(payload && payload.url || '');
+    const requestId = payload && typeof payload === 'object' ? String(payload.requestId || '') : '';
     let url;
     try { url = new URL(rawUrl); } catch (error) { throw new Error(ctx.T('无效的 API 地址')); }
     if (url.protocol !== 'https:' || !ALLOWED_API_HOSTS.has(url.hostname)) {
       throw new Error(ctx.T('不允许访问该 API 地址'));
     }
     // 15s 硬超时兜底：fetch 的 AbortSignal 只覆盖到响应头，body 读取挂起时仍可能永不返回，
-    // 这里用 race 包住「请求 + 读 body」全程，确保 IPC 一定会 settle。
+    // 这里用 race 包住「请求 + 读 body」全程，确保 IPC 一定会 settle；超时与外部取消
+    // 共用同一控制器——无论哪条路径触发，net.fetch 的 socket 都被丢弃。
+    const controller = new AbortController();
+    if (requestId) inflightFetchAborts.set(requestId, controller);
     let timer = null;
     const timeout = new Promise(function (_resolve, reject) {
-      timer = setTimeout(function () { reject(new Error(ctx.T('请求超时（15s）：') + url.hostname)); }, 15000);
+      timer = setTimeout(function () {
+        controller.abort();
+        reject(new Error(ctx.T('请求超时（15s）：') + url.hostname));
+      }, 15000);
     });
     const work = (async function () {
       const response = await net.fetch(url.href, {
         headers: { Accept: 'application/json' },
-        signal: AbortSignal.timeout(15000)
+        signal: controller.signal
       });
       if (process.env.LITBOARD_DEBUG_FETCH) console.log('[fetch-json] HTTP', response.status, url.hostname);
       let data = null;
@@ -63,7 +77,16 @@ function register() {
       throw error;
     } finally {
       clearTimeout(timer);
+      if (requestId) inflightFetchAborts.delete(requestId);
     }
+  });
+
+  // 渲染层信号中止 → 按 requestId 中止在飞请求；id 不存在（已 settle）时静默返回 false
+  ctx.handle('api:fetch-abort', function (_event, requestId) {
+    const controller = inflightFetchAborts.get(String(requestId || ''));
+    if (!controller) return false;
+    controller.abort();
+    return true;
   });
 
   // 下载一篇开放获取 PDF：渲染层提供直链 + 建议文件名。

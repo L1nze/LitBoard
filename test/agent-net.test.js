@@ -588,3 +588,55 @@ test('同会话新请求覆盖控制器时主动 abort 旧流：旧流按 aborte
   const r2 = await second;
   assert.equal(r2.aborted, true);
 });
+
+/* ---------------- 首字节超时：fetch 阶段（连接 + 响应头返回前）的兜底 ---------------- */
+test('首字节超时：headers 迟迟不回时按错误断开（不自动重试计费）；拿到 response 后的慢流不受影响', async function () {
+  {
+    // 挂死的 fetch：只在 signal abort 时 reject（模拟 TCP 连上但响应头永不返回）
+    let calls = 0;
+    const net = createAgentNet({
+      fetch: function (url, init) {
+        calls++;
+        return new Promise(function (resolve, reject) {
+          init.signal.addEventListener('abort', function () {
+            const error = new Error('This operation was aborted'); error.name = 'AbortError'; reject(error);
+          });
+        });
+      },
+      getConfig: async function () { return { agentBaseUrl: 'https://api.test', agentApiKey: 'K', agentModel: 'm' }; },
+      notify: function () {},
+      firstByteTimeoutMs: 20
+    });
+    await assert.rejects(function () {
+      return net.chatStream({ sessionId: 'fbt', body: { messages: [{ role: 'user', content: 'q' }] } });
+    }, /等待响应超时/);
+    assert.equal(calls, 1, '超时按错误上抛，不自动重试（请求可能已被计费）');
+  }
+  {
+    // 响应头立即返回、但流很慢（60ms 才出数，超过注入的 20ms 首字节超时）：
+    // 慢流交给既有的 120s 流空闲超时，不能被首字节计时器拦腰掐断
+    const encoder = new TextEncoder();
+    const net = createAgentNet({
+      fetch: async function () {
+        return {
+          ok: true, status: 200, text: async function () { return ''; },
+          body: { getReader: function () {
+            let step = 0;
+            return { read: async function () {
+              step++;
+              if (step === 1) { await new Promise(function (r) { setTimeout(r, 60); }); return { done: false, value: encoder.encode('data: {"choices":[{"delta":{"content":"慢"}}]}\n') }; }
+              if (step === 2) return { done: false, value: encoder.encode('data: [DONE]\n') };
+              return { done: true, value: undefined };
+            } };
+          } }
+        };
+      },
+      getConfig: async function () { return { agentBaseUrl: 'https://api.test', agentApiKey: 'K', agentModel: 'm' }; },
+      notify: function () {},
+      firstByteTimeoutMs: 20
+    });
+    const result = await net.chatStream({ sessionId: 'slow', body: { messages: [{ role: 'user', content: 'q' }] } });
+    assert.equal(result.message.content, '慢');
+    assert.equal(result.partial, undefined);
+  }
+});

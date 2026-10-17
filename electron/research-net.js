@@ -1,10 +1,12 @@
 'use strict';
 
 /**
- * LitBoard 检索服务（主进程专用）：每主机节流队列 + OpenAlex / Semantic Scholar 客户端。
+ * LitBoard 检索服务（主进程专用）：OpenAlex / Semantic Scholar / Scopus 客户端。
  *
- * 节流是「防触发」优先于「触发后退避」：每主机限并发 + 最小发起间隔，
- * 429/5xx 才走指数退避重试（尊重 Retry-After），其余错误直接上抛。
+ * 每主机节流队列、请求超时兜底与连接测试错误分类已抽到 `electron/net-throttle.js`
+ * （公共网络工具库，webfetch-net 同样引用）；本文件只保留检索侧的东西：
+ * 各源的端点、参数形状与归一化，以及端点级限速（R16）。
+ *
  * 计时（sleep/now）可注入，node:test 用假时钟覆盖队列行为。
  *
  * 端点级限速（R16）：OpenAlex 的 search.semantic 官方限 1 req/s，与该主机的普通检索
@@ -12,17 +14,7 @@
  * 否则语义检索会被自己的并发打死（主机策略管的是「主机」，管不了「端点」）。
  */
 const LitResearch = require('../js/research.js');
-
-const DEFAULT_POLICY = { concurrency: 2, minIntervalMs: 400 };
-const MAX_ATTEMPTS = 3;
-
-function defaultSleep(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
-
-function makeDeferred() {
-  let resolveFn = null;
-  const promise = new Promise(function (resolve) { resolveFn = resolve; });
-  return { promise: promise, resolve: resolveFn };
-}
+const { createThrottleQueue, classifyTestError, defaultSleep } = require('./net-throttle.js');
 
 /**
  * 端点级最小间隔闸门：把同一端点的调用串行化，并保证相邻两次发起间隔 ≥ minIntervalMs。
@@ -44,124 +36,6 @@ function createEndpointGate(minIntervalMs, options) {
     chain = run.then(function () {}, function () {});
     return run;
   };
-}
-
-function createThrottleQueue(doFetch, options) {
-  const opts = options || {};
-  const sleep = opts.sleep || defaultSleep;
-  const now = opts.now || function () { return Date.now(); };
-  const hosts = new Map(); // host → { running, lastDispatch, waiters, slot, pumping }
-
-  function hostState(host) {
-    if (!hosts.has(host)) {
-      hosts.set(host, { running: 0, lastDispatch: -Infinity, waiters: [], slot: makeDeferred(), pumping: false });
-    }
-    return hosts.get(host);
-  }
-
-  function setPolicy(host, policy) {
-    const st = hostState(host);
-    st.policy = {
-      concurrency: Math.max(1, Number(policy && policy.concurrency) || 1),
-      minIntervalMs: Math.max(0, Number(policy && policy.minIntervalMs) || 0)
-    };
-  }
-  function policyOf(st) { return st.policy || DEFAULT_POLICY; }
-
-  function pump(host) {
-    const st = hostState(host);
-    if (st.pumping) return;
-    st.pumping = true;
-    (async function () {
-      try {
-        while (st.waiters.length) {
-          const policy = policyOf(st);
-          while (st.running >= policy.concurrency && st.waiters.length) {
-            await st.slot.promise;
-          }
-          if (!st.waiters.length) break;
-          const wait = st.lastDispatch + policy.minIntervalMs - now();
-          if (wait > 0) await sleep(wait);
-          if (!st.waiters.length) break;
-          const resolveAcquired = st.waiters.shift();
-          st.running++;
-          st.lastDispatch = now();
-          if (typeof opts.onDispatch === 'function') {
-            try { opts.onDispatch(host, st.lastDispatch); } catch (error) { /* 观测钩子不反噬调度 */ }
-          }
-          resolveAcquired(function release() {
-            st.running--;
-            const prevSlot = st.slot;
-            st.slot = makeDeferred();
-            prevSlot.resolve();
-            pump(host);
-          });
-        }
-      } finally {
-        st.pumping = false;
-      }
-    })();
-  }
-
-  function acquire(host) {
-    const st = hostState(host);
-    return new Promise(function (resolve) {
-      st.waiters.push(resolve);
-      pump(host);
-    });
-  }
-
-  async function fetchThrottled(url, init) {
-    const host = new URL(url).host;
-    const release = await acquire(host);
-    try {
-      return await doFetch(url, init);
-    } finally {
-      release();
-    }
-  }
-
-  function backoffMs(attempt) {
-    return (1 << Math.min(attempt, 5)) * 500 + Math.floor(Math.random() * 250);
-  }
-
-  /** 带重试的 JSON GET/POST：仅 429/5xx/传输错误重试，其余状态码立即上抛 */
-  async function requestJson(url, init) {
-    let attempt = 0;
-    while (true) {
-      attempt++;
-      let response = null;
-      try {
-        response = await fetchThrottled(url, init || {});
-      } catch (error) {
-        if (attempt >= MAX_ATTEMPTS) {
-          throw new Error('网络请求失败（' + new URL(url).host + '）：' + String(error && error.message || error));
-        }
-        await sleep(backoffMs(attempt));
-        continue;
-      }
-      if (response.status === 429 || response.status >= 500) {
-        if (attempt >= MAX_ATTEMPTS) {
-          const err = new Error('上游限流或服务异常（HTTP ' + response.status + '）：' + new URL(url).host);
-          err.status = response.status;
-          throw err;
-        }
-        const retryAfter = Number(response.headers && response.headers.get && response.headers.get('retry-after'));
-        await sleep(isFinite(retryAfter) && retryAfter > 0 && retryAfter <= 120
-          ? retryAfter * 1000
-          : backoffMs(attempt));
-        continue;
-      }
-      if (!response.ok) {
-        const err = new Error('HTTP ' + response.status + '（' + new URL(url).host + '）');
-        err.status = response.status;
-        throw err;
-      }
-      return await response.json();
-    }
-  }
-
-  return { setPolicy: setPolicy, requestJson: requestJson, fetchThrottled: fetchThrottled };
 }
 
 /* ---------------- 摘要回填的纯解析（模块级导出，node:test 直测） ---------------- */
@@ -235,19 +109,6 @@ function parseElsevierAbstract(payload) {
     }
   })(abstracts);
   return decodeEntities(found).replace(/\s+/g, ' ').trim();
-}
-
-/** 连接测试的错误分类（模块作用域：research-net 与 webfetch-net 共用同一份判定）。
- *  code 语义固定，渲染层按 code 出文案：missing_key / unauthorized / rate_limited /
- *  not_found / network / error。 */
-function classifyTestError(error) {
-  const status = Number(error && error.status) || 0;
-  if (status === 401 || status === 403) return 'unauthorized';
-  if (status === 429) return 'rate_limited';
-  if (status === 404) return 'not_found';
-  if (error && error.code === 'NO_KEY') return 'missing_key';
-  if (/网络请求失败/.test(String(error && error.message || ''))) return 'network';
-  return 'error';
 }
 
 function createResearchNet(options) {
@@ -553,7 +414,7 @@ function createResearchNet(options) {
    * rate_limited 上游限流 / not_found 目标记录不存在（端点本身通了）/ network 不可达 /
    * error 其余。只做「能不能用」的判定，不进业务链、不改任何状态。
    * 客户端与业务路径共用同一个节流队列：测试同样受主机限流约束，不会额外冲击配额。
-   * （错误分类在模块作用域 classifyTestError，webfetch-net 复用同一份。） */
+   * （错误分类在 net-throttle 的 classifyTestError，webfetch-net 复用同一份。） */
 
   /** OpenAlex：固定 DOI 反查一发。无 Key 也能用（polite pool 靠邮箱），
    *  channel 如实回报实际走的是哪条通道——否则用户会以为填的 Key 生效了。 */
@@ -611,8 +472,10 @@ function createResearchNet(options) {
 
 module.exports = {
   createResearchNet: createResearchNet,
-  createThrottleQueue: createThrottleQueue,
   createEndpointGate: createEndpointGate,
+  // 节流队列与错误分类的正典位置已迁 electron/net-throttle.js；此处按原 API 转发，
+  // 既有消费方（test/research-net.test.js 等）引用路径不变、行为不变。
+  createThrottleQueue: createThrottleQueue,
   classifyTestError: classifyTestError,
   parseCrossrefAbstract: parseCrossrefAbstract,
   parseElsevierAbstract: parseElsevierAbstract,

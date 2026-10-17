@@ -511,3 +511,20 @@ test('sanitizeNoteAssetFileName: 过滤路径语义，落盘名单文件名化',
   assert.equal(asset.fileName, '._x.png');
   assert.equal(LitModel.normalizeNote({ id: 'n1', content: 'c', assets: [{ fileName: '', path: '', cloudName: '' }] }, undefined, 5).assets.length, 0);
 });
+
+test('pinyin-pro 晚到的全局（defer 加载）不破坏中文引用键：model.js 调用期解析', function () {
+  // 复现浏览器 defer 形态：model.js 先求值、pinyin-pro 后就位。求值期捕获的旧写法
+  // 会把 undefined 焊死，中文作者引用键静默退化成 anon2024（数据级损坏，见 v8 key 保留规则）
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const vm = require('node:vm');
+  const sandbox = { window: {} };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../js/model.js'), 'utf8'), sandbox);
+  const UiModel = sandbox.window.LitModel;
+  assert.ok(UiModel, '浏览器形态挂载 window.LitModel');
+  assert.equal(UiModel.citationKeyBase({ authors: ['李四'], year: 2020 }), 'anon2020',
+    '库缺失时退化为 anon（既有行为不变，仅作对照）');
+  sandbox.window.pinyinPro = require('../vendor/pinyin-pro/pinyin-pro.js');
+  assert.equal(UiModel.citationKeyBase({ authors: ['李四'], year: 2020 }), 'lisi2020',
+    '晚到的全局在调用期被解析，引用键按拼音生成');
+});

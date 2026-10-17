@@ -5,16 +5,19 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
-const vm = require('node:vm');
 const Core = require('../js/agentcore.js');
 const Loop = require('../js/agentloop.js');
+const { createSessionStore } = require('../js/agentsessions.js');
 const { createSessions } = require('../electron/sessions.js');
 
+/* persistRun 已拆至 js/agentsessions.js（2026-10）：直接用真 store，不再切片 agentui 源码 */
 async function persistenceUi(desk) {
-  const source = await fs.readFile(path.join(__dirname, '../js/agentui.js'), 'utf8');
-  const ctx = { desk, current: null, persistWarned: {}, T: s => s, setStatus() {}, renderAttachments() {} };
-  vm.runInNewContext(source.slice(source.indexOf('  function persistRun('), source.indexOf('  /** 分叉前提交')), ctx);
-  return ctx;
+  return createSessionStore({
+    desk, T: s => s, $: () => null, el: () => ({ appendChild() {} }), deps: {}, core: Core,
+    runner: () => null, isUploadBusy: () => false, isCompactBusy: () => false,
+    setStatus() {}, renderAttachments() {}, renderChips() {}, renderMode() {}, bump() {},
+    toastText() {}, toastError() {}
+  });
 }
 
 test('first-turn checkpoint waits for the automatic session directory rename even under cache pressure', async t => {

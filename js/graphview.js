@@ -7,7 +7,9 @@
  * - 「导出 HTML」把 vis 库文本 + 图数据 + 参数元数据打成离线自包含文件
  *   （LitGraphGen.renderGraphHtml 负责脚本上下文转义）；
  *   会话里发起的构建直接存进会话附件目录（agent 流程），手动构建走另存为；
- * - 面板关闭只销毁视图，保留最近一次图数据供 AI 侧快捷重开。
+ * - 面板关闭只销毁视图，保留最近一次图数据供 AI 侧快捷重开；关闭时把节点大字段
+ *   （abstract 等）剥离成轻量快照，重开即时渲染后再按节点 id 从调研库回查补全摘要
+ *   （本地读取，不触发联网构建），面板关闭期间不把整份图数据钉在内存。
  */
 window.LitGraphView = (function () {
   'use strict';
@@ -18,10 +20,11 @@ window.LitGraphView = (function () {
 
   var desk = null;
   var deps = null;
-  var lastGraph = null;     // 原始图数据（nodes/edges/communities/meta）
+  var lastGraph = null;     // 最近一次图数据；close() 后是轻量形态（节点 abstract 已剥离）
   var lastView = null;      // LitGraphGen.viewerData 产物（vis 数据 + 文案 + 预渲染列表/详情）
   var lastTitle = '';
   var lastSeeds = [];
+  var graphToken = 0;       // 视图换代计数：作废关闭/换图后才返回的异步摘要回查
   var net = null;
   var nodes = null;
   var nodeIndex = new Map();
@@ -29,7 +32,7 @@ window.LitGraphView = (function () {
   var syncing = false;
   var freezeTimer = null;
   var animStart = 0;
-  var visLibText = null;
+  var visLibTextRef = null; // WeakRef 包箱（{text}）：两次导出之间不把 ~700KB 库全文钉在内存
 
   function $(id) { return document.getElementById(id); }
   function G() { return window.LitGraphGen; }
@@ -92,18 +95,62 @@ window.LitGraphView = (function () {
     $('graph-mask').hidden = true;
     destroyView();
     lastView = null;
+    graphToken++;            // 作废在途的摘要回查，防止迟到的结果把大字段写回轻量快照
+    lastGraph = slimGraphForReopen(lastGraph);
   }
 
-  /** 关闭后重开最近一次原生图窗，不重新联网构建。 */
+  /** close 后 lastGraph 只留重开所需的最小形态：meta/布局/边/社区原样保留，
+   *  节点剥离 abstract 等大字段（id/title/year/作者/被引等展示小字段保留）。
+   *  复制而非原地改：不触碰 agent 工具/冒烟流程传入的原始数据对象。 */
+  function slimGraphForReopen(data) {
+    if (!data || !Array.isArray(data.nodes)) return data;
+    var slim = {};
+    Object.keys(data).forEach(function (key) { slim[key] = data[key]; });
+    slim.nodes = data.nodes.map(function (node) {
+      if (!node || node.abstract == null) return node;
+      var copy = {};
+      Object.keys(node).forEach(function (key) { if (key !== 'abstract') copy[key] = node[key]; });
+      return copy;
+    });
+    return slim;
+  }
+
+  /** 关闭后重开最近一次原生图窗：先渲染轻量快照（即时、离线），
+   *  再按节点 id 从调研库回查补全摘要（本地读取，不重新联网构建）。 */
   function reopen() {
     if (!lastGraph) return false;
     showGraph(lastGraph, lastTitle);
+    backfillAbstracts(lastGraph);
     return true;
+  }
+
+  /** 轻量快照的摘要回查：researchGetWorks 是调研库本地读取；查不到/失败就保持无摘要展示。 */
+  function backfillAbstracts(graph) {
+    if (!desk || typeof desk.researchGetWorks !== 'function' || !graph || !Array.isArray(graph.nodes)) return;
+    var ids = graph.nodes.filter(function (node) { return node && node.id && node.abstract == null; })
+      .map(function (node) { return node.id; });
+    if (!ids.length) return;
+    var token = graphToken;
+    Promise.resolve().then(function () { return desk.researchGetWorks(ids); }).then(function (rows) {
+      if (token !== graphToken) return; // 期间已关闭/换图：丢弃迟到结果
+      var byId = {};
+      (rows || []).forEach(function (row) { if (row && row.id) byId[row.id] = row.abstract || ''; });
+      var touched = false;
+      graph.nodes.forEach(function (node) {
+        if (!node || node.id == null || byId[node.id] == null) return;
+        node.abstract = byId[node.id];
+        var view = nodeIndex.get(node.id);
+        if (view) view.paperAbstract = String(byId[node.id]).trim();
+        touched = true;
+      });
+      if (touched && selected) renderDetail(selected);
+    }).catch(function () { /* 回查失败：保持轻量展示，摘要留待下次构建 */ });
   }
 
   function destroyView() {
     if (freezeTimer) { clearTimeout(freezeTimer); freezeTimer = null; }
     if (net) { try { net.destroy(); } catch (error) { /* 视图已销毁 */ } net = null; }
+    window.__network = null; // 已销毁的 vis.Network 不得再被 UI 全局钉住
     nodes = null;
     nodeIndex = new Map();
     selected = null;
@@ -144,6 +191,7 @@ window.LitGraphView = (function () {
   /** 直接展示已组装好的图数据（agent 工具 build_graph / 手动构建共用） */
   function showGraph(data, title) {
     lastGraph = data;
+    graphToken++;           // 换图作废在途的旧图摘要回查
     if (!lastSeeds.length) lastSeeds = (data && data.meta && data.meta.seeds) || [];
     if (title) lastTitle = title;
     $('graph-mask').hidden = false;
@@ -264,10 +312,14 @@ window.LitGraphView = (function () {
   }
 
   async function ensureVisLibText() {
-    if (visLibText) return visLibText;
+    var box = visLibTextRef && visLibTextRef.deref();
+    if (box) return box.text;
     var response = await fetch('vendor/vis-network/vis-network.min.js');
-    visLibText = await response.text();
-    return visLibText;
+    var text = await response.text();
+    // WeakRef 只能挂对象：字符串装箱。导出之间该箱可被回收（下次导出重新 fetch），
+    // 不把 ~700KB 的库全文常驻内存；无 WeakRef 的环境干脆不缓存。
+    if (typeof WeakRef === 'function') visLibTextRef = new WeakRef({ text: text });
+    return text;
   }
 
   /** 导出离线自包含 HTML：agent 会话里发起的存会话附件，手动入口走另存为 */

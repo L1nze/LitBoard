@@ -8,6 +8,7 @@ const os = require('node:os');
 const vm = require('node:vm');
 const Core = require('../js/agentcore.js');
 const Agent = require('../js/agenttools.js');
+const Sessions = require('../js/agentsessions.js');
 const { createReferences } = require('../electron/agent-reference.js');
 const { createSessions } = require('../electron/sessions.js');
 const source = fs.readFileSync(path.join(__dirname, '../js/agentui.js'), 'utf8');
@@ -19,16 +20,28 @@ function node(tag, text) {
 }
 function harness(run, desktop) {
   const nodes = new Map(), statuses = [];
+  /* 会话状态（runs/current/newSession）住在 js/agentsessions.js：注入真 store；
+   * uploadReferences/sendText（连同 renderPendingReferences/renderPlan）仍在 agentui.js，继续切片。 */
   const context = {
-    uploadBusy: false, compactBusy: false, forkBusy: false, current: run.id, runs: new Map([[run.id, run]]),
+    S: Sessions.createSessionStore({
+      desk: desktop, T: (s) => s, $: (id) => { if (!nodes.has(id)) nodes.set(id, node('div')); return nodes.get(id); },
+      el: (tag, _cls, text) => node(tag, text), deps: {}, core: Core,
+      runner: () => ({ isStreaming: () => false, runTurn: async () => {} }),
+      isUploadBusy: () => false, isCompactBusy: () => false,
+      setStatus: (text) => statuses.push(text), renderAttachments() {}, renderChips() {}, renderMode() {}, bump() {},
+      toastText: (text) => statuses.push(text), toastError: (e) => statuses.push(e.message)
+    }),
+    uploadBusy: false, compactBusy: false,
     T: (s) => s, $: (id) => { if (!nodes.has(id)) nodes.set(id, node('div')); return nodes.get(id); },
     el: (tag, _cls, text) => node(tag, text), setStatus: (text) => statuses.push(text), toastText: (text) => statuses.push(text), toastError: (e) => statuses.push(e.message),
-    desk: desktop, window: { LitAgentCore: Core, LitAgent: Agent }, freezeContext: () => ({ model: 'text-model' }),
-    thinkingCapability: () => ({ vision: false }), renderAttachments() {}, renderChips() {}, persistRun() {},
+    desk: desktop, window: { LitAgentCore: Core, LitAgent: Agent, LitResearch: { sessionTitleFrom: (t) => t } }, freezeContext: () => ({ model: 'text-model' }),
+    thinkingCapability: () => ({ vision: false }), renderAttachments() {}, renderChips() {}, renderPendingReferences() {},
     bump() {}, tools: Agent.createTools({ desktop: desktop }), runner: { isStreaming: () => false, runTurn: async () => {} }
   };
+  context.S.runs.set(run.id, run);
+  context.S.current = run.id;
   vm.runInNewContext(source.slice(source.indexOf('  function uploadReferences('), source.indexOf('  function renderAttachments(')) +
-    source.slice(source.indexOf('  function sendText('), source.indexOf('  /* ---------------- core.messages')), context);
+    source.slice(source.indexOf('  function sendText('), source.indexOf('  /* ---------------- 快照推送')), context);
   return { context, nodes, statuses };
 }
 

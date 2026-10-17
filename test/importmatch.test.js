@@ -103,34 +103,34 @@ test('indexPaper makes newly added papers matchable', function () {
   assert.equal(hit.paper.id, 'n1');
 });
 
-// ---------- mergeAttachments ----------
+// ---------- mergeAttachmentsDetailed（附件并入；.attachments 为合并结果） ----------
 
-test('mergeAttachments is a no-op when candidate has no attachments (bib/ris/json import)', function () {
+test('mergeAttachmentsDetailed is a no-op when candidate has no attachments (bib/ris/json import)', function () {
   const target = p({ attachments: [att({ id: 'a1', path: 'C:/lib/old.pdf' })] });
-  const merged = LitDedupe.mergeAttachments(target, p({}));
+  const merged = LitDedupe.mergeAttachmentsDetailed(target, p({})).attachments;
   assert.equal(merged.length, 1);
   assert.equal(merged[0].id, 'a1');
 });
 
-test('mergeAttachments makes incoming PDF the primary when target has no PDF', function () {
+test('mergeAttachmentsDetailed makes incoming PDF the primary when target has no PDF', function () {
   const target = p({ attachments: [att({ id: 's1', kind: 'supp', fileName: 'supp.zip' })] });
   const incoming = p({ attachments: [att({ id: 'n1', path: 'C:/new.pdf', fingerprint: 'b'.repeat(64) })] });
-  const merged = LitDedupe.mergeAttachments(target, incoming);
+  const merged = LitDedupe.mergeAttachmentsDetailed(target, incoming).attachments;
   assert.equal(merged.length, 2);
   assert.equal(merged[0].id, 'n1');
   assert.equal(merged[0].kind, 'pdf');
 });
 
-test('mergeAttachments appends PDF as extra attachment when target already has a primary', function () {
+test('mergeAttachmentsDetailed appends PDF as extra attachment when target already has a primary', function () {
   const target = p({ attachments: [att({ id: 'a1', path: 'C:/lib/main.pdf', fingerprint: 'c'.repeat(64) })] });
   const incoming = p({ attachments: [att({ id: 'n1', path: 'C:/dl/version2.pdf', fingerprint: 'd'.repeat(64) })] });
-  const merged = LitDedupe.mergeAttachments(target, incoming);
+  const merged = LitDedupe.mergeAttachmentsDetailed(target, incoming).attachments;
   assert.equal(merged.length, 2);
   assert.equal(merged[0].id, 'a1'); // 主 PDF 不动
   assert.equal(merged[1].id, 'n1');
 });
 
-test('mergeAttachments dedupes by fingerprint, path (case-insensitive) and id', function () {
+test('mergeAttachmentsDetailed dedupes by fingerprint, path (case-insensitive) and id', function () {
   const fp = 'e'.repeat(64);
   const target = p({ attachments: [att({ id: 'a1', path: 'C:/Lib/Main.pdf', fingerprint: fp })] });
   const incoming = p({ attachments: [
@@ -139,7 +139,7 @@ test('mergeAttachments dedupes by fingerprint, path (case-insensitive) and id', 
     att({ id: 'a1', path: 'D:/other.pdf' }),                                // 同 id → 丢
     att({ id: 'x3', path: 'D:/really-new.pdf', fingerprint: 'f'.repeat(64) })
   ] });
-  const merged = LitDedupe.mergeAttachments(target, incoming);
+  const merged = LitDedupe.mergeAttachmentsDetailed(target, incoming).attachments;
   assert.equal(merged.length, 2);
   assert.equal(merged[1].id, 'x3');
 });
@@ -168,10 +168,10 @@ test('mergeAttachmentsDetailed keeps different PDF versions on one entry', funct
   assert.deepEqual(merged.attachments.map(function (item) { return item.id; }), ['v1', 'v2']);
 });
 
-test('mergeAttachments does not mutate inputs', function () {
+test('mergeAttachmentsDetailed does not mutate inputs', function () {
   const target = p({ attachments: [att({ id: 'a1', path: 'C:/lib/main.pdf' })] });
   const incoming = p({ attachments: [att({ id: 'n1', path: 'C:/new.pdf' })] });
-  const merged = LitDedupe.mergeAttachments(target, incoming);
+  const merged = LitDedupe.mergeAttachmentsDetailed(target, incoming).attachments;
   assert.equal(target.attachments.length, 1);
   assert.equal(incoming.attachments.length, 1);
   assert.equal(merged.length, 2);

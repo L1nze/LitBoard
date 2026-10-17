@@ -12,6 +12,21 @@
   var engine = null;        // { instance, createPromise } —— PaddleOCR worker 实例（懒创建，单例）
   var engineLangDir = '';
   var cancelled = false;
+  var idleTimer = 0;        // 用后空闲回收：OCR worker（wasm 运行时）不永久常驻
+  var IDLE_TERMINATE_MS = 5 * 60 * 1000;
+
+  function clearIdleTerminate() {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = 0; }
+  }
+
+  /** 识别结束后计时：5 分钟无新请求即 dispose worker（下次 ensureEngine 自愈重建） */
+  function scheduleIdleTerminate() {
+    clearIdleTerminate();
+    idleTimer = setTimeout(function () {
+      idleTimer = 0;
+      terminate();
+    }, IDLE_TERMINATE_MS);
+  }
 
   function vendorUrl(rel) {
     return new URL('vendor/paddleocr/' + rel, document.baseURI).href;
@@ -57,6 +72,7 @@
 
   /** 创建/复用 worker 实例。numThreads 恒 1：无 COI 头时无 SharedArrayBuffer，多线程不可用。 */
   function ensureEngine(langDir) {
+    clearIdleTerminate();
     if (engine && engine.instance && engineLangDir === langDir) return Promise.resolve(engine.instance);
     return terminate().then(function () {
       return loadEngineScript();
@@ -101,7 +117,14 @@
 
   function cancel() {
     cancelled = true;
+    clearIdleTerminate();
     return terminate();
+  }
+
+  /** 页间让步：每页渲染前回到事件循环一轮，期间到达的阅读器渲染/文本层请求
+   *  先行发出（worker 端另有低优先级通道，两者叠加保证 OCR 大活不挡翻页）。 */
+  function yieldToUi() {
+    return new Promise(function (resolve) { setTimeout(resolve, 0); });
   }
 
   /**
@@ -118,20 +141,31 @@
       function next() {
         if (index >= total || cancelled) return Promise.resolve(result);
         var pageIndex = pageIndexes[index++];
-        return renderPage(pageIndex).then(function (canvas) {
-          return instance.predict(canvas);
-        }).then(function (out) {
-          var items = out && out[0] && out[0].items || [];
-          result[pageIndex] = items.map(function (it) { return it && it.text || ''; }).join('\n');
-          if (onProgress) onProgress({ done: index, total: total, page: pageIndex + 1 });
-          return next();
-        }).catch(function () {
-          result[pageIndex] = '';
-          if (onProgress) onProgress({ done: index, total: total, page: pageIndex + 1 });
-          return next();
+        return yieldToUi().then(function () {
+          if (cancelled) return result;
+          return renderPage(pageIndex).then(function (canvas) {
+            return instance.predict(canvas);
+          }).then(function (out) {
+            var items = out && out[0] && out[0].items || [];
+            result[pageIndex] = items.map(function (it) { return it && it.text || ''; }).join('\n');
+            if (onProgress) onProgress({ done: index, total: total, page: pageIndex + 1 });
+            return next();
+          }).catch(function () {
+            result[pageIndex] = '';
+            if (onProgress) onProgress({ done: index, total: total, page: pageIndex + 1 });
+            return next();
+          });
         });
       }
-      return next().then(function () { return { pages: result }; });
+      return next().then(function (pages) {
+        return { pages: pages };
+      }).finally(function () {
+        // 批次收尾即起空闲计时；再次 ocrPages/ensureData 会清掉
+        scheduleIdleTerminate();
+      });
+    }, function (error) {
+      scheduleIdleTerminate();
+      throw error;
     });
   }
 

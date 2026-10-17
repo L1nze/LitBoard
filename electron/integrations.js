@@ -188,10 +188,17 @@ function createIntegrations(options) {
   }
   async function runSyncTask(task) {
     if (activeSync) throw new Error('已有同步任务正在进行');
+    // 同步会话边界：hashWorkspace 引用键控缓存只在单次同步流程内复用。
+    // IPC 传入的 workspace 每次都是新克隆对象，跨任务/跨调用的引用天然不同；
+    // 会话开始即清空，保证「工作区内容已变更」绝不复用旧哈希（见 hashWorkspace）。
+    workspaceHashCache.clear();
     const controller = new AbortController();
     activeSync = controller;
     try { return await syncContext.run(controller, task); }
-    finally { if (activeSync === controller) activeSync = null; }
+    finally {
+      if (activeSync === controller) activeSync = null;
+      workspaceHashCache.clear();
+    }
   }
   /* 只读的云端检查/计划生成（inspectNutstoreRemote / createNutstoreSyncPlan）不占
    * 同步串行锁（与正在进行的同步交错读取是既有语义），但必须登记进取消注册表：
@@ -1040,14 +1047,25 @@ function createIntegrations(options) {
   }
 
   let cnkiTokenCache = { value: '', t: 0 };
+  let cnkiTokenPromise = null;
   async function getCnkiToken() {
-    // 令牌复用 4 分钟（zotero-pdf-translate 缓存 5 分钟，留安全余量）
+    // 令牌复用 4 分钟（zotero-pdf-translate 缓存 5 分钟，留安全余量）；
+    // 并发分块下首个取令牌的请求在途时后来者共用同一 promise，不重复请求
     if (cnkiTokenCache.value && Date.now() - cnkiTokenCache.t < 4 * 60 * 1000) return cnkiTokenCache.value;
-    const tokenRequest = LitTranslate.buildCnkiTokenRequest();
-    const response = await request(tokenRequest.url, tokenRequest.init);
-    const token = LitTranslate.parseCnkiToken(await readTranslationBody(response, 'CNKI 学术翻译'));
-    cnkiTokenCache = { value: token, t: Date.now() };
-    return token;
+    if (!cnkiTokenPromise) {
+      cnkiTokenPromise = (async function () {
+        try {
+          const tokenRequest = LitTranslate.buildCnkiTokenRequest();
+          const response = await request(tokenRequest.url, tokenRequest.init);
+          const token = LitTranslate.parseCnkiToken(await readTranslationBody(response, 'CNKI 学术翻译'));
+          cnkiTokenCache = { value: token, t: Date.now() };
+          return token;
+        } finally {
+          cnkiTokenPromise = null; // 失败/成功都允许下一轮重取
+        }
+      })();
+    }
+    return cnkiTokenPromise;
   }
 
   function cnkiWords(text) {
@@ -1079,18 +1097,45 @@ function createIntegrations(options) {
     return String(parsed);
   }
 
+  // 免费接口分块并发数：保守 2（总速率仍受服务商限制约束）。块间保持 200ms
+  // 的请求起始间隔（与旧串行版的礼貌限速一致），重叠的只是上一块的网络往返。
+  const TRANSLATE_CHUNK_CONCURRENCY = 2;
+  const TRANSLATE_CHUNK_GAP_MS = 200;
+
   async function translateFreeText(providerName, text, config) {
     const spec = LitTranslate.FREE_SERVICES[providerName];
     const label = FREE_PROVIDER_LABELS[providerName] || providerName;
     if (text.length > spec.max) throw new Error(label + '单次不能超过 ' + spec.max + ' 个字符');
     const targetCode = LitTranslate.freeTargetCode(providerName, config.translatorTarget === 'en' ? 'en' : 'zh');
     const chunks = LitTranslate.splitChunks(text, spec.chunk);
-    const outputs = [];
-    for (let i = 0; i < chunks.length; i++) {
-      // 免费接口礼貌限速：多块顺序翻译，块间稍作停顿
-      if (i) await new Promise(function (resolve) { setTimeout(resolve, 200); });
-      outputs.push(await translateFreeChunk(providerName, chunks[i], targetCode));
-    }
+    const outputs = new Array(chunks.length);
+    let nextIndex = 0;
+    let failed = false;
+    // 下一次块请求的最早开始时刻：拿槽位时排入 200ms 后的队，保证任意两个
+    // 请求的起始间隔 ≥200ms（首个块立即开始，与旧串行实现相同）。
+    let startGate = Promise.resolve();
+    const runWorker = async function () {
+      while (!failed) {
+        const index = nextIndex++;
+        if (index >= chunks.length) return;
+        const gate = startGate;
+        startGate = gate.then(function () {
+          return new Promise(function (resolve) { setTimeout(resolve, TRANSLATE_CHUNK_GAP_MS); });
+        });
+        await gate;
+        try {
+          outputs[index] = await translateFreeChunk(providerName, chunks[index], targetCode);
+        } catch (error) {
+          // 与旧串行实现一致的失败语义：任一块失败即整体失败，其余 worker
+          // 完成手头块后不再拉取新块（至多多发一个已在途的请求）
+          failed = true;
+          throw error;
+        }
+      }
+    };
+    const workers = [];
+    for (let w = 0; w < Math.min(TRANSLATE_CHUNK_CONCURRENCY, chunks.length); w++) workers.push(runWorker());
+    await Promise.all(workers);
     return outputs.join('').trim();
   }
 
@@ -1138,11 +1183,42 @@ function createIntegrations(options) {
     return { provider: providerName, translation: String(translated).trim() };
   }
 
+  /* 划词翻译结果 LRU：同段文字反复划词不再重复等待网络往返。键 =
+   * provider+target+sha1(text)，只在内容完全命中时使用（部分命中不拼接）；
+   * 故意不含模型名/凭据——切换模型或账号后沿用已缓存译文，划词场景可接受。
+   * testTranslationConnection 不走此缓存（连接测试必须真实出网）。 */
+  const TRANSLATION_CACHE_LIMIT = 200;
+  const translationCache = new Map();
+  function translationCacheKey(providerName, target, text) {
+    return providerName + '\n' + (target === 'en' ? 'en' : 'zh') + '\n' +
+      crypto.createHash('sha1').update(text, 'utf8').digest('hex');
+  }
+  function translationCacheGet(key) {
+    if (!translationCache.has(key)) return undefined;
+    const value = translationCache.get(key);
+    translationCache.delete(key); // LRU：命中即移到最新端
+    translationCache.set(key, value);
+    return value;
+  }
+  function translationCachePut(key, value) {
+    if (translationCache.has(key)) translationCache.delete(key);
+    translationCache.set(key, value);
+    if (translationCache.size > TRANSLATION_CACHE_LIMIT) {
+      translationCache.delete(translationCache.keys().next().value); // 淘汰最旧
+    }
+  }
+
   async function translateText(input) {
     const text = String(input && input.text || '').trim();
     if (!text) throw new Error('请选择需要翻译的文字');
     const config = await loadRawConfig();
-    return requestTranslation(text, config, decrypt(config.translatorApiKey));
+    const providerName = translators[config.translatorProvider] ? config.translatorProvider : DEFAULT_TRANSLATOR;
+    const cacheKey = translationCacheKey(providerName, config.translatorTarget, text);
+    const cached = translationCacheGet(cacheKey);
+    if (cached !== undefined) return { provider: providerName, translation: cached };
+    const result = await requestTranslation(text, config, decrypt(config.translatorApiKey));
+    translationCachePut(cacheKey, result.translation);
+    return result;
   }
 
   async function testTranslationConnection(input) {
@@ -1564,6 +1640,9 @@ function createIntegrations(options) {
     }
     result.exists = true;
     result.remote = remote;
+    // 下载解析处算一次整库哈希挂到返回值上：下游（写前比对、apply 失效判定、
+    // 写后校验）直接取 remoteHash / 命中 hashWorkspace 引用缓存，不再重算。
+    result.remoteHash = hashWorkspace(remote);
     await archiveLocalLibrary(remote);
     return result;
   }
@@ -1711,7 +1790,9 @@ function createIntegrations(options) {
     }
     reportProgress('upload', '正在写入云端库…');
     const payload = LitSync.createSyncEnvelope(workspace);
-    await conditionalPut(remoteOptions.fileUrl, JSON.stringify(payload, null, 2), remoteOptions.headers,
+    // 紧凑 JSON：体积比 pretty-print 小 10-20%，直接省坚果云流量与按体积放宽的
+    // 请求超时预算。读回路径只 JSON.parse，对格式无依赖（远端旧 pretty 文件照常读）。
+    await conditionalPut(remoteOptions.fileUrl, JSON.stringify(payload), remoteOptions.headers,
       baseline.etag, { contentType: 'application/json; charset=utf-8', label: '坚果云写入',
         conditional: baseline.exists, createOnly: !baseline.exists });
     reportProgress('verify-write', '正在确认云端写入结果…');
@@ -1824,7 +1905,20 @@ function createIntegrations(options) {
     return { hash: actualHash, size: actualSize };
   }
 
+  /** 附件同步会把 cloudName/cloudHash/cloudSize 等元数据**原地写回**工作区对象；
+   *  该对象（以及与它共享实体引用的 cloudWorkspace 形态——applyPinsToWorkspace
+   *  在无 pins 时直接返回原引用）此前若进过 hashWorkspace 的引用缓存，哈希已
+   *  过期。凡从本函数返回（含抛错）一律整体失效哈希缓存，finalWrite 的内容
+   *  比对必须基于当前内容而非变更前。 */
   async function syncWorkspaceAssets(workspace, remoteOptions, settings) {
+    try {
+      return await runSyncWorkspaceAssets(workspace, remoteOptions, settings);
+    } finally {
+      workspaceHashCache.clear();
+    }
+  }
+
+  async function runSyncWorkspaceAssets(workspace, remoteOptions, settings) {
     const config = settings || {};
     const failures = [];
     const made = {};
@@ -2310,14 +2404,37 @@ function createIntegrations(options) {
   /** 云端写入前的附件元数据净化（对象先行不变式的写侧执行）：
    *  verifiedNames（本会话上传/核实成功）∪ 真实远端清单之外的 cloudName 一律
    *  剥离，云端库 JSON 不留下「词条声称有附件但对象不存在」的悬空登记。
-   *  返回净化后的深拷贝（绝不原地改动合并结果）；knownRemoteAssets 为 null
-   *  （服务器不支持清单）时不净化，维持旧语义。 */
+   *  绝不原地改动入参：先对原对象只读扫描判定剥离点，确有剥离才深拷贝后在
+   *  拷贝上执行（同一判定、同一遍历序，剥离结果与拷贝后判定逐位一致）；
+   *  零剥离的常见路径（健康同步的 finalLocal / 无悬空登记的 firstPass）直接
+   *  返回原对象引用，省一次全库深克隆。knownRemoteAssets 为 null（服务器
+   *  不支持清单）时不净化，维持旧语义。 */
   function sanitizeCloudAssets(workspace, verifiedNames, knownRemoteAssets) {
     if (!knownRemoteAssets) return { workspace: workspace, stripped: 0 };
-    const out = cloneJson(workspace);
     const verified = verifiedNames instanceof Set ? verifiedNames : new Set();
+    const doomed = [];
+    const collect = function (asset) {
+      if (!asset) return;
+      const name = safeCloudName(asset.cloudName);
+      if (name && !cloudNameInSet(verified, name) && !cloudNameInSet(knownRemoteAssets, name)) doomed.push(asset);
+    };
+    const walk = function (value, visit) {
+      (Array.isArray(value && value.papers) ? value.papers : []).forEach(function (paper) {
+        if (!paper) return;
+        (Array.isArray(paper.attachments) ? paper.attachments : []).forEach(visit);
+        (Array.isArray(paper.pdfAnnotations) ? paper.pdfAnnotations : []).forEach(function (annotation) {
+          if (annotation && annotation.type === 'snapshot') visit(annotation);
+        });
+      });
+      (Array.isArray(value && value.notes) ? value.notes : []).forEach(function (note) {
+        if (note) (Array.isArray(note.assets) ? note.assets : []).forEach(visit);
+      });
+    };
+    walk(workspace, collect);
+    if (!doomed.length) return { workspace: workspace, stripped: 0 };
+    const out = cloneJson(workspace);
     let stripped = 0;
-    const visit = function (asset) {
+    walk(out, function (asset) {
       if (!asset) return;
       const name = safeCloudName(asset.cloudName);
       if (name && !cloudNameInSet(verified, name) && !cloudNameInSet(knownRemoteAssets, name)) {
@@ -2326,18 +2443,20 @@ function createIntegrations(options) {
         delete asset.cloudSize;
         stripped++;
       }
-    };
-    (Array.isArray(out.papers) ? out.papers : []).forEach(function (paper) {
-      if (!paper) return;
-      (Array.isArray(paper.attachments) ? paper.attachments : []).forEach(visit);
-      (Array.isArray(paper.pdfAnnotations) ? paper.pdfAnnotations : []).forEach(function (annotation) {
-        if (annotation && annotation.type === 'snapshot') visit(annotation);
-      });
-    });
-    (Array.isArray(out.notes) ? out.notes : []).forEach(function (note) {
-      if (note) (Array.isArray(note.assets) ? note.assets : []).forEach(visit);
     });
     return { workspace: out, stripped: stripped };
+  }
+
+  /** 附件核对后是否出现了「清单里没有、本会话新核实」的 cloudName：没有则
+   *  finalPass 的净化结果与 firstPass 逐位相同（保留条件 verified ∪ known 与
+   *  known 完全一致），可直接复用 firstPass 的结果对象，免第二次全库深克隆；
+   *  有新上传/新核实的名字才重建。 */
+  function hasUnlistedVerifiedNames(verifiedNames, knownRemoteAssets) {
+    if (!(verifiedNames instanceof Set) || !knownRemoteAssets || !verifiedNames.size) return false;
+    for (const name of verifiedNames) {
+      if (!cloudNameInSet(knownRemoteAssets, name)) return true;
+    }
+    return false;
   }
 
   async function writeSyncBase(value) {
@@ -2460,6 +2579,7 @@ function createIntegrations(options) {
       fileUrl: remoteOptions.fileUrl,
       libraryEtag: library.etag || '',
       remote: remote,
+      remoteHash: library.remoteHash || '',
       config: { exists: remoteConfig.exists, locked: remoteConfig.locked, etag: remoteConfig.etag || '',
         value: portableConfigView(remoteConfig.value), pathConflict: !!remoteConfig.pathConflict },
       counts: {
@@ -2601,6 +2721,9 @@ function createIntegrations(options) {
       remoteExists: inspected.exists,
       remoteEtag: inspected.libraryEtag || '',
       remote: inspected.remote || { papers: [], folders: [] },
+      // 计划生成时对远端 payload 算好的整库哈希：apply 的失效判定直接复用，
+      // 免得跨任务后再把 plan.remote 全库重哈希一遍
+      remoteHash: inspected.remoteHash || '',
       local: localValue,
       base: base && base.workspace ? base.workspace : null,
       workspace: corePlan.preview.workspace,
@@ -2808,7 +2931,8 @@ function createIntegrations(options) {
     reportProgress('verify', { message: '正在校验云端版本…' });
     const current = await readRemoteLibrary(plan._options);
     if (current.exists !== plan.remoteExists || current.etag !== plan.remoteEtag ||
-        (!current.etag && current.exists && hashWorkspace(current.remote) !== hashWorkspace(plan.remote))) {
+        (!current.etag && current.exists &&
+          (current.remoteHash || hashWorkspace(current.remote)) !== (plan.remoteHash || hashWorkspace(plan.remote)))) {
       pendingSyncPlans.delete(plan.planId);
       const error = new RemoteChangedError('云端内容已变化，旧同步计划已失效，请重新生成', plan._options.fileUrl);
       error.code = 'SYNC_PLAN_STALE';
@@ -2920,7 +3044,12 @@ function createIntegrations(options) {
         }
       });
       throwIfSyncCancelled();
-      const finalPass = sanitizeCloudAssets(cloudWorkspace, session.verifiedNames, knownRemoteAssets);
+      // 终写净化：附件核对未引入清单外新核实的 cloudName 时，净化结果与
+      // firstPass 逐位相同，直接复用同一结果对象（省一次全库深克隆与整库重哈希）；
+      // 有新上传/新核实的名字才重建。
+      const finalPass = hasUnlistedVerifiedNames(session.verifiedNames, knownRemoteAssets)
+        ? sanitizeCloudAssets(cloudWorkspace, session.verifiedNames, knownRemoteAssets)
+        : firstPass;
       const finalLocal = sanitizeCloudAssets(workspace, session.verifiedNames, knownRemoteAssets);
       const finalWrite = await writeCloudLibrary(plan._options, finalPass.workspace, firstWrite.current, function (phase, message) {
         reportProgress(phase, { message: message });
@@ -3030,8 +3159,11 @@ function createIntegrations(options) {
       });
       // 终写净化：只有本会话核实（上传/下载/签名）或真实清单确认存在的附件
       // 元数据才进云端 JSON；悬空登记剥离。云端写/基线用净化后的 cloud 形态，
-      // 本地应用用净化后的合并结果（保持 pins 的两侧分叉语义）。
-      const finalPass = sanitizeCloudAssets(cloudWorkspace, session.verifiedNames, knownRemoteAssets);
+      // 本地应用用净化后的合并结果（保持 pins 的两侧分叉语义）。附件核对未引入
+      // 清单外新核实的 cloudName 时复用 firstPass 的结果对象，免第二次全库深克隆。
+      const finalPass = hasUnlistedVerifiedNames(session.verifiedNames, knownRemoteAssets)
+        ? sanitizeCloudAssets(cloudWorkspace, session.verifiedNames, knownRemoteAssets)
+        : firstPass;
       const finalLocal = sanitizeCloudAssets(merged, session.verifiedNames, knownRemoteAssets);
       const finalWrite = await writeCloudLibrary(remoteOptions, finalPass.workspace, firstWrite.current, function (phase, message) {
         emitSyncProgress({ scope: 'sync', phase: phase, message: message });
@@ -3093,14 +3225,32 @@ function createIntegrations(options) {
   async function createSyncPlan(input) { return createNutstoreSyncPlan(input); }
   async function applySyncPlan(input) { return applyNutstoreSyncPlan(input); }
 
+  /* 引用键控的哈希缓存：同一次同步流程内对同一 workspace 对象（引用相等）只
+   * 算一次哈希。一次自动同步原本要对全库过 4-8 遍 hashWorkspace（写前比对、
+   * 备份去重、写后校验、apply 失效判定各 1-2 遍，全在主进程消息泵里）。
+   * 失效防线有三：runSyncTask 会话开始/结束各清一次（绝不跨任务复用）；
+   * syncWorkspaceAssets 出口清一次（它会把附件元数据原地写回工作区，是链路里
+   * 唯一的原地变更点，见其注释）；条目超上限整体清空兜底（同一会话同时存活
+   * 的形态屈指可数，上限只防理论上的镜像整理长循环）。 */
+  const WORKSPACE_HASH_CACHE_LIMIT = 24;
+  const workspaceHashCache = new Map();
+
   function hashWorkspace(value) {
+    if (value && typeof value === 'object' && workspaceHashCache.has(value)) {
+      return workspaceHashCache.get(value);
+    }
     const ws = LitSync.syncWorkspace(value);
     const signatures = LitModel.workspaceSignatures(ws);
-    return crypto.createHash('sha1')
+    const hash = crypto.createHash('sha1')
       // 内容哈希排除由 normalize 生成的 addedAt/updatedAt，避免同一
       // 旧格式远端在两次读取之间因补默认时间而被误判为发生变化。
       .update(JSON.stringify([signatures.papers, signatures.notes, signatures.folders, signatures.savedSearches, signatures.tagColorRecords]))
       .digest('hex');
+    if (value && typeof value === 'object') {
+      if (workspaceHashCache.size >= WORKSPACE_HASH_CACHE_LIMIT) workspaceHashCache.clear();
+      workspaceHashCache.set(value, hash);
+    }
+    return hash;
   }
 
   async function testNutstoreConnection(input) {

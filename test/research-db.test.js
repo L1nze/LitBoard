@@ -118,39 +118,6 @@ test('updateWorkText：写 provenance 并使向量失效；内容未变短路（
   }
 });
 
-test('importFromHarness maps and imports idempotently', async function () {
-  const { db, dir } = await makeDb();
-  // 构造一个最小 harness 形态的库
-  const harnessFile = path.join(dir, 'harness.db');
-  const h = new DatabaseSync(harnessFile);
-  h.exec(`CREATE TABLE works(
-    id TEXT PRIMARY KEY, doi TEXT, title TEXT, publication_year INTEGER,
-    publication_date TEXT, type TEXT, cited_by_count INTEGER, is_oa INTEGER,
-    language TEXT, abstract TEXT, authors_json TEXT, concepts_json TEXT,
-    keywords_json TEXT, referenced_works TEXT, source_id TEXT, source_name TEXT, oa_url TEXT)`);
-  h.prepare(`INSERT INTO works(id, doi, title, publication_year, cited_by_count, is_oa, abstract,
-    authors_json, concepts_json, referenced_works, source_id, source_name)
-    VALUES('https://openalex.org/W9', 'https://doi.org/10.1/B', 'Imported Work', 2020, 5, 1, 'abs text',
-    '[{"display_name":"Author A"}]', '["AI"]', '["W1","W2"]', 'https://openalex.org/S3', 'Journal X')`).run();
-  h.close();
-  try {
-    let last = null;
-    const r = await db.importFromHarness(harnessFile, function (p) { last = p; });
-    assert.equal(r.imported, 1);
-    assert.ok(last && last.done === 1 && last.total === 1);
-    const [row] = db.getWorks(['W9']);
-    assert.equal(row.doi, '10.1/b');
-    assert.equal(row.sourceId, 'S3');
-    assert.deepEqual(row.authors, [{ name: 'Author A' }]);
-    assert.deepEqual(row.refs, ['W1', 'W2']);
-    // 再导入一遍：幂等
-    const r2 = await db.importFromHarness(harnessFile, function () {});
-    assert.equal(r2.imported, 1);
-    assert.equal(db.stats().total, 1);
-    await assert.rejects(function () { return db.importFromHarness(path.join(dir, 'nope.db'), function () {}); });
-  } finally { db.close(); }
-});
-
 test('vec layer: put, pending by hash/model/recipe, cosine search with year filter', async function () {
   const { db } = await makeDb();
   try {
@@ -253,33 +220,7 @@ test('待办扫描：pendingEmbeddings 两段式（戳在即跳过，不再逐�
   }
 });
 
-test('身份体系：identity core 空库 round-trip（元数据留空身份保留）；addExtIds / findIdByNormalizedTitle 挂靠既有身份', async function () {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-idcore-'));
-  const db1 = createResearchDb({ dir });
-  await db1.open();
-  db1.upsertWorks([{ id: 'W30', doi: '10.1/z', title: 'Keep me', year: 2022, abstract: 'rebuildable' }]);
-  db1.updateWorkText('W30', { abstract: 'backfilled' }, 'crossref');
-  db1.recordSearch({ q: 'q', filters: {}, count: 3 });
-  const core = db1.exportIdentityCore();
-  db1.close();
-
-  // 恢复场景：空目录新建库 → 导入身份核
-  const dir2 = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-idcore2-'));
-  const db2 = createResearchDb({ dir: dir2 });
-  await db2.open();
-  const r = db2.importIdentityCore(core);
-  assert.equal(r.works, 1);
-  assert.equal(db2.stats().total, 1);
-  assert.equal(db2.stats().searches, 1);
-  const [row] = db2.getWorks(['W30']);
-  assert.equal(row.title, 'Keep me');
-  assert.equal(row.year, 2022);
-  assert.equal(row.doi, '10.1/z');
-  assert.equal(row.abstract, ''); // 元数据留空待重建，身份保留
-  // provenance 恢复（updateWorkText 曾记录）
-  assert.equal(db2.findByExtId('doi', '10.1/z'), 'W30');
-  db2.close();
-
+test('身份体系：addExtIds / findIdByNormalizedTitle 挂靠既有身份', async function () {
   const { db } = await makeDb();
   try {
     db.upsertWorks([{ id: 'W50', title: 'Zinc-Ion Batteries: A Review', doi: '10.1/z' }]);

@@ -16,7 +16,7 @@ function sha256(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
-async function makeEnv(t) {
+async function makeEnv(t, options) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-bk-'));
   const configDir = path.join(root, 'config');
   const libraryDir = path.join(root, 'savefolder');
@@ -25,9 +25,9 @@ async function makeEnv(t) {
   await fs.mkdir(configDir, { recursive: true });
   await fs.mkdir(libraryDir, { recursive: true });
   await fs.mkdir(defaultDir, { recursive: true });
-  await fs.writeFile(path.join(defaultDir, 'data-paths.json'), JSON.stringify({
-    version: 1, configDir: configDir, libraryDir: libraryDir
-  }), 'utf8');
+  const locator = { version: 1, configDir: configDir, libraryDir: libraryDir };
+  if (options && options.backupKeep != null) locator.backupKeep = options.backupKeep;
+  await fs.writeFile(path.join(defaultDir, 'data-paths.json'), JSON.stringify(locator), 'utf8');
   const dataPathManager = createDataPathManager({ defaultDir: defaultDir });
   dataPathManager.prepareAtStartup();
   const db = createLibraryDb(libraryDir);
@@ -361,9 +361,8 @@ test('snapshot listing is cheap by default and only hashes assets when asked', a
 });
 
 test('rotation honours a user-configured retention count', async function (t) {
-  const env = await makeEnv(t);
+  const env = await makeEnv(t, { backupKeep: 2 });
   env.dataPathManager.stageBackupDir(env.backupDir);
-  env.dataPathManager.stageBackupKeep(2);
   assert.equal(env.dataPathManager.getState().backupKeep, 2);
   assert.equal((await env.manager.status()).keepSnapshots, 2);
 
@@ -374,15 +373,6 @@ test('rotation honours a user-configured retention count', async function (t) {
     assert.equal(result.prunedSnapshots, i >= 2 ? 1 : 0);
   }
   assert.equal((await env.manager.listSnapshots()).length, 2);
-
-  assert.throws(function () { env.dataPathManager.stageBackupKeep(0.5); }, /1–30/);
-  assert.throws(function () { env.dataPathManager.stageBackupKeep(31); }, /1–30/);
-  // 还没设置备份目录时不允许改份数（用一个全新的、没有 backupDir 的定位文件）
-  const emptyDefaultDir = path.join(env.root, 'fresh-default');
-  await fs.mkdir(emptyDefaultDir, { recursive: true });
-  const fresh = createDataPathManager({ defaultDir: emptyDefaultDir });
-  fresh.prepareAtStartup();
-  assert.throws(function () { fresh.stageBackupKeep(3); }, /请先设置完整备份目录/);
 });
 
 test('an unchanged library does not publish a duplicate snapshot', async function (t) {
@@ -416,112 +406,6 @@ test('an unchanged library does not publish a duplicate snapshot', async functio
   assert.equal(third.ok, true, third.error);
   assert.ok(!third.unchanged);
   assert.equal((await env.manager.listSnapshots()).length, 3);
-});
-
-test('leftover cleanup removes only provably-dead files and keeps referenced ones', async function (t) {
-  const env = await makeEnv(t);
-  env.dataPathManager.stageBackupDir(env.backupDir);
-  const old = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
-
-  // 被库引用的恢复附件：必须保留
-  const restoredRoot = path.join(env.configDir, 'restored-assets');
-  const referenced = path.join(restoredRoot, '20260910-000000-bbbbbb');
-  const livePdf = path.join(referenced, 'assets', 'p1', 'live.pdf');
-  await fs.mkdir(path.dirname(livePdf), { recursive: true });
-  await fs.writeFile(livePdf, 'LIVE PDF');
-  await env.db.saveState({ papers: [{ id: 'p1', title: 'T', attachments: [
-    { id: 'a1', kind: 'pdf', fileName: 'live.pdf', path: livePdf }] }] });
-  const snapshot = await env.manager.createSnapshot();
-  assert.equal(snapshot.ok, true, snapshot.error);
-
-  // 库内已无引用的恢复目录：可清
-  const orphan = path.join(restoredRoot, '20200101-000000-aaaaaa');
-  await fs.mkdir(path.join(orphan, 'assets', 'p9'), { recursive: true });
-  await fs.writeFile(path.join(orphan, 'assets', 'p9', 'old.pdf'), 'OLD CONTENT');
-
-  // 恢复残留 .previous-*（老化后可清）
-  const previous = path.join(restoredRoot, '.previous-20200101-000000-cccccc-111-2222');
-  await fs.mkdir(previous, { recursive: true });
-  await fs.writeFile(path.join(previous, 'x.pdf'), 'X');
-  await fs.utimes(previous, old, old);
-
-  // 崩溃残留的暂存目录（老化后可清）与新建的（必须保留）
-  const staleStaging = path.join(env.backupDir, '.staging-20200101-000000-deadbe');
-  await fs.mkdir(staleStaging, { recursive: true });
-  await fs.writeFile(path.join(staleStaging, 'library.sqlite.gz'), 'garbage');
-  await fs.utimes(staleStaging, old, old);
-  const freshStaging = path.join(env.backupDir, '.staging-20990101-000000-fresh1');
-  await fs.mkdir(freshStaging, { recursive: true });
-
-  // 迁移数据目录留下的旧库副本：保留最新一份
-  const oldMigrated = path.join(env.libraryDir, 'litboard.sqlite.pre-path-change-20200101000000.bak');
-  const newMigrated = path.join(env.libraryDir, 'litboard.sqlite.pre-path-change-20260910000000.bak');
-  await fs.writeFile(oldMigrated, 'old library copy');
-  await fs.writeFile(newMigrated, 'new library copy');
-  await fs.utimes(oldMigrated, old, old);
-
-  // 隔离的数据库副本：超 30 天的可清，未超期的必须保留
-  const oldQuarantine = path.join(env.libraryDir, 'litboard.sqlite.corrupt-' + (Date.now() - 90 * 86400000) + '-1-abcdef');
-  const freshQuarantine = path.join(env.libraryDir, 'litboard.sqlite.before-restore-' + Date.now() + '-1-abcdef');
-  await fs.writeFile(oldQuarantine, 'old corrupt copy');
-  await fs.writeFile(freshQuarantine, 'recent quarantine');
-  await fs.utimes(oldQuarantine, old, old);
-
-  const objectsBefore = await fs.readdir(path.join(env.backupDir, 'objects'));
-
-  const scan = await env.manager.scanLeftovers();
-  const names = scan.items.map(function (item) { return item.name; });
-  const has = function (target) { return names.indexOf(path.basename(target)) !== -1; };
-  assert.ok(has(orphan), '库内无引用的恢复目录应被列出');
-  assert.ok(!has(referenced), '仍被引用的恢复目录不应被列出');
-  assert.ok(has(previous), '过期的 .previous-* 应被列出');
-  assert.ok(has(staleStaging), '陈旧的 .staging-* 应被列出');
-  assert.ok(!has(freshStaging), '新建的 .staging-* 不应被列出');
-  assert.ok(has(oldMigrated), '旧的迁移副本应被列出');
-  assert.ok(!has(newMigrated), '最新的迁移副本应保留');
-  assert.ok(has(oldQuarantine), '超过 30 天的隔离副本应被列出');
-  assert.ok(!has(freshQuarantine), '未超期的隔离副本必须保留');
-  assert.equal(scan.categories.quarantineDb.count, 1);
-  assert.equal(scan.items.filter(function (item) { return item.danger; }).length, 1);
-  assert.ok(scan.totalBytes > 0);
-
-  const result = await env.manager.cleanLeftovers();
-  assert.equal(result.ok, true);
-  assert.equal(result.removed, scan.items.length);
-  assert.deepEqual(result.failed, []);
-
-  await assert.rejects(fs.stat(orphan));
-  await assert.rejects(fs.stat(oldQuarantine));
-  await assert.rejects(fs.stat(oldMigrated));
-  // 该留的一个都不能少：引用中的附件、最新迁移副本、未超期隔离件、进行中的暂存、当前库与快照
-  await fs.stat(referenced);
-  await fs.stat(newMigrated);
-  await fs.stat(freshQuarantine);
-  await fs.stat(freshStaging);
-  await fs.stat(path.join(env.libraryDir, 'litboard.sqlite'));
-  assert.equal((await env.manager.listSnapshots()).length, 1);
-  assert.deepEqual(await fs.readdir(path.join(env.backupDir, 'objects')), objectsBefore);
-});
-
-test('leftover cleanup skips reference-based categories when the database is unreadable', async function (t) {
-  const env = await makeEnv(t);
-  env.dataPathManager.stageBackupDir(env.backupDir);
-  const restoredRoot = path.join(env.configDir, 'restored-assets');
-  const candidate = path.join(restoredRoot, '20200101-000000-aaaaaa');
-  await fs.mkdir(candidate, { recursive: true });
-  // 库不可读（未打开）→ 不允许依据引用关系删任何恢复附件目录
-  const offline = createBackupManager({
-    libraryDir: env.libraryDir, configDir: env.configDir,
-    dataPathManager: env.dataPathManager,
-    getDb: function () { return null; }
-  });
-  const scan = await offline.scanLeftovers();
-  assert.equal(scan.items.some(function (item) { return item.category === 'orphanRestored'; }), false);
-  assert.match(scan.skipped.join('；'), /数据库不可读/);
-  await fs.stat(candidate); // 目录仍在
-  const cleaned = await offline.cleanLeftovers();
-  assert.equal(cleaned.removed, 0);
-  await fs.stat(candidate);
 });
 
 test('legacy .bak throttle no longer writes into the database', async function (t) {
@@ -619,39 +503,9 @@ test('restore rewrites note asset and snapshot directory paths into restored-ass
   await db2.close();
 });
 
-test('leftover scan keeps restored dirs referenced via note assets or snapshot directories', async function (t) {
-  const env = await makeEnv(t);
-  env.dataPathManager.stageBackupDir(env.backupDir);
-  const restoredRoot = path.join(env.configDir, 'restored-assets');
-  const snapRef = path.join(restoredRoot, '20200101-000000-snap01', 'assets', 'p1', 'snapdir');
-  await fs.mkdir(snapRef, { recursive: true });
-  await fs.writeFile(path.join(snapRef, 'page.html'), 'x');
-  const noteRef = path.join(restoredRoot, '20200102-000000-note01', 'assets', '_notes');
-  await fs.mkdir(noteRef, { recursive: true });
-  const noteImg = path.join(noteRef, 'n1-0-img.png');
-  await fs.writeFile(noteImg, 'y');
-  const orphan = path.join(restoredRoot, '20200103-000000-orph01');
-  await fs.mkdir(orphan, { recursive: true });
-  await fs.writeFile(path.join(orphan, 'old.pdf'), 'OLD');
-  await env.db.saveState({
-    papers: [{ id: 'p1', title: 'T', attachments: [
-      { id: 's1', kind: 'snapshot', fileName: 'snapdir', path: snapRef }
-    ] }],
-    notes: [{ id: 'n1', paperId: '', content: 'n', createdAt: 1, updatedAt: 1,
-      assets: [{ fileName: 'img.png', path: noteImg }] }]
-  });
-
-  const scan = await env.manager.scanLeftovers();
-  const names = scan.items.map(function (item) { return item.name; });
-  assert.ok(names.indexOf('20200103-000000-orph01') !== -1, '库内无引用的恢复目录应被列出');
-  assert.ok(names.indexOf('20200101-000000-snap01') === -1, '快照目录引用的恢复目录不应被列出');
-  assert.ok(names.indexOf('20200102-000000-note01') === -1, '笔记资产引用的恢复目录不应被列出');
-});
-
 test('rotation prunes hash-cache entries no longer referenced by surviving snapshots', async function (t) {
-  const env = await makeEnv(t);
+  const env = await makeEnv(t, { backupKeep: 1 });
   env.dataPathManager.stageBackupDir(env.backupDir);
-  env.dataPathManager.stageBackupKeep(1);
 
   // 第一份快照引用 fileA：hash-cache 里出现 fileA 的条目
   const fileA = path.join(env.configDir, 'synced-attachments', 'zOLD0001.pdf');
@@ -682,97 +536,3 @@ test('rotation prunes hash-cache entries no longer referenced by surviving snaps
   assert.ok(entries[0].sha256 !== shaA);
 });
 
-test('managed orphan files and stale .litbak backups are scanned and cleaned', async function (t) {
-  const env = await makeEnv(t);
-  env.dataPathManager.stageBackupDir(env.backupDir);
-  const old = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
-  const syncedDir = path.join(env.configDir, 'synced-attachments');
-  await fs.mkdir(syncedDir, { recursive: true });
-
-  // 被库引用的受管文件 + 墓碑条目引用的受管文件：必须保留
-  const livePdf = path.join(syncedDir, 'zLIVE0001.pdf');
-  await fs.writeFile(livePdf, 'LIVE', 'utf8');
-  const tombPdf = path.join(syncedDir, 'zTOMB0002.pdf');
-  await fs.writeFile(tombPdf, 'TOMB', 'utf8');
-  const nestedLive = path.join(syncedDir, 'items', 'p1', 'zLIVE0003.pdf');
-  await fs.mkdir(path.dirname(nestedLive), { recursive: true });
-  await fs.writeFile(nestedLive, 'NESTED-LIVE', 'utf8');
-  await env.db.saveState({ papers: [
-    { id: 'p1', title: 'Live', attachments: [
-      { id: 'a1', kind: 'pdf', fileName: 'live.pdf', path: livePdf },
-      { id: 'a3', kind: 'pdf', fileName: 'nested.pdf', path: nestedLive }
-    ] },
-    { id: 'p2', title: 'Tomb', deletedAt: Date.now(),
-      attachments: [{ id: 'a2', kind: 'pdf', fileName: 'tomb.pdf', path: tombPdf }] }
-  ] });
-
-  // 孤儿（已陈旧）：z 键文件、.litwrite 残留、批注截图、笔记图片、下载快照目录
-  const orphanPdf = path.join(syncedDir, 'zORPH0003.pdf');
-  await fs.writeFile(orphanPdf, 'ORPHAN', 'utf8');
-  await fs.utimes(orphanPdf, old, old);
-  const nestedOrphan = path.join(syncedDir, 'items', 'p1', 'zORPH0004.pdf');
-  await fs.writeFile(nestedOrphan, 'NESTED-ORPHAN', 'utf8');
-  await fs.utimes(nestedOrphan, old, old);
-  const litwrite = path.join(syncedDir, 'zORPH0003.pdf.litwrite');
-  await fs.writeFile(litwrite, 'PARTIAL', 'utf8');
-  await fs.utimes(litwrite, old, old);
-  const freshOrphan = path.join(syncedDir, 'zFRESH0004.pdf');
-  await fs.writeFile(freshOrphan, 'FRESH', 'utf8');
-  const orphanImg = path.join(env.configDir, 'annotation-images', 'orphan-ann.png');
-  await fs.mkdir(path.dirname(orphanImg), { recursive: true });
-  await fs.writeFile(orphanImg, 'IMG', 'utf8');
-  await fs.utimes(orphanImg, old, old);
-  const orphanNote = path.join(env.configDir, 'note-assets', 'nGone', 'img.png');
-  await fs.mkdir(path.dirname(orphanNote), { recursive: true });
-  await fs.writeFile(orphanNote, 'NOTE', 'utf8');
-  await fs.utimes(orphanNote, old, old);
-  const orphanSnapDir = path.join(syncedDir, 'pGone.attGone.snapshot');
-  await fs.mkdir(orphanSnapDir, { recursive: true });
-  await fs.writeFile(path.join(orphanSnapDir, 'index.html'), 'SNAP', 'utf8');
-  await fs.utimes(orphanSnapDir, old, old);
-  // 非受管命名的散落文件：即使陈旧也不碰
-  const stranger = path.join(syncedDir, 'readme.txt');
-  await fs.writeFile(stranger, 'hello', 'utf8');
-  await fs.utimes(stranger, old, old);
-
-  // .litbak：陈旧的可清（danger 类），新鲜的必须保留
-  const staleBak = path.join(syncedDir, 'zBAKX0009.pdf.litbak');
-  await fs.writeFile(staleBak, 'OLD BAK', 'utf8');
-  await fs.utimes(staleBak, old, old);
-  const freshBak = path.join(syncedDir, 'zBAKY0010.pdf.litbak');
-  await fs.writeFile(freshBak, 'FRESH BAK', 'utf8');
-
-  const scan = await env.manager.scanLeftovers();
-  const byPath = {};
-  scan.items.forEach(function (item) { byPath[item.path] = item; });
-  assert.ok(byPath[orphanPdf] && byPath[orphanPdf].category === 'orphanManaged', '孤儿 z 键文件应被列出');
-  assert.ok(byPath[nestedOrphan] && byPath[nestedOrphan].category === 'orphanManaged', '条目目录内的孤儿 z 键文件应被列出');
-  assert.ok(byPath[litwrite] && byPath[litwrite].category === 'orphanManaged', '.litwrite 残留应被列出');
-  assert.ok(byPath[orphanImg] && byPath[orphanImg].category === 'orphanManaged', '孤儿批注截图应被列出');
-  assert.ok(byPath[orphanNote] && byPath[orphanNote].category === 'orphanManaged', '孤儿笔记图片应被列出');
-  assert.ok(byPath[orphanSnapDir] && byPath[orphanSnapDir].category === 'orphanManaged', '孤儿下载快照目录应被列出');
-  assert.ok(!byPath[freshOrphan], '未到 7 天的孤儿不应被列出');
-  assert.ok(!byPath[livePdf], '被库引用的文件不应被列出');
-  assert.ok(!byPath[nestedLive], '条目目录内仍被引用的附件不应被列出');
-  assert.ok(!byPath[tombPdf], '墓碑条目引用的文件不应被列出（回收站语义）');
-  assert.ok(!byPath[stranger], '非受管命名的文件不应被列出');
-  assert.ok(byPath[staleBak] && byPath[staleBak].category === 'writeBackups', '陈旧 .litbak 应被列出');
-  assert.equal(byPath[staleBak].danger, true, '.litbak 属危险类别');
-  assert.ok(!byPath[freshBak], '未到 30 天的 .litbak 不应被列出');
-
-  const result = await env.manager.cleanLeftovers();
-  assert.equal(result.ok, true, JSON.stringify(result.failed));
-  await assert.rejects(fs.stat(orphanPdf));
-  await assert.rejects(fs.stat(nestedOrphan));
-  await assert.rejects(fs.stat(litwrite));
-  await assert.rejects(fs.stat(orphanImg));
-  await assert.rejects(fs.stat(orphanNote));
-  await assert.rejects(fs.stat(orphanSnapDir));
-  await assert.rejects(fs.stat(staleBak));
-  await fs.stat(livePdf);
-  await fs.stat(nestedLive);
-  await fs.stat(tombPdf);
-  await fs.stat(freshOrphan);
-  await fs.stat(stranger);
-  await fs.stat(freshBak);
-});

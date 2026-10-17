@@ -159,8 +159,6 @@
     return { text: lines.join('\n') + '\n', omitted: omitted };
   }
 
-  function paperToRis(paper) { return paperToRisReport(paper).text; }
-
   return { parse: parse, entryToPaper: entryToPaper, parsePapers: parsePapers,
-    paperToRis: paperToRis, paperToRisReport: paperToRisReport };
+    paperToRisReport: paperToRisReport };
 });

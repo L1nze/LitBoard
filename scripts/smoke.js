@@ -34,12 +34,13 @@ const env = Object.assign({}, process.env, {
   LITBOARD_SMOKE_RESULT: resultFile,
   LITBOARD_SMOKE_FOLDER: folderFixture
 });
+// 不可加 windowsHide：以隐藏进程拉起 Electron 会把渲染层 rAF/定时器节流到 ~1Hz，
+// settle()（等一帧）全部被拖慢，冒烟耗时被虚假拉长几十秒（测试期间窗口短暂可见，可接受）。
 const run = spawnSync(electronPath, ['.', '--user-data-dir=' + path.join(workDir, 'userdata')], {
   cwd: projectRoot,
   env: env,
   encoding: 'utf8',
-  timeout: 120000,
-  windowsHide: true
+  timeout: 120000
 });
 let payload = null;
 try {

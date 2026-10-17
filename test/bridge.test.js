@@ -29,7 +29,9 @@ async function makeBridge(t, fetchImpl) {
 }
 
 test('bridge server serves ping, saves papers with token auth, dedupes by DOI', async function (t) {
+  let enrichCalls = 0;
   const { bridge, db, saved } = await makeBridge(t, async function (url) {
+    enrichCalls++;
     // 模拟 OpenAlex 响应
     return new Response(JSON.stringify({
       title: 'Attention Is All You Need',
@@ -54,7 +56,7 @@ test('bridge server serves ping, saves papers with token auth, dedupes by DOI', 
   });
   assert.equal(unauthorized.status, 401);
 
-  // 正常保存（联网补全被 mock 拦截）
+  // 无标题只带 DOI：标题只能来自联网补全，这条罕见路径保留「先补全再入库」，响应即终态
   const save = await fetch(base + '/save', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token },
@@ -62,16 +64,20 @@ test('bridge server serves ping, saves papers with token auth, dedupes by DOI', 
   }).then(function (r) { return r.json(); });
   assert.equal(save.ok, true);
   assert.equal(save.duplicated, false);
+  assert.equal(save.enrichPending, false);
   assert.match(save.title, /Attention/);
   assert.equal(saved.length, 1);
 
-  // 同 DOI 再存 → 合并去重
+  // 同 DOI 再存 → 合并去重；本会话已补全过的 DOI 不再联网
   const again = await fetch(base + '/save', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token },
     body: JSON.stringify({ doi: '10.48550/arxiv.1706.03762' })
   }).then(function (r) { return r.json(); });
   assert.equal(again.duplicated, true);
+  assert.equal(again.enrichPending, false);
+  assert.equal(enrichCalls, 1);
+  await bridge.whenIdle();
 
   const state = await db.loadState();
   assert.equal(state.papers.length, 1);
@@ -104,6 +110,8 @@ test('bridge rejects private PDF URLs without sending them to its metadata trans
     assert.equal(result.ok, true);
     assert.equal(result.pdfAttached, false);
   }
+  // PDF 下载已转后台：等后台任务跑完（safe-fetch 会静默拒绝私网地址）再核对零外联
+  await bridge.whenIdle();
   assert.deepEqual(calls, []);
 });
 
@@ -154,6 +162,7 @@ test('CNKI page metadata repairs a malformed PDF journal name for the same DOI',
       volume: '62', issue: '11', issn: '0577-6686', sourceType: 'translator:cnki'
     })
   }).then(r => r.json());
+  await bridge.whenIdle();
   assert.equal(response.duplicated, true);
   const papers = db.loadState().papers;
   assert.equal(papers.length, 1);
@@ -169,6 +178,7 @@ test('CNKI page metadata repairs a malformed PDF journal name for the same DOI',
     body: JSON.stringify({ doi: '10.1234/hv-tech', title: '储能电池荷电状态评估',
       venue: '高电压技术', sourceType: 'translator:cnki' })
   }).then(r => r.json());
+  await bridge.whenIdle();
   assert.equal(repaired.duplicated, true);
   assert.equal(db.loadState().papers.find(p => p.doi === '10.1234/hv-tech').venue, '高电压技术');
 });
@@ -330,6 +340,8 @@ test('bridge falls back to Crossref when OpenAlex misses', async function (t) {
     body: JSON.stringify({ doi: '10.1000/crossref-only' })
   }).then(function (r) { return r.json(); });
   assert.equal(save.ok, true);
+  assert.equal(save.enrichPending, false); // 无标题路径同步完成补全
+  await bridge.whenIdle();
   const paper = (await db.loadState()).papers[0];
   assert.equal(paper.title, 'Crossref Only Paper');
   assert.deepEqual(paper.authors, ['Lovelace, Ada']);
@@ -342,7 +354,7 @@ test('bridge falls back to Crossref when OpenAlex misses', async function (t) {
 });
 
 test('bridge downloads the open-access PDF when the page has no direct pdfUrl', async function (t) {
-  const { bridge, db } = await makeBridge(t, async function (url) {
+  const { bridge, db, saved } = await makeBridge(t, async function (url) {
     if (url.indexOf('api.openalex.org') !== -1) {
       return new Response(JSON.stringify({
         title: 'OA Paper',
@@ -362,13 +374,22 @@ test('bridge downloads the open-access PDF when the page has no direct pdfUrl', 
     headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token },
     body: JSON.stringify({ doi: '10.1000/oa-test', title: 'OA Paper' })
   }).then(function (r) { return r.json(); });
+  // 提前响应：本地入库即返回，PDF 下载转后台
   assert.equal(save.ok, true);
-  assert.equal(save.pdfAttached, true);
-  const paper = (await db.loadState()).papers[0];
+  assert.equal(save.pdfAttached, false);
+  assert.equal(save.enrichPending, true);
+  assert.equal(saved.length, 1); // 早期事件已发（渲染层立即能看到条目）
+  await bridge.whenIdle();
+  let paper = (await db.loadState()).papers[0];
   assert.equal(paper.oaUrl, 'https://example.org/oa.pdf');
   assert.equal(paper.attachments.length, 1);
   const onDisk = await fs.readFile(paper.attachments[0].path);
   assert.equal(onDisk.subarray(0, 5).toString(), '%PDF-');
+  // 后台完成后补发一次事件，渲染层据此刷新富化字段与附件
+  assert.equal(saved.length, 2);
+  assert.equal(saved[1].paperId, paper.id);
+  assert.equal(saved[1].pdfAttached, true);
+  assert.equal(saved[1].duplicated, false);
 });
 
 test('bridge prefers the page pdfUrl over the OA fallback', async function (t) {
@@ -393,6 +414,8 @@ test('bridge prefers the page pdfUrl over the OA fallback', async function (t) {
     headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token },
     body: JSON.stringify({ doi: '10.1000/both', title: 'Both Sources', pdfUrl: 'https://publisher.example/direct.pdf' })
   });
+  // 下载转后台：等任务落定再核对抓取顺序
+  await bridge.whenIdle();
   const pdfFetches = fetched.filter(function (url) { return /\.pdf$/.test(url); });
   assert.deepEqual(pdfFetches, ['https://publisher.example/direct.pdf']);
 
@@ -467,7 +490,9 @@ test('bridge resolves the download dir per save (mkdir included) and reports pap
     body: JSON.stringify({ doi: '10.1000/resolver-test', title: 'Resolver Paper' })
   }).then(function (r) { return r.json(); });
   assert.equal(save.ok, true);
-  assert.equal(save.pdfAttached, true);
+  assert.equal(save.pdfAttached, false);
+  assert.equal(save.enrichPending, true);
+  await bridge.whenIdle();
 
   const paper = (await db.loadState()).papers[0];
   assert.equal(paper.attachments.length, 1);
@@ -475,8 +500,158 @@ test('bridge resolves the download dir per save (mkdir included) and reports pap
   const onDisk = await fs.readFile(paper.attachments[0].path);
   assert.equal(onDisk.subarray(0, 5).toString(), '%PDF-');
 
-  // onSaved 带 paperId：渲染层靠它定位条目做后台补下载与全文索引
-  assert.equal(saved.length, 1);
+  // onSaved 带 paperId：渲染层靠它定位条目做后台补下载与全文索引；
+  // 早期事件（入库即可见）+ 后台完成事件（富化/附件落定）各一次
+  assert.equal(saved.length, 2);
   assert.equal(saved[0].paperId, paper.id);
-  assert.equal(saved[0].pdfAttached, true);
+  assert.equal(saved[0].pdfAttached, false);
+  assert.equal(saved[1].paperId, paper.id);
+  assert.equal(saved[1].pdfAttached, true);
+});
+
+test('save responds before enrichment finishes, background completion fires onSaved again', async function (t) {
+  let releaseEnrich;
+  const enrichGate = new Promise(function (resolve) { releaseEnrich = resolve; });
+  let enrichCalls = 0;
+  const { bridge, db, saved } = await makeBridge(t, async function (url) {
+    if (url.indexOf('api.openalex.org') !== -1) {
+      enrichCalls++;
+      await enrichGate;
+      return new Response(JSON.stringify({
+        title: 'Gated Paper',
+        publication_year: 2024,
+        doi: 'https://doi.org/10.1000/gated',
+        authorships: [{ author: { display_name: 'Grace Hopper' } }],
+        cited_by_count: 7,
+        // OpenAlex 真实形态：摘要走倒排索引 {词: [位置]}
+        abstract_inverted_index: { 'Gated': [0], 'abstract.': [1] }
+      }), { status: 200 });
+    }
+    throw new Error('unexpected url: ' + url);
+  });
+  const status = await bridge.start();
+  const savePromise = fetch('http://127.0.0.1:' + status.port + '/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token },
+    body: JSON.stringify({ doi: '10.1000/gated', title: 'From Page' })
+  }).then(function (r) { return r.json(); });
+
+  // 响应必须在富化完成前返回（提前响应 = 同步段只剩本地入库）
+  const save = await Promise.race([
+    savePromise,
+    new Promise(function (_, reject) { setTimeout(function () { reject(new Error('save response blocked by enrichment')); }, 1500); })
+  ]);
+  assert.equal(save.ok, true);
+  // 响应形状是旧协议的超集：老字段一个不少，新字段 enrichPending 旧扩展可忽略
+  ['ok', 'id', 'title', 'duplicated', 'pdfAttached'].forEach(function (key) {
+    assert.ok(key in save, 'response keeps legacy field: ' + key);
+  });
+  assert.equal(save.title, 'From Page');
+  assert.equal(save.duplicated, false);
+  assert.equal(save.pdfAttached, false);
+  assert.equal(save.enrichPending, true);
+  assert.equal(saved.length, 1); // 早期事件：条目入库即对渲染层可见
+  assert.equal(saved[0].pdfAttached, false);
+
+  releaseEnrich();
+  await bridge.whenIdle();
+  assert.equal(enrichCalls, 1);
+  const paper = (await db.loadState()).papers[0];
+  assert.equal(paper.id, save.id);
+  assert.equal(paper.title, 'From Page'); // 页面提取优先，富化只补缺
+  assert.equal(paper.abstract, 'Gated abstract.');
+  assert.equal(paper.citations, 7);
+  // 后台完成事件：渲染层据此刷新
+  assert.equal(saved.length, 2);
+  assert.equal(saved[1].paperId, paper.id);
+  assert.equal(saved[1].duplicated, false);
+  assert.equal(saved[1].paper.abstract, 'Gated abstract.');
+
+  // 字段已齐全的重复保存：完全跳过联网（响应即终态，不再排队后台任务）
+  const again = await fetch('http://127.0.0.1:' + status.port + '/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token },
+    body: JSON.stringify({ doi: '10.1000/gated', title: 'From Page' })
+  }).then(function (r) { return r.json(); });
+  assert.equal(again.duplicated, true);
+  assert.equal(again.enrichPending, false);
+  await bridge.whenIdle();
+  assert.equal(enrichCalls, 1); // 未再联网
+  // 第 3 个事件是重存的早期事件（渲染层刷新用）；短路路径没有后台完成事件
+  assert.equal(saved.length, 3);
+});
+
+test('duplicate save with complete fields skips all network work', async function (t) {
+  let fetchCalls = 0;
+  const { bridge, db, saved } = await makeBridge(t, async function () {
+    fetchCalls++;
+    throw new Error('network must not be touched');
+  });
+  // 预置一个字段齐全（带 abstract）的已有条目
+  db.bridgeUpsertPaper({
+    doi: '10.1000/complete', title: 'Complete Paper',
+    abstract: 'Already has a rich abstract.', venue: 'Some Journal', year: 2020
+  });
+  const status = await bridge.start();
+  const save = await fetch('http://127.0.0.1:' + status.port + '/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token },
+    body: JSON.stringify({ doi: '10.1000/complete', title: 'Complete Paper' })
+  }).then(function (r) { return r.json(); });
+  assert.equal(save.ok, true);
+  assert.equal(save.duplicated, true);
+  assert.equal(save.enrichPending, false); // 完全短路：无后台任务
+  await bridge.whenIdle();
+  assert.equal(fetchCalls, 0);
+  assert.equal(saved.length, 1); // 仅早期事件
+  assert.equal((await db.loadState()).papers.length, 1);
+});
+
+test('attach-pdf accepts raw PDF bytes (application/pdf + query params)', async function (t) {
+  const { bridge, db } = await makeBridge(t);
+  const status = await bridge.start();
+  const base = 'http://127.0.0.1:' + status.port;
+  const headers = { 'Content-Type': 'application/json', 'X-LitBoard-Token': status.token };
+
+  await fetch(base + '/save', {
+    method: 'POST', headers: headers,
+    body: JSON.stringify({ title: '直传论文', doi: '10.1000/raw-upload' })
+  });
+  const paper = (await db.loadState()).papers[0];
+  const fakePdf = Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.alloc(4096, 0x25)]);
+
+  // 原始字节直传：paperId/fileName 走查询参数
+  const attach = await fetch(base + '/attach-pdf?paperId=' + encodeURIComponent(paper.id) +
+    '&fileName=' + encodeURIComponent('litboard-raw-test.pdf'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/pdf', 'X-LitBoard-Token': status.token },
+    body: fakePdf
+  }).then(function (r) { return r.json(); });
+  assert.equal(attach.ok, true);
+  assert.equal(attach.attached, true);
+
+  const updated = (await db.loadState()).papers[0];
+  assert.equal(updated.attachments.length, 1);
+  assert.equal(updated.attachments[0].kind, 'pdf');
+  assert.match(updated.attachments[0].fileName, /litboard-raw-test\.pdf$/);
+  const onDisk = await fs.readFile(updated.attachments[0].path);
+  assert.equal(onDisk.length, fakePdf.length);
+  assert.equal(onDisk.subarray(0, 5).toString(), '%PDF-');
+
+  // 非 PDF 字节被拒（响应形状与 base64 路径一致）
+  const bad = await fetch(base + '/attach-pdf?paperId=' + encodeURIComponent(paper.id), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/pdf', 'X-LitBoard-Token': status.token },
+    body: 'this is not a pdf at all'
+  }).then(function (r) { return r.json(); });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.attached, false);
+
+  // 缺 paperId → 422（与 base64 路径一致）
+  const missing = await fetch(base + '/attach-pdf', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/pdf', 'X-LitBoard-Token': status.token },
+    body: fakePdf
+  });
+  assert.equal(missing.status, 422);
 });

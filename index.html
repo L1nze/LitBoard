@@ -1660,7 +1660,11 @@
 <script src="vendor/foliate/foliate.min.js"></script>
 <script src="js/i18n.js"></script>
 <script src="js/i18n-en.js"></script>
-<script src="vendor/pinyin-pro/pinyin-pro.js"></script>
+<!-- pinyin-pro（324KB）走 defer：不阻塞 HTML 解析与首屏渲染，在解析完成后、
+     DOMContentLoaded 之前执行；引用键生成只发生在 app.js 的异步回调（库加载/导入/编辑，
+     均晚于 DOMContentLoaded），必然晚于它。model.js 侧为调用期解析（pinyinProNow），
+     晚到的全局照常命中，中文作者引用键不会退化成 anon。 -->
+<script defer src="vendor/pinyin-pro/pinyin-pro.js"></script>
 <script src="js/model.js"></script>
 <script src="js/merge.js"></script>
 <script src="js/bibtex.js"></script>
@@ -1717,10 +1721,12 @@
 <script src="js/litsearch.js"></script>
 <script src="js/agentfilecontext.js"></script>
 <script src="js/agentplan.js"></script>
+<script src="js/agentsnapshot.js"></script>
+<script src="js/agentchatrich.js"></script>
+<script src="js/agentsessions.js"></script>
 <script src="js/agenttools.js"></script>
-<script src="vendor/vis-network/vis-network.min.js"></script>
-<script src="js/graphgen.js"></script>
-<script src="js/graphview.js"></script>
+<!-- 引文网络组件（vendor/vis-network + js/graphgen.js + js/graphview.js）按需加载：
+     app.js 的 ensureGraphLibs 在首次构建引文网络时按依赖序注入，不占启动首屏 -->
 <script src="js/agentui.js"></script>
 <script src="js/app.js"></script>
 </body>

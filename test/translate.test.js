@@ -122,13 +122,13 @@ test('toUrlSafeBase64：/ → _、+ → -，其余不动', () => {
 
 test('免费服务注册表：目标语言代码映射与上限齐全', () => {
   ['google', 'tencent', 'volc', 'cnki', 'mymemory'].forEach(id => {
-    assert.ok(LitTranslate.isFreeService(id), id);
+    assert.ok(LitTranslate.FREE_SERVICES[id], id);
     assert.ok(LitTranslate.FREE_SERVICES[id].chunk > 0);
     assert.ok(LitTranslate.FREE_SERVICES[id].max >= LitTranslate.FREE_SERVICES[id].chunk);
     assert.strictEqual(LitTranslate.freeTargetCode(id, 'zh').length > 0, true);
     assert.strictEqual(LitTranslate.freeTargetCode(id, 'en'), 'en');
   });
-  assert.strictEqual(LitTranslate.isFreeService('qwen'), false);
+  assert.strictEqual(LitTranslate.FREE_SERVICES['qwen'], undefined);
   assert.strictEqual(LitTranslate.freeTargetCode('google', 'zh'), 'zh-CN');
   assert.strictEqual(LitTranslate.freeTargetCode('mymemory', 'zh'), 'zh-CN');
   assert.throws(() => LitTranslate.freeTargetCode('nope', 'zh'), /未知免费/);

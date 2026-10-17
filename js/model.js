@@ -1,13 +1,25 @@
 /* LitBoard 数据模型：校验、迁移与规范化（浏览器 / Node 共用） */
 (function (root, factory) {
-  var pinyinPro = root && root.pinyinPro;
-  if (typeof module === 'object' && module.exports) {
-    try { pinyinPro = require('../vendor/pinyin-pro/pinyin-pro.js'); } catch (e) { /* 浏览器 bundle 不走 require */ }
+  var nodeRequire = (typeof module === 'object' && module.exports && typeof require === 'function') ? require : null;
+  var cachedPinyin = null;
+  /* 调用期解析（而非求值期捕获）：求值期捕获会把 pinyin-pro 的加载顺序焊死在本模块
+   * 求值时刻——index.html 里 pinyin-pro 走 defer（不阻塞首屏解析）时，model.js 先于它
+   * 执行，旧写法拿到的永远是 undefined，中文作者引用键会静默退化成 anon2024（数据级
+   * 损坏：v8 的 key 保留规则会让坏 key 永久钉住，事后重算也不会修）。调用期读全局、
+   * Node 首用时 require 并缓存，晚到的全局（defer/懒加载）同样能用上。 */
+  function pinyinProNow() {
+    if (cachedPinyin) return cachedPinyin;
+    var lib = root && root.pinyinPro;
+    if (!lib && nodeRequire) {
+      try { lib = nodeRequire('../vendor/pinyin-pro/pinyin-pro.js'); } catch (e) { /* 浏览器 bundle 不走 require */ }
+    }
+    if (lib && typeof lib.pinyin === 'function') cachedPinyin = lib;
+    return lib;
   }
-  var api = factory(pinyinPro);
+  var api = factory(pinyinProNow);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.LitModel = api;
-})(typeof window !== 'undefined' ? window : null, function (pinyinPro) {
+})(typeof window !== 'undefined' ? window : null, function (pinyinProNow) {
   'use strict';
 
   var SCHEMA_VERSION = 14;
@@ -213,7 +225,9 @@
     var family = first ? (first.indexOf(',') !== -1 ? first.split(',')[0].trim() : first.split(/\s+/).pop()) : 'anon';
     // 自动 key 必须是 LaTeX/BibTeX 安全的 ASCII。中文姓名通过本地 vendored pinyin-pro
     // 转为无声调拼音；既有导入 key 与用户手动钉住的 key 不走这里，保持原值和稳定性。
+    // pinyinProNow() 调用期解析（见文件头注释）：defer 加载的 pinyin-pro 也能在此命中。
     var romanized = family;
+    var pinyinPro = pinyinProNow();
     if (/[\u3400-\u9fff\uf900-\ufaff]/.test(romanized) && pinyinPro && typeof pinyinPro.pinyin === 'function') {
       romanized = pinyinPro.pinyin(romanized, { toneType: 'none', mode: 'surname', separator: '' });
     }

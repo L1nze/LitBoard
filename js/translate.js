@@ -42,10 +42,6 @@
     mymemory: { chunk: 450, max: 4000, target: { zh: 'zh-CN', en: 'en' } }
   };
 
-  function isFreeService(id) {
-    return Object.prototype.hasOwnProperty.call(FREE_SERVICES, String(id || ''));
-  }
-
   function freeTargetCode(id, target) {
     var spec = FREE_SERVICES[String(id || '')];
     if (!spec) throw new Error(T('未知免费翻译服务商：') + id);
@@ -292,7 +288,6 @@
 
   return {
     FREE_SERVICES: FREE_SERVICES,
-    isFreeService: isFreeService,
     freeTargetCode: freeTargetCode,
     splitChunks: splitChunks,
     splitSentences: splitSentences,

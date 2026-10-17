@@ -63,24 +63,6 @@ test('title matching does not merge conflicting years or first authors', functio
   assert.equal(groups.length, 0);
 });
 
-test('isDuplicate only accepts exact DOI or PDF fingerprint', function () {
-  assert.equal(LitDedupe.isDuplicate(
-    p({ title: 'A Shared Research Title', doi: '10.1000/a' }),
-    p({ title: 'A Shared Research Title', doi: '10.1000/b' })
-  ), false);
-  assert.equal(LitDedupe.isDuplicate(
-    p({ title: 'Attention Is All You Need', year: 2017, authors: ['Ashish Vaswani'] }),
-    p({ title: 'attention is all you need!' })
-  ), false);
-});
-
-test('title-only matches are exposed as manual candidates', function () {
-  assert.equal(LitDedupe.isTitleCandidate(
-    p({ title: 'Attention Is All You Need', year: 2017, authors: ['Ashish Vaswani'] }),
-    p({ title: 'attention is all you need!' })
-  ), true);
-});
-
 test('merge keeps the most complete entry id and fills gaps from others', function () {
   const rich = p({ id: 'rich', title: 'T', doi: '10.1/t', abstract: 'Long abstract', venue: 'Nature', year: 2020, citations: 5, notes: '我的笔记', addedAt: 2000 });
   const poor = p({ id: 'poor', title: 'T', pdfPath: 'C:\\papers\\t.pdf', pdfFileName: 't.pdf', citations: 120, citationSource: 'OpenAlex', tags: ['经典'], status: 'read', rating: 4, addedAt: 1000 });

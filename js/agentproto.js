@@ -96,6 +96,15 @@
 
   function isDialect(value) { return DIALECT_VALUES.indexOf(str(value).toLowerCase()) !== -1; }
 
+  /** 归一到三种形态之一：非法值（空 / 未知）一律回退 chat。endpointFor /
+   *  modelsEndpointFor / buildHeaders / convertBody / createAccumulator 各入口
+   *  只在这里判定一次，向下传递的都是已归一的形态（判定语义与原先逐处的
+   *  `isDialect(x) ? str(x).toLowerCase() : CHAT` 完全一致）。 */
+  function normalizeDialect(value) {
+    var kind = str(value).toLowerCase();
+    return isDialect(kind) ? kind : DIALECTS.CHAT;
+  }
+
   /** 模型名 → 协议面（仅 OpenCode 分流用；未识别返回空串 = 交给默认 chat） */
   function dialectForModel(model) {
     var tail = modelTail(model);
@@ -132,7 +141,7 @@
   function endpointFor(baseUrl, dialect) {
     var base = trimSlashes(baseUrl);
     var path = pathOf(base);
-    var kind = isDialect(dialect) ? str(dialect).toLowerCase() : DIALECTS.CHAT;
+    var kind = normalizeDialect(dialect);
     if (kind === DIALECTS.MESSAGES) {
       if (/\/messages$/.test(path)) return base;
       return (/\/v1$/.test(path) ? base : base + '/v1') + '/messages';
@@ -152,7 +161,7 @@
     if (/\/(chat\/completions|responses|messages)$/.test(path)) {
       return base.replace(/\/(chat\/completions|responses|messages)$/i, '/models');
     }
-    var kind = isDialect(dialect) ? str(dialect).toLowerCase() : DIALECTS.CHAT;
+    var kind = normalizeDialect(dialect);
     // Anthropic 系的 base 惯例是服务根（api.anthropic.com / …/anthropic），清单在 /v1/models；
     // OpenAI 兼容的 base 惯例自带 /v1，直接接 /models。
     if (kind !== DIALECTS.CHAT && !/\/v1$/.test(path)) return base + '/v1/models';
@@ -171,7 +180,7 @@
    */
   function buildHeaders(input) {
     var opts = input || {};
-    var dialect = isDialect(opts.dialect) ? str(opts.dialect).toLowerCase() : DIALECTS.CHAT;
+    var dialect = normalizeDialect(opts.dialect);
     var headers = { 'Content-Type': 'application/json' };
     if (dialect === DIALECTS.MESSAGES) {
       headers['x-api-key'] = str(opts.apiKey);
@@ -406,7 +415,7 @@
 
   /** 内部 OpenAI 形态请求体 → 目标协议请求体 */
   function convertBody(body, dialect) {
-    var kind = isDialect(dialect) ? str(dialect).toLowerCase() : DIALECTS.CHAT;
+    var kind = normalizeDialect(dialect);
     if (kind === DIALECTS.MESSAGES) return toMessagesBody(body, {});
     if (kind === DIALECTS.RESPONSES) return toResponsesBody(body, {});
     return toChatBody(body);
@@ -417,7 +426,81 @@
    * { content, reasoning_content?, tool_calls[{id,type,function{name,arguments}}] }
    * 事件词表与 chat 一致（delta / reasoning_delta / tool_call / _closed），
    * 渲染层与 agentloop 不需要知道背后是哪种协议。
+   * 行解析骨架与末段组装是三份累积器共用的（下方）；只有「事件 → 状态」的
+   * 分发按形态各写一份——那部分才是形态之间的真实差异。
    * ------------------------------------------------------------------ */
+
+  /** SSE 行骨架（三形态共用）：剥 data: 前缀、判 [DONE]、JSON.parse 容错。
+   *  返回 { kind:'skip' }（非 data 行 / 坏 JSON，调用方原样返回空事件表）、
+   *  { kind:'done' }（[DONE]，是否置 sawDone 与收尾语义由各形态自定）、
+   *  { kind:'json', json }（交给形态专属分支）。error 事件的上抛留在各累积器：
+   *  三种形态的错误负载形状不同（chat 顶层 error、responses 按 type 判别、
+   *  messages 的 type:'error'），骨架只统一 throwUpstream 的异常构造。 */
+  function parseSseLine(line) {
+    var trimmed = str(line == null ? '' : line).trim();
+    if (!trimmed || trimmed.indexOf('data:') !== 0) return { kind: 'skip' };
+    var payload = trimmed.slice(5).trim();
+    if (payload === '[DONE]') return { kind: 'done' };
+    try {
+      return { kind: 'json', json: JSON.parse(payload) };
+    } catch (error) {
+      return { kind: 'skip' };
+    }
+  }
+
+  /** 上游 error 事件统一上抛：upstream 标记与网络错误区分（上层据此不走重试） */
+  function throwUpstream(message) {
+    var error = new Error(str(message));
+    error.upstream = true;
+    throw error;
+  }
+
+  /** 归一化槽位表（responses 按 item id 记账、messages 按 content block index） */
+  function createSlots() {
+    var slots = {};
+    var order = [];
+    return {
+      at: function (key) {
+        if (!slots[key]) { slots[key] = { id: '', name: '', args: '', announced: false }; order.push(key); }
+        return slots[key];
+      },
+      list: function () {
+        return order.map(function (key) { return slots[key]; }).filter(function (slot) { return slot.name; });
+      }
+    };
+  }
+
+  function normalizeUsage(usage) {
+    if (!usage) return null;
+    var inTokens = Number(usage.prompt_tokens != null ? usage.prompt_tokens : usage.input_tokens);
+    var outTokens = Number(usage.completion_tokens != null ? usage.completion_tokens : usage.output_tokens);
+    if (!isFinite(inTokens) && !isFinite(outTokens)) return null;
+    return {
+      prompt_tokens: isFinite(inTokens) ? inTokens : 0,
+      completion_tokens: isFinite(outTokens) ? outTokens : 0,
+      total_tokens: isFinite(inTokens) && isFinite(outTokens) ? inTokens + outTokens : undefined
+    };
+  }
+
+  /** 槽位 → OpenAI 形态 tool_call 条目；id 缺省兜底由调用方给出（chat 按下标
+   *  拼 'call_'+index、responses/messages 用 'call_0'——两套兜底是既有行为） */
+  function slotToToolCall(slot, fallbackId) {
+    return {
+      id: slot.id || fallbackId,
+      type: 'function',
+      function: { name: slot.name, arguments: slot.args || '{}' }
+    };
+  }
+
+  /** 末段组装（三形态共用）：同一份 assistant 产物。toolCallEntries 为空时
+   *  不落 tool_calls 键；条目顺序由各形态自身的记账顺序决定（chat 按下标排序、
+   *  responses/messages 按插入序过滤未具名槽位）。 */
+  function finalizeMessage(state, toolCallEntries) {
+    var out = { role: 'assistant', content: state.content };
+    if (state.reasoning) out.reasoning_content = state.reasoning;
+    if (toolCallEntries && toolCallEntries.length) out.tool_calls = toolCallEntries;
+    return out;
+  }
 
   /** OpenAI Chat Completions（原实现，逐字保留行为） */
   function createChatAccumulator() {
@@ -425,21 +508,15 @@
 
     function pushLine(line) {
       var events = [];
-      var trimmed = str(line == null ? '' : line).trim();
-      if (!trimmed || trimmed.indexOf('data:') !== 0) return events;
-      var payload = trimmed.slice(5).trim();
-      if (payload === '[DONE]') {
+      var parsed = parseSseLine(line);
+      if (parsed.kind === 'skip') return events;
+      if (parsed.kind === 'done') {
         state.sawDone = true;
         events.push({ type: '_closed' });
         return events;
       }
-      var json = null;
-      try { json = JSON.parse(payload); } catch (error) { return events; }
-      if (json && json.error) {
-        var err = new Error(str(json.error.message || JSON.stringify(json.error)));
-        err.upstream = true;
-        throw err;
-      }
+      var json = parsed.json;
+      if (json && json.error) throwUpstream(json.error.message || JSON.stringify(json.error));
       var choice = json && Array.isArray(json.choices) ? json.choices[0] : null;
       var delta = choice && choice.delta;
       if (choice && choice.finish_reason) state.finishReason = str(choice.finish_reason);
@@ -481,19 +558,9 @@
 
     function message() {
       var indexes = Object.keys(state.toolCalls).map(Number).sort(function (a, b) { return a - b; });
-      var out = { role: 'assistant', content: state.content };
-      if (state.reasoning) out.reasoning_content = state.reasoning;
-      if (indexes.length) {
-        out.tool_calls = indexes.map(function (index) {
-          var slot = state.toolCalls[index];
-          return {
-            id: slot.id || ('call_' + index),
-            type: 'function',
-            function: { name: slot.name, arguments: slot.args || '{}' }
-          };
-        });
-      }
-      return out;
+      return finalizeMessage(state, indexes.map(function (index) {
+        return slotToToolCall(state.toolCalls[index], 'call_' + index);
+      }));
     }
 
     return {
@@ -501,35 +568,7 @@
       pushLine: pushLine,
       message: message,
       getUsage: function () { return state.usage; },
-      getFinishReason: function () { return state.finishReason; },
-      sawDone: function () { return state.sawDone; }
-    };
-  }
-
-  /** 归一化槽位表（responses 按 item id 记账、messages 按 content block index） */
-  function createSlots() {
-    var slots = {};
-    var order = [];
-    return {
-      at: function (key) {
-        if (!slots[key]) { slots[key] = { id: '', name: '', args: '', announced: false }; order.push(key); }
-        return slots[key];
-      },
-      list: function () {
-        return order.map(function (key) { return slots[key]; }).filter(function (slot) { return slot.name; });
-      }
-    };
-  }
-
-  function normalizeUsage(usage) {
-    if (!usage) return null;
-    var inTokens = Number(usage.prompt_tokens != null ? usage.prompt_tokens : usage.input_tokens);
-    var outTokens = Number(usage.completion_tokens != null ? usage.completion_tokens : usage.output_tokens);
-    if (!isFinite(inTokens) && !isFinite(outTokens)) return null;
-    return {
-      prompt_tokens: isFinite(inTokens) ? inTokens : 0,
-      completion_tokens: isFinite(outTokens) ? outTokens : 0,
-      total_tokens: isFinite(inTokens) && isFinite(outTokens) ? inTokens + outTokens : undefined
+      getFinishReason: function () { return state.finishReason; }
     };
   }
 
@@ -549,23 +588,15 @@
 
     function pushLine(line) {
       var events = [];
-      var trimmed = str(line == null ? '' : line).trim();
-      if (!trimmed || trimmed.indexOf('data:') !== 0) return events;
-      var payload = trimmed.slice(5).trim();
-      if (payload === '[DONE]') { close(); events.push({ type: '_closed' }); return events; }
-      var json = null;
-      try { json = JSON.parse(payload); } catch (error) { return events; }
+      var parsed = parseSseLine(line);
+      if (parsed.kind === 'skip') return events;
+      if (parsed.kind === 'done') { close(); events.push({ type: '_closed' }); return events; }
+      var json = parsed.json;
       var type = str(json && json.type);
-      if (json && json.error && !type) {
-        var bad = new Error(str(json.error.message || JSON.stringify(json.error)));
-        bad.upstream = true;
-        throw bad;
-      }
+      if (json && json.error && !type) throwUpstream(json.error.message || JSON.stringify(json.error));
       if (type === 'error' || type === 'response.failed') {
         var detail = json.error || (json.response && json.response.error);
-        var failed = new Error(str((detail && detail.message) || 'Responses API 返回失败'));
-        failed.upstream = true;
-        throw failed;
+        throwUpstream((detail && detail.message) || 'Responses API 返回失败');
       }
       if (type === 'response.output_text.delta' || type === 'response.refusal.delta') {
         var text = str(json.delta);
@@ -617,19 +648,7 @@
     }
 
     function message() {
-      var out = { role: 'assistant', content: state.content };
-      if (state.reasoning) out.reasoning_content = state.reasoning;
-      var calls = slots.list();
-      if (calls.length) {
-        out.tool_calls = calls.map(function (slot) {
-          return {
-            id: slot.id || 'call_0',
-            type: 'function',
-            function: { name: slot.name, arguments: slot.args || '{}' }
-          };
-        });
-      }
-      return out;
+      return finalizeMessage(state, slots.list().map(function (slot) { return slotToToolCall(slot, 'call_0'); }));
     }
 
     return {
@@ -637,8 +656,7 @@
       pushLine: pushLine,
       message: message,
       getUsage: function () { return state.usage; },
-      getFinishReason: function () { return state.finishReason; },
-      sawDone: function () { return state.sawDone; }
+      getFinishReason: function () { return state.finishReason; }
     };
   }
 
@@ -660,18 +678,14 @@
 
     function pushLine(line) {
       var events = [];
-      var trimmed = str(line == null ? '' : line).trim();
-      if (!trimmed || trimmed.indexOf('data:') !== 0) return events;
-      var payload = trimmed.slice(5).trim();
-      if (payload === '[DONE]') { state.sawDone = true; events.push({ type: '_closed' }); return events; }
-      var json = null;
-      try { json = JSON.parse(payload); } catch (error) { return events; }
+      var parsed = parseSseLine(line);
+      if (parsed.kind === 'skip') return events;
+      if (parsed.kind === 'done') { state.sawDone = true; events.push({ type: '_closed' }); return events; }
+      var json = parsed.json;
       var type = str(json && json.type);
       if (type === 'error') {
         var detail = json.error || {};
-        var failed = new Error(str(detail.message || JSON.stringify(json.error || {})));
-        failed.upstream = true;
-        throw failed;
+        throwUpstream(detail.message || JSON.stringify(json.error || {}));
       }
       if (type === 'message_start') {
         var startUsage = (json.message && json.message.usage) || {};
@@ -737,19 +751,7 @@
     }
 
     function message() {
-      var out = { role: 'assistant', content: state.content };
-      if (state.reasoning) out.reasoning_content = state.reasoning;
-      var calls = slots.list();
-      if (calls.length) {
-        out.tool_calls = calls.map(function (slot) {
-          return {
-            id: slot.id || 'call_0',
-            type: 'function',
-            function: { name: slot.name, arguments: slot.args || '{}' }
-          };
-        });
-      }
-      return out;
+      return finalizeMessage(state, slots.list().map(function (slot) { return slotToToolCall(slot, 'call_0'); }));
     }
 
     return {
@@ -757,13 +759,12 @@
       pushLine: pushLine,
       message: message,
       getUsage: function () { return state.usage; },
-      getFinishReason: function () { return state.finishReason; },
-      sawDone: function () { return state.sawDone; }
+      getFinishReason: function () { return state.finishReason; }
     };
   }
 
   function createAccumulator(dialect) {
-    var kind = isDialect(dialect) ? str(dialect).toLowerCase() : DIALECTS.CHAT;
+    var kind = normalizeDialect(dialect);
     if (kind === DIALECTS.MESSAGES) return createMessagesAccumulator();
     if (kind === DIALECTS.RESPONSES) return createResponsesAccumulator();
     return createChatAccumulator();

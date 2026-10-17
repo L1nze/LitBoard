@@ -3,8 +3,28 @@
   'use strict';
   var T = (typeof window !== 'undefined' && window.LitI18n && window.LitI18n.t) || function (s) { return s == null ? '' : String(s); }; // i18n：中文源串为键，译文见 js/i18n-en.js
 
+  /* 双 worker 池：阅读器渲染走 reader 实例，导入解析/FTS/agent 截图走 background
+   * 实例（互不排队）。LitMuPdf 无 createClient（旧注入/测试桩）时退回全局单例。 */
+  var readerClient = null;
+  var backgroundClient = null;
+
+  function clientFor(kind) {
+    var base = window.LitMuPdf;
+    if (!base) return null;
+    if (typeof base.createClient !== 'function') return base;
+    if (kind === 'reader') {
+      if (!readerClient) readerClient = base.createClient({ name: 'reader' });
+      return readerClient;
+    }
+    if (!backgroundClient) backgroundClient = base.createClient({ name: 'background' });
+    return backgroundClient;
+  }
+
   function loadMuPdf() {
     if (!window.LitMuPdf) return Promise.reject(new Error(T('MuPDF.js worker 未加载')));
+    // createClient 可用时不再 ping 全局单例（会拉起第三个没人用的 worker）；
+    // 每个实例的 startup/crash 兜底在各自 call 路径里
+    if (typeof window.LitMuPdf.createClient === 'function') return Promise.resolve(window.LitMuPdf);
     return window.LitMuPdf.resourceState().then(function () { return window.LitMuPdf; });
   }
 
@@ -66,10 +86,6 @@
       width: bbox[2] - bbox[0], height: bbox[3] - bbox[1], scale: zoom, rotation: turn,
       convertToViewportPoint: function (x, y) { return fromPdf([x, y]); },
       convertToPdfPoint: function (x, y) { return toPdf([x, y]); },
-      convertToViewportRectangle: function (rect) {
-        var a = fromPdf([rect[0], rect[1]]), b = fromPdf([rect[2], rect[3]]);
-        return [a[0], a[1], b[0], b[1]];
-      },
       convertMuRect: function (rect) {
         var a = fromMu([rect[0], rect[1]]), b = fromMu([rect[2], rect[3]]);
         return [a[0], a[1], b[0], b[1]];
@@ -77,35 +93,127 @@
     };
   }
 
-  function createMuDocument(info) {
+  /* 打开文档登记表：readAnnotations 优先复用「同路径已在阅读器打开的文档句柄」，
+   * 免去整读文件 + worker 里第二份 WASM 文档副本。键为规范化路径（Windows 大小写
+   * 与斜杠方向不敏感），值为文档数组（多标签可能同开同一文件，destroy 时按身份移除）。 */
+  var openDocumentsByKey = Object.create(null);
+
+  function documentFileKey(file) {
+    var path = typeof file === 'string' ? file : (file && file.path) || '';
+    return String(path).replace(/\//g, '\\').toLowerCase();
+  }
+
+  function registerOpenDocument(doc, file) {
+    var key = documentFileKey(file);
+    if (!key) return;
+    (openDocumentsByKey[key] = openDocumentsByKey[key] || []).push(doc);
+  }
+
+  function unregisterOpenDocument(doc) {
+    Object.keys(openDocumentsByKey).forEach(function (key) {
+      var list = openDocumentsByKey[key];
+      var index = list.indexOf(doc);
+      if (index !== -1) {
+        list.splice(index, 1);
+        if (!list.length) delete openDocumentsByKey[key];
+      }
+    });
+  }
+
+  function findOpenDocument(file) {
+    var list = openDocumentsByKey[documentFileKey(file)];
+    return list && list.length ? list[0] : null;
+  }
+
+  /* 批注空结果缓存：键 = 文件内容 sha256（worker 打开时后台算好）。内容寻址意味着
+   * 「文档代」天然安全——文件被写回/替换后 hash 变化必然失效重扫。只缓存「已扫过
+   * 且无内嵌批注」，有批注的结果不缓存（导入去重语义交给上层指纹比对）。 */
+  var EMPTY_ANNOTATION_CACHE_LIMIT = 128;
+  var emptyAnnotationHashes = Object.create(null);
+
+  function rememberEmptyAnnotations(hash) {
+    if (!hash || emptyAnnotationHashes[hash]) return;
+    emptyAnnotationHashes[hash] = Date.now();
+    var keys = Object.keys(emptyAnnotationHashes);
+    if (keys.length > EMPTY_ANNOTATION_CACHE_LIMIT) delete emptyAnnotationHashes[keys[0]]; // FIFO 淘汰
+  }
+
+  /** 分块扫批注：client 侧串行发块（每块一个 worker RPC），块间到达的阅读器渲染
+   * 请求自然插队；块走低优先级通道，在途渲染期间整块等待。 */
+  var ANNOTATION_SCAN_CHUNK = 20;
+  function scanAnnotationsChunked(client, docId, numPages) {
+    if (client && typeof client.annotationsChunk === 'function') {
+      var out = [];
+      var start = 0;
+      function next() {
+        if (start >= numPages) return Promise.resolve(out);
+        var from = start;
+        start += ANNOTATION_SCAN_CHUNK;
+        return client.annotationsChunk(docId, from, ANNOTATION_SCAN_CHUNK).then(function (items) {
+          (items || []).forEach(function (item) { out.push(item); });
+          return next();
+        });
+      }
+      return next();
+    }
+    return client.annotations(docId);
+  }
+
+  /** 在「已打开的文档句柄」上扫内嵌批注（内容指纹命中空结果缓存时直接跳过扫描） */
+  function scanDocumentAnnotations(client, docId, numPages, hash) {
+    if (hash && emptyAnnotationHashes[hash]) return Promise.resolve([]);
+    return scanAnnotationsChunked(client, docId, numPages).then(function (items) {
+      if (!items.length) rememberEmptyAnnotations(hash);
+      return items;
+    });
+  }
+
+  /** 文档级搜索的分块大小（worker 侧每块同步扫描的页数，块间渲染请求可插队） */
+  var SEARCH_DOCUMENT_CHUNK = 16;
+
+  function createMuDocument(info, client, opts) {
+    opts = opts || {};
     var pageInfo = {};
     var textCache = {};
     var annotationPromise = null;
     var closed = false;
+    var plainText = opts.textOnly === true; // 导入元数据识别：不需要逐字 quad 几何
+    var pageInfosPromise = null;
+    function prefetchPageInfos() {
+      if (pageInfosPromise || !client.pageInfos) return pageInfosPromise;
+      pageInfosPromise = client.pageInfos(info.id).then(function (list) {
+        (list || []).forEach(function (detail, index) {
+          if (detail && !pageInfo[index]) pageInfo[index] = detail;
+        });
+        return pageInfo;
+      }).catch(function () { return pageInfo; });
+      return pageInfosPromise;
+    }
+    if (opts.prefetchPageInfos) prefetchPageInfos();
     function page(number) {
       var index = Number(number) - 1;
-      return Promise.resolve(pageInfo[index] || window.LitMuPdf.pageInfo(info.id, index).then(function (value) {
+      return Promise.resolve(pageInfo[index] || client.pageInfo(info.id, index).then(function (value) {
         pageInfo[index] = value;
         return value;
       })).then(function (detail) {
         return {
           getViewport: function (opts) { return viewportFor(detail.bounds, Number(opts && opts.scale) || 1, opts && opts.rotation, detail.transform); },
           getTextContent: function () {
-            if (!textCache[index]) textCache[index] = window.LitMuPdf.pageText(info.id, index)
+            if (!textCache[index]) textCache[index] = client.pageText(info.id, index, plainText ? { plain: true } : null)
               .then(function (value) { return textItemsFromMuPdf(value, detail.bounds); });
             return textCache[index];
           },
           getAnnotations: function () {
-            if (!annotationPromise) annotationPromise = window.LitMuPdf.annotations(info.id);
+            if (!annotationPromise) annotationPromise = scanDocumentAnnotations(client, info.id, info.numPages, null);
             return annotationPromise.then(function (items) { return items.filter(function (item) { return item.position.pageIndex === index; }); });
           },
-          getLinks: function () { return window.LitMuPdf.pageLinks(info.id, index); },
+          getLinks: function () { return client.pageLinks(info.id, index); },
           renderToCanvas: function (canvas, scale, rotation) {
-            return window.LitMuPdf.renderPage(info.id, index, Number(scale) || 1, rotation).then(function (image) {
+            // OCR/缩略图走低优先级通道：在途的阅读器渲染永远排在它前面
+            return client.renderPage(info.id, index, Number(scale) || 1, rotation, { priority: 'low' }).then(function (image) {
               canvas.width = image.width;
               canvas.height = image.height;
-              canvas.getContext('2d', { alpha: false }).putImageData(
-                new ImageData(new Uint8ClampedArray(image.pixels), image.width, image.height), 0, 0);
+              paintMuImage(canvas.getContext('2d', { alpha: false }), image);
               return canvas;
             });
           },
@@ -114,25 +222,140 @@
             var transform = opts && opts.transform;
             var pixelScale = transform && transform[0] ? transform[0] : 1;
             var view = opts.viewport;
-            var promise = window.LitMuPdf.renderPage(info.id, index, (view && view.scale || 1) * pixelScale, view && view.rotation)
+            var keepImage = opts && opts.keepImage === true; // 阅读器 LRU 路径：位图不关闭，交调用方缓存/释放
+            var promise = client.renderPage(info.id, index, (view && view.scale || 1) * pixelScale, view && view.rotation)
               .then(function (image) {
-                if (cancelled) throw Object.assign(new Error('Rendering cancelled'), { name: 'RenderingCancelledException' });
+                if (cancelled) {
+                  discardMuImage(image); // 过期位图不再上画布，显式释放
+                  throw Object.assign(new Error('Rendering cancelled'), { name: 'RenderingCancelledException' });
+                }
                 var canvas = opts.canvasContext.canvas;
                 if (canvas.width !== image.width) canvas.width = image.width;
                 if (canvas.height !== image.height) canvas.height = image.height;
-                opts.canvasContext.putImageData(new ImageData(new Uint8ClampedArray(image.pixels), image.width, image.height), 0, 0);
+                if (keepImage && image.bitmap) {
+                  try {
+                    opts.canvasContext.drawImage(image.bitmap, 0, 0);
+                    return image; // 位图所有权转移给调用方（入 LRU 或显式 close）
+                  } catch (error) {
+                    try { image.bitmap.close(); } catch (e) {}
+                    throw error;
+                  }
+                }
+                if (keepImage && image.pixels) {
+                  // 像素缓冲路径（测试桩/老环境回退）：putImageData 不改动缓冲，可直接缓存复用
+                  opts.canvasContext.putImageData(new ImageData(new Uint8ClampedArray(image.pixels), image.width, image.height), 0, 0);
+                  return { width: image.width, height: image.height, pixels: image.pixels };
+                }
+                paintMuImage(opts.canvasContext, image);
+                return null;
               });
             return { promise: promise, cancel: function () { cancelled = true; } };
           }
         };
       });
     }
-    return {
+    var doc = {
       numPages: info.numPages,
       getPage: page,
-      getOutline: function () { return window.LitMuPdf.outline(info.id); },
-      destroy: function () { if (closed) return; closed = true; window.LitMuPdf.close(info.id).catch(function () {}); },
-      _muId: info.id
+      getOutline: function () { return client.outline(info.id); },
+      /** 页文本非空白字符数（1 基页码，与 getPage 一致）。扫描件检测的轻量 API：
+       *  worker 侧 asText 直取，不再为数字符拉整页逐字 quad。 */
+      pageTextLength: function (pageNumber) {
+        var index = Math.max(0, Number(pageNumber) - 1);
+        return client.pageTextLength(info.id, index);
+      },
+      destroy: function () {
+        if (closed) return;
+        closed = true;
+        unregisterOpenDocument(doc);
+        client.close(info.id).catch(function () {});
+      },
+      _muId: info.id,
+      _muClient: client,
+      _pageInfosReady: pageInfosPromise || null
+    };
+    registerOpenDocument(doc, opts.file);
+    return doc;
+  }
+
+  /** worker 位图落画布：ImageBitmap 路径 drawImage（免 15–22MB putImageData 整帧
+   *  拷贝），无 bitmap（测试桩/老环境/位图构造失败回退）走 putImageData。 */
+  function paintMuImage(canvasContext, image) {
+    if (image && image.bitmap) {
+      try {
+        canvasContext.drawImage(image.bitmap, 0, 0);
+      } finally {
+        try { image.bitmap.close(); } catch (e) {}
+      }
+      return;
+    }
+    canvasContext.putImageData(new ImageData(new Uint8ClampedArray(image.pixels), image.width, image.height), 0, 0);
+  }
+
+  function discardMuImage(image) {
+    if (image && image.bitmap) { try { image.bitmap.close(); } catch (e) {} }
+  }
+
+  /** 页位图 LRU：键 = 页码|位图边长|旋转（同参数光栅确定性一致，边长即可区分缩放桶）。
+   *  releasePage 清掉页 DOM 后位图仍留在缓存里，回翻/回滚时免 worker RPC 直接
+   *  drawImage 绘回（文本层照常重建，DOM 成本远低于重新光栅）。缩放/旋转/dpr 变化
+   *  时必须整体失效（clear），否则旧参数条目白占内存。内存按 w*h*4 估算，超限逐
+   *  最旧淘汰（含显式 close）。 */
+  function createBitmapLru(opts) {
+    opts = opts || {};
+    var maxEntries = Math.max(1, Number(opts.maxEntries) || 10);
+    var maxBytes = Number(opts.maxBytes) || 120 * 1024 * 1024;
+    var map = Object.create(null); // key → { image, bytes }
+    var order = [];                // 最旧在前，最新在后
+    var bytes = 0;
+    function imageSize(image) {
+      if (!image) return 0;
+      if (image.pixels) return image.pixels.byteLength || 0;
+      return (Number(image.width) || 0) * (Number(image.height) || 0) * 4;
+    }
+    function evict() {
+      while (order.length && (bytes > maxBytes || order.length > maxEntries)) {
+        var key = order.shift();
+        var entry = map[key];
+        delete map[key];
+        if (entry) { bytes -= entry.bytes; discardMuImage(entry.image); }
+      }
+    }
+    return {
+      /** 取缓存并刷新热度；未命中返回 null。不 remove：条目留待淘汰（可见画布与缓存共用同一份位图）。 */
+      use: function (key) {
+        var entry = map[key];
+        if (!entry) return null;
+        var index = order.indexOf(key);
+        if (index >= 0) { order.splice(index, 1); order.push(key); }
+        return entry.image;
+      },
+      /** 入缓存；单条超内存上限（异常巨页）返回 false，调用方须自行释放。 */
+      put: function (key, image) {
+        var size = imageSize(image);
+        if (!size || size > maxBytes) return false;
+        if (map[key]) {
+          bytes -= map[key].bytes;
+          discardMuImage(map[key].image);
+          var oldIndex = order.indexOf(key);
+          if (oldIndex >= 0) order.splice(oldIndex, 1);
+          delete map[key];
+        }
+        map[key] = { image: image, bytes: size };
+        order.push(key);
+        bytes += size;
+        evict();
+        return true;
+      },
+      clear: function () {
+        order.splice(0).forEach(function (key) {
+          discardMuImage(map[key] && map[key].image);
+        });
+        map = Object.create(null);
+        bytes = 0;
+      },
+      size: function () { return order.length; },
+      bytes: function () { return bytes; }
     };
   }
 
@@ -156,12 +379,19 @@
     });
   }
 
-  /** 打开一个 PDF 文档对象 */
-  function openDocument(file, providedBytes) {
+  /** 打开一个 PDF 文档对象。opts.kind: 'reader' | 'background'（默认 background：
+   *  导入/FTS 与阅读器渲染分 worker）；opts.textOnly: 文本抽取跳过逐字 quad；
+   *  opts.prefetchPageInfos: 打开即批量取回全部页信息（阅读器建页 sheet 骨架用）；
+   *  opts.file: 登记打开句柄用的原始文件标识（路径）。 */
+  function openDocument(file, providedBytes, opts) {
+    opts = opts || {};
+    var client = clientFor(opts.kind) || window.LitMuPdf;
     return loadMuPdf().then(function () {
       return (providedBytes ? Promise.resolve(providedBytes) : getBytes(file));
     }).then(function (bytes) {
-      return window.LitMuPdf.open(bytes, 'application/pdf').then(createMuDocument);
+      return client.open(bytes, 'application/pdf').then(function (info) {
+        return createMuDocument(info, client, opts);
+      });
     });
   }
 
@@ -249,8 +479,9 @@
     });
   }
 
-  /** 取前 maxPages 页的文本项（含字号信息）；默认 5 页，与 Zotero RecognizeDocument.MAX_PAGES 一致 */  function extractItems(file, maxPages, providedBytes) {
-    return openDocument(file, providedBytes).then(function (doc) {
+  /** 取前 maxPages 页的文本项（含字号信息）；默认 5 页，与 Zotero RecognizeDocument.MAX_PAGES 一致 */
+  function extractItems(file, maxPages, providedBytes) {
+    return openDocument(file, providedBytes, { kind: 'background', textOnly: true }).then(function (doc) {
       var pages = Math.min(doc.numPages, maxPages || MAX_TITLE_PAGES);
       var tasks = [];
       for (var p = 1; p <= pages; p++) {
@@ -664,13 +895,30 @@
 
 
   /**
-   * 提取全部页面的文本（跨库全文索引用；调用方负责缓存复用）。
-   * 页与页互不依赖：游标 + 6 worker 并发抽取（extractItems 已验证同一 pdf.js 文档
-   * 支持并发取页），结果按页码落位而非 push，页序与串行版完全一致；
-   * 任一页失败记为首个错误、全部 worker 收尾后统一 reject（不产生游离 rejection）。
+   * 提取全部页面的纯文本（跨库全文索引用；调用方负责缓存复用）。
+   * 走 worker 的无几何 extractText（asText）——不再复用带逐字 quad 的 getPageText
+   * （那一路每字符 push 8 个 float 再 transfer，FTS 只用 str、quads 全建全传后全丢）。
+   * 阅读器文本层路径（quads 硬不变量）不受影响。client 无 extractText（测试桩）时
+   * 回退旧的逐页 getPageText 路径。
    */
   function extractText(file, providedBytes) {
-    return openDocument(file, providedBytes).then(function (doc) {
+    return loadMuPdf().then(function () {
+      var client = clientFor('background') || window.LitMuPdf;
+      if (typeof client.extractText === 'function') {
+        return (providedBytes ? Promise.resolve(providedBytes) : getBytes(file)).then(function (bytes) {
+          return client.extractText(bytes, 'application/pdf').then(function (result) {
+            var pages = (result && result.pages) || [];
+            return { numPages: pages.length, pages: pages };
+          });
+        });
+      }
+      return extractTextViaPages(file, providedBytes);
+    });
+  }
+
+  /** 逐页 getPageText 的回退路径（与旧版行为一致） */
+  function extractTextViaPages(file, providedBytes) {
+    return openDocument(file, providedBytes, { kind: 'background' }).then(function (doc) {
       var pages = new Array(doc.numPages);
       var cursor = 0;
       var firstError = null;
@@ -782,14 +1030,17 @@
    * 返回 { patch, by }，by 为 'doi' | 'title' | null，供本地/远端标题校验使用。
    * 全部落空时（中文期刊/新文献常见），用文章编号里的 ISSN 反查期刊名兜底 venue——
    * venue 有了，期刊等级的按刊名查询链路才会触发。
+   * lookupSignal：作为尾参透传给 LitEnrich（{ signal } 形态）——8s 超时 abort 后，
+   * 在飞 HTTP 经 api:fetch-abort 跨进程中止（主进程 socket 一并丢弃），结果也被 race 丢弃。
    */
-  function lookupPdfMetadata(info) {
+  function lookupPdfMetadata(info, lookupSignal) {
     info = info || {};
+    var lookupOpts = lookupSignal ? { signal: lookupSignal } : null;
     function withIssnFallback(patch, by) {
       if (patch || info.venue || !info.issn || !window.LitEnrich || !window.LitEnrich.venueByIssn) {
         return Promise.resolve({ patch: patch, by: by });
       }
-      return window.LitEnrich.venueByIssn(info.issn).catch(function () { return ''; }).then(function (venue) {
+      return window.LitEnrich.venueByIssn(info.issn, lookupOpts).catch(function () { return ''; }).then(function (venue) {
         if (!venue) return { patch: null, by: null };
         return {
           patch: { venue: venue, citations: null, openalexId: '', enrichedAt: new Date().toISOString() },
@@ -798,10 +1049,10 @@
       });
     }
     if (info.doi) {
-      return window.LitEnrich.byDoi(info.doi).catch(function () { return null; }).then(function (patch) {
+      return window.LitEnrich.byDoi(info.doi, false, lookupOpts).catch(function () { return null; }).then(function (patch) {
         if (patch) return withIssnFallback(patch, 'doi');
         if (info.title) {
-          return window.LitEnrich.byTitle(info.title).catch(function () { return null; }).then(function (patch2) {
+          return window.LitEnrich.byTitle(info.title, lookupOpts).catch(function () { return null; }).then(function (patch2) {
             return withIssnFallback(patch2, patch2 ? 'title' : null);
           });
         }
@@ -809,7 +1060,7 @@
       });
     }
     if (info.title) {
-      return window.LitEnrich.byTitle(info.title).catch(function () { return null; }).then(function (patch) {
+      return window.LitEnrich.byTitle(info.title, lookupOpts).catch(function () { return null; }).then(function (patch) {
         return withIssnFallback(patch, patch ? 'title' : null);
       });
     }
@@ -841,12 +1092,20 @@
       });
     }).then(function (result) {
       var info = result.info;
-      var lookup = lookupPdfMetadata(info);
-
-      // 联网补全是尽力而为的增强，绝不能卡住导入：20s 不返回就按本地解析结果建条目
+      // 联网补全是尽力而为的增强，绝不能卡住导入：8s 不返回就按本地解析结果建条目。
+      // 超时即 abort：LitEnrich 消费 signal，在飞请求经 api:fetch-abort 跨进程中止，
+      // 不再占用主进程 15s 兜底与 API 限流配额。20s→8s：批量导入时单条卡满上限的等待显著收敛。
+      var controller = typeof AbortController === 'function' ? new AbortController() : null;
+      var lookup = lookupPdfMetadata(info, controller && controller.signal);
+      var LOOKUP_TIMEOUT_MS = 8000;
       var lookupWithTimeout = Promise.race([
         lookup.catch(function () { return { patch: null, by: null }; }),
-        new Promise(function (resolve) { setTimeout(function () { resolve({ patch: null, by: null }); }, 20000); })
+        new Promise(function (resolve) {
+          setTimeout(function () {
+            if (controller) controller.abort();
+            resolve({ patch: null, by: null });
+          }, LOOKUP_TIMEOUT_MS);
+        })
       ]);
 
       return lookupWithTimeout.then(function (resolved) {
@@ -1409,11 +1668,6 @@
     return matches;
   }
 
-  function searchPageText(items, query, options) {
-    return runPageSearch(buildPageSearchIndex(items), query, options);
-  }
-
-
   /** 在已渲染页面上绘制搜索高亮层（activeIndex 高亮当前命中的词） */
   function renderSearchLayer(sheet, matches, activeIndex) {
     var old = sheet.querySelector('.pdf-search-layer');
@@ -1553,6 +1807,12 @@
     // renderingPages：每页渲染串行化（避免连续缩放时并发写同一页）；
     // pendingRefresh：渲染途中被标记过期（stale/false）时，完成后自动补一轮重绘
     var renderingPages = {}, pendingRefresh = {};
+    // bitmapCache：releasePage 后按 (页码|位图边长|旋转) 保留位图，回滚免重光栅；
+    // 缩放/旋转/dpr 变化整体失效（见 clear 调用点）
+    var bitmapCache = createBitmapLru({ maxEntries: 10, maxBytes: 120 * 1024 * 1024 });
+    // searchGeneration：handle.search 的代际 token——换查询后旧代际的未完成结果
+    // （worker 回包/高亮落地）一律丢弃，晚到的部分结果不得覆盖新查询
+    var searchGeneration = 0;
     // lastPreviewAt：最近一次 zoomPreview 的时刻。缩放手势窗口内 IntersectionObserver
     // 不启动重绘——此刻进环的页等手势收尾的 renderNearViewport 统一画，避免连续
     // 缩放中 IO 把同步光栅风暴又放进来
@@ -1640,6 +1900,7 @@
         if (cancelled) return;
         cancelled = true;
         if (observer) observer.disconnect();
+        bitmapCache.clear();
         endSelectionDragTracking();
         container.removeEventListener('pointerdown', onSelectionPointerDown);
         container.removeEventListener('scroll', onSelectionScroll);
@@ -1655,8 +1916,17 @@
       goToPage: function (pageNumber) {
         var index = Math.max(0, Math.min(sheets.length - 1, Number(pageNumber) - 1));
         if (!sheets[index]) return Promise.resolve(null);
+        var from = currentScrollPageIndex();
+        // 跳转距离超过约 3 页改瞬时定位：平滑滚动会一路滚过几十页，沿途触发逐页
+        // 渲染并与目标页抢 worker；近距离保留平滑滚动的阅读感
+        var far = Math.abs(index - from) > 3;
+        if (far && from !== index && renderTasks[from + 1]) {
+          // 源页光栅仍在途（打开后直接 goToPage(targetPage) 的首屏路径）：让位给
+          // 目标页，位图到达即弃（releasePage 已 cancel + 抬 epoch）
+          releasePage(from + 1);
+        }
         var rendered = renderPage(index + 1);
-        sheets[index].scrollIntoView({ block: 'start', behavior: 'smooth' });
+        sheets[index].scrollIntoView({ block: 'start', behavior: far ? 'auto' : 'smooth' });
         return rendered;
       },
       setAnnotations: function (value) {
@@ -1695,6 +1965,8 @@
         // 记录滚动锚点（视口顶部命中的页 + 页内偏移比例），重排后恢复阅读位置
         var anchor = captureScrollAnchor();
         scale = nextScale; layout = nextLayout; rotation = nextRotation;
+        // 缩放/版式/旋转参数变化：LRU 里的位图全部按旧参数光栅，整体失效
+        bitmapCache.clear();
         container.classList.toggle('pdf-layout-spread', layout === 'spread');
         container.classList.toggle('pdf-layout-single', layout !== 'spread');
         sheets.forEach(function (sheet, index) {
@@ -1736,6 +2008,8 @@
         var anchor = captureScrollAnchor();
         scale = nextScale;
         lastPreviewAt = Date.now();
+        // 缩放手势改参数即整体失效位图缓存（条目按旧缩放光栅，留着只占内存）
+        bitmapCache.clear();
         sheets.forEach(function (sheet, index) {
           var page = pages[index];
           if (!sheet || !page) return;
@@ -1829,13 +2103,58 @@
        * 可据此在页面上画出高亮矩形。items 过滤条件必须与文本层一致
        * （typeof str === 'string'，含空串），否则空串 item 之后全部错位。
        * options.caseSensitive / options.wholeWord 透传给 runPageSearch。
+       *
+       * 主路径：worker 侧 searchDocument 分块扫描（一次一块、块间渲染可插队），
+       * 免去逐页 getPageText RPC 与逐字 quad 负载；命中页的高亮几何仍由
+       * renderPage 按需拉取带 quads 的 getPageText（与文本层同一构建路径）。
+       * 兼容回退：旧桩 client 无 searchDocumentChunk 时走渲染侧逐页纯函数链。
+       *
+       * 代际取消：每次调用自增 searchGeneration；换查询后旧代际的未完成链
+       * 永不落定（晚到的部分结果一旦 resolve 会把新查询的高亮清掉/盖掉）。
        */
       search: function (query, options) {
         if (!foldSearchText(query, options && options.caseSensitive)) return Promise.resolve([]);
+        var generation = ++searchGeneration;
+        function stalePromise() {
+          // 永不 settle：闭包随句柄生命周期释放，无定时器无轮询
+          return new Promise(function () {});
+        }
+        var client = handle.doc && handle.doc._muClient;
+        var docId = handle.doc && handle.doc._muId;
+        if (client && typeof client.searchDocumentChunk === 'function' && docId != null) {
+          var out = [];
+          var start = 0;
+          function nextChunk() {
+            if (cancelled) return Promise.resolve(out);
+            if (generation !== searchGeneration) return stalePromise();
+            var from = start;
+            start += SEARCH_DOCUMENT_CHUNK;
+            return client.searchDocumentChunk(docId, from, SEARCH_DOCUMENT_CHUNK, query, {
+              caseSensitive: options && options.caseSensitive === true,
+              wholeWord: options && options.wholeWord === true
+            }).then(function (chunk) {
+              if (generation !== searchGeneration) return stalePromise();
+              if (cancelled) return out;
+              (chunk && chunk.hits || []).forEach(function (hit) { out.push(hit); });
+              if (chunk && typeof chunk.next === 'number' && chunk.next >= 0 && chunk.next < handle.pageCount) {
+                start = chunk.next;
+                return nextChunk();
+              }
+              return out;
+            }, function (error) {
+              // 旧代际/已取消句柄的失败同样不得打扰新查询（app.js 的 catch 没有句柄守卫，
+              // 旧的失败会把「搜索失败」盖到新结果上）
+              if (generation !== searchGeneration || cancelled) return stalePromise();
+              throw error;
+            });
+          }
+          return nextChunk();
+        }
         var chain = Promise.resolve([]);
         pages.forEach(function (page, index) {
           chain = chain.then(function (results) {
             if (cancelled) return results;
+            if (generation !== searchGeneration) return stalePromise();
             var pageTextPromise = textCache[index] ? Promise.resolve(textCache[index]) : page.getTextContent().then(function (content) {
               // 某些 PDF（如包含 XFA/嵌套标注流）的 items 会混入 undefined，
               // 需要更严格的防御：str 必须是字符串（但不过滤空串，见上）
@@ -1847,6 +2166,7 @@
               return value;
             });
             return pageTextPromise.then(function (pageData) {
+              if (generation !== searchGeneration) return stalePromise();
               var matches = runPageSearch(pageData, query, options);
               if (matches.length) results.push({ pageIndex: index, page: index + 1, count: matches.length, matches: matches });
               return results;
@@ -1871,7 +2191,6 @@
       sheet._litTextDivs = null;
       sheet._litTextItems = null;
       sheet.dataset.rendered = 'false';
-      try { pages[pageNumber - 1].cleanup(); } catch (e) {}
     }
 
     function removeOverlayLayers(sheet) {
@@ -1893,6 +2212,17 @@
         }
       }
       return null;
+    }
+
+    /** 视口顶部命中的页下标（0 基）；无法判定时回 0（goToPage 用它测跳转距离） */
+    function currentScrollPageIndex() {
+      var rootRect = container.getBoundingClientRect();
+      if (!rootRect.height) return 0;
+      for (var i = 0; i < sheets.length; i++) {
+        var rect = sheets[i] && sheets[i].getBoundingClientRect();
+        if (rect && rect.bottom > rootRect.top && rect.top < rootRect.bottom) return i;
+      }
+      return 0;
     }
     function restoreScrollAnchor(anchor) {
       if (anchor && sheets[anchor.index]) {
@@ -1948,6 +2278,8 @@
       if (next === devicePixelRatio) return;
       devicePixelRatio = next;
       watchDevicePixelRatio();
+      // 光栅倍率随 dpr 变化：旧位图全部失效（键虽不再命中，也须释放内存）
+      bitmapCache.clear();
       sheets.forEach(function (sheet) {
         if (sheet && sheet.querySelector('canvas.pdf-page')) sheet.dataset.rendered = 'stale';
       });
@@ -2005,14 +2337,32 @@
       }
       var outputScaleX = canvas.width / viewport.width;
       var outputScaleY = canvas.height / viewport.height;
+      // LRU 键 = 页码|位图边长|旋转：光栅对同参数确定性一致，边长即可区分缩放桶
+      var rasterKey = pageNumber + '|' + canvas.width + 'x' + canvas.height + '|' + rotation;
       var muTask = null;
       function renderWithMuPdf() {
+        var cached = bitmapCache.use(rasterKey);
+        if (cached) {
+          // LRU 命中：免 RPC 直接把缓存位图绘回画布；文本层/链接/批注/搜索层
+          // 照常由本轮流程重建（DOM 重建成本远低于重新光栅）
+          if (cached.width && cached.width !== canvas.width) canvas.width = cached.width;
+          if (cached.height && cached.height !== canvas.height) canvas.height = cached.height;
+          if (cached.bitmap) canvasContext.drawImage(cached.bitmap, 0, 0);
+          else canvasContext.putImageData(new ImageData(new Uint8ClampedArray(cached.pixels), cached.width, cached.height), 0, 0);
+          return Promise.resolve('lru');
+        }
         muTask = page.render({
           canvasContext: canvasContext,
           viewport: viewport,
-          transform: outputScaleX === 1 && outputScaleY === 1 ? null : [outputScaleX, 0, 0, outputScaleY, 0, 0]
+          transform: outputScaleX === 1 && outputScaleY === 1 ? null : [outputScaleX, 0, 0, outputScaleY, 0, 0],
+          keepImage: true
         });
-        return muTask.promise.then(function () { return 'mupdf'; });
+        return muTask.promise.then(function (image) {
+          // 光栅完成即入 LRU（即便本轮已被更新的一轮取代：位图按参数仍有效，
+          // 留给下次免重光栅）；单页超内存上限则不入缓存，显式释放
+          if (image && !bitmapCache.put(rasterKey, image)) discardMuImage(image);
+          return 'mupdf';
+        });
       }
       var renderTask = {
         cancel: function () {
@@ -2097,8 +2447,8 @@
     }
 
     handle.promise = getSourceBytes().then(function (bytes) {
-      var docPromise = openDocument(file, new Uint8Array(bytes));
-      // 字节副本已交给 openDocument（LitMuPdf.open 把它 transfer 给 worker）；
+      var docPromise = openDocument(file, new Uint8Array(bytes), { kind: 'reader', prefetchPageInfos: true, file: file });
+      // 字节副本已交给 openDocument（client.open 把它 transfer 给 worker）；
       // 本地缓存的整份字节此后无人消费（批注写回走 worker 独占文档，不依赖它），
       // 打开完成（无论成败）即释放引用，避免整份 PDF 随标签常驻
       docPromise.then(function () { sourceBytesPromise = null; }, function () { sourceBytesPromise = null; });
@@ -2109,58 +2459,93 @@
       container.innerHTML = '';
       container.classList.toggle('pdf-layout-spread', layout === 'spread');
       container.classList.toggle('pdf-layout-single', layout !== 'spread');
-      var chain = Promise.resolve();
-      for (var p = 1; p <= doc.numPages; p++) {
-        (function (pageNum) {
-          chain = chain.then(function () {
-            if (cancelled) return null;
-            return doc.getPage(pageNum).then(function (page) {
+      // 批量页信息一次 RPC 已取回（getPageInfos）：下面的逐页循环全部命中缓存、
+      // 不再产生 per-page pageInfo 往返。取失败或旧桩无 pageInfos 时 _pageInfosReady
+      // 为 null，走旧逐页路径。
+      var infosReady = doc._pageInfosReady || Promise.resolve();
+      return infosReady.then(function () {
+        var chain = Promise.resolve();
+        for (var p = 1; p <= doc.numPages; p++) {
+          (function (pageNum) {
+            chain = chain.then(function () {
               if (cancelled) return null;
-              pages[pageNum - 1] = page;
-              var viewport = page.getViewport({ scale: scale, rotation: rotation });
-              var sheet = document.createElement('div');
-              sheet.className = 'pdf-page-sheet';
-              sheet.dataset.page = pageNum;
-              sheet.dataset.rendered = 'false';
-              sheet.style.width = viewport.width + 'px';
-              sheet.style.height = viewport.height + 'px';
-              sheet._litViewport = viewport;
-              sheets[pageNum - 1] = sheet;
-              container.appendChild(sheet);
-              return null;
+              return doc.getPage(pageNum).then(function (page) {
+                if (cancelled) return null;
+                pages[pageNum - 1] = page;
+                var viewport = page.getViewport({ scale: scale, rotation: rotation });
+                var sheet = document.createElement('div');
+                sheet.className = 'pdf-page-sheet';
+                sheet.dataset.page = pageNum;
+                sheet.dataset.rendered = 'false';
+                sheet.style.width = viewport.width + 'px';
+                sheet.style.height = viewport.height + 'px';
+                sheet._litViewport = viewport;
+                sheets[pageNum - 1] = sheet;
+                container.appendChild(sheet);
+                return null;
+              });
             });
-          });
-        })(p);
-      }
-      return chain.then(function () {
-        if (cancelled) { try { doc.destroy(); } catch (e) {} return null; }
-        ready = true;
-        if (typeof IntersectionObserver === 'function') {
-          observer = new IntersectionObserver(function (entries) {
-            // 缩放手势窗口内不启动重绘（见 lastPreviewAt 注释）：
-            // IO 的预取环与 renderNearViewport 同为 120%，收尾会统一覆盖
-            if (Date.now() - lastPreviewAt < 250) return;
-            entries.forEach(function (entry) {
-              if (entry.isIntersecting) renderPage(Number(entry.target.dataset.page));
-            });
-          }, { root: container, rootMargin: '120% 0px' });
-          sheets.forEach(function (sheet) { observer.observe(sheet); });
+          })(p);
         }
-        container.addEventListener('scroll', scheduleViewportUpdate, { passive: true });
-        if (opts.onPageChange) opts.onPageChange(1, doc.numPages);
-        return renderPage(1).then(function () { return doc; });
+        return chain.then(function () {
+          if (cancelled) { try { doc.destroy(); } catch (e) {} return null; }
+          ready = true;
+          if (typeof IntersectionObserver === 'function') {
+            observer = new IntersectionObserver(function (entries) {
+              // 缩放手势窗口内不启动重绘（见 lastPreviewAt 注释）：
+              // IO 的预取环与 renderNearViewport 同为 120%，收尾会统一覆盖
+              if (Date.now() - lastPreviewAt < 250) return;
+              entries.forEach(function (entry) {
+                if (entry.isIntersecting) renderPage(Number(entry.target.dataset.page));
+              });
+            }, { root: container, rootMargin: '120% 0px' });
+            sheets.forEach(function (sheet) { observer.observe(sheet); });
+          }
+          container.addEventListener('scroll', scheduleViewportUpdate, { passive: true });
+          if (opts.onPageChange) opts.onPageChange(1, doc.numPages);
+          // 首屏光栅不 gate 打开 promise：renderPage(1) 同步建好 canvas/层 DOM（冒烟
+          // 的同步断言读的就是这些），但调用方（app.js 打开后 goToPage(targetPage)）
+          // 紧随 promise 的微任务即可分发目标页光栅——targetPage>1 时「目标页最先
+          // 光栅」，仍在线途的首页光栅会被远距跳转取消让位（见 goToPage）
+          renderPage(1);
+          return doc;
+        });
       });
     });
     return handle;
   }
 
+  /** 读 PDF 内嵌批注。三条路径按成本递增：
+   *  1) 同路径已有打开的阅读器文档 → 复用句柄直接扫（免整读文件 + worker 里
+   *     第二份 WASM 文档副本；内容指纹命中「已扫无内嵌」缓存时连扫都跳过）；
+   *  2) 兼容路径（bytes 或无可复用句柄）：开独立 background 文档，先查缓存再扫。
+   *  扫描一律分块（低优先级），不挡阅读器渲染。 */
   function readAnnotations(file, providedBytes) {
-    return openDocument(file, providedBytes).then(function (doc) {
-      return window.LitMuPdf.annotations(doc._muId).then(function (items) {
-        doc.destroy();
+    if (!providedBytes) {
+      var openDoc = findOpenDocument(file);
+      if (openDoc && openDoc._muClient) {
+        var client = openDoc._muClient;
+        var hashPromise = typeof client.documentHash === 'function'
+          ? client.documentHash(openDoc._muId).catch(function () { return ''; })
+          : Promise.resolve('');
+        return hashPromise.then(function (hash) {
+          return scanDocumentAnnotations(client, openDoc._muId, openDoc.numPages, hash);
+        });
+      }
+    }
+    return openDocument(file, providedBytes, { kind: 'background', file: file }).then(function (doc) {
+      var client = doc._muClient;
+      var hashPromise = client && typeof client.documentHash === 'function'
+        ? client.documentHash(doc._muId).catch(function () { return ''; })
+        : Promise.resolve('');
+      var release = function () { try { doc.destroy(); } catch (e) {} };
+      return hashPromise.then(function (hash) {
+        return scanDocumentAnnotations(client, doc._muId, doc.numPages, hash);
+      }).then(function (items) {
+        release();
         return items;
       }, function (error) {
-        doc.destroy();
+        release();
         throw error;
       });
     });
@@ -2168,7 +2553,7 @@
 
   function writeAnnotations(pdfBytes, annotations) {
     return loadMuPdf().then(function () {
-      return window.LitMuPdf.writeAnnotations(pdfBytes, annotations);
+      return (clientFor('background') || window.LitMuPdf).writeAnnotations(pdfBytes, annotations);
     }).then(function (result) {
       return { bytes: new Uint8Array(result.bytes), written: result.written || 0, skipped: result.skipped || 0 };
     });
@@ -2199,6 +2584,6 @@
     }),
     buildPageSearchIndex: buildPageSearchIndex,
     runPageSearch: runPageSearch,
-    searchPageText: searchPageText
+    createBitmapLru: createBitmapLru
   };
 })();

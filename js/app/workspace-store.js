@@ -12,6 +12,11 @@
     var baseEntities = null;
     var saveChain = Promise.resolve(true);
     var model = options.model;
+    // trailing 去抖：编辑风暴时把连续 save() 合并成一次落库（全库签名+序列化是大开销）。
+    // maxWait 保证最长延迟；applyIncoming / waitForIdle 走立即路径，绝不因去抖丢数据。
+    var SAVE_DEBOUNCE_MS = options.saveDebounceMs != null ? options.saveDebounceMs : 500;
+    var SAVE_MAX_WAIT_MS = options.saveMaxWaitMs != null ? options.saveMaxWaitMs : 2000;
+    var pendingSave = null; // { skipSyncAll, promise, resolve, timer, maxTimer }
 
     function payload() {
       var state = options.state;
@@ -91,16 +96,47 @@
         .then(function (result) { return result !== false; }, function () { return false; });
       return promise;
     }
+    /** 单遍完成「touch 脏实体 + 只深克隆脏实体」（取代 touchWorkspaceChanges + 全库 JSON 克隆）：
+     *  - 脏判定与 model.touchWorkspaceChanges 同口径：无上次确认签名（首轮，与旧实现
+     *    一致不 touch、全量克隆）或签名不一致；
+     *  - 干净实体传引用即可——发送的是 normalizeWorkspace 的产物（全新对象图，它内部的
+     *    migrateLegacyPaperNotes/projectPaperNotes 只作用于自建数组，不改写入参），内存态
+     *    不会被改写；脏实体克隆一份再 touch，避免「已发送快照」与内存共享同一对象。
+     *  克隆失败不吞错：payload 缺实体会被库端按「保留库内行」处理、静默丢本地修改，
+     *  不如让整次保存失败并走 toast 上报。 */
+    function cloneDirtyAndTouch(workspace, previous, now) {
+      var out = {
+        papers: [], notes: [], folders: [], savedSearches: [], tagColorRecords: [],
+        tagColors: workspace.tagColors
+      };
+      ['papers', 'notes', 'folders', 'savedSearches', 'tagColorRecords'].forEach(function (collection) {
+        var prevMap = previous && previous[collection];
+        var keyOf = collection === 'tagColorRecords' ? function (item) { return item.tag; } : function (item) { return item.id; };
+        (workspace[collection] || []).forEach(function (item) {
+          if (!item) return;
+          if (prevMap && prevMap[keyOf(item)] === model.entitySignature(item)) {
+            out[collection].push(item); // 干净：传引用，normalize 会产出全新副本
+            return;
+          }
+          if (previous) item.updatedAt = now;
+          out[collection].push(JSON.parse(JSON.stringify(item)));
+        });
+      });
+      return out;
+    }
     function persistDesktop(skipSync, desktop) {
       var workspace = payload();
-      if (persistedSignatures) model.touchWorkspaceChanges(workspace, persistedSignatures, Date.now());
-      workspace = JSON.parse(JSON.stringify(workspace));
+      workspace = cloneDirtyAndTouch(workspace, persistedSignatures, Date.now());
       // 与 saveState 同口径归一化后再签名/发送：库端落库前会跑同一套 normalizeWorkspace
       // （重投影 paper.notes、过滤墓碑文件夹的 folderIds、迁移旧笔记等），若用内存原始
       // 状态算签名，任何兼容投影漂移都会让写后校验误判失败且锚点停摆、后续保存全挂。
       // 不传 idFactory，与 db.js saveState 的 normalizeWorkspace(value) 完全一致。
       workspace = model.normalizeWorkspace(workspace);
       var nextSignatures = model.workspaceSignatures(workspace);
+      // 签名直传：主进程校验通过则跳过整库重签（校验失败自动回退重算，不影响正确性）。
+      // preload 的 saveLibrary 只透传 workspace/base 两个字段，因此捎带在 workspace 上
+      // （ipc/library.js 会把它提升回顶层 nextSignatures 传给 db.saveState）。
+      workspace.nextSignatures = nextSignatures;
       var oldBase = persistedSignatures;
       return desktop.saveLibrary(workspace, oldBase).then(function (result) {
         if (result && result.conflicts && result.conflicts.length) {
@@ -140,10 +176,7 @@
         return false;
       });
     }
-    function save(skipSync) {
-      ++revision;
-      model.assignCitationKeys(options.state.papers);
-      if (options.clearQueryCache) options.clearQueryCache();
+    function enqueuePersist(skipSync) {
       var desktop = options.desktop();
       if (desktop) {
         var pending = saveChain.then(function () { return persistDesktop(skipSync, desktop); });
@@ -164,6 +197,47 @@
         options.toast(options.T('⚠ 本地存储已满，数据未能保存，请导出 JSON 备份'));
       }
       return track(Promise.resolve(ok));
+    }
+    /** 去抖冲刷：立即把挂起的合并保存入队（清除两个定时器）。同步入队，返回后
+     *  saveChain 已包含本轮落库——waitForIdle 先调它再返回链条即可等完。 */
+    function flushPendingSave() {
+      if (!pendingSave) return;
+      var pending = pendingSave;
+      pendingSave = null;
+      clearTimeout(pending.timer);
+      clearTimeout(pending.maxTimer);
+      try {
+        var run = enqueuePersist(pending.skipSyncAll);
+        run.then(function (result) { pending.resolve(result !== false); }, function () { pending.resolve(false); });
+      } catch (error) {
+        pending.resolve(false);
+      }
+    }
+    function prepareForSave() {
+      ++revision;
+      model.assignCitationKeys(options.state.papers);
+      if (options.clearQueryCache) options.clearQueryCache();
+    }
+    /** 立即落库（绕过去抖）：同步应用（applyIncoming）等不能延迟的路径用。 */
+    function saveNow(skipSync) {
+      prepareForSave();
+      return enqueuePersist(skipSync);
+    }
+    function save(skipSync) {
+      prepareForSave();
+      if (SAVE_DEBOUNCE_MS > 0 && options.desktop()) {
+        if (!pendingSave) {
+          pendingSave = { skipSyncAll: true, resolve: null, promise: null, timer: 0, maxTimer: 0 };
+          pendingSave.promise = new Promise(function (resolve) { pendingSave.resolve = resolve; });
+          pendingSave.maxTimer = setTimeout(flushPendingSave, SAVE_MAX_WAIT_MS);
+        }
+        // skipSync 语义：合并窗口内只要有一次调用要触发同步，收尾就不跳过
+        pendingSave.skipSyncAll = pendingSave.skipSyncAll && !!skipSync;
+        clearTimeout(pendingSave.timer);
+        pendingSave.timer = setTimeout(flushPendingSave, SAVE_DEBOUNCE_MS);
+        return pendingSave.promise;
+      }
+      return enqueuePersist(skipSync);
     }
     function load() {
       var desktop = options.desktop();
@@ -193,7 +267,7 @@
       var previous = persistedSignatures;
       replaceMemory(workspace);
       persistedSignatures = previous;
-      return save(skipSync).then(function (ok) {
+      return saveNow(skipSync).then(function (ok) {
         if (!ok) throw new Error(options.T('同步结果未能写入本地 SQLite，已停止显示完成状态'));
         return workspace;
       });
@@ -217,7 +291,10 @@
       payload: payload,
       replace: replace,
       save: save,
-      waitForIdle: function () { return saveChain; }
+      saveNow: saveNow,
+      // 等全部已排队的本地保存落库（before-quit / 批量导入收尾都靠它兜底）：
+      // 先把去抖窗口里挂起的合并保存立即入队，再返回链条——绝不因去抖漏存。
+      waitForIdle: function () { flushPendingSave(); return saveChain; }
     };
   }
 

@@ -120,8 +120,13 @@ async function doSave() {
   }).then(function (result) {
     if (result && result.ok) {
       lastSavedId = result.id;
+      // 新桌面端保存响应提前（本地入库即返回），联网补全与 PDF 下载转后台（enrichPending=true）；
+      // 旧桌面端没有该字段 → 走原有文案。两个更新方向互不依赖。
+      let pdfNote;
+      if (result.enrichPending) pdfNote = '，桌面端正在后台补全元数据/PDF…';
+      else pdfNote = result.pdfAttached ? '，PDF 已附加 ✓' : '（PDF 未能附加：桌面端需可访问该链接）';
       setStatus((result.duplicated ? '已存在，已并入文件夹“' : '已保存到“')
-        + currentFolderLabel() + '”' + (result.pdfAttached ? '，PDF 已附加 ✓' : '（PDF 未能附加：桌面端需可访问该链接）'));
+        + currentFolderLabel() + '”' + pdfNote);
       chrome.action.setBadgeText({ tabId: currentTabId, text: '✓' }).catch(function () {});
       chrome.action.setBadgeBackgroundColor({ tabId: currentTabId, color: '#2f8f4e' }).catch(function () {});
       setTimeout(function () { chrome.action.setBadgeText({ tabId: currentTabId, text: '' }).catch(function () {}); }, 4000);
@@ -138,7 +143,7 @@ async function doSave() {
 
 $('save').addEventListener('click', doSave);
 
-// ---------- 批量保存（搜索结果/列表页） ----------
+// ---------- 批量列表渲染（搜索结果/列表页） ----------
 function renderBatchList(items) {
   const list = $('batch-list');
   list.innerHTML = '';
@@ -164,33 +169,62 @@ function renderBatchList(items) {
   $('batch-section').hidden = false;
 }
 
+// ---------- 批量保存（搜索结果/列表页）：2 并发，按钮兼任「停止」 ----------
+let batchRunning = false;
+let batchCancelled = false;
+// 经函数读取：停止标志由点击回调在另一个闭包里修改，worker 循环里直接读会被
+// no-unmodified-loop-condition 误判（跨闭包修改它看不见）
+function batchStopRequested() { return batchCancelled; }
+
 $('batch-save').addEventListener('click', async function () {
+  // 批量进行中：同一点击视为停止（在途一条等它落定，不再取下一条）
+  if (batchRunning) {
+    batchCancelled = true;
+    $('batch-save').disabled = true;
+    setStatus('正在停止批量保存…');
+    return;
+  }
   const boxes = Array.prototype.slice.call($('batch-list').querySelectorAll('input:checked'));
   if (!boxes.length) { setStatus('先勾选要保存的条目', true); return; }
-  $('batch-save').disabled = true;
-  let ok = 0, failed = 0;
+  batchRunning = true;
+  batchCancelled = false;
+  $('batch-save').textContent = '停止批量保存';
+  let ok = 0, failed = 0, completed = 0;
   const failReasons = {};
-  for (let i = 0; i < boxes.length; i++) {
-    const item = batchItems[Number(boxes[i].dataset.index)];
-    setStatus('批量保存中 ' + (i + 1) + '/' + boxes.length + '…');
-    try {
-      const result = await chrome.runtime.sendMessage({
-        type: 'litboard-save',
-        tabId: currentTabId,
-        meta: { doi: item.doi, title: item.title, url: '', folderId: selectedFolderId, tags: userTags() }
-      });
-      if (result && result.ok) ok++;
-      else {
-        failed++;
-        const reason = (result && result.error) || '未知错误';
-        failReasons[reason] = (failReasons[reason] || 0) + 1;
-      }
-    } catch (e) { failed++; failReasons['扩展消息失败'] = (failReasons['扩展消息失败'] || 0) + 1; }
+  let next = 0;
+  setStatus('批量保存中 0/' + boxes.length + '…');
+  async function worker() {
+    while (!batchStopRequested()) {
+      const index = next++;
+      if (index >= boxes.length) return;
+      const item = batchItems[Number(boxes[index].dataset.index)];
+      try {
+        const result = await chrome.runtime.sendMessage({
+          type: 'litboard-save',
+          tabId: currentTabId,
+          meta: { doi: item.doi, title: item.title, url: '', folderId: selectedFolderId, tags: userTags() }
+        });
+        if (result && result.ok) ok++;
+        else {
+          failed++;
+          const reason = (result && result.error) || '未知错误';
+          failReasons[reason] = (failReasons[reason] || 0) + 1;
+        }
+      } catch (e) { failed++; failReasons['扩展消息失败'] = (failReasons['扩展消息失败'] || 0) + 1; }
+      completed++;
+      setStatus('批量保存中 ' + completed + '/' + boxes.length + '…');
+    }
   }
+  // 2 并发：桌面端同步段只剩本地入库，瓶颈在网络富化/PDF 的后台队列，前端 2 路即可喂满
+  await Promise.all([worker(), worker()]);
+  batchRunning = false;
+  $('batch-save').textContent = '保存选中的条目';
   $('batch-save').disabled = false;
   let failDetail = Object.keys(failReasons).map(function (r) { return r + '×' + failReasons[r]; }).join('；');
   if (failDetail.length > 120) failDetail = failDetail.slice(0, 120) + '…';
-  setStatus('批量保存完成：成功 ' + ok + ' 条' + (failed ? '，失败 ' + failed + ' 条（' + failDetail + '）' : '') + '（桌面端会自动联网补全元数据）', failed ? true : false);
+  setStatus((batchCancelled ? '已停止：' : '批量保存完成：') + '成功 ' + ok + ' 条'
+    + (failed ? '，失败 ' + failed + ' 条（' + failDetail + '）' : '')
+    + '（桌面端会自动联网补全元数据）', failed ? true : false);
 });
 
 $('options').addEventListener('click', function () { chrome.runtime.openOptionsPage(); });

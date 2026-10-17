@@ -23,14 +23,26 @@
   if (!MarkdownIt && typeof module === 'object' && module.exports) {
     try { MarkdownIt = require('../vendor/markdown-it/markdown-it.min.js'); } catch (e) { MarkdownIt = null; }
   }
-  var api = factory(MarkdownIt);
+  var LitExcerpt = root && root.LitExcerpt;
+  if (!LitExcerpt && typeof module === 'object' && module.exports) {
+    try { LitExcerpt = require('./excerpt.js'); } catch (e) { LitExcerpt = null; }
+  }
+  var api = factory(MarkdownIt, LitExcerpt);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.LitMarkdown = api;
-})(typeof window !== 'undefined' ? window : null, function (MarkdownIt) {
+})(typeof window !== 'undefined' ? window : null, function (MarkdownIt, LitExcerpt) {
   'use strict';
 
   var assetBase = ''; // 渲染层启动时设为 file:///<configDir>/（note-assets 相对路径拼接用）
   function setAssetBase(value) { assetBase = String(value || ''); }
+
+  /* 摘录定位链接统一走 LitExcerpt.buildLocateUrl（litboard:// URL 单一权威实现）。
+   * index.html 里 excerpt.js 晚于本文件加载，顶层捕获可能为空——运行时再取一次。 */
+  function excerptApi() {
+    if (LitExcerpt) return LitExcerpt;
+    if (typeof window !== 'undefined' && window.LitExcerpt) { LitExcerpt = window.LitExcerpt; return LitExcerpt; }
+    return null;
+  }
 
   function esc(value) {
     return String(value == null ? '' : value)
@@ -84,12 +96,7 @@
         return state.md.renderInline(line, state.env);
       }).join('<br>');
       if (meta && meta.paperId) {
-        var params = [];
-        if (meta.attachmentId) params.push('attachment=' + encodeURIComponent(meta.attachmentId));
-        if (meta.annotationId) params.push('annotation=' + encodeURIComponent(meta.annotationId));
-        if (meta.pageIndex != null) params.push('page=' + (Number(meta.pageIndex) + 1));
-        var url = 'litboard://open/paper/' + encodeURIComponent(meta.paperId) +
-          (params.length ? '?' + params.join('&') : '');
+        var url = excerptApi().buildLocateUrl(meta);
         body += '<a class="lb-excerpt-loc" href="' + esc(url) + '">↩ ' +
           esc(meta.pageIndex != null ? 'p.' + (Number(meta.pageIndex) + 1) : '定位') + '</a>';
         // 保留结构化元数据（begin 标记里的原始 JSON 串），保证 md → html → md 往返不丢出处

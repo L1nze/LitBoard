@@ -112,7 +112,7 @@
   function saveTableColumns() {
     try { localStorage.setItem(TABLE_COLUMNS_KEY, JSON.stringify(tableColumns)); } catch (error) {}
   }
-  function applyTableColumns(widthOnly) {
+  function applyTableColumns(widthOnly, wrapWidth) {
     var total = 0;
     var headers = {};
     TABLE_COLUMNS.forEach(function (column) {
@@ -123,7 +123,8 @@
       if (!widthOnly) th.hidden = !preference.visible;
       if (preference.visible) total += preference.width;
     });
-    var spare = Math.max(0, $('#table-wrap').clientWidth - total);
+    // wrapWidth：拖列宽期间由调用方缓存传入（拖动中视口不变，move 内只写不读）
+    var spare = Math.max(0, (wrapWidth != null ? wrapWidth : $('#table-wrap').clientWidth) - total);
     var titleExtra = Math.round(spare * (tableColumns.venue.visible ? 0.6 : 1));
     TABLE_COLUMNS.forEach(function (column) {
       var extra = column.key === 'title' ? titleExtra : column.key === 'venue' ? spare - titleExtra : 0;
@@ -170,6 +171,15 @@
     }
     wrapped.flush = function () { if (t) { clearTimeout(t); run(); } };
     return wrapped;
+  }
+  /* 把高频回调（resize / 拖拽 move）合并到每帧一次：连续事件只在下一帧执行最后一次 */
+  function rafThrottle(fn) {
+    var queued = false;
+    return function () {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(function () { queued = false; fn(); });
+    };
   }
 
   function readCollapsedFolders() {
@@ -265,11 +275,14 @@
     } catch (e) { return { left: 220, right: 370 }; }
   }
 
-  function applyPaneSizes(sizes) {
+  /* geo（可选）= 拖拽期间缓存的几何读数 { railWidth, available }：pointerdown 时取一次，
+   * move 内只写 CSS 变量，不再逐事件读 getComputedStyle/clientWidth（读写交错强制同步布局） */
+  function applyPaneSizes(sizes, geo) {
     var workspace = $('.workspace');
     if (!workspace) return;
-    var railWidth = parseFloat(getComputedStyle(workspace).getPropertyValue('--rail-width')) || 42;
-    var available = Math.max(0, workspace.clientWidth - railWidth - 430);
+    var railWidth = geo ? geo.railWidth :
+      (parseFloat(getComputedStyle(workspace).getPropertyValue('--rail-width')) || 42);
+    var available = geo ? geo.available : Math.max(0, workspace.clientWidth - railWidth - 430);
     var left = clamp(sizes.left, PANE_LIMITS.left.min, PANE_LIMITS.left.max);
     var right = clamp(sizes.right, PANE_LIMITS.right.min, PANE_LIMITS.right.max);
     var leftCollapsed = workspace.classList.contains('left-collapsed');
@@ -351,31 +364,42 @@
   function bindPaneResizer(id, side) {
     var handle = $('#' + id);
     var workspace = $('.workspace');
-    var startX = 0, startWidth = 0;
-    function resizeTo(width) {
+    var startX = 0, startWidth = 0, geo = null, frame = 0, pendingDelta = 0;
+    function resizeTo(width, cachedGeo) {
       var sizes = {
         left: Number(workspace.dataset.leftWidth) || 220,
         right: Number(workspace.dataset.rightWidth) || 370
       };
       sizes[side] = width;
-      applyPaneSizes(sizes);
+      applyPaneSizes(sizes, cachedGeo);
+    }
+    /* rAF 帧内只应用最后一次位移：pointermove 频率高于刷新率时合并，避免每事件一次
+     * 「写 CSS 变量 → syncReadingRail 读回」的强制布局 */
+    function applyPendingDelta() {
+      frame = 0;
+      resizeTo(startWidth + (side === 'left' ? pendingDelta : -pendingDelta), geo);
     }
     handle.addEventListener('pointerdown', function (e) {
       startX = e.clientX;
       startWidth = Number(workspace.dataset[side + 'Width']);
+      var railWidth = parseFloat(getComputedStyle(workspace).getPropertyValue('--rail-width')) || 42;
+      geo = { railWidth: railWidth, available: Math.max(0, workspace.clientWidth - railWidth - 430) };
       handle.setPointerCapture(e.pointerId);
       handle.classList.add('dragging');
       document.body.classList.add('resizing-panes');
     });
     handle.addEventListener('pointermove', function (e) {
       if (!handle.hasPointerCapture(e.pointerId)) return;
-      var delta = e.clientX - startX;
-      resizeTo(startWidth + (side === 'left' ? delta : -delta));
+      pendingDelta = e.clientX - startX;
+      if (frame) return;
+      frame = requestAnimationFrame(applyPendingDelta);
     });
     function finish(e) {
+      if (frame) { cancelAnimationFrame(frame); applyPendingDelta(); } // 挂起的末帧立即落定
       if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
       handle.classList.remove('dragging');
       document.body.classList.remove('resizing-panes');
+      geo = null;
       savePaneSizes();
     }
     handle.addEventListener('pointerup', finish);
@@ -484,10 +508,11 @@
       saveCurrentSize();
     });
     // 窗口变小后原尺寸可能已经超界：按新视口重新钳制（存的值不动，窗口变大再打开即恢复）
-    window.addEventListener('resize', function () {
+    // rAF 合并：连续 resize 事件每帧最多重算一次
+    window.addEventListener('resize', rafThrottle(function () {
       if (modal.hidden || !modal.style.width) return;
       applyModalSize(modal, currentSize(), minW, minH);
-    });
+    }));
   }
 
   function toast(msg, ms, action) {
@@ -624,14 +649,20 @@
   }
 
   /** 统一删除入口：软删除（置墓碑），toast 可撤销；回收站中可恢复或彻底清除 */
-  /** 删除/purge 时清理按文献驻留的运行时键：expandedRows（paperId→true）与
-   *  pdfReadingElapsed（paperId:attachmentId→ms）——两者都只写不删，不清理则键随库膨胀 */
+  /** 删除/purge 时清理按文献驻留的运行时键：expandedRows（paperId→true）、
+   *  pdfReadingElapsed（paperId:attachmentId→ms）与 itemOrganizeSeen（paperId→附件路径键）
+   *  ——三者都只写不删，不清理则键随库膨胀；同时按篇失效全文检索缓存（pdfsearch.js 的
+   *  invalidate 已存在；防御式调用，浏览器版/未加载时静默跳过） */
   function forgetPaperRuntimeState(id) {
     delete state.expandedRows[id];
+    delete itemOrganizeSeen[id];
     var prefix = id + ':';
     Object.keys(pdfReadingElapsed).forEach(function (key) {
       if (key === id || key.indexOf(prefix) === 0) delete pdfReadingElapsed[key];
     });
+    if (window.LitPdfSearch && typeof window.LitPdfSearch.invalidate === 'function') {
+      window.LitPdfSearch.invalidate(id);
+    }
   }
   function removePapers(ids, label) {
     var idSet = {};
@@ -889,8 +920,14 @@
     if (epubNotePanel) epubNotePanel.flush();
     return workspaceStore.waitForIdle();
   }
+  /* 整体换库不走 save 管线（load/replace 直接 replaceMemory，revision 不动）：
+   * 渲染缓存签名必须叠加这个换库纪元，否则 load 后所有分区缓存全数滞留旧内容 */
+  var renderEpoch = 0;
   function load() {
-    return workspaceStore.load();
+    return workspaceStore.load().then(function (value) {
+      renderEpoch++;
+      return value;
+    });
   }
 
   // ---------- 数据模型 ----------
@@ -1171,7 +1208,37 @@
   /* 排序用 collator 实例复用：localeCompare 每次调用都重解析 locale，万级文献排序时差一个数量级 */
   var SORT_COLLATOR = null;
 
+  /* ---- filteredPapers 记忆化 ----
+   * 同一次交互里 renderTable / syncCheckAll / selectRangeTo / moveFocus / Ctrl+A 都会取
+   * 当前列表，j/k 导航曾经每键全库过滤+排序一遍。签名口径：
+   * - workspaceRevision：save() 内 prepareForSave 同步 +1（js/app/workspace-store.js），
+   *   内容性修改一律先 save 再 render，revision 相同 = papers/folders/notes 内容未变；
+   * - 视图态（filters/排序/文件夹/全文开关与命中/隐藏墓碑/导入预览行数）单独进签名。
+   * 命中即返回同一数组实例（调用方都先 slice 再改，无原地修改）。
+   * 注意 querySyntaxError / plainSearchMatches 是过滤的副作用，随缓存一并复用——
+   * 签名不变时它们与列表本就同源一致。 */
+  var filteredPapersCache = { sig: '', list: null };
+  function workspaceRevision() {
+    return workspaceStore ? workspaceStore.getRevision() : -1;
+  }
   function filteredPapers() {
+    var f = state.filters;
+    var sig = [
+      renderEpoch, workspaceRevision(), state.papers.length,
+      JSON.stringify(f),
+      state.activeFolderId, state.activeFolderIds.join(','),
+      state.sort.key, state.sort.dir, searchSortOverride ? 1 : 0,
+      state.ftEnabled ? 1 : 0, ftHitsVersion,
+      Object.keys(state.hiddenPurged).length,
+      folderImportPreviewPapers.length
+    ].join('|');
+    if (filteredPapersCache.sig === sig && filteredPapersCache.list) return filteredPapersCache.list;
+    var out = computeFilteredPapers();
+    filteredPapersCache = { sig: sig, list: out };
+    return out;
+  }
+
+  function computeFilteredPapers() {
     var f = state.filters;
     var inTrash = state.activeFolderId === 'trash';
     var isRecent = state.activeFolderId === 'recent';
@@ -1314,6 +1381,13 @@
 
   // ---------- PDF 全文检索（跨库，桌面版） ----------
   var ftSearchToken = 0;
+  /* 全文命中集的版本号：ftHits 赋值点都走 setFtHits（filteredPapers 缓存签名依赖它——
+   * 同一 token 内命中集从空到有，签名必须跟着变） */
+  var ftHitsVersion = 0;
+  function setFtHits(value) {
+    state.ftHits = value;
+    ftHitsVersion++;
+  }
   var runFtSearch = debounce(function () { performFullTextSearch(); }, 350);
 
   function toggleFullTextSearch() {
@@ -1322,7 +1396,7 @@
     $('#btn-ft').classList.toggle('active', state.ftEnabled);
     if (!state.ftEnabled) {
       ftSearchToken++;
-      state.ftHits = {};
+      setFtHits({});
       var statusEl = $('#ft-status');
       statusEl.hidden = true;
       statusEl.textContent = '';
@@ -1339,7 +1413,7 @@
     var query = $('#search').value.trim();
     var token = ++ftSearchToken;
     if (!state.ftEnabled || !query) {
-      state.ftHits = {};
+      setFtHits({});
       $('#ft-status').hidden = true;
       renderAll();
       return;
@@ -1370,8 +1444,8 @@
         current.count += hit.count;
         totalMatches += hit.count;
       });
-      state.ftHits = hitsById;
       state.tablePage = 0;
+      setFtHits(hitsById);
       var matchedPapers = Object.keys(hitsById).length;
       statusEl.textContent = matchedPapers
         ? T('命中 ') + matchedPapers + T(' 篇 · ') + totalMatches + T(' 个命中页') +
@@ -1487,6 +1561,17 @@
 
   function folderPaperCount(folderId) {
     return sidebarCounts().byFolder[folderId] || 0;
+  }
+
+  /* ---- 渲染分区缓存（渲染性能）：stats / 年份柱图 / 标签 chips / 文件夹树的签名 ----
+   * 与 sidebarCounts 同一思路：revision 由 save() 同步递增（内容性修改一律先 save 再
+   * render），renderEpoch 覆盖 load/replace 的整体换库，papers.length/hiddenPurged 键数
+   * 兜住「先渲染后保存」的少数路径；签名不变则该分区的数据必然不变。
+   * 柱图与 chips 直接跳过整块 DOM 重建（既有监听器随 DOM 保留，不丢失）；
+   * stats 只缓存计算结果（DOM 文本写入本身便宜，每次照写防外部改动残留）。 */
+  function papersSignature() {
+    return [renderEpoch, workspaceRevision(), state.papers.length,
+      Object.keys(state.hiddenPurged).length].join('|');
   }
 
   function compareFolders(a, b) {
@@ -1632,6 +1717,20 @@
     reportCurrentFolder();
   }
 
+  /* 文件夹树分区渲染：树结构只在「结构签名」变化时重建（folders 内容走 revision +
+   * length/maxUpdatedAt——兜住 deleteFolders/导入回滚这类「先渲染后保存」的路径；
+   * 折叠/选中/焦点是视图态单独进签名）；普通文献增删只改每行的计数文本节点，
+   * 不再 innerHTML='' 整树重建（重建会丢 DOM 焦点、触发整列重排）。 */
+  var renderFoldersCache = { sig: '' };
+  function folderTreeSignature() {
+    var maxFolder = 0;
+    for (var i = 0; i < state.folders.length; i++) {
+      if (state.folders[i].updatedAt > maxFolder) maxFolder = state.folders[i].updatedAt;
+    }
+    return [renderEpoch, workspaceRevision(), state.folders.length, maxFolder,
+      JSON.stringify(state.collapsedFolders),
+      state.activeFolderId, state.activeFolderIds.join(','), state.folderFocusId || ''].join('|');
+  }
   function renderFolders() {
     var counts = sidebarCounts();
     $('#library-count-all').textContent = counts.all;
@@ -1641,12 +1740,30 @@
     $all('#library-nav [data-folder]').forEach(function (item) {
       item.classList.toggle('active', item.dataset.folder === state.activeFolderId);
     });
+    var list = $('#folder-list');
+    var treeSig = folderTreeSignature();
+    if (renderFoldersCache.sig === treeSig && list.children.length) {
+      // 结构未变：仅刷新行级计数与选中/焦点类（文本与类切换，无重排开销）
+      $all('#folder-list .folder-item').forEach(function (row) {
+        var fid = row.dataset.folder;
+        var active = state.activeFolderId === fid;
+        var multi = state.activeFolderIds.indexOf(fid) !== -1;
+        row.classList.toggle('active', active);
+        row.classList.toggle('multi-active', multi);
+        row.classList.toggle('focused', state.folderFocusId === fid);
+        row.setAttribute('aria-selected', String(active || multi));
+        var count = row.querySelector('.library-count');
+        if (count) count.textContent = counts.byFolder[fid] || 0;
+      });
+      $('#folder-empty').hidden = state.folders.length > 0;
+      return;
+    }
+    renderFoldersCache.sig = treeSig;
     var childCountByParent = {};
     state.folders.forEach(function (folder) {
       var pid = folder.parentId || '';
       childCountByParent[pid] = (childCountByParent[pid] || 0) + 1;
     });
-    var list = $('#folder-list');
     // 键盘导航：重建会丢掉 DOM 焦点，重建前记下、重建后还给聚焦行
     var hadFocus = document.activeElement === list || list.contains(document.activeElement);
     list.innerHTML = '';
@@ -2007,12 +2124,17 @@
   // ---------- 标签管理 ----------
   var TAG_PALETTE = ['#ffd400', '#5fbf77', '#5aa9ff', '#ff6b6b', '#b28dff', '#ff9f43', '#26c6da', '#8d99ae'];
 
+  /* 标签频次按文献集合签名缓存：renderAll 高频路径与标签管理弹窗共用同一份统计 */
+  var tagFrequencyCache = { sig: '', freq: null };
   function tagFrequency() {
+    var sig = papersSignature();
+    if (tagFrequencyCache.sig === sig && tagFrequencyCache.freq) return tagFrequencyCache.freq;
     var freq = {};
     state.papers.forEach(function (p) {
       if (p.deletedAt) return;
       (p.tags || []).forEach(function (tag) { freq[tag] = (freq[tag] || 0) + 1; });
     });
+    tagFrequencyCache = { sig: sig, freq: freq };
     return freq;
   }
 
@@ -3046,14 +3168,16 @@
     all.checked = list.length > 0 && selCount === list.length;
     all.indeterminate = selCount > 0 && selCount < list.length;
   }
-  function updateSelectionUi() {
+  /* list（可选）= 调用方已持有的当前列表（moveFocus/Ctrl+A 都先取过 filteredPapers，
+   * 传下去避免 syncCheckAll 再算一遍；不传时内部取（有记忆化，代价低）） */
+  function updateSelectionUi(list) {
     $all('#table-body tr').forEach(function (tr) {
       var on = !!state.selected[tr.dataset.id];
       tr.classList.toggle('selected', on);
       var box = tr.querySelector('[data-act="select"]');
       if (box) box.checked = on;
     });
-    syncCheckAll();
+    syncCheckAll(list);
     renderBulkBar();
   }
   function updateFocusUi() {
@@ -3089,7 +3213,7 @@
     state.focusId = list[idx].id;
     if (extend) {
       selectRangeTo(state.focusId);
-      updateSelectionUi();
+      updateSelectionUi(list);
     }
     var targetPage = Math.floor(idx / TABLE_PAGE_SIZE);
     if (targetPage !== state.tablePage) {
@@ -3101,7 +3225,9 @@
     if (tr) tr.scrollIntoView({ block: 'nearest' });
   }
 
-  function renderStats() {
+  /* 统计条：全库扫描的结果按文献集合签名缓存（renderAll 高频路径不再逐次全库遍历） */
+  var renderStatsCache = { sig: '', data: null };
+  function computeStatsData() {
     var livePapers = state.papers.filter(function (p) { return !p.deletedAt; });
     var total = livePapers.length;
     var monthAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
@@ -3115,33 +3241,52 @@
       if (p.doi) completeFields++; else missingDoi++;
       if (p.abstract) completeFields++; else missingAbstract++;
     });
+    var years = livePapers.map(function (p) { return p.year; }).filter(function (y) { return y != null; });
+    return { total: total, thisMonth: thisMonth, localPdf: localPdf, completeFields: completeFields,
+      missingDoi: missingDoi, missingAbstract: missingAbstract,
+      minYear: years.length ? Math.min.apply(null, years) : null,
+      maxYear: years.length ? Math.max.apply(null, years) : null };
+  }
+  function renderStats() {
+    // 「近 30 天」随墙钟滑动：签名带上天级时间桶，跨天最多多算一次
+    var sig = papersSignature() + '|' + Math.floor(Date.now() / 86400000);
+    if (renderStatsCache.sig !== sig || !renderStatsCache.data) {
+      renderStatsCache = { sig: sig, data: computeStatsData() };
+    }
+    var d = renderStatsCache.data;
+    var total = d.total;
     $('#stat-total').textContent = total;
-    var pdfPct = total ? Math.round(localPdf / total * 100) + '%' : '0%';
+    var pdfPct = total ? Math.round(d.localPdf / total * 100) + '%' : '0%';
     $('#stat-pdf').textContent = pdfPct;
-    $('#stat-pdf-hint').textContent = total ? localPdf + ' / ' + total + T(' 篇已落地') : T('暂无文献');
-    $('#stat-completeness').textContent = total ? Math.round(completeFields / (total * 5) * 100) + '%' : '0%';
+    $('#stat-pdf-hint').textContent = total ? d.localPdf + ' / ' + total + T(' 篇已落地') : T('暂无文献');
+    $('#stat-completeness').textContent = total ? Math.round(d.completeFields / (total * 5) * 100) + '%' : '0%';
     var doiBtn = $('#stat-missing-doi');
     var absBtn = $('#stat-missing-abstract');
-    doiBtn.hidden = !total || !missingDoi;
-    doiBtn.textContent = T('缺 DOI ') + missingDoi;
-    absBtn.hidden = !total || !missingAbstract;
-    absBtn.textContent = T('缺摘要 ') + missingAbstract;
-    var years = livePapers.map(function (p) { return p.year; }).filter(function (y) { return y != null; });
-    $('#stat-total-hint').textContent = years.length
-      ? Math.min.apply(null, years) + ' – ' + Math.max.apply(null, years)
-      : ' ';
+    doiBtn.hidden = !total || !d.missingDoi;
+    doiBtn.textContent = T('缺 DOI ') + d.missingDoi;
+    absBtn.hidden = !total || !d.missingAbstract;
+    absBtn.textContent = T('缺摘要 ') + d.missingAbstract;
+    $('#stat-total-hint').textContent = d.minYear != null ? d.minYear + ' – ' + d.maxYear : ' ';
     var stripText = $('#stats-strip-text');
     if (stripText) {
       var parts = [total + T(' 篇')];
       if (total) parts.push(T('本地 PDF ') + pdfPct);
-      if (thisMonth) parts.push(T('近 30 天 +') + thisMonth);
+      if (d.thisMonth) parts.push(T('近 30 天 +') + d.thisMonth);
       stripText.textContent = parts.join(' · ');
     }
   }
 
   var chartShowAllYears = false;
   var chartRecentStart = null;
+  /* 柱图整块缓存：签名 = 文献集合 + 显示范围开关 + 年份筛选（影响柱子 dimmed 类）。
+   * 命中时直接跳过重建——已渲染柱子的 mouseenter/click 监听器随 DOM 保留，
+   * 闭包捕获的年份数据仍与缓存签名一致，不会丢事件也不会指向旧数据。 */
+  var renderChartCache = { sig: '' };
   function renderChart() {
+    var chartSig = papersSignature() + '|' + (chartShowAllYears ? 1 : 0) + '|' +
+      (state.filters.year == null ? '' : state.filters.year);
+    if (renderChartCache.sig === chartSig) return;
+    renderChartCache.sig = chartSig;
     var body = $('#year-chart');
     body.innerHTML = '';
     var old = $('.ybar-x'); if (old) old.remove();
@@ -3217,7 +3362,7 @@
           state.activeSavedSearchIds = [];
           state.ftEnabled = false;
           ftSearchToken++;
-          state.ftHits = {};
+          setFtHits({});
           $('#btn-ft').classList.remove('active');
           $('#ft-status').hidden = true;
           state.filters.year = y;
@@ -3250,7 +3395,13 @@
       : T('点击柱子可按年份筛选');
   }
 
+  /* 标签 chips 整块缓存：签名 = 文献集合 + 当前标签筛选（active 类）；命中跳过重建，
+   * chip 的 click 监听器随 DOM 保留（闭包捕获的标签与频次仍与签名一致） */
+  var renderTagChipsCache = { sig: '' };
   function renderTagChips() {
+    var chipsSig = papersSignature() + '|' + (state.filters.tag || '');
+    if (renderTagChipsCache.sig === chipsSig) return;
+    renderTagChipsCache.sig = chipsSig;
     var wrap = $('#tag-chips');
     var freq = tagFrequency();
     var tags = Object.keys(freq).sort(function (a, b) { return freq[b] - freq[a]; }).slice(0, 12);
@@ -3279,6 +3430,21 @@
     var s = '';
     for (var i = 1; i <= 5; i++) s += '<span class="' + (i <= n ? 'on' : 'off') + '">★</span>';
     return '<span class="stars">' + s + '</span>';
+  }
+
+  /** 就地刷新某行评分单元格：详情栏点星不再整表 renderTable（全量过滤+排序只为
+   *  一颗星重画，代价不成比例）；行不在当前页时无操作，翻页自然按新值渲染。 */
+  function updateRowRatingCell(paper) {
+    if (!paper) return;
+    var row = document.querySelector('#table-body tr[data-id="' + paper.id + '"]');
+    if (!row) return;
+    var cell = null;
+    Array.prototype.forEach.call(row.cells, function (c) {
+      if (c.dataset && c.dataset.column === 'rating') cell = c;
+    });
+    if (cell) {
+      cell.innerHTML = paper.rating ? starsHtml(paper.rating) : '<span class="stars"><span class="off">—</span></span>';
+    }
   }
 
   function authorsShort(authors) {
@@ -4495,7 +4661,10 @@
     drawerId = null;
     $('#drawer').hidden = true;
     $('#detail-empty').hidden = false;
-    renderTable();
+    // 定向清行高亮：之前整页 renderTable 只为移除一个类，代价是全量过滤+排序+重建
+    $all('#table-body tr.detail-active').forEach(function (tr) {
+      tr.classList.remove('detail-active');
+    });
   }
 
   // ---------- 导入 ----------
@@ -4748,6 +4917,7 @@
     return run;
   }
   function restoreJsonWorkspace(workspace) {
+    renderEpoch++; // 整体换库不抬 revision（replace 路径无 save）：先抬纪元再渲染
     var replacing = workspaceStore.replace(workspace);
     resetActiveFolder();
     closeDrawer();
@@ -4864,6 +5034,8 @@
           renderAll();
           queueImportedPdfIndex(result);
         }).catch(function () {});
+        // 解析期联网元数据没拿全（无 DOI 且无 venue/年份）的条目后台静默补全（24h 台账防重）
+        enrichImportedInBackground((result.addedIds || []).map(getById));
         return result;
       });
     });
@@ -5023,9 +5195,12 @@
         (plan.skippedUnsupported ? T('；跳过不支持的文件 {n} 个', { n: plan.skippedUnsupported }) : '') +
         (scan.hiddenSkipped ? T('；跳过隐藏项 {n} 个', { n: scan.hiddenSkipped }) : '') +
         (scan.unreadable && scan.unreadable.length ? T('；无法读取 {n} 项', { n: scan.unreadable.length }) : ''), 9000);
-      if (result && pdfPapers.length) {
+      // 纯 EPUB/文档批次也建全文索引：queueImportedPdfIndex 内部按附件类型分流
+      // （extractEpubPages 就绪，other 类附件不产生检索单元），指纹回填对 EPUB 同样适用
+      if (result) {
         backfillPdfFingerprints((result.addedIds || []).concat((result.matches || []).map(function (m) { return m.id; })))
           .then(function () { queueImportedPdfIndex(result); }).catch(function () {});
+        enrichImportedInBackground((result.addedIds || []).map(getById));
       }
       if (desktop && desktop.getScigreatRank) refreshFolderJournalRanks(rootId);
       return result;
@@ -5090,9 +5265,10 @@
         added: result ? result.added : 0,
         duplicates: duplicates.length + (result ? result.merged : 0), failed: failures
       }));
-      if (result && pdfPapers.length) {
+      if (result) {
         backfillPdfFingerprints((result.addedIds || []).concat((result.matches || []).map(function (m) { return m.id; })))
           .then(function () { queueImportedPdfIndex(result); }).catch(function () {});
+        enrichImportedInBackground((result.addedIds || []).map(getById));
       }
     } catch (error) { toast('⚠ ' + (error && error.message || error)); }
   }
@@ -5181,7 +5357,11 @@
   }
 
   function startEnrichRun(targets, startToastPrefix) {
-    enrichRun = { ctl: { paused: false, aborted: false }, targets: targets, done: 0, ok: 0 };
+    // ctl.signal 进 enrichBatch 链：✕ 中断时在飞 HTTP 请求也经跨进程通道一并中止，
+    // 不再留它们跑满 15s 主进程超时兜底（白白占用 API 限流配额）
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    enrichRun = { ctl: { paused: false, aborted: false, signal: controller && controller.signal }, targets: targets, done: 0, ok: 0 };
+    enrichRun.abortHttp = controller ? function () { controller.abort(); } : function () {};
     setEnrichUi();
     if (startToastPrefix) toast(startToastPrefix + targets.length + T(' 篇…（顶栏按钮可暂停，✕ 中断）'));
     var run = enrichRun;
@@ -5240,6 +5420,30 @@
     run.ctl.aborted = true;
     run.ctl.paused = false;
     run.ctl.wake();
+    if (run.abortHttp) run.abortHttp();
+  }
+
+  /* 导入收尾的静默后台富化：对本批「无 DOI 且无 venue/年份」的新条目跑联网补全。
+   * - 复用 enrichLedger 24h 台账（近期查过未命中的自动跳过，不会无限重试）；
+   * - 不占用顶栏「一键补全」按钮状态、无任何提示（命中结果随 save+renderAll 静默出现）；
+   * - 用户此刻正开着显式补全任务时不抢跑（两批并发只会互相放大限流）。 */
+  function enrichImportedInBackground(papers) {
+    if (!window.LitEnrich || !window.LitEnrich.enrichBatch || enrichRun) return;
+    var targets = (papers || []).filter(function (p) {
+      return p && !p.deletedAt && !p.doi && !p.venue && p.year == null && !enrichLedger.isRecent(p.id);
+    });
+    if (!targets.length) return Promise.resolve();
+    var touched = false;
+    return window.LitEnrich.enrichBatch(targets, function (done, total, paper, patch) {
+      enrichLedger.mark(paper.id);
+      if (patch) {
+        applyPatch(paper, patch);
+        touched = true;
+        if (done % 5 === 0 || done === total) { save(); renderAll(); }
+      }
+    }, { paused: false, aborted: false }).then(function () {
+      if (touched) { save(); renderAll(); }
+    }).catch(function () { /* 静默：导入主流程已成功，后台补全失败不打扰 */ });
   }
 
   /* 补全结果只能写投影字段（year / authors），权威的 date / creators 靠整体重规范化补齐：
@@ -6091,13 +6295,19 @@
     if (!doc || !desktop || !window.LitOcr) return;
     var checks = [];
     var pagesToCheck = Math.min(3, doc.numPages);
+    // 轻路径：doc.pageTextLength(p)（pdfimport 内核实装）直接给页字符数；
+    // 旧内核无此方法时回退「拉 3 页完整 quads 只为数字符」的旧路径
+    var lightPath = typeof doc.pageTextLength === 'function';
     for (var p = 1; p <= pagesToCheck; p++) {
       (function (pageNum) {
-        checks.push(doc.getPage(pageNum).then(function (page) {
-          return page.getTextContent();
-        }).then(function (content) {
-          return content.items.reduce(function (sum, item) { return sum + (item.str || '').trim().length; }, 0);
-        }).catch(function () { return 0; }));
+        var task = lightPath
+          ? Promise.resolve(doc.pageTextLength(pageNum))
+          : doc.getPage(pageNum).then(function (page) {
+            return page.getTextContent();
+          }).then(function (content) {
+            return content.items.reduce(function (sum, item) { return sum + (item.str || '').trim().length; }, 0);
+          });
+        checks.push(task.catch(function () { return 0; }));
       })(p);
     }
     Promise.all(checks).then(function (counts) {
@@ -8451,7 +8661,7 @@
         }
       }).observe(node, { attributes: true, attributeFilter: ['hidden', 'class'] });
     });
-    if (typeof window !== 'undefined') window.addEventListener('resize', syncReadingRail);
+    if (typeof window !== 'undefined') window.addEventListener('resize', rafThrottle(syncReadingRail));
     syncReadingRail();
   }
 
@@ -8574,15 +8784,23 @@
       /* M9 二期：收藏桥 / PDF 收入（供 agent 写类工具共用） */
       collectWorks: collectWorks,
       importStagedPdfs: importStagedPdfs,
-      /* M9 三期：引文网络面板（agent build_graph 工具的展示与快照出口） */
+      /* M9 三期：引文网络面板（agent build_graph 工具的展示与快照出口）。
+       * 组件按需加载（ensureGraphLibs）：首次调用注入 vis/graphgen/graphview 后再展示；
+       * reopen 保持同步语义——库未加载 = 从未开过图，交给调用方走重建路径。 */
       openGraphPanel: function (data, title) {
-        if (window.LitGraphView) LitGraphView.showData(data, title);
+        ensureGraphLibs().then(function () {
+          window.LitGraphView.showData(data, title);
+        }).catch(function (error) {
+          toast('⚠ ' + (error && error.message || error));
+        });
       },
       reopenGraphPanel: function () {
         return !!(window.LitGraphView && LitGraphView.reopen && LitGraphView.reopen());
       },
       saveGraphHtmlToSession: function (data, sessionId) {
-        return window.LitGraphView ? LitGraphView.saveHtmlToSession(data, sessionId) : Promise.resolve({ file: '' });
+        return ensureGraphLibs().then(function () {
+          return window.LitGraphView.saveHtmlToSession(data, sessionId);
+        }).catch(function () { return { file: '' }; });
       },
       /* M9-4：网页快照挂载（主进程已落盘 + 已入 pdf_fts，这里补附件记录并走 save 管线） */
       attachSnapshot: attachSnapshotFromResearch,
@@ -8639,6 +8857,52 @@
     return seeds.slice(0, 50);
   }
 
+  /* ---- 引文网络组件按需加载 ----
+   * vis-network.min.js（689KB）+ graphgen + graphview 只服务引文网络面板，却常驻
+   * 启动首屏。改为首次构建时按依赖序注入 <script>（同源，CSP 不变），范式同
+   * agentui.ensureMathJax：单例 Promise、失败置空允许重试。加载成功后补一次
+   * LitGraphView.init（原启动期绑定，含面板关闭/导出/重建监听）。 */
+  var graphLibsPromise = null;
+  var graphViewInited = false;
+  function ensureGraphLibs() {
+    if (window.LitGraphView && window.LitGraphGen && window.vis && window.vis.Network) {
+      return initGraphViewOnce();
+    }
+    if (graphLibsPromise) return graphLibsPromise;
+    var sources = ['vendor/vis-network/vis-network.min.js', 'js/graphgen.js', 'js/graphview.js'];
+    graphLibsPromise = new Promise(function (resolve, reject) {
+      var index = 0;
+      function loadNext() {
+        if (index >= sources.length) {
+          if (!(window.vis && window.vis.Network && window.LitGraphGen && window.LitGraphView)) {
+            reject(new Error(T('引文网络组件加载失败')));
+            return;
+          }
+          initGraphViewOnce().then(resolve, reject);
+          return;
+        }
+        var script = document.createElement('script');
+        script.src = sources[index++];
+        script.onload = loadNext;
+        script.onerror = function () { reject(new Error(T('引文网络组件加载失败'))); };
+        document.head.appendChild(script);
+      }
+      loadNext();
+    });
+    // 加载失败后允许重试（下次构建再试一次）
+    graphLibsPromise.catch(function () { graphLibsPromise = null; });
+    return graphLibsPromise;
+  }
+  function initGraphViewOnce() {
+    if (!graphViewInited && window.LitGraphView && desktop && desktop.researchGraph) {
+      graphViewInited = true;
+      window.LitGraphView.init({ desktop: desktop, toast: toast });
+    }
+    return Promise.resolve();
+  }
+  // 冒烟断言入口：smoke 直接 await window.LitBoardEnsureGraph() 后再探引文网络面板
+  window.LitBoardEnsureGraph = function () { return ensureGraphLibs(); };
+
   function openGraphForPapers(papers) {
     if (!desktop || !desktop.researchGraph) { toast(T('引文网络需要桌面版')); return; }
     var seeds = researchSeedsForPapers(papers);
@@ -8646,7 +8910,12 @@
       toast(T('所选文献还没登记到调研库：请先在 设置 → 调研库 →「补登记文献库」，或通过 AI 助手收藏'));
       return;
     }
-    if (window.LitGraphView) LitGraphView.build(seeds, papers.length > 1 ? T('已选文献的引文网络') : (papers[0].title || T('引文网络')).slice(0, 40));
+    var title = papers.length > 1 ? T('已选文献的引文网络') : (papers[0].title || T('引文网络')).slice(0, 40);
+    ensureGraphLibs().then(function () {
+      window.LitGraphView.build(seeds, title);
+    }).catch(function (error) {
+      toast('⚠ ' + (error && error.message || error));
+    });
   }
 
   function buildFolderGraph(folder) {
@@ -11376,7 +11645,7 @@
       state.filters.q = e.target.value.trim();
       searchSortOverride = false;
       state.tablePage = 0;
-      if (state.ftEnabled) { state.ftHits = {}; runFtSearch(); }
+      if (state.ftEnabled) { setFtHits({}); runFtSearch(); }
       renderAll();
       var hint = $('#search-hint');
       if (querySyntaxError && state.filters.q) {
@@ -11415,7 +11684,7 @@
       $('#search').value = text;
       state.filters.q = text;
       state.tablePage = 0;
-      state.ftHits = {};
+      setFtHits({});
       if (state.ftEnabled) runFtSearch();
       renderAll();
     }
@@ -11518,14 +11787,24 @@
         var key = th.dataset.column;
         var startX = event.clientX;
         var startWidth = th.getBoundingClientRect().width;
+        // 拖动期间视口宽度不变：几何读数一次取齐，move 内只写列宽（rAF 合帧）
+        var wrapWidth = $('#table-wrap').clientWidth;
+        var frame = 0, pendingWidth = startWidth;
+        function applyWidth() {
+          frame = 0;
+          tableColumns[key].width = pendingWidth;
+          applyTableColumns(true, wrapWidth);
+        }
         grip.classList.add('dragging');
         document.body.classList.add('resizing-columns');
         function move(moveEvent) {
-          tableColumns[key].width = Math.max(key === 'title' ? 180 : 48,
+          pendingWidth = Math.max(key === 'title' ? 180 : 48,
             Math.min(800, Math.round(startWidth + moveEvent.clientX - startX)));
-          applyTableColumns(true);
+          if (frame) return;
+          frame = requestAnimationFrame(applyWidth);
         }
         function stop() {
+          if (frame) { cancelAnimationFrame(frame); applyWidth(); } // 挂起的末帧立即落定
           document.removeEventListener('pointermove', move);
           document.removeEventListener('pointerup', stop);
           document.removeEventListener('pointercancel', stop);
@@ -11848,7 +12127,7 @@
         e.preventDefault();
         var allList = filteredPapers();
         allList.forEach(function (p) { state.selected[p.id] = true; });
-        updateSelectionUi();
+        updateSelectionUi(allList);
         return;
       }
       if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -11906,7 +12185,8 @@
       var v = parseInt(star.dataset.star, 10);
       p.rating = (p.rating === v) ? 0 : v; // 点同一颗星取消
       renderDrawerRating(p.rating);
-      save(); renderTable();
+      save();
+      updateRowRatingCell(p); // 定向更新该行单元格，不整表重建
     });
     $('#d-tags').addEventListener('change', function (e) {
       var p = getById(drawerId); if (!p) return;
@@ -12030,12 +12310,22 @@
       saveNotes(p.id);
     });
     window.addEventListener('beforeunload', function () { if (saveNotes) saveNotes.flush(); });
-    function enrichDrawerPaper() {
+    function enrichDrawerPaper(force) {
       var p = getById(drawerId); if (!p) return;
       if (drawerEnriching) return;
+      // 接 24h 台账：命中近期「查过未命中」记录时先确认再强制重查，单条补全不再无限重复全链路
+      if (!force && enrichLedger.isRecent(p.id)) {
+        dlgConfirm(T('补全元数据'),
+          T('该文献近 24 小时内已查过未命中。要忽略记录、强制重新查询吗？'),
+          T('强制重查')).then(function (yes) {
+          if (yes) enrichDrawerPaper(true);
+        });
+        return;
+      }
       drawerEnriching = true;
       toast(T('查询中…'));
       window.LitEnrich.enrichPaper(p).then(function (patch) {
+        enrichLedger.mark(p.id); // 查过即入账（含未命中）：与批量补全同口径
         if (patch) {
           var updated = applyPatch(p, patch);
           save(); renderAll(); openDrawer(updated.id);
@@ -12243,10 +12533,8 @@
      * 阅读层右侧让出同等宽度（css body.reading-open；AI 对话由此可达）。
      * hidden/class 都会被各处直接赋值，统一 MutationObserver 同步，不逐点插桩。 */
     watchReadingRail();
-    // M9 三期：引文网络面板
-    if (window.LitGraphView && desktop && desktop.researchGraph) {
-      LitGraphView.init({ desktop: desktop, toast: toast });
-    }
+    // M9 三期：引文网络面板——vis/graphgen/graphview 改为按需加载（ensureGraphLibs，
+    // 首次构建时注入并补 init 绑定），不再占用启动首屏；此处在启动期无事可做
     // 阶段三：Markdown 图片相对路径（note-assets/）拼接基准 = 配置目录
     if (desktop && desktop.getDataPaths && window.LitMarkdown && window.LitMarkdown.setAssetBase) {
       desktop.getDataPaths().then(function (paths) {

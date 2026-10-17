@@ -21,23 +21,17 @@ window.LitAgentUi = (function () {
   var deps = null;
   var tools = null;
   var runner = null;
-  var sessionsIndex = [];
-  var runs = new Map();      // sessionId → run（活跃会话，含流式状态）；驻留上限见 RUNS_LIMIT
-  var RUNS_LIMIT = 12;       // runs 的 LRU 上限：超出时驱逐最久未打开的空闲 run（防内存随会话数线性涨）
-  var current = null;
-  var pendingNewSession = null;
+  var S = null;               // 会话存储（js/agentsessions.js：runs/S.current/生命周期/历史视图）
+  var Snapshot = null;        // 展示快照纯转换层（js/agentsnapshot.js）
+  var Rich = null;            // 聊天富内容后处理（js/agentchatrich.js：公式/mermaid）
   var activePane = 'detail';   // 当前右栏面板：detail | ai | anno
   var agentReady = false;    // 端点 + Key 配置齐 → 对话模式；否则显示配置引导
   var thinking = '';         // ''=默认 | off | low | medium | high | xhigh | max
   var lastConfig = null;
   // 文献/文件夹上下文恒携带（界面不再渲染对应 chip，无开关）；划词上下文仍可由「选中」chip 切换
   var chipState = { selection: true };
-  var openSeq = 0;           // A09：会话打开请求序号，慢返回不覆盖新选择
   var bumpTimer = null;
   var subscriber = null;
-  var persistWarned = {};    // sessionId → 已提示过保存失败
-  var historySelectMode = false;   // 历史会话多选删除
-  var historySelected = {};        // sessionId → true
   var semanticReady = false;       // 二期：语义检索（向量）可用
   var webSearchReady = false;      // M9-4：科研网页检索（开关+出境告知+Key 三者齐备）
   var scopusReady = false;         // Scopus 检索（Elsevier Key 已配置）
@@ -48,7 +42,6 @@ window.LitAgentUi = (function () {
   var MASK_KEEP_LAST = 30;         // R17：掩码保留的最近消息条数（压缩关闭时的零成本降级）
   var compactBusy = false;         // H3：手动压缩进行中——与正常发送互斥（控制器按会话唯一，并发会互相顶掉）
   var recentGraphSessionId = null;
-  var forkBusy = false;
   var uploadBusy = false;
 
   function $(id) { return document.getElementById(id); }
@@ -65,9 +58,32 @@ window.LitAgentUi = (function () {
     deps = options || {};
     desk = deps.desktop;
     if (!desk || typeof desk.agentChat !== 'function') return;
+    Snapshot = window.LitAgentSnapshot;
+    Rich = window.LitAgentChatRich;
+    S = window.LitAgentSessions.createSessionStore({
+      desk: desk,
+      T: T,
+      $: $,
+      el: el,
+      deps: deps,
+      core: window.LitAgentCore,
+      // runner 在下面才创建——host 侧一律调用时读取（同 IPC 域的「禁止解构捕获」约定）
+      runner: function () { return runner; },
+      isUploadBusy: function () { return uploadBusy; },
+      isCompactBusy: function () { return compactBusy; },
+      setStatus: setStatus,
+      renderAttachments: renderAttachments,
+      renderChips: renderChips,
+      renderMode: renderMode,
+      bump: bump,
+      toastText: toastText,
+      toastError: toastError
+    });
     buildTools();
     runner = window.LitAgentLoop.createRunner({
       core: window.LitAgentCore,
+      // 长任务工具的步数预算（agenttools.TOOL_STEP_BUDGET）：编排层不硬编码工具名
+      toolStepBudgets: window.LitAgent && window.LitAgent.TOOL_STEP_BUDGET ? window.LitAgent.TOOL_STEP_BUDGET : null,
       chat: function (input) { return desk.agentChat(input); },
       cancelChat: function (id, turnId) { desk.agentCancel(id, turnId).catch(function () {}); },
       // 二期写类工具门：collect/download/add_pdfs 先经用户确认，再带会话上下文执行
@@ -79,13 +95,13 @@ window.LitAgentUi = (function () {
       context: window.LitAgentContext || null,
       maybeCompact: function (run) { return maybeCompactRun(run); },
       // 循环的四个事件点（轮开始/工具前/工具后/轮收尾）都是 checkpoint：await 到磁盘提交（R04）
-      persist: function (run) { return persistRun(run, true); },
+      persist: function (run) { return S.persistRun(run, true); },
       emit: function (id, event) {
         if (event && event.type === 'run_end') {
           // 定位到「刚结束的会话」而非当前打开的会话：后台会话收尾时，
           // 状态行/附件同步不得把别的会话的停止/失败标签写到界面上
-          var run = runs.get(id);
-          if (run && id === current) {
+          var run = S.runs.get(id);
+          if (run && id === S.current) {
             var labels = {
               done: '', stopped: T('已停止'), failed: T('失败（可重试）'),
               max_steps: T('已达单轮步数上限'), stuck: T('检测到重复调用，已停止')
@@ -98,11 +114,11 @@ window.LitAgentUi = (function () {
             desk.sessionRead(run.id).then(function (doc) {
               if (doc && Array.isArray(doc.attachments)) {
                 run.doc.attachments = doc.attachments;
-                if (run.id === current) renderAttachments(run);
+                if (run.id === S.current) renderAttachments(run);
               }
             }).catch(function () {});
           }
-          loadSessions();
+          S.loadSessions();
         }
         bump();
       }
@@ -113,10 +129,10 @@ window.LitAgentUi = (function () {
     desk.onAgentEvent(function (payload) {
       if (runner && payload && payload.sessionId) {
         runner.handleStreamEvent(payload.sessionId, payload);
-        if (payload.sessionId === current) bump();
+        if (payload.sessionId === S.current) bump();
       }
     });
-    refreshConfig().then(function () { loadSessions(); }).catch(function () {});
+    refreshConfig().then(function () { S.loadSessions(); }).catch(function () {});
     // 恢复上次使用的右栏面板（首次启动为「详情」）
     try {
       var savedPane = localStorage.getItem('litboard.railPane');
@@ -146,6 +162,8 @@ window.LitAgentUi = (function () {
           maxContextTokens: contextBudget,
           maxOutputTokens: outputBudget,
           historyMessageCap: window.LitAgentCore.historyCapFor(contextBudget),
+          // [cN] 证据短别名表（core 不依赖业务模块，由这里注入 agentplan 的实现）
+          toolAliasMap: window.LitAgentPlan ? window.LitAgentPlan.toolAliasMap : null,
           // R17：压缩关闭时的零成本降级——超阈值即把较旧工具结果换成占位行（存储不动）
           maskToolResults: shouldMaskToolResults(run, limits) ? MASK_KEEP_LAST : 0,
           maskToolMessage: window.LitAgentContext ? window.LitAgentContext.maskToolMessage : null,
@@ -174,7 +192,7 @@ window.LitAgentUi = (function () {
         if (!deps.openGraphPanel) return;
         deps.openGraphPanel(data);
         recentGraphSessionId = sessionId || null;
-        renderAttachments(current ? runs.get(current) : null);
+        renderAttachments(S.current ? S.runs.get(S.current) : null);
       },
       saveGraphHtmlToSession: deps.saveGraphHtmlToSession,
       buildGraph: !!deps.openGraphPanel && !!deps.saveGraphHtmlToSession,
@@ -403,7 +421,7 @@ window.LitAgentUi = (function () {
       // 推理档位与就绪判定也跟着换——只改标签会留下「界面换了、发的还是旧能力」的错位
       return refreshConfig();
     }).then(function () {
-      var busy = !!(runner && current && runner.isStreaming && runner.isStreaming(current));
+      var busy = !!(runner && S.current && runner.isStreaming && runner.isStreaming(S.current));
       if (deps.toast) {
         deps.toast(T('已切换模型：') + model + (busy ? T('（本轮仍用原模型，下一轮生效）') : ''));
       }
@@ -441,7 +459,7 @@ window.LitAgentUi = (function () {
     if (ws && ws.classList.contains('rail-collapsed')) ws.classList.remove('rail-collapsed');
     activePane = name;
     try { localStorage.setItem('litboard.railPane', name); } catch (error) {}
-    if (name === 'ai') { loadSessions(); bump(); }
+    if (name === 'ai') { S.loadSessions(); bump(); }
   }
 
   function toggle() { agentPaneActive() ? switchPane('detail') : switchPane('ai'); }
@@ -474,25 +492,25 @@ window.LitAgentUi = (function () {
       });
     });
     $('agent-close-btn').addEventListener('click', close);
-    $('agent-new-btn').addEventListener('click', function () { newSession(); });
+    $('agent-new-btn').addEventListener('click', function () { S.newSession(); });
     $('agent-compact-btn').addEventListener('click', function () { compactCurrentSession(); });
     $('agent-history-btn').addEventListener('click', function () {
       var box = $('agent-history');
       var show = box.hidden;
       box.hidden = !show;
-      if (show) { loadSessions(); renderHistory(); }
+      if (show) { S.loadSessions(); S.renderHistory(); }
     });
-    $('agent-history-filter').addEventListener('input', function () { renderHistory(); });
-    $('agent-history-select').addEventListener('click', function () { toggleSelectMode(!historySelectMode); });
-    $('agent-history-bulk-cancel').addEventListener('click', function () { toggleSelectMode(false); });
+    $('agent-history-filter').addEventListener('input', function () { S.renderHistory(); });
+    $('agent-history-select').addEventListener('click', function () { S.toggleSelectMode(!S.historySelectMode); });
+    $('agent-history-bulk-cancel').addEventListener('click', function () { S.toggleSelectMode(false); });
     $('agent-history-bulk-all').addEventListener('click', function () {
-      var ids = visibleHistoryItems().map(function (s) { return s.id; });
-      var allSelected = ids.length > 0 && ids.every(function (id) { return historySelected[id]; });
-      ids.forEach(function (id) { if (allSelected) delete historySelected[id]; else historySelected[id] = true; });
+      var ids = S.visibleHistoryItems().map(function (s) { return s.id; });
+      var allSelected = ids.length > 0 && ids.every(function (id) { return S.historySelected[id]; });
+      ids.forEach(function (id) { if (allSelected) delete S.historySelected[id]; else S.historySelected[id] = true; });
       $('agent-history-bulk-all').textContent = allSelected ? T('全选') : T('取消全选');
-      renderHistory();
+      S.renderHistory();
     });
-    $('agent-history-bulk-delete').addEventListener('click', function () { deleteSelectedSessions(); });
+    $('agent-history-bulk-delete').addEventListener('click', function () { S.deleteSelectedSessions(); });
     var thinkingSel = $('agent-thinking');
     thinkingSel.addEventListener('change', function () {
       thinking = thinkingSel.value;
@@ -535,6 +553,7 @@ window.LitAgentUi = (function () {
       maxContextTokens: 0,
       maxOutputTokens: limits.maxOutputTokens,
       historyMessageCap: 1000000,
+      toolAliasMap: window.LitAgentPlan ? window.LitAgentPlan.toolAliasMap : null,
       replayReasoning: !!(cap && cap.provider === 'deepseek' && schema.length), sendImages: !!(cap && cap.vision)
     });
   }
@@ -595,14 +614,14 @@ window.LitAgentUi = (function () {
         setStatus(T('摘要没有减少上下文，已保留原文'));
         // persistRun 失败返回 null 而非 reject——不能把它当成功吞掉，但内存状态
         // 本就未变，这里只需如实呈现（后续任意事件点的 checkpoint 自愈）
-        return persistRun(run, true).then(function (saved) {
+        return S.persistRun(run, true).then(function (saved) {
           if (!saved) setStatus(T('会话保存失败：压缩结果将在下次操作时重试'));
           return null;
         });
       }
       setStatus(T('已压缩上下文：≈{before} → ≈{after} tokens').replace('{before}', fmtTokensK(beforeTokens)).replace('{after}', fmtTokensK(liveContextTokens(run))));
       updateTokens();
-      return persistRun(run, true).then(function (saved) {
+      return S.persistRun(run, true).then(function (saved) {
         if (!saved) {
           // 内存已压缩、磁盘未落：界面如实告知，后续 checkpoint 自愈，不再虚报成功
           setStatus(T('已压缩上下文，但会话保存失败，将在下次操作时自动重试'));
@@ -629,10 +648,10 @@ window.LitAgentUi = (function () {
    *  压缩与对话并发会互相顶掉控制器，停止按钮将失效。 */
   function compactCurrentSession() {
     if (uploadBusy) return;
-    var run = runs.get(current);
+    var run = S.runs.get(S.current);
     if (!run) return;
-    if (compactBusy || forkBusy) return;
-    if (runner && runner.isStreaming && runner.isStreaming(current)) {
+    if (compactBusy || S.forkBusy) return;
+    if (runner && runner.isStreaming && runner.isStreaming(S.current)) {
       setStatus(T('正在生成，稍后再压缩'));
       return;
     }
@@ -740,227 +759,8 @@ window.LitAgentUi = (function () {
     return lines.join('\n\n');
   }
 
-  /* ---------------- 会话生命周期 ---------------- */
-
-  function loadSessions() {
-    if (!desk.sessionList) return;
-    desk.sessionList().then(function (list) {
-      sessionsIndex = list || [];
-      renderHistory();
-    }).catch(function () {});
-  }
-
-  function blankDoc(id) {
-    return {
-      v: 2, id: id, title: T('新会话'), createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(), model: '', attachments: [],
-      turnMeta: {}, messages: [], steps: 0, tokens: { in: 0, out: 0 },
-      recentToolSignatures: [], done: false, stopReason: '', endReason: '', turnId: '',
-      lastInputTokens: 0
-    };
-  }
-
-  function makeRun(id, doc) {
-    var core = window.LitAgentCore.deserialize(doc || blankDoc(id));
-    // R03：重开/重启后，恢复上一轮的冻结上下文（模型/思考档/文献/选区）——
-    // 紧接着的重试/重跑沿用原上下文，不拿当前界面状态顶替
-    var lastMeta = doc && doc.turnMeta ? doc.turnMeta[core.turnId || ''] : null;
-    return {
-      id: id,
-      doc: doc || blankDoc(id),
-      core: core,
-      streaming: false,
-      phase: '',
-      streamText: '',
-      streamReasoning: '',
-      streamToolName: '',
-      endReason: '',
-      frozen: lastMeta || null,
-      toolSnapshot: null
-    };
-  }
-
-  /** LRU 记录最近使用：把 run 挪到 Map 末尾（Map 迭代即插入序），驱逐从头部取。 */
-  function touchRun(id) {
-    var run = runs.get(id);
-    if (run) { runs.delete(id); runs.set(id, run); }
-  }
-
-  /** runs 上限控制：只驱逐空闲 run——当前打开的会话、生成中（streaming，含确认门挂起：
-   *  门开在轮次中途）永不驱逐；agentloop 侧 unregister 再兜一道（排队输入未消费等拒绝）。
-   *  被逐出的会话走既有回退：openSession 对未驻留会话从磁盘重新 deserialize（含
-   *  restoreInterrupted 恢复中断），功能无损，只是重开时多读一次盘。
-   *  全部在运行/当前会话时如实超限，不强逐。 */
-  function evictIdleRuns() {
-    if (runs.size <= RUNS_LIMIT) return;
-    var overflow = runs.size - RUNS_LIMIT;
-    runs.forEach(function (run, id) {
-      if (overflow <= 0) return;
-      if (id === current) return;
-      if (run && run.streaming) return;
-      if (run && run.persistenceError) return; // 保存失败的内存历史必须保留，不能被旧磁盘内容替换。
-      if (runner && runner.unregister && !runner.unregister(id)) return;
-      runs.delete(id);
-      delete persistWarned[id];
-      overflow--;
-    });
-  }
-
-  function newSession() {
-    if (pendingNewSession) return pendingNewSession;
-    pendingNewSession = desk.sessionCreate({ title: T('新会话') }).then(function (created) {
-      var run = makeRun(created.id, created.data);
-      runs.set(created.id, run);
-      openSession(created.id);
-      loadSessions();
-      return run;
-    }).catch(function (error) { toastError(error); return null; }).finally(function () { pendingNewSession = null; });
-    return pendingNewSession;
-  }
-
-  function openSession(id) {
-    var seq = ++openSeq; // A09：仅最新一次打开生效
-    desk.sessionRead(id).then(function (doc) {
-      if (seq !== openSeq) return;
-      if (!doc) { toastText(T('会话不存在或已删除')); loadSessions(); return; }
-      var run = runs.get(id);
-      // 驻留 run 始终是内存权威：读盘请求发出后本轮可能已完成或保存失败，
-      // 不能只凭回调时 streaming=false 就用旧快照覆盖刚生成的内容。
-      if (!run) {
-        run = makeRun(id, doc);
-        runs.set(id, run);
-        // A06：上次运行没收尾 → 恢复中断内容；恢复结果立即落盘（checkpoint），
-        // 否则「运行标记」只在内存复位，再重启会被重复恢复一次。
-        // persistRun 失败返回 null（不 reject）——重试一次，仍失败则留给后续
-        // 事件点自愈，但不静默（persistRun 内部已设 persistenceError 状态）
-        if (runner && runner.restoreInterrupted(run)) {
-          persistRun(run, true).then(function (saved) {
-            if (!saved) return persistRun(run, true);
-            return saved;
-          });
-        }
-      }
-      touchRun(id);
-      current = id;
-      evictIdleRuns();
-      $('agent-history').hidden = true;
-      $('agent-cur-title').textContent = run.doc.title || T('新会话');
-      renderMode();
-      renderAttachments(run);
-      renderChips(); // 换了会话：chips 不能残留上一个会话的冻结/上下文显示
-      bump();
-      renderHistory();
-    }).catch(function (error) { toastError(error); });
-  }
-
-  /** 会话持久化：普通路径走 1s 防抖 setData；checkpoint=true 走主进程 commit——
-   *  立即写盘并等待完成（R04 关键事件），返回的附件登记回写本地副本（R05）。
-   *  保存失败返回 null，并在 run 上保留具体原因供编排层的错误卡显示。 */
-  function persistRun(run, checkpoint) {
-    run.doc.messages = run.core.messages;
-    run.doc.steps = run.core.steps;
-    run.doc.tokens = run.core.tokens;
-    run.doc.recentToolSignatures = run.core.recentToolSignatures;
-    run.doc.done = run.core.done;
-    run.doc.stopReason = run.core.stopReason;
-    run.doc.endReason = run.endReason || run.core.endReason || '';
-    run.doc.turnId = run.core.turnId || '';
-    // H4：真实输入 token 地板（压缩/掩码判定的依据）随会话落盘——漏写这一行，
-    // 重载会话后就退回纯估算，预算判定偏差回来
-    run.doc.lastInputTokens = Number(run.core.lastInputTokens) || 0;
-    run.doc.inputUsageBaseline = run.core.inputUsageBaseline || null;
-    run.doc.updatedAt = new Date().toISOString();
-    var task = checkpoint && desk.sessionCommit
-      ? desk.sessionCommit(run.id, run.doc)
-      : desk.sessionSetData(run.id, run.doc);
-    return task.then(function (result) {
-      run.persistenceError = null;
-      delete persistWarned[run.id];
-      if (result && Array.isArray(result.attachments) && result.attachments.length) {
-        run.doc.attachments = result.attachments;
-        if (run.id === current) renderAttachments(run);
-      }
-      return result;
-    }, function (error) {
-      run.persistenceError = new Error(T('会话保存失败：') + String(error && error.message || error));
-      if (!persistWarned[run.id]) {
-        persistWarned[run.id] = true;
-        setStatus(T('会话保存失败：') + String(error && error.message || error));
-      }
-      return null; // 保存失败不虚报：返回 null，调用方据需呈现
-    });
-  }
-
-  /** 分叉前提交当前内存历史；主进程复制消息与附件，原会话继续保留。 */
-  function forkSession(id, messageIndex) {
-    if (uploadBusy) { setStatus(T('请等待参考文件上传结束')); return Promise.resolve(); }
-    var run = runs.get(id);
-    if (forkBusy) return Promise.resolve();
-    if (compactBusy || (run && run.streaming)) {
-      toastText(T('请等待生成或压缩结束后再分叉'));
-      return Promise.resolve();
-    }
-    forkBusy = true;
-    var ready = run ? persistRun(run, true).then(function (result) {
-      if (!result) throw new Error(T('会话保存失败，未创建分支'));
-      return run.doc;
-    }) : desk.sessionRead(id);
-    return ready.then(function (doc) {
-      if (!doc) throw new Error(T('会话不存在或已删除'));
-      return desk.sessionFork(id, { title: (doc.title || T('新会话')) + T('（分支）'), messageIndex: messageIndex });
-    }).then(function (created) {
-      // 由 openSession 从新文档恢复 frozen 等运行上下文。
-      openSession(created.id);
-      loadSessions();
-    }).catch(function (error) {
-      toastText(T('分叉失败：') + String(error && error.message || error));
-    }).then(function () { forkBusy = false; });
-  }
-
-  function renameSession(s) {
-    if (uploadBusy) { setStatus(T('请等待参考文件上传结束')); return; }
-    if (!deps.prompt) return;
-    deps.prompt(T('重命名会话'), s.title || '').then(function (title) {
-      if (uploadBusy) { setStatus(T('请等待参考文件上传结束')); return; }
-      if (!title || !title.trim() || title.trim() === s.title) return;
-      desk.sessionRename(s.id, title.trim()).then(function () {
-        var run = runs.get(s.id);
-        if (run) run.doc.title = title.trim(); // A10：运行中文档同步改名
-        if (current === s.id) $('agent-cur-title').textContent = title.trim();
-        loadSessions();
-      }).catch(function (error) { toastText(T('重命名失败：') + String(error && error.message || error)); });
-    }).catch(function () {});
-  }
-
-  function deleteSession(s) {
-    if (uploadBusy) { setStatus(T('请等待参考文件上传结束')); return; }
-    if (!deps.confirm) return;
-    deps.confirm(T('删除会话'), T('会话「') + (s.title || '') + T('」将移入系统回收站（含对话与附件）。')).then(function (yes) {
-      if (uploadBusy) { setStatus(T('请等待参考文件上传结束')); return; }
-      if (!yes) return;
-      var run = runs.get(s.id);
-      var stopped = !!(run && runner) && runner.cancel(s.id); // A03：删除运行中会话先取消循环
-      // R08：取消后等当前轮真正收尾（挂着确认框/在途工具写入完成），超时 3s 如实继续
-      var settle = stopped && runner.waitIdle ? runner.waitIdle(s.id, 3000) : Promise.resolve(true);
-      settle.then(function () {
-        if (uploadBusy) throw new Error(T('请等待参考文件上传结束'));
-        return desk.sessionDelete(s.id);
-      }).then(function () {
-        runs.delete(s.id);
-        // 内存泄露出口：agentloop 注册表同步移除（settle 已等收尾；force 兜底 3s 超时
-        // 仍在飞的边缘），persistWarned 记账一并清
-        if (runner && runner.unregister) runner.unregister(s.id, true);
-        delete persistWarned[s.id];
-        if (current === s.id) {
-          current = null;
-          $('agent-cur-title').textContent = T('AI 助手');
-          renderChips(); // 不残留已删会话的冻结/上下文显示
-          bump();
-        }
-        loadSessions();
-      }).catch(function (error) { toastText(T('删除失败：') + String(error && error.message || error)); });
-    }).catch(function () {});
-  }
+  /* 会话生命周期（新建/打开/持久化/分叉/重命名/删除）与历史视图已拆至 js/agentsessions.js（store S）。
+   * 本文件只保留 UI 桥：发送/快照推送/附件条/chips/bridge；runs/S.current 状态经 S.runs / S.current 访问。 */
 
   /* ---------------- 发送 / 编辑 / 重试（桥接 assistant-ui） ---------------- */
 
@@ -969,17 +769,17 @@ window.LitAgentUi = (function () {
     if (uploadBusy) { setStatus(T('正在上传参考文件，请稍候再发送')); return; }
     text = String(text == null ? '' : text).trim();
     if (!text) return;
-    if (forkBusy) return;
+    if (S.forkBusy) return;
     // H3：手动压缩进行中不接受发送——主进程控制器按会话唯一，并发请求会互相顶掉、停止失效
     if (compactBusy) { setStatus(T('正在压缩上下文，请稍候再发送')); return; }
     // 在点击发送时绑定目标，异步回调不得改用后来切换到的会话。
-    var boot = current && runs.get(current) ? Promise.resolve(runs.get(current)) : newSession();
+    var boot = S.current && S.runs.get(S.current) ? Promise.resolve(S.runs.get(S.current)) : S.newSession();
     boot.then(async function (run) {
       if (!run) return;
       // 生成中不再静默吞掉发送（调研计划的「继续任务」按钮曾因此点了没反应）：
       // 提示用户稍候或用输入行的排队通道
       if (runner.isStreaming(run.id)) { setStatus(T('正在生成回复，稍候自动继续；也可用输入行排队补充')); return; }
-      if (forkBusy) return;
+      if (S.forkBusy) return;
       if (compactBusy) { setStatus(T('正在压缩上下文，请稍候再发送')); return; }
       if ((run.doc.queuedInputs || []).length) {
         try { await runner.flushQueue(run); } catch (error) { toastText(String(error.message || error)); return; }
@@ -1003,8 +803,8 @@ window.LitAgentUi = (function () {
       if (run.doc.title === T('新会话')) {
         run.doc.title = window.LitResearch.sessionTitleFrom(text);
         desk.sessionRename(run.id, run.doc.title).then(function () {
-          if (current === run.id) $('agent-cur-title').textContent = run.doc.title;
-          loadSessions();
+          if (S.current === run.id) $('agent-cur-title').textContent = run.doc.title;
+          S.loadSessions();
         }).catch(function () {});
       }
       // 轮开始的 checkpoint 会提交这份消息，避免额外的防抖保存与它并发。
@@ -1018,103 +818,13 @@ window.LitAgentUi = (function () {
   }
 
 
-  /* ---------------- core.messages → ThreadMessageLike 快照 ---------------- */
-
-  /** core 消息在 assistant-ui 中使用的稳定前缀。摘要没有业务 turnId，展示层以原始
-   *  下标生成 tN；编辑回调给的是前驱消息的展示前缀，反向定位必须使用同一规则。 */
-  function messageDisplayKey(msg, index) {
-    return msg && msg.turnId ? msg.turnId : ('t' + index);
-  }
-
-  function convertRun(run) {
-    var out = [];
-    var messages = run.core.messages;
-    var counters = {};
-    messages.forEach(function (msg, index) {
-      var turnId = messageDisplayKey(msg, index);
-      if (msg.role === 'user' && msg.kind === 'compaction') {
-        // R17 上下文摘要：以带标记的助手气泡呈现（📦 头部行说明压缩了什么），不是用户的发言
-        var skey = turnId + ':c' + (counters[turnId] = (counters[turnId] || 0) + 1);
-        out.push({
-          id: skey,
-          role: 'assistant',
-          content: [{ type: 'text', text: '📦 ' + String(msg.content || '') }],
-          metadata: { custom: { turnId: turnId, lbCompaction: true } }
-        });
-      } else if (msg.role === 'user') {
-        // H1：每条 user 消息独立稳定 ID（轮内多条——工具注入的截图/合成消息——
-        // 共用 turnId+':u' 会让 assistant-ui 的 MessageRepository 因重复 ID 报错进错误边界）
-        var ukey = turnId + ':u' + (counters[turnId] = (counters[turnId] || 0) + 1);
-        var uparts = [{ type: 'text', text: String(msg.content || '') }];
-        if (Array.isArray(msg.images) && msg.images.length) {
-          uparts.push({ type: 'text', text: '[📎 本条附带 ' + msg.images.length + ' 张图片]' });
-        }
-        out.push({
-          id: ukey,
-          role: 'user',
-          content: uparts,
-          // synthetic 标记下传给 bundle：合成消息（截图/摘要）不提供「编辑」入口
-          metadata: { custom: { turnId: turnId, synthetic: msg.synthetic === true, forkIndex: msg.synthetic === true ? null : index } }
-        });
-      } else if (msg.role === 'assistant') {
-        var key = turnId + ':a' + (counters[turnId] = (counters[turnId] || 0) + 1);
-        var parts = [];
-        if (msg.reasoning) parts.push({ type: 'reasoning', text: msg.reasoning }); // A02
-        if (msg.content) parts.push({ type: 'text', text: msg.content });
-        (Array.isArray(msg.toolCalls) ? msg.toolCalls : []).forEach(function (call) {
-          parts.push({
-            type: 'tool-call',
-            toolCallId: call.callId || call.id || key,
-            toolName: call.name || '',
-            args: call.args || {},
-            argsText: safeJson(call.args),
-            result: call.status === 'running' ? undefined : (call.result != null ? call.result : undefined),
-            isError: call.status === 'error'
-          });
-        });
-        out.push({ id: key, role: 'assistant', content: parts, metadata: { custom: { turnId: turnId, forkIndex: index } } });
-      } else if (msg.role === 'error') {
-        var ekey = turnId + ':e' + (counters[turnId] = (counters[turnId] || 0) + 1);
-        out.push({
-          id: ekey,
-          role: 'assistant',
-          content: [{ type: 'text', text: String(msg.content || '') }],
-          metadata: { custom: { turnId: turnId, lbError: { text: String(msg.content || ''), turnId: turnId, retry: msg.retry === true } } }
-        });
-      }
-      // role:'tool' 的结果已并入前一条 assistant 的 tool-call part
-    });
-    // 流式中的 live assistant（A06/A07：由循环的流缓冲驱动）。
-    // 整轮恒挂载（只看 run.streaming）：工具执行、等待下一句首个增量的间隙里缓冲
-    // 暂时为空，此前条件渲染会把气泡整个卸载——下一批增量再来又重新挂载，
-    // 表现为「对话到一半气泡消失/闪烁」。无内容时以「…」占位保持占位与滚动位置。
-    if (run.streaming) {
-      var liveParts = [];
-      if (run.streamReasoning) liveParts.push({ type: 'reasoning', text: run.streamReasoning });
-      if (run.streamToolName && !run.streamText) {
-        liveParts.push({ type: 'tool-call', toolCallId: 'live', toolName: run.streamToolName, args: {}, argsText: '' });
-      }
-      if (run.streamText) liveParts.push({ type: 'text', text: run.streamText });
-      if (!liveParts.length) liveParts.push({ type: 'text', text: '…' });
-      out.push({
-        id: (run.core.turnId || 'live') + ':live',
-        role: 'assistant',
-        content: liveParts,
-        status: { type: 'running' }
-      });
-    }
-    return out;
-  }
-
-  function safeJson(value) {
-    try { return JSON.stringify(value || {}); } catch (error) { return '{}'; }
-  }
+  /* ---------------- 快照推送（转换层 = js/agentsnapshot.js：messageDisplayKey/convertRun/safeJson） ---------------- */
 
   function getSnapshot() {
-    var run = current ? runs.get(current) : null;
+    var run = S.current ? S.runs.get(S.current) : null;
     return {
-      messages: run ? convertRun(run) : [],
-      sessionId: current || '',
+      messages: run ? Snapshot.convertRun(run) : [],
+      sessionId: S.current || '',
       queuedCount: run && (run.doc.queuedInputs || []).length || 0,
       isRunning: !!(run && run.streaming),
       // 设置 → AI 助手：空态引导建议 / 生成中排队栏（bundle 按此条件渲染）
@@ -1124,7 +834,7 @@ window.LitAgentUi = (function () {
   }
 
   function bump() {
-    var visibleRun = current ? runs.get(current) : null;
+    var visibleRun = S.current ? S.runs.get(S.current) : null;
     renderPlan(visibleRun);
     renderPendingReferences(visibleRun);
     syncChipsStreamingState(); // 进入/离开生成时切换 chips 的冻结/实时显示（重试等路径由此兜住）
@@ -1145,7 +855,7 @@ window.LitAgentUi = (function () {
    *  分母与自动压缩同一口径（usableInputTokens，扣掉输出预留后的可用输入预算）；
    *  环色分级：<75% 常规、≥75% 琥珀（逼近自动压缩阈值 80%）、≥92% 红（将触发裁剪/压缩）。 */
   function updateTokens() {
-    var run = current ? runs.get(current) : null;
+    var run = S.current ? S.runs.get(S.current) : null;
     var node = $('agent-tokens');
     if (!node) return;
     if (!run) { node.innerHTML = ''; node.title = ''; node.classList.remove('warn', 'full'); return; }
@@ -1192,36 +902,11 @@ window.LitAgentUi = (function () {
     if (agentReady && !chatRoot.dataset.mounted && window.LitAgentChat) {
       window.LitAgentChat.mount(chatRoot, bridge());
       chatRoot.dataset.mounted = '1';
-      watchChatRich(chatRoot); // 公式/mermaid 后处理观察器随挂载建立（流式/切会话的 DOM 重建都由它驱动）
+      Rich.watchChatRich(chatRoot); // 公式/mermaid 后处理观察器随挂载建立（流式/切会话的 DOM 重建都由它驱动）
     }
-    var run = current ? runs.get(current) : null;
+    var run = S.current ? S.runs.get(S.current) : null;
     setStatus(!agentReady ? '' : (run && run.streaming ? T('生成中…（切换会话不会中断）') : ''));
     updateTokens();
-  }
-
-  /**
-   * R02：编辑定位。assistant-ui 的 onEdit 只给 appendMessage.parentId = 被编辑消息的
-   * **前驱** id；bundle 侧已把前缀（前驱所属 turnId）传回来。由于线程是线性结构，
-   * 「前驱属于 turn T」唯一确定「被编辑的是 T 之后的第一条 user 消息」——不猜、
-   * 找不到就放弃（宁可不动也不能改错轮次把后面历史截掉）。
-   */
-  function turnIdAfterParent(run, parentTurnPrefix) {
-    var messages = run.core.messages;
-    var start = 0;
-    if (parentTurnPrefix) {
-      var last = -1;
-      for (var i = 0; i < messages.length; i++) {
-        if (messageDisplayKey(messages[i], i) === parentTurnPrefix) last = i;
-      }
-      if (last < 0) return '';
-      start = last + 1;
-    }
-    // A-followup #1：与 rerunTurn 同一规则——合成 user 消息（上下文摘要 / 工具注入截图）
-    // 不是轮次入口，编辑定位跳过它们，否则编辑重发会截到摘要那一轮
-    for (var j = start; j < messages.length; j++) {
-      if (messages[j].role === 'user' && messages[j].synthetic !== true) return messages[j].turnId || '';
-    }
-    return '';
   }
 
   /* ---------------- 会话附件条（R05：主进程登记的附件在此可见/可打开） ---------------- */
@@ -1249,8 +934,8 @@ window.LitAgentUi = (function () {
   }
 
   function uploadReferences(paths) {
-    if (!paths.length || uploadBusy || compactBusy || forkBusy) return Promise.resolve();
-    var selectedRun = current ? runs.get(current) : null;
+    if (!paths.length || uploadBusy || compactBusy || S.forkBusy) return Promise.resolve();
+    var selectedRun = S.current ? S.runs.get(S.current) : null;
     if (paths.length + (selectedRun && selectedRun.pendingReferences || []).length > 10) {
       setStatus(T('最多同时选择 10 个参考文件，请先发送或取消部分文件'));
       return Promise.resolve();
@@ -1258,12 +943,12 @@ window.LitAgentUi = (function () {
     if (selectedRun && selectedRun.streaming) { setStatus(T('请等待生成结束后再上传参考文件')); return Promise.resolve(); }
     uploadBusy = true;
     setStatus(T('正在上传参考文件…'));
-    return (selectedRun ? Promise.resolve(selectedRun) : newSession()).then(function (run) {
+    return (selectedRun ? Promise.resolve(selectedRun) : S.newSession()).then(function (run) {
       if (!run) return;
       return desk.sessionImportReference(run.id, paths).then(function (result) {
         run.doc.attachments = result.attachments || run.doc.attachments;
         run.pendingReferences = (run.pendingReferences || []).concat(result.imported || []);
-        if (run.id === current) { renderAttachments(run); renderPendingReferences(run); }
+        if (run.id === S.current) { renderAttachments(run); renderPendingReferences(run); }
         if (result.failed && result.failed.length) toastText(T('参考文件上传失败：') + result.failed.map(function (f) { return f.name + ': ' + f.error; }).join('\n'));
         setStatus(result.imported && result.imported.length ? T('参考文件已保存，发送后按需读取') : T('参考文件未上传成功'));
       });
@@ -1400,38 +1085,38 @@ window.LitAgentUi = (function () {
       composerSlotReady: fillComposerSlot,
       composerSlotPark: parkComposerControls,
       retry: function (turnId) {
-        if (forkBusy || compactBusy) return;
-        var run = current ? runs.get(current) : null;
+        if (S.forkBusy || compactBusy) return;
+        var run = S.current ? S.runs.get(S.current) : null;
         if (run) runner.retryTurn(run, turnId);
       },
       onCancel: function () {
-        var run = current ? runs.get(current) : null;
+        var run = S.current ? S.runs.get(S.current) : null;
         if (run) runner.cancel(run.id);
       },
       clearQueue: function () {
-        var run = current ? runs.get(current) : null;
+        var run = S.current ? S.runs.get(S.current) : null;
         if (!run) return Promise.resolve(false);
         return runner.clearQueue(run.id).then(function (cleared) { bump(); return cleared; }, function (error) { toastText(String(error.message || error)); return false; });
       },
       queueMessage: function (text) {
-        var run = current ? runs.get(current) : null;
+        var run = S.current ? S.runs.get(S.current) : null;
         if (!run || !run.streaming) return Promise.resolve(false);
         if (!steeringEnabled) return Promise.resolve(false); // 设置关掉排队栏后不接受新排队（旧队列仍可清空）
         return runner.enqueue(run.id, text).then(function (queued) { if (queued) { setStatus(T('补充要求已排队，将在当前操作完成后处理')); bump(); } return queued; }, function (error) { toastText(String(error.message || error)); return false; });
       },
       onNew: function (a) { sendText(a && a.text); },
       onEdit: function (a) {
-        if (forkBusy || compactBusy) return;
-        var run = current ? runs.get(current) : null;
+        if (S.forkBusy || compactBusy) return;
+        var run = S.current ? S.runs.get(S.current) : null;
         if (!run) return;
         // R02：bundle 传回的 turnId 实为「被编辑消息前驱」的前缀，这里解析出真正的目标轮
-        var target = turnIdAfterParent(run, String(a && a.turnId || ''));
+        var target = Snapshot.turnIdAfterParent(run, String(a && a.turnId || ''));
         if (!target) return;
         runner.rerunTurn(run, target, a && a.text);
       },
       onReload: function (a) {
-        if (forkBusy || compactBusy) return;
-        var run = current ? runs.get(current) : null;
+        if (S.forkBusy || compactBusy) return;
+        var run = S.current ? S.runs.get(S.current) : null;
         if (!run) return;
         if (a && a.turnId) {
           // A15：重新生成——reload 目标的前驱就是本轮 user，前缀即目标轮；找不到退回最近一轮
@@ -1443,170 +1128,15 @@ window.LitAgentUi = (function () {
         }
       },
       onFork: function (a) {
-        var run = current ? runs.get(current) : null;
+        var run = S.current ? S.runs.get(S.current) : null;
         if (!run) return;
         // 重新解析展示消息 ID，避免错误卡/合成消息或过期快照截错位置。
-        var message = convertRun(run).find(function (m) { return m.id === (a && a.messageId); });
+        var message = Snapshot.convertRun(run).find(function (m) { return m.id === (a && a.messageId); });
         var index = message && message.metadata.custom.forkIndex;
         if (!Number.isInteger(index)) return;
-        return forkSession(run.id, index);
+        return S.forkSession(run.id, index);
       }
     };
-  }
-
-  /* ---------------- 历史视图 ---------------- */
-
-  /** 当前过滤条件下可见的会话（全选/计数都以它为准） */
-  function visibleHistoryItems() {
-    var filter = ($('agent-history-filter').value || '').toLowerCase();
-    return sessionsIndex.filter(function (s) {
-      return !filter || (s.title || '').toLowerCase().indexOf(filter) !== -1;
-    });
-  }
-
-  function toggleSelectMode(on) {
-    historySelectMode = on;
-    historySelected = {};
-    var btn = $('agent-history-select');
-    btn.textContent = on ? T('完成') : T('多选');
-    btn.classList.toggle('active', on);
-    $('agent-history-bulk-all').textContent = T('全选');
-    renderHistory();
-  }
-
-  function updateBulkBar() {
-    var ids = Object.keys(historySelected);
-    var bar = $('agent-history-bulk');
-    bar.hidden = !historySelectMode;
-    $('agent-history-bulk-count').textContent = T('已选 ') + ids.length + T(' 项');
-    $('agent-history-bulk-delete').disabled = !ids.length;
-  }
-
-  /** 批量删除：逐个进系统回收站；失败明细如实报出（不静默吞） */
-  function deleteSelectedSessions() {
-    if (uploadBusy) { setStatus(T('请等待参考文件上传结束')); return; }
-    var ids = Object.keys(historySelected);
-    if (!ids.length || !deps.confirm) return;
-    var hasRunning = ids.some(function (id) { var r = runs.get(id); return r && r.streaming; });
-    deps.confirm(
-      T('删除会话'),
-      T('将删除 ') + ids.length + T(' 个会话（移入系统回收站，可恢复）。') +
-        (hasRunning ? T('其中包含正在生成的会话，删除会先停止它。') : '')
-    ).then(function (yes) {
-      if (uploadBusy) { setStatus(T('请等待参考文件上传结束')); return; }
-      if (!yes) return;
-      ids.forEach(function (id) { var r = runs.get(id); if (r && runner) runner.cancel(id); });
-      // R08：等被取消的运行中会话收尾（在途确认/工具写入），超时 3s 如实继续
-      var settle = runner && runner.waitIdle
-        ? Promise.all(ids.map(function (id) { return runner.waitIdle(id, 3000); }))
-        : Promise.resolve([]);
-      var task = settle.then(function () {
-        if (uploadBusy) throw new Error(T('请等待参考文件上传结束'));
-        return desk.sessionDeleteMany ? desk.sessionDeleteMany(ids) : Promise.reject(new Error(T('当前版本不支持批量删除')));
-      });
-      task.then(function (result) {
-        var deleted = (result && result.deleted) || [];
-        deleted.forEach(function (id) {
-          runs.delete(id);
-          if (runner && runner.unregister) runner.unregister(id, true); // 同单删：settle 后移除注册表
-          delete persistWarned[id];
-          if (current === id) current = null;
-        });
-        if (current === null) {
-          $('agent-cur-title').textContent = T('AI 助手');
-          bump();
-        }
-        var failed = (result && result.failed) || [];
-        if (failed.length) {
-          toastText(T('已删除 ') + deleted.length + T(' 个，') + failed.length + T(' 个失败：') + failed[0].error);
-        } else {
-          toastText(T('✓ 已删除 ') + deleted.length + T(' 个会话（可在系统回收站恢复）'));
-        }
-        historySelected = {};
-        toggleSelectMode(false);
-        if (Array.isArray(result && result.sessions)) {
-          sessionsIndex = result.sessions;
-          renderHistory();
-        } else {
-          loadSessions();
-        }
-      }).catch(function (error) { toastText(T('删除失败：') + String(error && error.message || error)); });
-    }).catch(function () {});
-  }
-
-  function renderHistory() {
-    var list = $('agent-history-list');
-    if (!list || $('agent-history').hidden) return;
-    list.innerHTML = '';
-    var items = visibleHistoryItems();
-    if (!items.length) {
-      list.appendChild(el('div', 'agent-history-empty', T('暂无历史会话')));
-      updateBulkBar();
-      return;
-    }
-    var groups = { today: [], yesterday: [], earlier: [] };
-    var today = new Date();
-    var yesterday = new Date(Date.now() - 86400000);
-    var sameDay = function (a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(); };
-    items.forEach(function (s) {
-      var when = new Date(s.updatedAt || s.createdAt || 0);
-      if (sameDay(when, today)) groups.today.push(s);
-      else if (sameDay(when, yesterday)) groups.yesterday.push(s);
-      else groups.earlier.push(s);
-    });
-    [['today', T('今天')], ['yesterday', T('昨天')], ['earlier', T('更早')]].forEach(function (pair) {
-      if (!groups[pair[0]].length) return;
-      list.appendChild(el('div', 'agent-history-group', pair[1]));
-      groups[pair[0]].forEach(function (s) {
-        var run = runs.get(s.id);
-        var selected = historySelected[s.id] === true;
-        var item = el('div', 'agent-history-item' + (s.id === current ? ' active' : '') +
-          (historySelectMode ? ' selecting' : '') + (selected ? ' selected' : ''));
-        if (historySelectMode) {
-          var box = el('span', 'agent-history-check');
-          box.textContent = selected ? '☑' : '☐';
-          item.appendChild(box);
-        }
-        if (run && run.streaming) item.appendChild(el('span', 'spin'));
-        item.appendChild(el('span', 'agent-history-title', s.title || T('未命名会话')));
-        item.appendChild(el('span', 'agent-history-time', relativeTime(s.updatedAt || s.createdAt)));
-        item.addEventListener('click', function () {
-          if (historySelectMode) {
-            if (historySelected[s.id]) delete historySelected[s.id];
-            else historySelected[s.id] = true;
-            renderHistory();
-            return;
-          }
-          openSession(s.id);
-        });
-        item.addEventListener('contextmenu', function (event) {
-          if (historySelectMode) return; // 多选模式下不弹单项菜单，避免误操作
-          event.preventDefault();
-          deps.showCtxMenu && deps.showCtxMenu(event.clientX, event.clientY, [
-            { label: T('分叉会话'), fn: function () { forkSession(s.id); } },
-            { label: T('重命名…'), fn: function () { renameSession(s); } },
-            { label: T('删除（进回收站）'), fn: function () { deleteSession(s); } },
-            { label: T('导出 会话记录.md'), fn: function () {
-              desk.sessionExportMarkdown(s.id).then(function (r) {
-                toastText(T('✓ 已导出：') + (r && r.path || ''));
-              }).catch(function (error) { toastText(T('导出失败：') + String(error && error.message || error)); });
-            } }
-          ]);
-        });
-        list.appendChild(item);
-      });
-    });
-    updateBulkBar();
-  }
-
-  function relativeTime(iso) {
-    var t = new Date(iso || 0).getTime();
-    if (!isFinite(t)) return '';
-    var diff = Date.now() - t;
-    if (diff < 60000) return T('刚刚');
-    if (diff < 3600000) return Math.floor(diff / 60000) + T(' 分钟前');
-    if (diff < 86400000) return Math.floor(diff / 3600000) + T(' 小时前');
-    return new Date(t).toLocaleDateString();
   }
 
   /* ---------------- 上下文 chips ---------------- */
@@ -1620,9 +1150,9 @@ window.LitAgentUi = (function () {
   function renderChips() {
     var wrap = $('agent-chips');
     if (!wrap) return;
-    if (!deps) { wrap.hidden = true; return; } // init 前被 renderAll 带起时安全退出
+    if (!deps || !S) { wrap.hidden = true; return; } // init 前被 renderAll 带起时安全退出
     wrap.innerHTML = '';
-    var run = current ? runs.get(current) : null;
+    var run = S.current ? S.runs.get(S.current) : null;
     var frozen = run && run.frozen;
     var showFrozen = !!(frozen && run && run.streaming);
     chipsShownFrozen = showFrozen;
@@ -1662,7 +1192,7 @@ window.LitAgentUi = (function () {
    *  只单向切入：重试、编辑重发、重新生成不经过 sendText，靠这里的流式事件兜住；
    *  退出生成由 run_end 处理器显式渲染（避免与发送路径的时序竞争）。 */
   function syncChipsStreamingState() {
-    var run = current ? runs.get(current) : null;
+    var run = S.current ? S.runs.get(S.current) : null;
     if (run && run.streaming && !chipsShownFrozen) renderChips();
   }
 
@@ -1716,280 +1246,8 @@ window.LitAgentUi = (function () {
   function toastText(text) { if (deps.toast) deps.toast(text); }
   function toastError(error) { toastText(T('AI 助手：') + String(error && error.message || error)); }
 
-  /* ---------------- 聊天富内容后处理（公式 / mermaid，均懒加载） ----------------
-   * 正文经 LitMarkdown 渲染：$...$ / $$...$$ 已被摘成 .lb-math / .lb-math-block
-   * 节点（内容 = 转义后的原始 LaTeX，textContent 即 TeX 源）；```mermaid 围栏落成
-   * div.lb-mermaid 占位（data-mmd-src 带源码）。聊天是 React 侧渲染——流式增量每个
-   * chunk 都会整条消息重设 innerHTML，把已排版的 SVG 一并销毁。因此这里做三件事：
-   * 1) 渲染结果缓存（TeX → SVG / mermaid 源码 → SVG）：DOM 重建后在 MutationObserver
-   *    回调（微任务，先于绘制）里同步回填缓存命中，用户看不到公式闪回源码；
-   * 2) 节流扫描（先导沿 + 尾随）替代旧防抖——高频 chunk 会把纯防抖无限重置，
-   *    公式要等流式结束才出现（饿死）；节流保证流式期间每 ~0.7s 就排版一轮新增公式；
-   * 3) mermaid 流式语义：解析失败不标记成功，保留源码展示；源码随 chunk 变长后
-   *    DOM 重建、自然重试，直到能 parse 才成图。
-   * MathJax（tex-svg 单文件）与 mermaid（vendor/mermaid UMD）都只在首次出现
-   * 对应内容时才注入，没有公式/图的会话零开销。 */
-  function escapeHtml(value) {
-    return String(value == null ? '' : value)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
-
-  /* 先导沿 + 尾随节流：冷却窗口内只排队一次，窗口到期补跑；首触发立即执行 */
-  function makeThrottle(ms) {
-    var cooldown = null, queued = null;
-    return function (fn) {
-      if (cooldown) { queued = fn; return; }
-      cooldown = setTimeout(function () {
-        cooldown = null;
-        if (queued) { var run = queued; queued = null; run(); }
-      }, ms);
-      fn();
-    };
-  }
-
-  function cachePut(map, key, value, max) {
-    if (map.has(key)) map.delete(key); // 重置插入序，做简单 LRU
-    map.set(key, value);
-    if (map.size > max) {
-      var oldest = map.keys().next().value;
-      map.delete(oldest);
-    }
-  }
-
-  var MATH_SWEEP_MS = 700, MERMAID_SWEEP_MS = 1200;
-  var MATH_CACHE_MAX = 400, MERMAID_CACHE_MAX = 100;
-  var mathSvgCache = new Map();     // (display?'B':'I')+\0+TeX → mjx-container outerHTML
-  var mermaidSvgCache = new Map();  // mermaid 源码 → svg 串
-  var mmdSeq = 0;
-  var mathjaxPromise = null;
-  function ensureMathJax() {
-    if (window.MathJax && window.MathJax.startup && window.MathJax.startup.promise) {
-      return window.MathJax.startup.promise;
-    }
-    if (mathjaxPromise) return mathjaxPromise;
-    // 配置必须在脚本加载前就位；菜单在桌面应用里是干扰，关掉
-    window.MathJax = {
-      startup: { typeset: false },
-      options: { enableMenu: false },
-      // tex2svgPromise 逐节点使用时，全局字形缓存不会挂进页面；每张 SVG 自带字形定义。
-      svg: { fontCache: 'local' }
-    };
-    mathjaxPromise = new Promise(function (resolve, reject) {
-      var script = document.createElement('script');
-      script.src = 'vendor/mathjax/tex-svg.js';
-      script.onload = function () {
-        (window.MathJax && window.MathJax.startup ? window.MathJax.startup.promise : Promise.resolve())
-          .then(resolve, reject);
-      };
-      script.onerror = function () { reject(new Error('MathJax 加载失败')); };
-      document.head.appendChild(script);
-    });
-    // 加载失败后允许重试（下次出现公式再试一次）
-    mathjaxPromise.catch(function () { mathjaxPromise = null; });
-    return mathjaxPromise;
-  }
-
-  /** 同步回填缓存命中的公式（微任务时机调用可先于绘制，消除源码闪烁）；返回命中数 */
-  function restoreCachedMath(root) {
-    var pending = root.querySelectorAll('.lb-math:not([data-math-typeset]), .lb-math-block:not([data-math-typeset])');
-    var hits = 0;
-    Array.prototype.forEach.call(pending, function (span) {
-      var tex = span.textContent;
-      var cached = mathSvgCache.get((span.classList.contains('lb-math-block') ? 'B\u0000' : 'I\u0000') + tex);
-      if (cached == null) return;
-      span.setAttribute('data-math-typeset', '1');
-      span.innerHTML = cached;
-      hits++;
-    });
-    return hits;
-  }
-
-  /** 对 root 内尚未处理的公式做类型化；缓存命中同步回填，未命中走 MathJax。
-   * 无（新）公式返回 false，处理了返回 true。失败（LaTeX 语法错等）保留原文，
-   * 绝不打断消息显示。 */
-  function typesetMath(root) {
-    if (!root || !root.querySelectorAll) return Promise.resolve(false);
-    restoreCachedMath(root);
-    var pending = Array.prototype.slice.call(
-      root.querySelectorAll('.lb-math:not([data-math-typeset]), .lb-math-block:not([data-math-typeset])'));
-    if (!pending.length) return Promise.resolve(false);
-    pending.forEach(function (span) { span.setAttribute('data-math-typeset', '1'); });
-    return ensureMathJax().then(function () {
-      var MathJax = window.MathJax;
-      var chain = Promise.resolve();
-      pending.forEach(function (span) {
-        var tex = span.textContent;
-        var display = span.classList.contains('lb-math-block');
-        var key = (display ? 'B\u0000' : 'I\u0000') + tex;
-        var cached = mathSvgCache.get(key);
-        if (cached != null) {
-          span.innerHTML = cached;
-          return;
-        }
-        chain = chain.then(function () {
-          return MathJax.tex2svgPromise(tex, { display: display }).then(function (node) {
-            span.textContent = '';
-            span.appendChild(node);
-            cachePut(mathSvgCache, key, node.outerHTML, MATH_CACHE_MAX);
-          }).catch(function () {
-            // 单条公式失败（LaTeX 语法错误等）：还原为原文继续展示
-            span.removeAttribute('data-math-typeset');
-          });
-        });
-      });
-      return chain.then(function () { return true; });
-    }).catch(function () {
-      // MathJax 本身加载失败：全部还原（下次 Observer 触发会重试）
-      pending.forEach(function (span) { span.removeAttribute('data-math-typeset'); });
-      return false;
-    });
-  }
-
-  /* ---------------- mermaid 渲染（vendor/mermaid UMD，懒加载） ----------------
-   * div.lb-mermaid 占位（markdown.js 的 fence 拦截产出）→ mermaid.parse 校验 →
-   * mermaid.render 成图。流式期间源码不完整、parse 会失败：保留源码块展示、
-   * 不标记成功；源码随 chunk 变长后 React 重建 DOM、节点状态归零，自然重试。
-   * securityLevel 固定 strict（模型输出不可信，标签一律转义）；主题跟随应用
-   * 明暗（data-theme 前缀，auto 时看 colorScheme），切换时清缓存并重排已成的图。 */
-  var mermaidLibPromise = null;
-  var mermaidTheme = null;
-
-  function mermaidThemeNow() {
-    var doc = document.documentElement;
-    var v = doc.getAttribute('data-theme') || '';
-    if (/^dark/i.test(v)) return 'dark';
-    if (/^light/i.test(v)) return 'default';
-    try { return /dark/i.test(getComputedStyle(doc).colorScheme || '') ? 'dark' : 'default'; }
-    catch (e) { return 'default'; }
-  }
-
-  function ensureMermaid() {
-    if (window.mermaid && window.mermaid.initialize) return Promise.resolve(window.mermaid);
-    if (mermaidLibPromise) return mermaidLibPromise;
-    mermaidLibPromise = new Promise(function (resolve, reject) {
-      var script = document.createElement('script');
-      script.src = 'vendor/mermaid/mermaid.min.js';
-      script.onload = function () {
-        window.mermaid && window.mermaid.initialize
-          ? resolve(window.mermaid) : reject(new Error('mermaid 不可用'));
-      };
-      script.onerror = function () { reject(new Error('mermaid 加载失败')); };
-      document.head.appendChild(script);
-    });
-    // 加载失败后允许重试（下次出现 mermaid 块再试一次）
-    mermaidLibPromise.catch(function () { mermaidLibPromise = null; });
-    return mermaidLibPromise;
-  }
-
-  /** 拿到按当前主题初始化好的 mermaid；主题变了就重新 initialize 并清空 SVG 缓存 */
-  function mermaidReady() {
-    return ensureMermaid().then(function (mm) {
-      var theme = mermaidThemeNow();
-      if (theme !== mermaidTheme) {
-        mermaidTheme = theme;
-        mm.initialize({ startOnLoad: false, securityLevel: 'strict', theme: theme });
-        mermaidSvgCache.clear();
-      }
-      return mm;
-    });
-  }
-
-  /** 同步回填缓存命中的图（与公式同一时机，先于绘制）；返回命中数 */
-  function restoreCachedMermaid(root) {
-    var pending = root.querySelectorAll('.lb-mermaid:not([data-mmd-ok])');
-    var hits = 0;
-    Array.prototype.forEach.call(pending, function (node) {
-      var src = node.getAttribute('data-mmd-src') || '';
-      var cached = src && mermaidSvgCache.get(src);
-      if (cached == null) return;
-      node.setAttribute('data-mmd-ok', '1');
-      node.innerHTML = cached;
-      hits++;
-    });
-    return hits;
-  }
-
-  /** 主题切换：清缓存、把已成的图还原成源码占位，交由下一轮扫描按新主题重排 */
-  function resetMermaidForTheme(root) {
-    var now = mermaidThemeNow();
-    if (mermaidTheme == null || now === mermaidTheme) return;
-    var nodes = root.querySelectorAll('.lb-mermaid[data-mmd-ok]');
-    Array.prototype.forEach.call(nodes, function (node) {
-      var src = node.getAttribute('data-mmd-src') || '';
-      node.removeAttribute('data-mmd-ok');
-      node.removeAttribute('data-mmd-tried');
-      node.innerHTML = src
-        ? '<pre class="lb-mermaid-src"><code>' + escapeHtml(src) + '</code></pre>' : '';
-    });
-  }
-
-  /** 对 root 内未处理的 mermaid 占位做 parse + render；失败保留源码展示 */
-  function renderMermaidNodes(root) {
-    var nodes = root.querySelectorAll('.lb-mermaid:not([data-mmd-ok]):not([data-mmd-tried])');
-    if (!nodes.length) return Promise.resolve(false);
-    return mermaidReady().then(function (mm) {
-      var chain = Promise.resolve(false);
-      Array.prototype.forEach.call(nodes, function (node) {
-        var src = node.getAttribute('data-mmd-src') || '';
-        if (!src.trim()) { node.setAttribute('data-mmd-tried', '1'); return; }
-        var cached = mermaidSvgCache.get(src);
-        if (cached != null) {
-          node.setAttribute('data-mmd-ok', '1');
-          node.innerHTML = cached;
-          chain = chain.then(function () { return true; });
-          return;
-        }
-        chain = chain.then(function (did) {
-          // 离屏测量容器（对照 CherryStudio MermaidPreview）：按占位实际宽度出图，
-          // 避免 mermaid 按默认宽渲染后再被 CSS 压扁、字小难读
-          var probe = document.createElement('div');
-          var width = node.clientWidth || (node.parentElement && node.parentElement.clientWidth) || 0;
-          probe.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden;width:' +
-            Math.max(240, Math.min(1600, width)) + 'px';
-          document.body.appendChild(probe);
-          return Promise.resolve().then(function () { return mm.parse(src); })
-            .then(function () { return mm.render('lb-mmd-' + (++mmdSeq), src, probe); })
-            .then(function (out) {
-              var svg = out && out.svg || '';
-              node.setAttribute('data-mmd-ok', '1');
-              node.innerHTML = svg;
-              cachePut(mermaidSvgCache, src, svg, MERMAID_CACHE_MAX);
-              return true;
-            })
-            .catch(function () {
-              // 解析/渲染失败（流式中途或源码本就非法）：保留源码块；节点不再重试，
-              // 流式续写后 React 重建的节点（源码更长）会自然再试
-              node.setAttribute('data-mmd-tried', '1');
-              return did;
-            })
-            .then(function (value) { probe.remove(); return value; });
-        });
-      });
-      return chain;
-    }).catch(function () {
-      // mermaid 库加载失败：不标记任何节点，下一轮扫描自动重试
-      return false;
-    });
-  }
-
-  /** 聊天是 React 侧渲染（流式增量 + 会话切换都会重建 DOM），用 MutationObserver
-   *  驱动富内容后处理；只在挂载时建立一次。Observer 回调（微任务）里同步回填
-   *  缓存命中的公式/图——先于绘制，重建后不闪源码；未命中的走节流扫描。 */
-  function watchChatRich(root) {
-    var mathSweep = makeThrottle(MATH_SWEEP_MS);
-    var mmdSweep = makeThrottle(MERMAID_SWEEP_MS);
-    function onMutations() {
-      restoreCachedMath(root);
-      restoreCachedMermaid(root);
-      mathSweep(function () { typesetMath(root); });
-      // 主题探测（auto 主题要 getComputedStyle）只在节流回调里做，不进每次 mutation
-      mmdSweep(function () { resetMermaidForTheme(root); renderMermaidNodes(root); });
-    }
-    var observer = new MutationObserver(onMutations);
-    observer.observe(root, { childList: true, subtree: true });
-    onMutations();
-  }
+  /* 聊天富内容后处理（公式 / mermaid，均懒加载）已拆至 js/agentchatrich.js（Rich）；
+   * typesetMath 经下方返回对象转出（主进程冒烟 chatMathRendered 断言用）。 */
 
   return {
     init: init,
@@ -2002,8 +1260,7 @@ window.LitAgentUi = (function () {
     refreshChips: refreshChips,
     onSettingsOpen: onSettingsOpen,
     refreshResearchStats: refreshResearchStats,
-    typesetMath: typesetMath,
-    ensureMathJax: ensureMathJax,
+    typesetMath: function (root) { return Rich.typesetMath(root); },
     renderPlan: renderPlan
   };
 })();

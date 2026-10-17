@@ -86,6 +86,15 @@ if (!hasSingleInstanceLock) {
  * 保留本地引用——createWindow 是唯一赋值点，与 ctx.mainWindow 同时写入（单点镜像）。 */
 let mainWindow = null;
 
+/* M4 分段计时：主进程启动 → 首个窗口 did-finish-load 的毫秒数。必须在 did-finish-load
+ * 事件发生那一刻定格（createWindow 里的共享 once 处理器）；此前在整段 smoke 断言之后
+ * 取值，量到的是「启动 + 全部断言」的耗时，与指标名义不符。 */
+let bootToFinishLoadMs = 0;
+// 渲染进程崩溃自动 reload 次数（同会话累计；上限防崩溃循环）
+let rendererCrashReloads = 0;
+// did-finish-load 后的启动维护链是否已调度（会话级一次；activate 重建窗口不重复跑）
+let postLoadMaintenanceStarted = false;
+
 /* litboard:// 深链：仅允许 open/paper/<id> 形态（+ attachment/annotation/page 查询），
  * 其余形态一律拒绝。返回 { paperId, attachmentId, annotationId, page } 或 null。 */
 function parseLitboardUrl(raw) {
@@ -169,11 +178,49 @@ function createWindow() {
   });
 
   mainWindow.webContents.once('did-finish-load', function () {
+    // M4 分段计时：真·「主进程启动 → 页面加载完成」在这一刻定格（smoke 的 result.mainBootMs
+    // 读这里记录的值，而不是在断言跑完后现取）。
+    bootToFinishLoadMs = Date.now() - BOOT_T0;
+    startupLog('did-finish-load +' + bootToFinishLoadMs + 'ms（主进程启动→页面加载完成）');
+    // 启动维护链（延迟完整性校验 / 旧存储迁移 / 到期备份）：窗口可用之后再跑，
+    // 不再挡住窗口创建与首帧（见 runPostLoadMaintenance）。
+    schedulePostLoadMaintenance();
     // 启动时经命令行传入的 litboard:// 深链：窗口与渲染层就绪后派发
     if (pendingOpenTarget) {
       mainWindow.webContents.send('app:open-target', pendingOpenTarget);
       pendingOpenTarget = null;
     }
+  });
+
+  // 渲染进程崩溃恢复：OOM/崩溃后的白屏死窗口会一直占着单实例锁。记 startupLog（reason/
+  // exitCode）并自动 reload；同会话最多 3 次防崩溃循环，超过则 dialog 告知后退出。
+  // clean-exit（正常关窗/退出路径的渲染进程收尾）不算崩溃，直接忽略。
+  mainWindow.webContents.on('render-process-gone', function (_event, details) {
+    const reason = (details && details.reason) || 'unknown';
+    const exitCode = details && details.exitCode;
+    startupLog('render-process-gone: reason=' + reason + ' exitCode=' + exitCode +
+      ' reloads=' + rendererCrashReloads);
+    if (reason === 'clean-exit' || quitting || quitApproved || ctx.forceQuitNext) return;
+    if (mainWindow.isDestroyed()) return;
+    if (SMOKE_TEST) {
+      // smoke 有独立失败报告路径；崩溃时直接失败退出，reload 只会把断言流程搅成假挂起
+      app.exit(1);
+      return;
+    }
+    if (rendererCrashReloads >= 3) {
+      dialog.showErrorBox('LitBoard',
+        T('窗口渲染进程反复崩溃（本会话已自动重载 3 次），应用即将退出。\n\n') +
+        T('最近一次崩溃：') + 'reason=' + reason + '，exitCode=' + exitCode + '\n' +
+        T('详细信息见配置目录下的 litboard-startup.log。'));
+      app.exit(1);
+      return;
+    }
+    rendererCrashReloads++;
+    mainWindow.webContents.reload();
+  });
+  // 渲染层事件循环长时间无响应只落日志（不弹窗打扰），供事后定位
+  mainWindow.webContents.on('unresponsive', function () {
+    startupLog('renderer unresponsive（渲染层事件循环阻塞超过 Electron 默认阈值）');
   });
 
   if (SMOKE_TEST && LIFECYCLE_MODE) {
@@ -338,8 +385,10 @@ function createWindow() {
               !!window.litboardDesktop.researchSemanticSearch && !!window.litboardDesktop.researchBackfill &&
               !!window.litboardDesktop.researchEmbedBuild && !!window.litboardDesktop.researchDownloadPdfs &&
               !!window.litboardDesktop.researchStagePdfs && !!window.litboardDesktop.researchRegister,
-            // M9 三期：引文网络面板 + vis 库 + 组装模块 + IPC 面 + 双入口菜单项
+            // M9 三期：引文网络面板 + 组装模块 + IPC 面 + 双入口菜单项
             // （版式对照 literature-mcp：三栏 = 本图论文 / 画布 / 详情 + 图例）
+            // vis/graphgen/graphview 改为按需加载：启动期只断言注入器存在，
+            // 组件本身的加载与端到端验证在下方 graphViewerWorks 里 await 注入器后进行
             agentGraphPresent: !!document.querySelector('#graph-mask') && !!document.querySelector('#graph-canvas') &&
               !!document.querySelector('#graph-resize-grip') &&
               !!document.querySelector('.graph-modal') &&
@@ -347,14 +396,19 @@ function createWindow() {
               !!document.querySelector('#graph-export') &&
               !!document.querySelector('#graph-list') && !!document.querySelector('#graph-detail') &&
               !!document.querySelector('#graph-legend') && !!document.querySelector('#graph-meta') &&
-              !!window.vis && !!window.vis.Network && !!window.LitGraphGen && !!window.LitGraphView &&
+              typeof window.LitBoardEnsureGraph === 'function' &&
               !!window.litboardDesktop.researchGraph,
-            // 引文网络三栏端到端：纯函数建图 → 面板渲染 → 左列表/右详情/图例/画布都真的产出
+            // 引文网络三栏端到端：先按需注入组件 → 纯函数建图 → 面板渲染 → 左列表/右详情/图例/画布都真的产出
             // （不联网、不碰调研库：数据源注入内存库）
             graphViewerWorks: await (async function () {
               try {
+                if (typeof window.LitBoardEnsureGraph !== 'function') return 'graph loader missing';
+                await window.LitBoardEnsureGraph();
+                if (!window.vis || !window.vis.Network || !window.LitGraphGen || !window.LitGraphView) {
+                  return 'graph components not loaded on demand';
+                }
                 const G = window.LitGraphGen;
-                if (!G || !window.LitGraphView || !G.viewerData || !G.buildGraphData) return false;
+                if (!G.viewerData || !G.buildGraphData) return false;
                 const lib = {};
                 for (let i = 0; i < 24; i++) {
                   lib['W' + i] = {
@@ -466,7 +520,9 @@ function createWindow() {
               !!window.litboardDesktop.researchAutocomplete && !!window.litboardDesktop.researchGraphNeighbors &&
               !!window.litboardDesktop.researchFulltextRead && !!window.litboardDesktop.researchFulltextStore,
             agentCoreLoaded: !!window.LitResearch && !!window.LitAgentCore && !!window.LitAgentLoop &&
-              !!window.LitAgent && !!window.LitAgentUi && !!window.LitAgentChat,
+              !!window.LitAgent && !!window.LitAgentUi && !!window.LitAgentChat &&
+              // 2026-10 拆分出的三个子模块也一并断言（漏挂 script 标签时这里先红）
+              !!window.LitAgentSnapshot && !!window.LitAgentSessions && !!window.LitAgentChatRich,
             // 右栏图标轨（Zotero 式）：AI 与详情共用同一栏宽度，点击图标互相切换。
             // 断言用真实可见性（offsetParent），不只看 hidden 属性——嵌套错误会让
             // 「hidden=false 但被祖先隐藏」这类问题漏网。
@@ -1779,8 +1835,9 @@ function createWindow() {
           }
           return result;
         })()`);
-        // M4 分段计时：主进程启动 → 窗口 did-finish-load（含渲染层脚本求值完成）
-        result.mainBootMs = Date.now() - BOOT_T0;
+        // M4 分段计时：主进程启动 → 窗口 did-finish-load。取共享 once 处理器在事件发生
+        // 那一刻定格的 bootToFinishLoadMs（此前在整段断言之后现取，量成「启动+全部断言」）
+        result.mainBootMs = bootToFinishLoadMs || (Date.now() - BOOT_T0);
         // 顶栏在最小窗宽（minWidth 1080）下必须仍单行且不横向溢出——顶栏加按钮后守住这条
         const sizeBefore = mainWindow.getContentSize();
         mainWindow.setContentSize(1080, sizeBefore[1]);
@@ -2152,6 +2209,128 @@ function scheduleDataDirCleanupRetries() {
   });
 }
 
+/* —— 启动维护链（did-finish-load 之后）——
+ * 启动序列瘦身后，非关键路径（延迟完整性校验、旧存储迁移探测、到期备份）不再挡在
+ * createWindow 前面：quick_check 是同步全页扫描、备份的同步段含 loadState 全库解析 +
+ * wal_checkpoint(TRUNCATE)，它们在窗口创建前跑会直接推迟首帧，在渲染层加载期跑又会
+ * 占住主进程消息泵。这里统一挪到「窗口加载完成 + 渲染层首屏就绪」之后串行执行。
+ * 单实例锁与退出清理（will-quit 链）语义不变：维护链不参与关闭握手，timer 均 unref。 */
+function schedulePostLoadMaintenance() {
+  if (postLoadMaintenanceStarted) return;
+  postLoadMaintenanceStarted = true;
+  // 再延迟 5s：先让渲染层完成首屏与初始 IPC（library:load 等），避免重活正好压上加载期
+  const timer = setTimeout(function () {
+    runPostLoadMaintenance().catch(function (error) {
+      startupLog('post-load maintenance failed: ' + (error && error.stack || error));
+    });
+  }, 5000);
+  if (typeof timer.unref === 'function') timer.unref();
+}
+
+async function runPostLoadMaintenance() {
+  const startedAt = Date.now();
+  // 1) 延迟完整性校验：db.open({deferIntegrityCheck:true}) 腾出的启动时间在这里还账。
+  //    防御式接线——旧版 db.js 没有该 API 时静默跳过（其打开路径的同步 quick_check 仍在）。
+  if (ctx.libraryDb && typeof ctx.libraryDb.runDeferredIntegrityCheck === 'function') {
+    const checkT0 = Date.now();
+    try {
+      await ctx.libraryDb.runDeferredIntegrityCheck();
+      startupLog('deferred integrity check ok in ' + (Date.now() - checkT0) + 'ms');
+    } catch (error) {
+      await handleDeferredCorruption(error);
+      return; // 恢复/退出流程已接管，后续维护无意义
+    }
+  }
+  // 2) 旧 JSON 存储 / 旧全文缓存 → SQLite（一次性迁移，旧文件改名留底）。迁移发生在
+  //    窗口就绪之后：迁到了数据要通知渲染层重载，否则升级用户的首屏还是旧空库。
+  try {
+    const state = ctx.dataPathState;
+    const config = await ctx.integrations.getConfig();
+    const customCacheDir = config.pdfCacheDir && path.isAbsolute(config.pdfCacheDir) ? config.pdfCacheDir : '';
+    const seenPaths = new Set();
+    const uniquePaths = function (values) {
+      return values.filter(Boolean).filter(function (value) {
+        const resolved = path.resolve(value);
+        const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+        if (seenPaths.has(key)) return false;
+        seenPaths.add(key);
+        return true;
+      });
+    };
+    const migrated = [];
+    const legacyDirs = uniquePaths([state.libraryDir, state.configDir, bootstrapUserData]);
+    for (const directory of legacyDirs) {
+      migrated.push(...await ctx.libraryDb.migrateLegacy(createLibraryStorage(directory), null));
+    }
+    seenPaths.clear();
+    const cacheFiles = uniquePaths([customCacheDir && path.join(customCacheDir, 'pdftext.v1.json')]
+      .concat(legacyDirs.map(function (directory) { return path.join(directory, 'pdftext.v1.json'); })));
+    for (const cacheFile of cacheFiles) {
+      migrated.push(...await ctx.libraryDb.migrateLegacy(null, cacheFile));
+    }
+    if (migrated.length) {
+      console.log('LitBoard migrated legacy stores:', migrated.join(', '));
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('library:externally-updated', { source: 'legacy-migration' });
+      }
+    }
+  } catch (error) {
+    console.error('LitBoard legacy migration failed:', error);
+  }
+  // 3) 到期备份 + 数据目录清扫重试 + 每小时完整备份巡检（原启动链里的非关键路径平移）
+  ctx.libraryDb.backupIfDue(false).catch(function () {});
+  scheduleDataDirCleanupRetries();
+  // 完整备份：启动时检查一次，之后每小时检查；距上次成功超过 24 小时则自动备份
+  ctx.backupManager.maybeAutoBackup().catch(function (error) {
+    console.error('LitBoard auto backup at startup failed:', error);
+  });
+  setInterval(function () {
+    ctx.backupManager.maybeAutoBackup().catch(function (error) {
+      console.error('LitBoard auto backup failed:', error);
+    });
+  }, 60 * 60 * 1000);
+  startupLog('post-load maintenance done in ' + (Date.now() - startedAt) + 'ms');
+}
+
+/* 延迟完整性校验发现损坏：走与启动路径同源的 fail-closed 处置——先关库句柄，再按
+ * 「最新完整快照 → .bak 兜底」恢复（损坏文件原样隔离保留，绝不删除/覆盖）；成功则清
+ * 同步基线并重启应用（数据库已切换，置 forceQuitNext 跳过渲染层保存收尾——与
+ * backup:restore 的重启语义一致），无可恢复来源则 dialog 告知后退出。 */
+async function handleDeferredCorruption(error) {
+  startupLog('deferred integrity check FAILED: ' + (error && error.message || error));
+  if (SMOKE_TEST) {
+    await finishSmokeTest({ error: T('数据库损坏且无有效备份：') + (error && error.message || error) }, 1);
+    return;
+  }
+  console.error('LitBoard database corrupted (deferred integrity check):', error && error.message || error);
+  try { await ctx.libraryDb.close(); } catch (closeError) {}
+  let restored = null;
+  const attempt = await ctx.backupManager.restoreLatestValid();
+  if (attempt.ok) restored = attempt;
+  else {
+    const legacy = await ctx.backupManager.restoreLegacyBak();
+    if (legacy.ok) restored = legacy;
+  }
+  dialog.showErrorBox(T('LitBoard 数据库已损坏'),
+    restored
+      ? T('完整性校验发现数据库损坏，已从最近一次可用备份恢复，应用即将自动重启。\n\n') +
+        T('损坏的主库/WAL/SHM 文件已原样隔离保留，不会被删除或覆盖。\n\n') + (error && error.message || error)
+      : T('完整性校验发现数据库损坏，且没有找到可用的完整备份，应用即将退出。\n\n') +
+        T('（损坏的主库/WAL/SHM 文件会原样保留，不会被删除或覆盖；下次启动时可选择备份目录重试恢复。）\n\n') +
+        (error && error.message || error));
+  if (restored) {
+    // 数据库已切换到历史状态，旧的远端同步基线不再可信；下次同步必须重新建立基线
+    await fs.rm(path.join(ctx.dataPathState.configDir, 'sync-base.json'), { force: true }).catch(function () {});
+    setImmediate(function () {
+      ctx.forceQuitNext = true;
+      app.relaunch();
+      app.quit();
+    });
+  } else {
+    app.exit(1);
+  }
+}
+
 if (hasSingleInstanceLock) app.whenReady().then(async function () {
   const dbOpenT0 = Date.now();
   startupLog('app ready, opening database…');
@@ -2182,7 +2361,11 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
     getResearchIdentity: function () { return ctx.researchDb ? ctx.researchDb.exportIdentityCore() : null; }
   });
   try {
-    await ctx.libraryDb.open();
+    // deferIntegrityCheck：把打开路径里的同步 quick_check（全页扫描）推迟到窗口加载完成后
+    // 的维护链执行（runPostLoadMaintenance），不让它挡住窗口创建。旧版 db.js 忽略该参数，
+    // 同步 quick_check 仍在打开时执行——调用点无需分叉。损坏处置在两条路径上等价
+    // （fail-closed：快照 → .bak → 用户选目录/退出，绝不静默覆盖）。
+    await ctx.libraryDb.open({ deferIntegrityCheck: true });
     startupLog('database open done in ' + (Date.now() - dbOpenT0) + 'ms');
     // 主进程界面语言跟随上次保存的选择（渲染层启动后也会实时推 uiLang）
     LitI18n.setLang(String(ctx.libraryDb.getSetting('uiLang') || ''), { persist: false });
@@ -2231,7 +2414,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
     if (recovered) await fs.rm(path.join(configDir, 'sync-base.json'), { force: true }).catch(function () {});
     // 还原成功后重新打开；仍失败则停止启动，绝不静默继续空白库
     try {
-      await ctx.libraryDb.open();
+      await ctx.libraryDb.open({ deferIntegrityCheck: true });
     } catch (openError) {
       console.error('LitBoard database still unusable after restore:', openError);
       if (SMOKE_TEST) await finishSmokeTest({ error: String(openError && openError.message || openError) }, 1);
@@ -2325,35 +2508,10 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
     startupLog('research subsystem init FAILED: ' + (error && error.message || error));
     ctx.researchDb = null;
   }
-  // 旧 JSON 存储 / 旧全文缓存 → SQLite（一次性迁移，旧文件改名留底）
-  try {
-    const config = await ctx.integrations.getConfig();
-    const customCacheDir = config.pdfCacheDir && path.isAbsolute(config.pdfCacheDir) ? config.pdfCacheDir : '';
-    const seenPaths = new Set();
-    const uniquePaths = function (values) {
-      return values.filter(Boolean).filter(function (value) {
-        const resolved = path.resolve(value);
-        const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
-        if (seenPaths.has(key)) return false;
-        seenPaths.add(key);
-        return true;
-      });
-    };
-    const migrated = [];
-    const legacyDirs = uniquePaths([libraryDir, configDir, bootstrapUserData]);
-    for (const directory of legacyDirs) {
-      migrated.push(...await ctx.libraryDb.migrateLegacy(createLibraryStorage(directory), null));
-    }
-    seenPaths.clear();
-    const cacheFiles = uniquePaths([customCacheDir && path.join(customCacheDir, 'pdftext.v1.json')]
-      .concat(legacyDirs.map(function (directory) { return path.join(directory, 'pdftext.v1.json'); })));
-    for (const cacheFile of cacheFiles) {
-      migrated.push(...await ctx.libraryDb.migrateLegacy(null, cacheFile));
-    }
-    if (migrated.length) console.log('LitBoard migrated legacy stores:', migrated.join(', '));
-  } catch (error) {
-    console.error('LitBoard legacy migration failed:', error);
-  }
+  // 旧 JSON 存储 / 旧全文缓存 → SQLite 的一次性迁移、到期备份与清扫重试，
+  // 已平移到窗口 did-finish-load 之后的维护链（runPostLoadMaintenance）：
+  // 它们的同步段（迁移探测的 fs 扫描、备份的 loadState + wal_checkpoint）不再
+  // 挡在 createWindow 前面，也不与渲染层初始加载抢主进程消息泵。
   const pendingRebase = ctx.dataPathManager.pendingRebase();
   if (pendingRebase) {
     try {
@@ -2367,17 +2525,8 @@ if (hasSingleInstanceLock) app.whenReady().then(async function () {
       ctx.dataPathState = ctx.dataPathManager.getState();
     }
   }
-  ctx.libraryDb.backupIfDue(false).catch(function () {});
-  scheduleDataDirCleanupRetries();
-  // 完整备份：启动时检查一次，之后每小时检查；距上次成功超过 24 小时则自动备份
-  ctx.backupManager.maybeAutoBackup().catch(function (error) {
-    console.error('LitBoard auto backup at startup failed:', error);
-  });
-  setInterval(function () {
-    ctx.backupManager.maybeAutoBackup().catch(function (error) {
-      console.error('LitBoard auto backup failed:', error);
-    });
-  }, 60 * 60 * 1000);
+  // 到期备份（backupIfDue）、数据目录清扫重试、每小时完整备份巡检：
+  // 已平移到 did-finish-load 之后的维护链（runPostLoadMaintenance），不再排在窗口创建前
   registerAll();
   // 应用自动更新：发现更高版本即后台预下载安装包（SHA-256 校验 + 单份缓存），
   // 就绪后通知渲染层；点「立即更新」直接拉起 NSIS 安装界面并退出本应用。

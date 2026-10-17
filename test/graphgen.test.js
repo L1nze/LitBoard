@@ -356,3 +356,27 @@ test('escapeForInlineScript neutralizes script-closing sequences; renderGraphHtm
     assert.equal(restored.options.smooth, undefined);
   }
 });
+
+test('导出快照按行编码：payload 行数 = 节点数（O(n²) 预渲染回归护栏）', function () {
+  const nodes = [];
+  for (let i = 0; i < 12; i++) {
+    nodes.push({ id: 'N' + i, title: 'Paper ' + i, year: 2015 + (i % 8), citedBy: i, authors: ['A'], refs: [], seed: i === 0 });
+  }
+  const edges = [];
+  for (let i = 1; i < nodes.length; i++) edges.push({ from: 'N0', to: 'N' + i });
+  const data = { nodes, edges, communities: {}, meta: { nodeCount: nodes.length, edgeCount: edges.length, seeds: ['N0'], depth: 1, maxNodes: 120 } };
+  const html = G.renderGraphHtml(data, '', {});
+  const m = html.match(/^var DATA=JSON\.parse\("(.*)"\);$/m);
+  assert.ok(m, 'payload present');
+  const restored = JSON.parse(JSON.parse('"' + m[1] + '"'));
+  assert.ok(restored.paperRows && Array.isArray(restored.sortedIds), '按行编码字段（paperRows + sortedIds）存在');
+  assert.equal(restored.paperListHtml, undefined, '旧的「每选中态一份完整列表」编码必须移除');
+  assert.equal(Object.keys(restored.paperRows).length, nodes.length, '每节点恰好一行');
+  const rowCount = Object.values(restored.paperRows)
+    .reduce((sum, row) => sum + ((String(row).match(/class="paper-row/g) || []).length), 0);
+  assert.equal(rowCount, nodes.length,
+    '行 HTML 总数 = 节点数（旧编码为 n²+1，12 节点会预渲染 145 份行）');
+  // 查看器脚本按 data-id 组装并 toggle active，选中态不再依赖预渲染
+  assert.ok(/DATA\.paperRows\[DATA\.sortedIds\[i\]\]/.test(html));
+  assert.ok(/classList\.toggle\("active",row\.getAttribute\("data-id"\)===selected\)/.test(html));
+});

@@ -5,12 +5,12 @@
  *
  * - 固定 URL 主机（api.search.tinyfish.ai / api.fetch.tinyfish.ai），主进程 net.fetch 直连，
  *   与 ALLOWED_API_HOSTS/CSP（渲染层直连白名单）无关——比照 M9 一期信任边界；
- * - 复用 createThrottleQueue（免费额度条款未稳定，保守起步：2 并发 + ≥500ms 间隔）；
+ * - 复用 net-throttle 的节流队列（免费额度条款未稳定，保守起步）；
  * - 按可替换 provider 设计：所有 TinyFish 特定形状（端点/参数/字段名）收敛在本模块，
  *   响应形状校验与规范化在 js/webfetch.js（纯函数）；
  * - 失败不自动重试计费类请求（Search/Fetch 虽免费，仍沿用队列既有 429/5xx 退避语义，仅 3 次封顶）。
  */
-const { createThrottleQueue, classifyTestError } = require('./research-net.js');
+const { createThrottleQueue, classifyTestError } = require('./net-throttle.js');
 const LitWebFetch = require('../js/webfetch.js');
 
 const SEARCH_URL = 'https://api.search.tinyfish.ai';

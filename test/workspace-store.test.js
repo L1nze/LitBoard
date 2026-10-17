@@ -27,7 +27,7 @@ for (const scenario of [{ cancelFirst: false, overlap: false }, { cancelFirst: t
       saveLibrary: function (value, base) { return Promise.resolve(db.saveState(Object.assign({}, value, { baseSignatures: base }))); }
     };
     const store = createStore({
-      state: state, model: LitModel, uid: function () { return 'id'; }, T: function (s) { return s; },
+      state: state, model: LitModel, saveDebounceMs: 0, uid: function () { return 'id'; }, T: function (s) { return s; },
       toast: function () {}, desktop: function () { return desktop; }, scheduleSync: function () {}, onLoad: function () {},
       resolveConflicts: function (conflicts, base) {
         ++resolutions;
@@ -78,6 +78,7 @@ function makeModel() {
     assignCitationKeys: function () {},
     normalizeWorkspace: function (workspace) { return workspace; },
     touchWorkspaceChanges: function () {},
+    entitySignature: function (item) { return JSON.stringify(item); },
     workspaceSignatures: signatures
   };
 }
@@ -100,7 +101,7 @@ test('同步应用用应用前确认签名保存，避免把远端工作区误�
     }
   };
   const store = createStore({
-    state: state, model: model, uid: function () { return 'id'; }, T: function (s) { return s; },
+    state: state, model: model, saveDebounceMs: 0, uid: function () { return 'id'; }, T: function (s) { return s; },
     toast: function () {}, storeKey: 'test', localStorage: { getItem: function () { return null; }, setItem: function () {} },
     desktop: function () { return desktop; }, clearQueryCache: function () {}, scheduleSync: function () {},
     resolveConflicts: function () { return Promise.resolve(true); }, onLoad: function () {}
@@ -120,7 +121,7 @@ test('保存完成后仅把变化的实体推进到冲突合并 base', async fun
   const model = makeModel();
   const desktop = { saveLibrary: function (value) { return Promise.resolve({ signatures: model.workspaceSignatures(value), conflicts: [] }); } };
   const store = createStore({
-    state: state, model: model, uid: function () { return 'id'; }, T: function (s) { return s; },
+    state: state, model: model, saveDebounceMs: 0, uid: function () { return 'id'; }, T: function (s) { return s; },
     toast: function () {}, storeKey: 'test', localStorage: { getItem: function () { return null; }, setItem: function () {} },
     desktop: function () { return desktop; }, clearQueryCache: function () {}, scheduleSync: function () {},
     resolveConflicts: function () { return Promise.resolve(true); }, onLoad: function () {}
@@ -140,16 +141,18 @@ test('连续保存按顺序写入并使用上次确认的签名', async function
   const model = makeModel();
   const pending = [];
   const bases = [];
+  const sent = [];
   const toasts = [];
   const desktop = {
     loadLibrary: function () { return Promise.resolve(workspace('base')); },
-    saveLibrary: function (_value, base) {
+    saveLibrary: function (value, base) {
       bases.push(base);
+      sent.push(value);
       return new Promise(function (resolve) { pending.push(resolve); });
     }
   };
   const store = createStore({
-    state: state, model: model, uid: function () { return 'id'; }, T: function (s) { return s; },
+    state: state, model: model, saveDebounceMs: 0, uid: function () { return 'id'; }, T: function (s) { return s; },
     toast: function (message) { toasts.push(message); }, storeKey: 'test',
     localStorage: { getItem: function () { return null; }, setItem: function () {} },
     desktop: function () { return desktop; }, clearQueryCache: function () {}, scheduleSync: function () {},
@@ -162,17 +165,20 @@ test('连续保存按顺序写入并使用上次确认的签名', async function
   state.papers[0].title = 'second';
   const second = store.save(true);
   assert.equal(pending.length, 1);
-  const firstSignatures = model.workspaceSignatures(workspace('first'));
+  // 库端确认签名 = 对「实际收到的 payload」重算（payload 里脏实体的 updatedAt 已被 touch 抬过）
+  const firstSignatures = model.workspaceSignatures(sent[0]);
   pending[0]({ signatures: firstSignatures, conflicts: [] });
   assert.equal(await first, true);
   await Promise.resolve();
   assert.equal(pending.length, 2);
-  const latest = model.workspaceSignatures(workspace('second'));
+  const latest = model.workspaceSignatures(sent[1]);
   pending[1]({ signatures: latest, conflicts: [] });
   assert.equal(await second, true);
   assert.deepEqual(toasts, []);
   assert.equal(bases[1].papers.p1, firstSignatures.papers.p1);
   assert.equal(store.getBase().papers.p1.title, 'second');
+  assert.equal(sent[0].papers[0].title, 'first', '第一次保存的快照在入队时定格');
+  assert.equal(sent[1].papers[0].title, 'second', '第二次保存取最新状态');
 });
 
 test('连续删除同一文献所在的文件夹时每次保存均落库', async function (t) {
@@ -198,7 +204,7 @@ test('连续删除同一文献所在的文件夹时每次保存均落库', async
     }
   };
   const store = createStore({
-    state: state, model: LitModel, uid: function () { return 'id'; }, T: function (s) { return s; },
+    state: state, model: LitModel, saveDebounceMs: 0, uid: function () { return 'id'; }, T: function (s) { return s; },
     toast: function (message) { toasts.push(message); }, storeKey: 'test',
     localStorage: { getItem: function () { return null; }, setItem: function () {} },
     desktop: function () { return desktop; }, clearQueryCache: function () {}, scheduleSync: function () {},
@@ -244,7 +250,7 @@ test('彻底清除带笔记的文献后连续保存均落库（内存投影漂�
     }
   };
   const store = createStore({
-    state: state, model: LitModel, uid: function () { return 'id'; }, T: function (s) { return s; },
+    state: state, model: LitModel, saveDebounceMs: 0, uid: function () { return 'id'; }, T: function (s) { return s; },
     toast: function (message) { toasts.push(message); }, storeKey: 'test',
     localStorage: { getItem: function () { return null; }, setItem: function () {} },
     desktop: function () { return desktop; }, clearQueryCache: function () {}, scheduleSync: function () {},
@@ -297,7 +303,7 @@ test('写后校验失败后锚点推进到库端真实签名，下一次保存�
     }
   };
   const store = createStore({
-    state: state, model: model, uid: function () { return 'id'; }, T: function (s) { return s; },
+    state: state, model: model, saveDebounceMs: 0, uid: function () { return 'id'; }, T: function (s) { return s; },
     toast: function (message) { toasts.push(message); }, storeKey: 'test',
     localStorage: { getItem: function () { return null; }, setItem: function () {} },
     desktop: function () { return desktop; }, clearQueryCache: function () {}, scheduleSync: function () {},
@@ -310,4 +316,166 @@ test('写后校验失败后锚点推进到库端真实签名，下一次保存�
   sabotage = false;
   assert.equal(await store.save(true), true); // 锚点已推进到库端真实签名，自愈
   assert.equal(toasts.length, 1);
+});
+
+/* ---------- 保存去抖（trailing + maxWait）与签名直传 ---------- */
+
+function debounceStore(state, desktop, model, debounceOpts) {
+  return createStore(Object.assign({
+    state: state, model: model, T: function (s) { return s; }, toast: function () {},
+    storeKey: 'test', localStorage: { getItem: function () { return null; }, setItem: function () {} },
+    desktop: function () { return desktop; }, clearQueryCache: function () {}, scheduleSync: function () {},
+    resolveConflicts: function () { return Promise.resolve(true); }, onLoad: function () {}
+  }, debounceOpts));
+}
+
+test('去抖把连续 save 合并为一次落库，skipSync 语义为任一调用需要同步', async function () {
+  const state = { papers: [], notes: [], folders: [], folderTombstones: [], savedSearches: [],
+    savedSearchTombstones: [], tagColors: {}, tagColorRecords: [] };
+  const model = makeModel();
+  const calls = [];
+  const desktop = {
+    loadLibrary: function () { return Promise.resolve(workspace('base')); },
+    saveLibrary: function (value) {
+      calls.push(value.papers[0].title);
+      return Promise.resolve({ signatures: model.workspaceSignatures(value), conflicts: [] });
+    }
+  };
+  const store = debounceStore(state, desktop, model, { saveDebounceMs: 60, saveMaxWaitMs: 2000 });
+  await store.load();
+  state.papers[0].title = 'a';
+  const p1 = store.save(true);
+  state.papers[0].title = 'b';
+  const p2 = store.save(); // 不跳过同步
+  state.papers[0].title = 'c';
+  const p3 = store.save(true);
+  assert.equal(calls.length, 0, '去抖窗口内不落库');
+  assert.equal(await Promise.all([p1, p2, p3]).then(function (r) { return r.every(Boolean); }), true);
+  assert.deepEqual(calls, ['c'], '三次调用合并为一次 saveLibrary，快照取最后一次状态');
+  assert.equal(store.getRevision(), 3, 'revision 按调用次数递增（同步变化检测依赖它）');
+});
+
+test('合并保存收尾的 scheduleSync 遵循「任一调用需要同步」', async function () {
+  const state = { papers: [], notes: [], folders: [], folderTombstones: [], savedSearches: [],
+    savedSearchTombstones: [], tagColors: {}, tagColorRecords: [] };
+  const model = makeModel();
+  let scheduled = 0;
+  const desktop = {
+    loadLibrary: function () { return Promise.resolve(workspace('base')); },
+    saveLibrary: function (value) {
+      return Promise.resolve({ signatures: model.workspaceSignatures(value), conflicts: [] });
+    }
+  };
+  const store = createStore({
+    state: state, model: model, saveDebounceMs: 30, saveMaxWaitMs: 2000,
+    T: function (s) { return s; }, toast: function () {},
+    storeKey: 'test', localStorage: { getItem: function () { return null; }, setItem: function () {} },
+    desktop: function () { return desktop; }, clearQueryCache: function () {},
+    scheduleSync: function () { scheduled++; }, resolveConflicts: function () { return Promise.resolve(true); }, onLoad: function () {}
+  });
+  await store.load();
+  // 全部 skipSync=true → 不调度
+  await store.save(true);
+  await store.save(true);
+  await new Promise(function (r) { setTimeout(r, 80); });
+  assert.equal(scheduled, 0, '全部 skipSync 的合并保存不触发同步');
+  // 混入一次 save() → 调度一次
+  await store.save(true);
+  await store.save();
+  await new Promise(function (r) { setTimeout(r, 80); });
+  assert.equal(scheduled, 1, '任一非 skip 调用都会让合并收尾调度同步');
+});
+
+test('maxWait 到期强制落库（持续编辑不会无限推迟）', async function () {
+  const state = { papers: [], notes: [], folders: [], folderTombstones: [], savedSearches: [],
+    savedSearchTombstones: [], tagColors: {}, tagColorRecords: [] };
+  const model = makeModel();
+  const calls = [];
+  const desktop = {
+    loadLibrary: function () { return Promise.resolve(workspace('base')); },
+    saveLibrary: function (value) { calls.push(value.papers[0].title); return Promise.resolve({ signatures: model.workspaceSignatures(value), conflicts: [] }); }
+  };
+  // trailing 极长（永不因静默触发），只靠 maxWait
+  const store = debounceStore(state, desktop, model, { saveDebounceMs: 60000, saveMaxWaitMs: 100 });
+  await store.load();
+  const saved = store.save();
+  await new Promise(function (r) { setTimeout(r, 250); });
+  assert.equal(calls.length, 1, 'maxWait 到期即落库');
+  assert.equal(await saved, true);
+});
+
+test('waitForIdle 先冲刷挂起的去抖保存再返回（before-quit / 导入收尾兜底）', async function () {
+  const state = { papers: [], notes: [], folders: [], folderTombstones: [], savedSearches: [],
+    savedSearchTombstones: [], tagColors: {}, tagColorRecords: [] };
+  const model = makeModel();
+  const calls = [];
+  const desktop = {
+    loadLibrary: function () { return Promise.resolve(workspace('base')); },
+    saveLibrary: function (value) { calls.push(value.papers[0].title); return Promise.resolve({ signatures: model.workspaceSignatures(value), conflicts: [] }); }
+  };
+  const store = debounceStore(state, desktop, model, { saveDebounceMs: 60000, saveMaxWaitMs: 60000 });
+  await store.load();
+  state.papers[0].title = 'urgent';
+  const saved = store.save();
+  assert.equal(calls.length, 0);
+  assert.equal(await Promise.all([saved, store.waitForIdle()]).then(function (r) { return r[0] === true && r[1] === true; }), true);
+  assert.deepEqual(calls, ['urgent'], 'waitForIdle 必须立即冲刷去抖窗口里挂起的保存');
+});
+
+test('applyIncoming 立即落库，不受去抖窗口影响', async function () {
+  const state = { papers: [], notes: [], folders: [], folderTombstones: [], savedSearches: [],
+    savedSearchTombstones: [], tagColors: {}, tagColorRecords: [] };
+  const model = makeModel();
+  const calls = [];
+  const desktop = {
+    loadLibrary: function () { return Promise.resolve(workspace('base')); },
+    saveLibrary: function (value) { calls.push(value.papers[0].title); return Promise.resolve({ signatures: model.workspaceSignatures(value), conflicts: [] }); }
+  };
+  const store = debounceStore(state, desktop, model, { saveDebounceMs: 60000, saveMaxWaitMs: 60000 });
+  await store.load();
+  await store.applyIncoming(workspace('remote applied'), true);
+  assert.deepEqual(calls, ['remote applied'], '同步应用走立即路径');
+  assert.equal(await store.waitForIdle(), true);
+});
+
+test('persistDesktop 携带 nextSignatures，主进程直传签名与本地重算逐实体一致', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-store-sigpass-'));
+  const db = createLibraryDb(dir);
+  await db.open();
+  t.after(async function () { await db.close(); await fs.rm(dir, { recursive: true, force: true }); });
+  db.replaceState({ papers: [{ id: 'p1', title: 'One' }, { id: 'p2', title: 'Two' }], folders: [{ id: 'f1', name: 'F' }] });
+  const state = { papers: [], notes: [], folders: [], folderTombstones: [], savedSearches: [],
+    savedSearchTombstones: [], tagColors: {}, tagColorRecords: [] };
+  let seen = null;
+  const desktop = {
+    loadLibrary: function () { return Promise.resolve(db.loadState()); },
+    saveLibrary: function (value, base) {
+      seen = value;
+      // 与 ipc/library.js 相同的转发口径（preload 只透传 workspace/base）
+      return Promise.resolve(db.saveState(Object.assign({}, value, {
+        baseSignatures: base,
+        nextSignatures: value.nextSignatures || null
+      })));
+    }
+  };
+  const store = createStore({
+    state: state, model: LitModel, saveDebounceMs: 0, uid: function () { return 'id'; },
+    T: function (s) { return s; }, toast: function (message) { throw new Error(message); },
+    desktop: function () { return desktop; }, clearQueryCache: function () {}, scheduleSync: function () {},
+    resolveConflicts: function () { return Promise.resolve(true); }, onLoad: function () {}
+  });
+  await store.load();
+  state.papers[0].title = 'One Edited';
+  assert.equal(await store.save(true), true);
+  assert.ok(seen && seen.nextSignatures, 'payload 必须捎带 nextSignatures');
+  // 直传值与「主进程口径的本地重算」逐实体一致（对同一 payload 重新 normalize+签名）
+  const recomputed = LitModel.workspaceSignatures(LitModel.normalizeWorkspace(seen));
+  for (const collection of ['papers', 'notes', 'folders', 'savedSearches', 'tagColorRecords']) {
+    assert.deepEqual(seen.nextSignatures[collection], recomputed[collection], collection + ' 直传签名与重算一致');
+  }
+  const reloaded = db.loadState();
+  assert.equal(reloaded.papers.find(function (p) { return p.id === 'p1'; }).title, 'One Edited');
+  // 干净实体（p2 未动）的直传签名与库端 loadState 重算一致
+  const fromDb = LitModel.workspaceSignatures(reloaded);
+  assert.equal(seen.nextSignatures.papers.p2, fromDb.papers.p2);
 });

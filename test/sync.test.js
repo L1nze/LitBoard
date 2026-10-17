@@ -1106,28 +1106,38 @@ test('v6 envelope round-trips the notes collection', function () {
   });
   assert.equal(env.syncVersion, 6);
   assert.equal(env.notes.length, 1);
-  const read = LitSync.readSyncEnvelope(JSON.parse(JSON.stringify(env)));
-  assert.equal(read.syncVersion, 6);
-  assert.equal(read.legacy, false);
-  assert.equal(read.workspace.notes.length, 1);
-  assert.equal(read.workspace.notes[0].content, 'note body');
-  assert.equal(read.workspace.notes[0].paperId, 'p1');
+  // 读取路径 = 产品实际的「解析 JSON → 当作远端工作区进三方计划」：
+  const parsed = JSON.parse(JSON.stringify(env));
+  const plan = LitSync.createSyncPlan({
+    local: { papers: [], notes: [], folders: [] },
+    remoteWorkspace: parsed, mode: 'sync', now: 123
+  });
+  assert.equal(Number(plan.remoteVersion), 6);
+  assert.equal(plan.remote.notes.length, 1);
+  const applied = LitSync.applySyncPlan(plan, {}, { now: 123 });
+  assert.equal(applied.workspace.notes.length, 1);
+  assert.equal(applied.workspace.notes[0].content, 'note body');
+  assert.equal(applied.workspace.notes[0].paperId, 'p1');
 });
 
 test('v6 reader accepts v3/v4/v5 envelopes and rejects newer versions', function () {
   [undefined, 3, 4, 5, 6].forEach(function (version) {
     const input = { papers: [{ id: 'p1', title: 'T' }], folders: [] };
     if (version !== undefined) input.syncVersion = version;
-    const read = LitSync.readSyncEnvelope(input);
-    assert.ok(Array.isArray(read.workspace.notes));
-    assert.equal(read.workspace.notes.length, 0); // 旧格式没有 notes 集合
+    assert.equal(LitSync.isSupportedSyncVersion(input.syncVersion), true, '版本 ' + version + ' 可读');
+    const plan = LitSync.createSyncPlan({
+      local: { papers: [], folders: [] },
+      remoteWorkspace: input, mode: 'sync', now: 1
+    });
+    assert.ok(Array.isArray(plan.remote.notes));
+    assert.equal(plan.remote.notes.length, 0); // 旧格式没有 notes 集合
   });
   assert.ok(LitSync.SUPPORTED_SYNC_VERSIONS.indexOf(3) !== -1);
   assert.ok(LitSync.SUPPORTED_SYNC_VERSIONS.indexOf(4) !== -1);
   assert.ok(LitSync.SUPPORTED_SYNC_VERSIONS.indexOf(5) !== -1);
   // 更新的格式一律拒读：旧端不会把新格式改坏后写回
   assert.equal(LitSync.isSupportedSyncVersion(6), true);
-  assert.throws(function () { LitSync.readSyncEnvelope({ syncVersion: 99 }); }, /不支持的/);
+  assert.equal(LitSync.isSupportedSyncVersion(99), false);
   assert.equal(LitSync.isSupportedSyncVersion(7), false);
 });
 
@@ -1741,7 +1751,7 @@ test('non-snapshot annotations do not advance attachment progress', async functi
     folders: []
   };
   const remoteEnvelope = LitSync.createSyncEnvelope(rawWorkspace);
-  const workspace = LitSync.readSyncEnvelope(remoteEnvelope).workspace;
+  const workspace = rawWorkspace; // 本机输入形态：normalize 由同步链路自行完成
   const progress = [];
   const fetch = async function (url, init) {
     if (init.method === 'GET' && url.endsWith('litboard-library.json')) {
@@ -2079,8 +2089,13 @@ test('v5 envelope carries lastReadAt for the recent-reading view', function () {
     papers: [{ id: 'p1', title: 'T', lastReadAt: 1700000000000 }, { id: 'p2', title: 'U' }],
     notes: [], folders: []
   });
-  const read = LitSync.readSyncEnvelope(JSON.parse(JSON.stringify(env)));
-  const p1 = read.workspace.papers.find(function (p) { return p.id === 'p1'; });
+  // 解析后的信封作为远端工作区进三方计划（产品实际读回路径），lastReadAt 必须过 normalize 存活
+  const parsed = JSON.parse(JSON.stringify(env));
+  const plan = LitSync.createSyncPlan({
+    local: { papers: [], folders: [] },
+    remoteWorkspace: parsed, mode: 'sync', now: 1
+  });
+  const p1 = plan.remote.papers.find(function (p) { return p.id === 'p1'; });
   assert.equal(Number(p1.lastReadAt), 1700000000000);
 });
 

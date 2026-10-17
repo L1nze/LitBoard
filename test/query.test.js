@@ -494,3 +494,52 @@ test('缓存：全空字段文献的空串缓存值可命中（真值判断回�
   assert.equal(matcher2(paper2), true);
   assert.ok(contentReads > readsAfterFirst, '笔记 updatedAt 变化后应重拼');
 });
+
+test('缓存：同 id 同 updatedAt 的笔记替换实例（重规范化副本）命中，不再作废重拼；换序/换 id 仍失效', function () {
+  const paper = countingPaper('cache-note-instance', { title: 'alpha', abstract: 'alpha' }, 500);
+  const cloneNote = function () {
+    return { id: 'n1', paperId: 'cache-note-instance', title: 't1', content: 'zebra body', updatedAt: 10 };
+  };
+  const ctx1 = { notesByPaper: { 'cache-note-instance': [cloneNote()] }, folders: [] };
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctx1).matched, true);
+  const reads = paper.__reads.abstract + paper.__reads.title;
+  // 换实例不换内容（同步/保存流程重规范化后的常见形态）：id+updatedAt 聚合键应命中
+  const ctx2 = { notesByPaper: { 'cache-note-instance': [cloneNote()] }, folders: [] };
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctx2).matched, true);
+  assert.equal(paper.__reads.abstract + paper.__reads.title, reads, '同 id 同 updatedAt 的替换实例不重算');
+  // 换 id（内容来源变了）必须失效
+  const ctx3 = { notesByPaper: { 'cache-note-instance': [{ id: 'n9', paperId: 'cache-note-instance', title: 't', content: 'plain', updatedAt: 10 }] }, folders: [] };
+  assert.equal(LitQuery.rankPlainText(paper, 'zebra', ctx3).matched, false, '换成别的笔记（不同 id）不得串缓存');
+});
+
+test('缓存：三缓存合计按估算字节封顶，逐条最旧先出；clearHaystackCache 归零计数', function () {
+  LitQuery.clearHaystackCache();
+  const restore = LitQuery.setHayCacheByteBudget(9000);
+  try {
+    assert.equal(LitQuery.hayCacheBytesInUse(), 0);
+    const big = function (i) {
+      return countingPaper('cache-budget-' + i, { title: 't' + i, abstract: 'zebra ' + String(i).padStart(4, '0') + ' '.repeat(4000) });
+    };
+    const a = big(1), b = big(2), c = big(3);
+    LitQuery.rankPlainText(a, 'zebra');
+    LitQuery.rankPlainText(b, 'zebra'); // 单条记录 ≈8KB：b 的插入即把最旧的 a 挤出
+    assert.ok(LitQuery.hayCacheBytesInUse() <= 9000, '合计估算字节不得超预算：' + LitQuery.hayCacheBytesInUse());
+    LitQuery.rankPlainText(c, 'zebra');
+    const readsC = c.__reads.abstract;
+    LitQuery.rankPlainText(c, 'zebra');
+    assert.equal(c.__reads.abstract, readsC, '最新条目仍应命中');
+    const readsA = a.__reads.abstract;
+    LitQuery.rankPlainText(a, 'zebra');
+    assert.ok(a.__reads.abstract > readsA, '被淘汰的旧条目重查必须重读字段（逐条最旧先出）');
+    // AST 路径（hayCache）与普通路径计入同一预算池
+    const matcher = LitQuery.parse('zebra').matcher;
+    const astBig = countingPaper('cache-budget-ast', { title: 'ast', abstract: 'zebra ' + 'x'.repeat(6000) });
+    assert.equal(matcher(astBig), true);
+    assert.ok(LitQuery.hayCacheBytesInUse() <= 9000, 'hayCache 条目同样受合计预算约束');
+    LitQuery.clearHaystackCache();
+    assert.equal(LitQuery.hayCacheBytesInUse(), 0, 'clearHaystackCache 应归零字节计数');
+  } finally {
+    LitQuery.setHayCacheByteBudget(restore);
+    LitQuery.clearHaystackCache();
+  }
+});

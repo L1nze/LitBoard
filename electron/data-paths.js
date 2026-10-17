@@ -706,26 +706,6 @@ function createDataPathManager(options) {
     return runtimeState;
   }
 
-  /**
-   * 设置完整备份保留份数（1–30；传 0 或 null 表示恢复默认）。
-   * 只改轮换上限，不触发任何删除：多出来的旧快照要等下一次成功发布新快照时才被清理。
-   */
-  function stageBackupKeep(value) {
-    const raw = readRaw();
-    const current = runtimeState || publicState(raw, rawCurrent(raw));
-    if (!current.backupDir) throw new Error('请先设置完整备份目录');
-    const count = value == null || value === '' ? 0 : Number(value);
-    if (count !== 0 && (!Number.isFinite(count) || count < 1 || count > 30)) {
-      throw new Error('保留份数需要在 1–30 之间');
-    }
-    if (count === 0) delete raw.backupKeep;
-    else raw.backupKeep = Math.round(count);
-    raw.version = LOCATOR_VERSION;
-    writeJsonAtomic(locatorFile, raw);
-    runtimeState = publicState(raw, rawCurrent(raw));
-    return runtimeState;
-  }
-
   /** 记录最近一次成功快照（备份管理模块发布后调用） */
   function markBackupSuccess(at, snapshotId) {
     const raw = readRaw();
@@ -740,7 +720,6 @@ function createDataPathManager(options) {
     getState: getState,
     stage: stage,
     stageBackupDir: stageBackupDir,
-    stageBackupKeep: stageBackupKeep,
     markBackupSuccess: markBackupSuccess,
     pendingRebase: pendingRebase,
     completeRebase: completeRebase,

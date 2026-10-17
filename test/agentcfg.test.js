@@ -71,7 +71,6 @@ test('mirror：把当前服务商写成扁平字段（agent-net / embedcfg 回�
     agentApiDialect: 'chat',
     agentModel: 'kimi-k2.7-code'
   });
-  assert.deepStrictEqual(C.selectionOf(cfg), { providerId: 'p1', model: 'kimi-k2.7-code' });
 });
 
 test('selectModel / upsertProvider / removeProvider：纯函数，不改入参', () => {

@@ -107,3 +107,33 @@ test('pdfimport exposes word-level search fragments and a search highlight layer
   assert.match(html, /js\/pdfsearch\.js/);
   assert.match(html, /id="btn-ft"/);
 });
+
+test('invalidate：清渲染层 metaCache 镜像并转发主进程通道；文献级调用连旧版 paperId 裸键一起清', async function () {
+  const bridge = fakeDesktopBridge();
+  const invalidated = [];
+  bridge.litboardDesktop.pdfSearchInvalidate = function (value) { invalidated.push(value); return Promise.resolve({}); };
+  const module = loadPdfSearchModule(bridge);
+  const papers = [{ id: 'p1', attachments: [{ id: 'a1', kind: 'pdf', path: 'D:/x/one.pdf', fingerprint: 'f1' }] }];
+  await module.reindex(papers);
+  assert.equal((await module.reindex(papers)).stale, 0, '指纹未变不重复提取');
+
+  module.invalidate('p1', 'a1');
+  assert.equal(invalidated.length, 1, '转发主进程失效通道（文献删除/附件移除时主进程 FTS 行由 deletePaper 清，渲染层镜像靠这里清）');
+  assert.equal(invalidated[0].paperId, 'p1');
+  assert.equal(invalidated[0].attachmentId, 'a1');
+  assert.equal((await module.reindex(papers)).stale, 1, '附件级失效后 metaCache 镜像已清，视为过期重建');
+
+  await module.reindex(papers);
+  module.invalidate('p1');
+  assert.equal(invalidated[1].paperId, 'p1', '文献级失效也转发主进程');
+  assert.equal(invalidated[1].attachmentId, '');
+  assert.equal((await module.reindex(papers)).stale, 1, '文献级失效清掉 paperId:a1 键与旧版 paperId 裸键');
+});
+
+test('invalidate：浏览器版丢弃会话内存缓存/失败标记，不抛错不阻塞后续检索', async function () {
+  const module = loadPdfSearchModule();
+  module.invalidate('p9', 'a9');
+  module.invalidate('p9');
+  const hits = await module.search('hello', [{ id: 'p9', pdfPath: 'x.pdf' }]);
+  assert.ok(Array.isArray(hits));
+});

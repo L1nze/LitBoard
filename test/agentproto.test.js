@@ -198,7 +198,7 @@ test('responses 累积器：文本/推理/工具分片/completed 用量；incomp
   assert.equal(msg.tool_calls[0].id, 'c1');
   assert.equal(msg.tool_calls[0].function.arguments, '{"query":"电池"}');
   assert.equal(acc.getFinishReason(), 'tool_calls');
-  assert.equal(acc.sawDone(), true);
+  assert.equal(acc.state.sawDone, true);
   assert.deepEqual(acc.getUsage(), { prompt_tokens: 31, completion_tokens: 7, total_tokens: 38 });
   // incomplete 归一为截断，failed 抛出上游错误
   const acc2 = P.createResponsesAccumulator();
@@ -242,7 +242,7 @@ test('messages 累积器：文本/思考/工具分片/stop_reason 映射；max_t
   assert.equal(msg.tool_calls[0].function.name, 'search_library');
   assert.equal(msg.tool_calls[0].function.arguments, '{"query":"量子"}');
   assert.equal(acc.getFinishReason(), 'tool_calls');
-  assert.equal(acc.sawDone(), true);
+  assert.equal(acc.state.sawDone, true);
   assert.equal(acc.getUsage().prompt_tokens, 12);
   assert.equal(acc.getUsage().completion_tokens, 9);
   // max_tokens → length（截断），error 事件抛出
@@ -311,6 +311,68 @@ test('providerLabel: 服务商展示名（OpenCode 分 Go/Zen，未知回落真�
   assert.equal(P.providerLabel('   '), '');
   assert.equal(P.providerLabel(null), '');
   assert.equal(P.providerLabel(undefined), '');
+});
+
+/* ---------------- 三形态对拍：同一逻辑轮次在三种协议的线上形态下归一产物必须一致 ----------------
+ * 同一轮 = 推理增量 + 文本增量 + 一个工具调用（参数分片到达）+ tool_calls 收尾 + 用量 31/7。
+ * 这是 SSE 累积器收敛（共享骨架/末段组装）的逐位不变基准：重构前后该测试输出不得漂移。 */
+test('三形态对拍：同一逻辑轮次的 {content, reasoning, tool_calls, usage, finishReason, sawDone} 归一一致', function () {
+  function readout(acc, lines) {
+    lines.forEach(function (line) { acc.pushLine(line); });
+    const message = acc.message();
+    const usage = acc.getUsage() || {};
+    return {
+      role: message.role,
+      content: message.content,
+      reasoning: message.reasoning_content,
+      tool_calls: message.tool_calls,
+      finishReason: acc.getFinishReason(),
+      prompt_tokens: usage.prompt_tokens,
+      completion_tokens: usage.completion_tokens,
+      sawDone: acc.state.sawDone
+    };
+  }
+  const chat = readout(P.createChatAccumulator(), [
+    'data: {"choices":[{"delta":{"reasoning_content":"思考"}}]}',
+    'data: {"choices":[{"delta":{"content":"你"}}]}',
+    'data: {"choices":[{"delta":{"content":"好"}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"search","arguments":"{\\"qu"}}]}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ery\\":\\"电池\\"}"}}]}}]}',
+    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":31,"completion_tokens":7}}',
+    'data: [DONE]'
+  ]);
+  const responses = readout(P.createResponsesAccumulator(), [
+    'data: {"type":"response.reasoning_summary_text.delta","delta":"思考"}',
+    'data: {"type":"response.output_text.delta","delta":"你"}',
+    'data: {"type":"response.output_text.delta","delta":"好"}',
+    'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc1","call_id":"c1","name":"search","arguments":""}}',
+    'data: {"type":"response.function_call_arguments.delta","item_id":"fc1","delta":"{\\"qu"}',
+    'data: {"type":"response.function_call_arguments.delta","item_id":"fc1","delta":"ery\\":\\"电池\\"}"}',
+    'data: {"type":"response.completed","response":{"usage":{"input_tokens":31,"output_tokens":7}}}'
+  ]);
+  const messages = readout(P.createMessagesAccumulator(), [
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"思考"}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你"}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好"}}',
+    'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"c1","name":"search","input":{}}}',
+    'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"query\\":"}}',
+    'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\\"电池\\"}"}}',
+    'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":31,"output_tokens":7}}',
+    'data: {"type":"message_stop"}'
+  ]);
+  // 逐项给出期望值（而非只互相比对）：收敛引入的任何漂移都会在此显式失败
+  assert.deepEqual(chat, {
+    role: 'assistant',
+    content: '你好',
+    reasoning: '思考',
+    tool_calls: [{ id: 'c1', type: 'function', function: { name: 'search', arguments: '{"query":"电池"}' } }],
+    finishReason: 'tool_calls',
+    prompt_tokens: 31,
+    completion_tokens: 7,
+    sawDone: true
+  });
+  assert.deepEqual(responses, chat);
+  assert.deepEqual(messages, chat);
 });
 
 test('chat 累积器：网关在每个 delta 重发完整工具名不拼接叠加', function () {

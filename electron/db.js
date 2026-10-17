@@ -325,8 +325,15 @@ function createLibraryDb(baseDir) {
    * - 绝不在损坏文件上创建空库掩盖故障；
    * - 主库缺失但存在 WAL 残留同样视为损坏（WAL 里可能还有未归档的数据）。
    * 恢复流程见 electron/backup.js（验证快照 → 隔离保留件 → 还原验证 → 替换）。
+   *
+   * options.deferIntegrityCheck === true：跳过打开前的同步 quick_check（GB 级库该检查
+   * 是秒级全页扫描，会拖住首屏），改由调用方稍后显式调用 runDeferredIntegrityCheck()
+   * 补跑（主进程接线负责挪到窗口就绪后）。不传选项时行为与历史版本完全一致。
+   * 注意：硬损坏（文件根本不是 SQLite 库）在打开读写句柄/落 PRAGMA 时仍会当场抛错，
+   * 延后只影响「页级损坏」的检出时机——这是该选项拿慢启动换首屏速度的既定取舍。
    */
-  async function open() {
+  async function open(options) {
+    const deferIntegrityCheck = !!(options && options.deferIntegrityCheck === true);
     await fs.mkdir(baseDir, { recursive: true });
     const mainExists = await pathExists(file);
     const walExists = await pathExists(file + '-wal');
@@ -334,19 +341,7 @@ function createLibraryDb(baseDir) {
       throw corruptionError('主库文件缺失但存在 WAL 残留（已原样保留全部文件，未做任何改动）');
     }
     if (mainExists) {
-      // 用只读探针做完整性检查：损坏时绝不执行 journal_mode 变更，
-      // 且只读句柄关闭不会重建/丢弃 WAL、SHM（读写句柄关闭会清理它们）。
-      // 启动只做页级 quick_check（大库跑完整 integrity_check + 索引核对会明显拖慢启动）；
-      // 深度校验保留在备份/恢复路径（backup.js 与本模块的快照流程）。
-      let healthy = false;
-      let probe = null;
-      try {
-        probe = new DatabaseSync(file, { readOnly: true });
-        const check = probe.prepare('PRAGMA quick_check').get();
-        healthy = check && Object.values(check)[0] === 'ok';
-      } catch (error) { healthy = false; }
-      try { if (probe) probe.close(); } catch (error) {}
-      if (!healthy) {
+      if (!deferIntegrityCheck && !quickCheckHealthy()) {
         throw corruptionError('quick_check 未通过（主库/WAL/SHM 均已原样保留）');
       }
       db = new DatabaseSync(file);
@@ -366,6 +361,36 @@ function createLibraryDb(baseDir) {
       throw error;
     }
     return { restoredFromBackup: false, created: !mainExists };
+  }
+
+  /** 用只读探针做页级完整性检查：损坏时绝不执行 journal_mode 变更，
+   *  且只读句柄关闭不会重建/丢弃 WAL、SHM（读写句柄关闭会清理它们）。
+   *  启动只做页级 quick_check（大库跑完整 integrity_check + 索引核对会明显拖慢启动）；
+   *  深度校验保留在备份/恢复路径（backup.js 与本模块的快照流程）。 */
+  function quickCheckHealthy() {
+    let healthy = false;
+    let probe = null;
+    try {
+      probe = new DatabaseSync(file, { readOnly: true });
+      const check = probe.prepare('PRAGMA quick_check').get();
+      healthy = !!(check && Object.values(check)[0] === 'ok');
+    } catch (error) { healthy = false; }
+    try { if (probe) probe.close(); } catch (error) {}
+    return healthy;
+  }
+
+  /**
+   * 补跑被 deferIntegrityCheck 跳过的 quick_check。
+   * 声明为 async 便于调用方接入启动链；探针本身是同步的（quick_check 无法在
+   * 不重写校验器的前提下分块），所以调用方应自行选择时机（如首帧绘制后）。
+   * 未通过时抛 LITBOARD_DB_CORRUPT —— fail-closed 处置与 open 完全一致
+   * （不删/不改任何数据文件），由调用方决定提示重启或进入恢复流程。
+   */
+  async function runDeferredIntegrityCheck() {
+    if (!quickCheckHealthy()) {
+      throw corruptionError('quick_check 未通过（延迟检查；主库/WAL/SHM 均已原样保留）');
+    }
+    return { ok: true };
   }
 
   function requireDb() {
@@ -431,8 +456,10 @@ function createLibraryDb(baseDir) {
       updated_at=excluded.updated_at, deleted_at=excluded.deleted_at,
       hash=excluded.hash, data=excluded.data`;
 
-  // 子表语句缓存（按连接隔离）：writePaperChildren 每篇文献原本要 prepare 十来条语句，
-  // 批量标记/同步应用时是纯编译开销；WeakMap 保证连接关闭即随对象回收，不会跨连接复用
+  // 语句缓存（按连接隔离，SQL 文本 → prepared statement）：writePaperChildren 每篇文献
+  // 原本要 prepare 十来条语句，主表 upsert/delete（writePaper/writeNote/deletePaper 等）
+  // 此前也每次调用重新 prepare——批量标记/同步应用/整库替换时全是纯编译开销；
+  // WeakMap 保证连接关闭即随对象回收，不会跨连接复用
   const paperChildStmtCache = new WeakMap();
   function childStmt(d, sql) {
     let bySql = paperChildStmtCache.get(d);
@@ -467,11 +494,27 @@ function createLibraryDb(baseDir) {
     });
   }
 
+  const writeNoteSql = `INSERT INTO notes(id, paper_id, title, format, created_at, updated_at, deleted_at, hash, data)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET paper_id=excluded.paper_id, title=excluded.title,
+        format=excluded.format, created_at=excluded.created_at, updated_at=excluded.updated_at,
+        deleted_at=excluded.deleted_at, hash=excluded.hash, data=excluded.data`;
+  const writeFolderSql = `INSERT INTO folders(id, name, parent_id, sort_index, updated_at, deleted_at, hash)
+      VALUES(?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET name=excluded.name, parent_id=excluded.parent_id,
+        sort_index=excluded.sort_index, updated_at=excluded.updated_at,
+        deleted_at=excluded.deleted_at, hash=excluded.hash`;
+  const writeSavedSearchSql = `INSERT INTO saved_searches(id, name, query, ast, sort_index, updated_at, deleted_at) VALUES(?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET name=excluded.name, query=excluded.query, ast=excluded.ast, sort_index=excluded.sort_index,
+        updated_at=excluded.updated_at, deleted_at=excluded.deleted_at`;
+  const writeTagColorSql = `INSERT INTO tag_colors(tag, color, updated_at, deleted_at) VALUES(?, ?, ?, ?)
+      ON CONFLICT(tag) DO UPDATE SET color=excluded.color, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at`;
+
   function writePaper(d, paper, now) {
     const hash = hashEntity(paper);
     const updatedAt = Number(paper.updatedAt) || now;
     const stored = Object.assign({}, paper, { updatedAt: updatedAt });
-    d.prepare(upsertPaperSql).run(
+    childStmt(d, upsertPaperSql).run(
       paper.id, paper.key, paper.entryType, paper.title, paper.year, paper.venue, paper.doi,
       paper.citations, paper.rating, paper.status, paper.addedAt, updatedAt, paper.deletedAt,
       hash, JSON.stringify(stored)
@@ -485,29 +528,32 @@ function createLibraryDb(baseDir) {
    * 索引表必须一起清：pdf_text / pdf_fts 都没有外键级联，留下孤儿行会让
    * 已删除的文献继续被全文检索命中，并永久占用数据库体积 —— 而数据库会被压缩进
    * 每一份完整快照，所以这份垃圾是按备份份数翻倍的。
+   * settings 里的阅读位置同样随文献删除：readpos:<id>:<att>（PDF）、readpos:epub:<id>:<att>（EPUB）
+   * 与旧单附件形态 readpos:<id>（js/app.js 的读取兜底还在用）——留着是确定性无界增长，
+   * 且每次备份都会把这份垃圾再压一遍。paper id 恰为 'epub' 时第一条 LIKE 会越界
+   * 匹配到其它文献的 EPUB 行，用 NOT LIKE 收窄（Zotero key 8 位、本地 id 带 'p' 前缀，
+   * 实际不可达，纯防御）。
    * 墓碑（deletedAt）走的是 saveState，不经过这里，所以撤销删除仍然有效。
    */
   function deletePaper(d, id) {
-    d.prepare('DELETE FROM papers WHERE id = ?').run(id);
-    d.prepare('DELETE FROM authors WHERE paper_id = ?').run(id);
-    d.prepare('DELETE FROM tags WHERE paper_id = ?').run(id);
-    d.prepare('DELETE FROM folder_items WHERE paper_id = ?').run(id);
-    d.prepare('DELETE FROM attachments WHERE paper_id = ?').run(id);
-    d.prepare('DELETE FROM annotations WHERE paper_id = ?').run(id);
-    d.prepare('DELETE FROM notes WHERE paper_id = ?').run(id); // 该文献的附属笔记；主题笔记（paper_id=''）不受影响
-    d.prepare('DELETE FROM pdf_text WHERE paper_id = ?').run(id);
-    d.prepare('DELETE FROM pdf_fts WHERE paper_id = ?').run(id);
+    childStmt(d, 'DELETE FROM papers WHERE id = ?').run(id);
+    childStmt(d, 'DELETE FROM authors WHERE paper_id = ?').run(id);
+    childStmt(d, 'DELETE FROM tags WHERE paper_id = ?').run(id);
+    childStmt(d, 'DELETE FROM folder_items WHERE paper_id = ?').run(id);
+    childStmt(d, 'DELETE FROM attachments WHERE paper_id = ?').run(id);
+    childStmt(d, 'DELETE FROM annotations WHERE paper_id = ?').run(id);
+    childStmt(d, 'DELETE FROM notes WHERE paper_id = ?').run(id); // 该文献的附属笔记；主题笔记（paper_id=''）不受影响
+    childStmt(d, 'DELETE FROM pdf_text WHERE paper_id = ?').run(id);
+    childStmt(d, 'DELETE FROM pdf_fts WHERE paper_id = ?').run(id);
+    childStmt(d, "DELETE FROM settings WHERE key = 'readpos:' || ? OR (key LIKE 'readpos:' || ? || ':%' AND key NOT LIKE 'readpos:epub:%')").run(id, id);
+    childStmt(d, "DELETE FROM settings WHERE key LIKE 'readpos:epub:' || ? || ':%'").run(id);
   }
 
   function writeNote(d, note) {
     const hash = hashEntity(note);
     const updatedAt = Number(note.updatedAt) || 0;
     const stored = Object.assign({}, note, { updatedAt: updatedAt || note.updatedAt });
-    d.prepare(`INSERT INTO notes(id, paper_id, title, format, created_at, updated_at, deleted_at, hash, data)
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET paper_id=excluded.paper_id, title=excluded.title,
-        format=excluded.format, created_at=excluded.created_at, updated_at=excluded.updated_at,
-        deleted_at=excluded.deleted_at, hash=excluded.hash, data=excluded.data`)
+    childStmt(d, writeNoteSql)
       .run(note.id, note.paperId || '', note.title || '', note.format || 'markdown',
         note.createdAt != null ? note.createdAt : null, note.updatedAt != null ? note.updatedAt : null,
         note.deletedAt != null ? note.deletedAt : null, hash, JSON.stringify(stored));
@@ -515,25 +561,18 @@ function createLibraryDb(baseDir) {
 
   function writeFolder(d, folder, now) {
     const updatedAt = Number(folder.updatedAt) || now;
-    d.prepare(`INSERT INTO folders(id, name, parent_id, sort_index, updated_at, deleted_at, hash)
-      VALUES(?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET name=excluded.name, parent_id=excluded.parent_id,
-        sort_index=excluded.sort_index, updated_at=excluded.updated_at,
-        deleted_at=excluded.deleted_at, hash=excluded.hash`)
+    childStmt(d, writeFolderSql)
       .run(folder.id, folder.name, folder.parentId, folder.sortIndex, updatedAt, folder.deletedAt, hashEntity(folder));
   }
 
   function writeSavedSearch(d, search) {
-    d.prepare(`INSERT INTO saved_searches(id, name, query, ast, sort_index, updated_at, deleted_at) VALUES(?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET name=excluded.name, query=excluded.query, ast=excluded.ast, sort_index=excluded.sort_index,
-        updated_at=excluded.updated_at, deleted_at=excluded.deleted_at`)
+    childStmt(d, writeSavedSearchSql)
       .run(search.id, search.name, search.query, search.ast || '', search.sortIndex, Number(search.updatedAt) || 0,
         search.deletedAt != null ? search.deletedAt : null);
   }
 
   function writeTagColor(d, record) {
-    d.prepare(`INSERT INTO tag_colors(tag, color, updated_at, deleted_at) VALUES(?, ?, ?, ?)
-      ON CONFLICT(tag) DO UPDATE SET color=excluded.color, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at`)
+    childStmt(d, writeTagColorSql)
       .run(record.tag, record.color, Number(record.updatedAt) || 0,
         record.deletedAt != null ? record.deletedAt : null);
   }
@@ -544,13 +583,13 @@ function createLibraryDb(baseDir) {
    */
   function recordReadAt(paperId, at) {
     const d = requireDb();
-    const row = d.prepare('SELECT data FROM papers WHERE id = ?').get(paperId);
+    const row = childStmt(d, 'SELECT data FROM papers WHERE id = ?').get(paperId);
     if (!row) return false;
     let paper;
     try { paper = JSON.parse(row.data); } catch (error) { return false; }
     if (Number(paper.lastReadAt) === Number(at)) return true;
     paper.lastReadAt = Number(at) || Date.now();
-    d.prepare('UPDATE papers SET data = ? WHERE id = ?').run(JSON.stringify(paper), paperId);
+    childStmt(d, 'UPDATE papers SET data = ? WHERE id = ?').run(JSON.stringify(paper), paperId);
     return true;
   }
 
@@ -604,14 +643,65 @@ function createLibraryDb(baseDir) {
   }
 
   /**
-   * 实体级保存协议：渲染层发送 { ...workspace, baseSignatures }。
+   * 实体级保存协议：渲染层发送 { ...workspace, baseSignatures, nextSignatures? }。
    * baseSignatures 是渲染层最近一次被数据库确认的工作区签名：
    * - 本地未改（签名 == base）→ 跳过，绝不覆盖库内可能被扩展更新的版本；
    * - 库内未变（库签名 == base）→ 正常写入本地修改；
    * - 双方都变且不一致 → 记入 conflicts，不写入，由渲染层三方合并后带新 base 重提；
    * - payload 缺少某实体 → 一律保留库内记录（正常保存绝不硬删；删除走墓碑）。
    * 无 baseSignatures（旧渲染层/内部调用）时退化为「按差异写、不删除」。
+   *
+   * nextSignatures（可选）：渲染层随 payload 附上的「同一工作区、同一套 normalize 口径」
+   * 算好的签名表，主进程据此跳过整库重签这一遍（normalizeWorkspace 仍照跑——它是入库
+   * 校验权威）。绝不能因传参错误写坏库：结构校验（形状 + 实体 id 集合与归一化后的
+   * 工作区完全一致 + 每集合首/中/尾三个实体抽样重算比对）任一不过即回退本地重算。
+   * 抽样挡的是「渲染层签的根本不是这份工作区」（版本/口径漂移会系统性影响所有实体，
+   * 抽样必中）；单个签名的孤立错误无法零成本识别，但后果只是该实体被误判
+   * skip/conflict 并由渲染层写后校验自愈，不会写坏数据。
    */
+  const SIGNATURE_COLLECTION_KEY_OF = {
+    papers: function (e) { return e.id; },
+    notes: function (e) { return e.id; },
+    folders: function (e) { return e.id; },
+    savedSearches: function (e) { return e.id; },
+    tagColorRecords: function (e) { return e.tag; }
+  };
+
+  function validatedIncomingSignatures(candidates, workspace) {
+    if (!candidates || typeof candidates !== 'object' || Array.isArray(candidates)) return null;
+    const names = Object.keys(SIGNATURE_COLLECTION_KEY_OF);
+    for (const name of names) {
+      const map = candidates[name];
+      if (!map || typeof map !== 'object' || Array.isArray(map)) return null;
+      const list = workspace[name] || [];
+      const expected = new Set(list.map(SIGNATURE_COLLECTION_KEY_OF[name]));
+      const keys = Object.keys(map);
+      if (keys.length !== expected.size) return null; // 覆盖不完整或夹带多余 id
+      for (const key of keys) {
+        if (typeof map[key] !== 'string') return null;
+        if (!expected.has(key)) return null;
+      }
+    }
+    // 抽样复核（每集合 首/中/尾 三个实体）：直传签名必须与主进程归一化结果重算一致
+    for (const name of names) {
+      const list = workspace[name] || [];
+      if (!list.length) continue;
+      const keyOf = SIGNATURE_COLLECTION_KEY_OF[name];
+      const picks = new Set([0, list.length - 1, list.length >> 1]);
+      for (const index of picks) {
+        const entity = list[index];
+        if (LitModel.entitySignature(entity) !== candidates[name][keyOf(entity)]) return null;
+      }
+    }
+    return {
+      papers: candidates.papers,
+      notes: candidates.notes,
+      folders: candidates.folders,
+      savedSearches: candidates.savedSearches,
+      tagColorRecords: candidates.tagColorRecords
+    };
+  }
+
   function saveState(value) {
     const d = requireDb();
     const workspace = LitModel.normalizeWorkspace(value);
@@ -625,7 +715,9 @@ function createLibraryDb(baseDir) {
     };
 
     const currentSigs = signaturesCache || LitModel.workspaceSignatures(loadState());
-    const incomingSigs = LitModel.workspaceSignatures(workspace);
+    const trustedSigs = validatedIncomingSignatures(value && value.nextSignatures, workspace);
+    const incomingSigs = trustedSigs || LitModel.workspaceSignatures(workspace);
+    stats.signaturesFromCaller = !!trustedSigs;
     const resultSigs = {
       papers: Object.assign({}, currentSigs.papers),
       notes: Object.assign({}, currentSigs.notes),
@@ -747,7 +839,7 @@ function createLibraryDb(baseDir) {
       });
       Object.keys(existingNotes).forEach(function (id) {
         if (seenNotes[id]) return;
-        d.prepare('DELETE FROM notes WHERE id = ?').run(id);
+        childStmt(d, 'DELETE FROM notes WHERE id = ?').run(id);
         stats.notesDeleted++;
       });
 
@@ -760,25 +852,25 @@ function createLibraryDb(baseDir) {
       });
       Object.keys(existingFolders).forEach(function (id) {
         if (seenFolders[id]) return;
-        d.prepare('DELETE FROM folders WHERE id = ?').run(id);
+        childStmt(d, 'DELETE FROM folders WHERE id = ?').run(id);
         stats.foldersDeleted++;
       });
 
       // 小型附属实体：整体替换（行数小，代价可忽略）
-      d.prepare('DELETE FROM saved_searches').run();
+      childStmt(d, 'DELETE FROM saved_searches').run();
       workspace.savedSearches.forEach(function (search) {
-        d.prepare('INSERT INTO saved_searches(id, name, query, ast, sort_index, updated_at, deleted_at) VALUES(?, ?, ?, ?, ?, ?, ?)')
+        childStmt(d, 'INSERT INTO saved_searches(id, name, query, ast, sort_index, updated_at, deleted_at) VALUES(?, ?, ?, ?, ?, ?, ?)')
           .run(search.id, search.name, search.query, search.ast || '', search.sortIndex, Number(search.updatedAt) || 0,
             search.deletedAt != null ? search.deletedAt : null);
       });
-      d.prepare('DELETE FROM tag_colors').run();
+      childStmt(d, 'DELETE FROM tag_colors').run();
       const tagColorRecords = Array.isArray(workspace.tagColorRecords)
         ? workspace.tagColorRecords
         : Object.keys(workspace.tagColors).map(function (tag) {
           return { tag: tag, color: workspace.tagColors[tag], updatedAt: now, deletedAt: null };
         });
       tagColorRecords.forEach(function (record) {
-        d.prepare('INSERT INTO tag_colors(tag, color, updated_at, deleted_at) VALUES(?, ?, ?, ?)')
+        childStmt(d, 'INSERT INTO tag_colors(tag, color, updated_at, deleted_at) VALUES(?, ?, ?, ?)')
           .run(record.tag, record.color, Number(record.updatedAt) || 0,
             record.deletedAt != null ? record.deletedAt : null);
       });
@@ -988,7 +1080,18 @@ function createLibraryDb(baseDir) {
   // pdf_text.pages 存 zlib(level 1) 压缩的 JSON BLOB（v6 起；旧库迁移时已转换）。
   // 全文文本在库里本就存了两份（pages + pdf_fts 索引原文），压缩让 pages 这份缩小 ~3x。
 
-  async function pdfTextPut(entry) {
+  // pdfTextPut 分块提交（块间 setImmediate 让出消息泵，对齐查询侧 pdfTextQuery 的分批
+  // 让出护栏）——大书整篇重建 trigram FTS 曾把主进程堵住数百 ms 到秒级。两个上限谁先到
+  // 谁切块：页数防小页场景的语句数膨胀，字节数防「扫描/OCR 书单页很大」的场景——
+  // 实测 trigram 索引 ~0.5ms/KB（高熵语料），256KB/块 ≈ 最坏 ~150ms 同步块。
+  // pdf_text 行本身是个 BLOB upsert（2.6MB 实测 ~30ms），不构成切块约束。
+  const PDF_PUT_CHUNK_PAGES = 32;
+  const PDF_PUT_CHUNK_BYTES = 256 * 1024;
+  // 调用级串行队列：分块让出后多个 pdfTextPut 可能交错执行，交错会破坏
+  // 「先 DELETE 该篇旧行再 INSERT」的重建语义（A 的剩余块插进 B 已清空的索引里）。
+  let pdfTextPutChain = Promise.resolve();
+
+  async function pdfTextPutChunked(entry) {
     const d = requireDb();
     const paperId = String(entry.paperId || '');
     const attachmentId = String(entry.attachmentId || '');
@@ -999,24 +1102,58 @@ function createLibraryDb(baseDir) {
     });
     const hasCjk = pages.some(function (pageText) { return CJK_RE.test(String(pageText || '')); }) ? 1 : 0;
     const packed = await gzipAsync(Buffer.from(JSON.stringify(pages), 'utf8'), { level: 1 });
-    d.exec('BEGIN');
-    try {
-      d.prepare(`INSERT INTO pdf_text(paper_id, attachment_id, fingerprint, method, pages, has_cjk, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)
+    const upsertRow = childStmt(d, `INSERT INTO pdf_text(paper_id, attachment_id, fingerprint, method, pages, has_cjk, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(paper_id, attachment_id) DO UPDATE SET fingerprint=excluded.fingerprint, method=excluded.method,
-          pages=excluded.pages, has_cjk=excluded.has_cjk, updated_at=excluded.updated_at`)
-        .run(paperId, attachmentId, String(entry.fingerprint || ''), String(entry.method || 'mupdf'),
-          packed, hasCjk, Date.now());
-      d.prepare('DELETE FROM pdf_fts WHERE paper_id = ? AND attachment_id = ?').run(paperId, attachmentId);
-      const insert = d.prepare('INSERT INTO pdf_fts(paper_id, attachment_id, page, text) VALUES(?, ?, ?, ?)');
-      pages.forEach(function (pageText, index) {
-        if (pageText) insert.run(paperId, attachmentId, index, pageText);
-      });
-      d.exec('COMMIT');
-    } catch (error) {
-      try { d.exec('ROLLBACK'); } catch (rollbackError) {}
-      throw error;
+          pages=excluded.pages, has_cjk=excluded.has_cjk, updated_at=excluded.updated_at`);
+    const clearFts = childStmt(d, 'DELETE FROM pdf_fts WHERE paper_id = ? AND attachment_id = ?');
+    const insert = childStmt(d, 'INSERT INTO pdf_fts(paper_id, attachment_id, page, text) VALUES(?, ?, ?, ?)');
+    const writeBlock = function (from, to) {
+      d.exec('BEGIN');
+      try {
+        if (from === 0) {
+          upsertRow.run(paperId, attachmentId, String(entry.fingerprint || ''), String(entry.method || 'mupdf'),
+            packed, hasCjk, Date.now());
+          clearFts.run(paperId, attachmentId);
+        }
+        for (let i = from; i < to; i++) {
+          if (pages[i]) insert.run(paperId, attachmentId, i, pages[i]);
+        }
+        d.exec('COMMIT');
+      } catch (error) {
+        try { d.exec('ROLLBACK'); } catch (rollbackError) {}
+        throw error;
+      }
+    };
+    // 块边界：页数 ≥32 或累计字节 ≥256KB（至少装下 1 页——单页超上限只能整页一块）
+    const blockEnd = function (from) {
+      let end = from;
+      let bytes = 0;
+      while (end < pages.length && end - from < PDF_PUT_CHUNK_PAGES) {
+        const size = pages[end] ? pages[end].length : 0;
+        if (end > from && bytes + size > PDF_PUT_CHUNK_BYTES) break;
+        bytes += size;
+        end += 1;
+      }
+      return end;
+    };
+    let cursor = 0;
+    let end = blockEnd(cursor);
+    writeBlock(cursor, end); // 首块无条件立即写（含 pdf_text 行 upsert + 清旧 FTS；pages 为空也走这里）
+    cursor = end;
+    while (cursor < pages.length) {
+      await yieldToLoop();
+      end = blockEnd(cursor);
+      writeBlock(cursor, end);
+      cursor = end;
     }
     return { paperId: paperId, attachmentId: attachmentId, pages: pages.length };
+  }
+
+  async function pdfTextPut(entry) {
+    const attempt = function () { return pdfTextPutChunked(entry); };
+    const run = pdfTextPutChain.then(attempt, attempt);
+    pdfTextPutChain = run.then(function () {}, function () {});
+    return run;
   }
 
   /** pages 列双格式兼容：BLOB 解压、TEXT 原样（防御旧数据），解析失败返回空数组。
@@ -1358,6 +1495,7 @@ function createLibraryDb(baseDir) {
 
   return {
     open: open,
+    runDeferredIntegrityCheck: runDeferredIntegrityCheck,
     loadState: loadState,
     saveState: saveState,
     replaceState: replaceState,

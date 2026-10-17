@@ -38,8 +38,8 @@ for (let i = 0; i < rounds; i++) {
       LITBOARD_SMOKE_RESULT: resultFile
     }),
     encoding: 'utf8',
-    timeout: 120000,
-    windowsHide: true
+    // 不可加 windowsHide：隐藏进程会把渲染层 rAF/定时器节流到 ~1Hz，量出的启动/首帧耗时全失真
+    timeout: 120000
   });
   try {
     const payload = JSON.parse(fs.readFileSync(resultFile, 'utf8'));

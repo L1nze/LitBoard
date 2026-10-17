@@ -343,29 +343,41 @@
 
   // ---------- 求值 ----------
   var TEXT_HAY_FIELDS = ['key', 'title', 'authors', 'venue', 'abstract', 'notes', 'tags'];
-  /* 缓存硬约束（本节三条缓存共用）：① 键 = id+updatedAt 依赖「改内容必抬 updatedAt」不变量
-   * （lastReadAt 不进 haystack 字段，不受影响）；值内存 paper 引用，同 id 同版本的另一实例不串缓存。
-   * ② notes 非文献自身字段，按「活跃笔记引用 + 各自 updatedAt 的有序快照」校验——编辑较早笔记、
-   * 换引用、换序都会失效，重建 notesByPaper（笔记引用不变）照常命中。③ save 落库调 clearHaystackCache() 兜底清空。 */
-  // 万级文献库一次全文搜索就会写满缓存：容量按规模放大，淘汰改为逐条最旧先出，
-  // 不再用「超限即整表清空」——那会让同一次遍历的后半程全部 miss、下一次搜索重建一半。
-  var HAY_CACHE_MAX = 20000;
+  /* 缓存硬约束（本节三条缓存共用）：
+   * ① 键 = id+updatedAt 依赖「改内容必抬 updatedAt」不变量（lastReadAt 不进 haystack 字段，
+   *    不受影响）：app.js 编辑路径全部 LitModel.touch；保存路径 model.touchWorkspaceChanges
+   *    按内容签名兜底 touch；save 落库再调 clearHaystackCache() 全量清一次。
+   * ② notes 非文献自身字段，按「活跃笔记 id+updatedAt 的有序聚合串」校验——不持笔记对象引用；
+   *    编辑任一笔记、换 id、增删、换序都会失效；同 id 同 updatedAt 的替换实例（重规范化副本）
+   *    视为内容相同可命中，重建 notesByPaper 照常命中。
+   * ③ 条目内存 paperRef 一律 WeakRef：同 id 同 updatedAt 的两个存活实例仍互不串缓存，
+   *    但被工作区换血替换掉的旧实例不再被缓存钉住，可正常回收。
+   * ④ 容量 = 三缓存合计估算字节 ≤ HAY_CACHE_BYTE_BUDGET（规范化串长度≈字节数的近似），
+   *    另保留单缓存条目数上限兜底。淘汰逐条最旧先出，不用「超限即整表清空」——
+   *    那会让同一次遍历的后半程全部 miss、下一次搜索重建一半。 */
+  var HAY_CACHE_MAX = 20000;                     // 单缓存条目数兜底（防近零字节条目无限堆条目）
+  var HAY_CACHE_BYTE_BUDGET = 32 * 1024 * 1024;  // hayCache/notesHayCache/plainFieldCache 合计预算
+  var HAS_WEAK_REF = typeof WeakRef === 'function';
+  var hayCacheBytes = 0;                         // 三缓存共享的已用估算字节
+  var registeredHayCaches = [];                  // 注册进共享字节预算的缓存（Map 或普通对象兜底）
+  function registerHayCache(store) { registeredHayCaches.push(store); return store; }
+  function weakPaperRef(paper) {
+    // WeakRef 只能挂对象且不阻止回收；无 WeakRef 的环境退化为强引用（旧语义，仅求可用）
+    return HAS_WEAK_REF ? new WeakRef(paper) : { deref: function () { return paper; } };
+  }
   function notesSigOf(list) {
     if (list == null) return null; // null = 无笔记上下文（区别于「有上下文但活跃笔记为空」的 []）
-    var sig = [];
+    var parts = [];
     for (var i = 0; i < list.length; i++) {
-      sig.push({ ref: list[i], updatedAt: (list[i] && list[i].updatedAt) || 0 });
+      var n = list[i];
+      parts.push((n && n.id ? n.id : '#' + i) + '@' + ((n && n.updatedAt) || 0));
     }
-    return sig;
+    return parts.join(',');
   }
   function notesSigMatch(stored, list) {
     if (stored == null && list == null) return true;   // 两边都无 notes 上下文
-    if (!stored || !list || stored.length !== list.length) return false;
-    for (var i = 0; i < stored.length; i++) {
-      var n = list[i];
-      if (!n || stored[i].ref !== n || stored[i].updatedAt !== (n.updatedAt || 0)) return false;
-    }
-    return true;
+    if (stored == null || list == null) return false;
+    return stored === notesSigOf(list);
   }
   function cacheGet(store, key) {
     if (store.get) {
@@ -374,16 +386,65 @@
     }
     return Object.prototype.hasOwnProperty.call(store, key) ? store[key] : null;
   }
-  function cachePut(store, key, value, max) {
-    if (store.set) {
-      if (store.size >= max) {
-        var oldest = store.keys().next().value;
-        if (oldest !== undefined) store.delete(oldest);
-      }
-      store.set(key, value);
-    } else store[key] = value;
+  /** 条目估算字节：串长度≈字节数的近似 + 每条固定开销（键/记录壳） */
+  function hayEntryWeight(entry) {
+    var bytes = 64;
+    if (!entry) return bytes;
+    if (typeof entry.value === 'string') bytes += entry.value.length;
+    if (typeof entry.notesSig === 'string') bytes += entry.notesSig.length;
+    if (entry.values) {
+      Object.keys(entry.values).forEach(function (field) {
+        var cell = entry.values[field];
+        if (!cell) return;
+        if (typeof cell.raw === 'string') bytes += cell.raw.length;
+        if (typeof cell.normalized === 'string') bytes += cell.normalized.length;
+      });
+    }
+    return bytes;
   }
-  var hayCache = new (typeof Map !== 'undefined' ? Map : Object)();
+  function hayEntryWeightOf(store, key) {
+    var entry = cacheGet(store, key);
+    return entry && typeof entry.__w === 'number' ? entry.__w : 0;
+  }
+  function evictOldestHay(store) {
+    if (store.keys) {
+      var key = store.keys().next().value;
+      if (key === undefined) return false;
+      hayCacheBytes -= hayEntryWeightOf(store, key);
+      store.delete(key);
+      return true;
+    }
+    var objectKeys = Object.keys(store);
+    if (!objectKeys.length) return false;
+    hayCacheBytes -= hayEntryWeightOf(store, objectKeys[0]);
+    delete store[objectKeys[0]];
+    return true;
+  }
+  function evictToHayBudget(preferred) {
+    while (hayCacheBytes > HAY_CACHE_BYTE_BUDGET) {
+      if (!(preferred && evictOldestHay(preferred))) {
+        var evicted = false;
+        for (var i = 0; i < registeredHayCaches.length; i++) {
+          if (registeredHayCaches[i] !== preferred && evictOldestHay(registeredHayCaches[i])) { evicted = true; break; }
+        }
+        if (!evicted) break; // 全空仍超限（单条大于预算）：放行，等下一轮淘汰
+      }
+    }
+  }
+  function cachePut(store, key, value, max) {
+    value.__w = hayEntryWeight(value);
+    if (store.set) {
+      if (store.has && store.has(key)) hayCacheBytes -= hayEntryWeightOf(store, key);
+      if (store.size >= max) evictOldestHay(store);
+      store.set(key, value);
+    } else {
+      if (Object.prototype.hasOwnProperty.call(store, key)) hayCacheBytes -= hayEntryWeightOf(store, key);
+      store[key] = value;
+    }
+    hayCacheBytes += value.__w;
+    evictToHayBudget(store);
+  }
+  var hayCache = registerHayCache(new (typeof Map !== 'undefined' ? Map : Object)());
   function buildHaystackValue(target, fields) {
     return normalizeForSearch(fields.map(function (f) {
       var v = target[f];
@@ -395,25 +456,26 @@
     var key = cacheable ? paper.id + ':' + (paper.updatedAt || 0) : null;
     if (key != null) {
       var hit = cacheGet(hayCache, key);
-      if (hit !== null && hit.paperRef === paper) return hit.value;
+      if (hit !== null && hit.paperRef && hit.paperRef.deref() === paper) return hit.value;
     }
     var value = buildHaystackValue(paper, fields);
-    if (key != null) cachePut(hayCache, key, { paperRef: paper, value: value }, HAY_CACHE_MAX);
+    if (key != null) cachePut(hayCache, key, { paperRef: weakPaperRef(paper), value: value }, HAY_CACHE_MAX);
     return value;
   }
   /* AST text 条件的 notes 投影 haystack（ctx.notesByPaper 存在时）：
-   * 独立缓存 + notes 签名，避免每次条件求值都克隆 paper 并重拼全部笔记。 */
-  var notesHayCache = new (typeof Map !== 'undefined' ? Map : Object)();
+   * 独立缓存 + notes 聚合签名，避免每次条件求值都克隆 paper 并重拼全部笔记。 */
+  var notesHayCache = registerHayCache(new (typeof Map !== 'undefined' ? Map : Object)());
   function projectedHaystack(paper, ctx) {
     var list = (ctx.notesByPaper && ctx.notesByPaper[paper.id]) || [];
     var key = paper.id && paper.updatedAt != null
       ? paper.id + ':' + (paper.updatedAt || 0) : null;
     if (key != null) {
       var hit = cacheGet(notesHayCache, key);
-      if (hit !== null && hit.paperRef === paper && notesSigMatch(hit.notesSig, list)) return hit.value;
+      if (hit !== null && hit.paperRef && hit.paperRef.deref() === paper &&
+        notesSigMatch(hit.notesSig, list)) return hit.value;
     }
     var value = buildHaystackValue(Object.assign({}, paper, { notes: noteSearchText(paper, ctx) }), TEXT_HAY_FIELDS);
-    if (key != null) cachePut(notesHayCache, key, { paperRef: paper, notesSig: notesSigOf(list), value: value }, HAY_CACHE_MAX);
+    if (key != null) cachePut(notesHayCache, key, { paperRef: weakPaperRef(paper), notesSig: notesSigOf(list), value: value }, HAY_CACHE_MAX);
     return value;
   }
   /** 正则专用：原始（未规范化）小写 haystack —— 正则不做 Unicode 折叠，模式与原文字符对应 */
@@ -424,9 +486,23 @@
     }).join(' ').toLowerCase();
   }
   function clearHaystackCache() {
-    if (hayCache.clear) hayCache.clear(); else hayCache = {};
-    if (notesHayCache.clear) notesHayCache.clear(); else notesHayCache = {};
-    if (plainFieldCache.clear) plainFieldCache.clear(); else plainFieldCache = {};
+    registeredHayCaches.forEach(function (store) {
+      if (store.clear) store.clear();
+      else Object.keys(store).forEach(function (key) { delete store[key]; });
+    });
+    hayCacheBytes = 0;
+  }
+  /** 三缓存合计已用估算字节（测试/诊断用） */
+  function hayCacheBytesInUse() { return hayCacheBytes; }
+  /** 调整合计字节预算并立即执行淘汰；返回调整前的旧预算（便于调用方恢复） */
+  function setHayCacheByteBudget(bytes) {
+    var previous = HAY_CACHE_BYTE_BUDGET;
+    var n = Number(bytes);
+    if (Number.isFinite(n) && n >= 0) {
+      HAY_CACHE_BYTE_BUDGET = Math.floor(n);
+      evictToHayBudget(registeredHayCaches[0]);
+    }
+    return previous;
   }
 
   /* 普通关键词检索的相关度层：布尔命中语义仍是「所有词可分布在任意元数据字段」，
@@ -482,9 +558,10 @@
     return (start > 0 ? '…' : '') + raw.slice(start, end) + (end < raw.length ? '…' : '');
   }
 
-  /* 普通关键词检索的逐字段规范化缓存（按篇一条记录）：键 = id+updatedAt + paper 引用，
-   * notes 另带引用快照签名（契约见上）。记录只读——score 等查询相关量不写入；raw 供命中说明取用。 */
-  var plainFieldCache = new (typeof Map !== 'undefined' ? Map : Object)();
+  /* 普通关键词检索的逐字段规范化缓存（按篇一条记录）：键 = id+updatedAt + paper 弱引用，
+   * notes 另带 id+updatedAt 聚合签名（契约见上）。记录只读——score 等查询相关量不写入；
+   * raw 供命中说明取用。 */
+  var plainFieldCache = registerHayCache(new (typeof Map !== 'undefined' ? Map : Object)());
   var plainTermsMemo = { input: null, terms: null };
   function plainFieldValues(paper, ctx) {
     var hasNotesCtx = !!(ctx && (ctx.notesByPaper || Array.isArray(ctx.notes)));
@@ -492,8 +569,9 @@
     var key = paper && paper.id && paper.updatedAt != null
       ? paper.id + ':' + (paper.updatedAt || 0) : null;
     var rec = key != null ? cacheGet(plainFieldCache, key) : null;
-    if (rec && rec.paperRef === paper && notesSigMatch(rec.notesSig, notesList)) return rec.values;
-    var samePaper = !!(rec && rec.paperRef === paper);
+    var recPaper = rec && rec.paperRef ? rec.paperRef.deref() : null;
+    if (rec && recPaper === paper && notesSigMatch(rec.notesSig, notesList)) return rec.values;
+    var samePaper = recPaper === paper;
     var values = samePaper ? rec.values : {};
     PLAIN_SEARCH_FIELDS.forEach(function (spec) {
       if (samePaper && spec.key !== 'notes') return; // 记录其余字段仍有效，只重算 notes
@@ -504,10 +582,12 @@
         : plainFieldText(paper, spec.key);
       values[spec.key] = { raw: raw, normalized: normalizeForSearch(raw) };
     });
-    if (samePaper) rec.notesSig = notesSigOf(notesList);
-    else if (key != null) {
+    if (samePaper) {
+      rec.notesSig = notesSigOf(notesList);
+      rec.__w = hayEntryWeight(rec); // 原地改签名后同步修正记账
+    } else if (key != null) {
       cachePut(plainFieldCache, key,
-        { paperRef: paper, notesSig: notesSigOf(notesList), values: values }, HAY_CACHE_MAX);
+        { paperRef: weakPaperRef(paper), notesSig: notesSigOf(notesList), values: values }, HAY_CACHE_MAX);
     }
     return values;
   }
@@ -1033,6 +1113,8 @@
     normalizeForSearch: normalizeForSearch,
     rankPlainText: rankPlainText,
     clearHaystackCache: clearHaystackCache,
+    hayCacheBytesInUse: hayCacheBytesInUse,
+    setHayCacheByteBudget: setHayCacheByteBudget,
     rowsToText: rowsToText,
     entityHits: entityHits,
     searchEntities: searchEntities,

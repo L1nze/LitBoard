@@ -35,12 +35,12 @@ function phase(mode, timeoutMs) {
     LITBOARD_SMOKE_LIFECYCLE: mode,
     LITBOARD_SMOKE_RESULT: resultFile
   });
+  // 不可加 windowsHide：隐藏进程会节流渲染层 rAF/定时器（~1Hz），拖慢两阶段计时（窗口短暂可见，可接受）
   const run = spawnSync(electronPath, ['.', '--user-data-dir=' + userData], {
     cwd: projectRoot,
     env: env,
     encoding: 'utf8',
-    timeout: timeoutMs,
-    windowsHide: true
+    timeout: timeoutMs
   });
   let payload = null;
   try { payload = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch (e) {}

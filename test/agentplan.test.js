@@ -125,10 +125,10 @@ test('编造的 call_N 被 rejected 且报错附带近期可用调用提示', ()
   assert.match(result.error, /近期可用：c1=search_library、c2=get_paper/);
   assert.match(result.error, /\[cN\] 短 id/);
 });
-test('agentcore 请求渲染的 [cN] 前缀与 agentplan 别名编号一致', () => {
+test('agentcore 请求渲染的 [cN] 前缀与 agentplan 别名编号一致（core 经 opts.toolAliasMap 注入，零业务依赖）', () => {
   const Core = require('../js/agentcore');
   const state = { messages: multi, historyMessageCap: 0 };
-  const body = Core.buildRequestBody(state, {});
+  const body = Core.buildRequestBody(state, { toolAliasMap: P.toolAliasMap });
   const tools = body.messages.filter((m) => m.role === 'tool');
   assert.equal(tools.length, 2);
   assert.match(tools[0].content, /^\[c1\] /);

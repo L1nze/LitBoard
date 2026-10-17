@@ -19,6 +19,27 @@ function loadPdfModule() {
   return context.window.LitPdf;
 }
 
+/** searchPageText 已删除（产品搜索走 handle.search 的 worker 分块路径）：
+ *  断言迁移到活路径 buildPageSearchIndex + runPageSearch——它们仍是 handle.search
+ *  的兼容回退实现，也是 worker 侧搜索核心的对拍参照。 */
+function searchItems(api, items, query, options) {
+  return api.runPageSearch(api.buildPageSearchIndex(items), query, options);
+}
+
+/** 在 Node vm 里求值 mupdf-worker.js（懒加载改造后无顶层 dynamic import），
+ *  经 LitPdfWorkerSearchExpose 钩子取 worker 侧搜索核心引用 */
+function loadWorkerSearchCore() {
+  const vm = require('node:vm');
+  const source = fs.readFileSync(path.join(root, 'js', 'mupdf-worker.js'), 'utf8');
+  let exposed = null;
+  const context = {};
+  context.self = context; // self === globalThis（onmessage 顶层赋值可落地）
+  context.LitPdfWorkerSearchExpose = function (core) { exposed = core; };
+  vm.runInNewContext(source, context);
+  assert.ok(exposed && typeof exposed.searchItems === 'function', 'worker 暴露搜索核心');
+  return exposed;
+}
+
 test('MuPDF module worker is the only packaged PDF engine; raster pixels map 1:1 and the renderer toggle is gone', function () {
   const pdfSource = fs.readFileSync(path.join(root, 'js', 'pdfimport.js'), 'utf8');
   const workerSource = fs.readFileSync(path.join(root, 'js', 'mupdf-worker.js'), 'utf8');
@@ -253,7 +274,7 @@ test('reader search maps fragments across items: empty-slot div alignment, split
     { str: '', hasEOL: true },
     { str: 'free of charge' }
   ];
-  const matches = api.searchPageText(items, 'snapshot');
+  const matches = searchItems(api, items, 'snapshot');
   assert.equal(matches.length, 1);
   const divs = fakeTextDivs(items);
   matches[0].fragments.forEach(function (fragment) {
@@ -265,7 +286,7 @@ test('reader search maps fragments across items: empty-slot div alignment, split
 
   // 同一行内因字体/TJ 数组断开的两个 chunk 之间没有空格字形，join(' ') 会拆散单词
   const splitItems = [{ str: 'snaps' }, { str: 'hot' }, { str: ' of the' }];
-  const splitMatches = api.searchPageText(splitItems, 'snapshot');
+  const splitMatches = searchItems(api, splitItems, 'snapshot');
   assert.equal(splitMatches.length, 1);
   assert.equal(fragmentText(splitItems, splitMatches[0].fragments), 'snapshot');
   // 跨 realm（vm 上下文）对象不用 deepStrictEqual，比较序列化形态
@@ -281,7 +302,7 @@ test('reader search joins phrases across line breaks and resolves hyphenation', 
     { str: 'at the end of' , hasEOL: true },
     { str: 'line text' }
   ];
-  const phrase = api.searchPageText(lines, 'end of line');
+  const phrase = searchItems(api, lines, 'end of line');
   assert.equal(phrase.length, 1);
   assert.equal(fragmentText(lines, phrase[0].fragments), 'end ofline'); // 片段拼接近似（行界不属任何 div）
   assert.equal(phrase[0].text, 'end of\nline');                          // match.text 保留行界换行
@@ -291,42 +312,42 @@ test('reader search joins phrases across line breaks and resolves hyphenation', 
     { str: 'a sig-', hasEOL: true },
     { str: 'nificant result' }
   ];
-  const joined = api.searchPageText(hyphenated, 'significant');
+  const joined = searchItems(api, hyphenated, 'significant');
   assert.equal(joined.length, 1);
   assert.equal(fragmentText(hyphenated, joined[0].fragments), 'significant');
   // 行中连字符不受影响
-  assert.equal(api.searchPageText([{ str: 'well-known' }], 'well-known').length, 1);
+  assert.equal(searchItems(api, [{ str: 'well-known' }], 'well-known').length, 1);
 });
 
 test('reader search match basics: folding (case, ligature, fullwidth, whitespace), CJK boundaries, multiple matches', function () {
   const api = loadPdfModule();
   // 连字 ﬁ → fi
-  assert.equal(api.searchPageText([{ str: '\uFB01le system' }], 'file').length, 1);
+  assert.equal(searchItems(api, [{ str: '\uFB01le system' }], 'file').length, 1);
   // 全角 → 半角
-  assert.equal(api.searchPageText([{ str: '\uFF34\uFF45\uFF58\uFF54' }], 'Text').length, 1);
+  assert.equal(searchItems(api, [{ str: '\uFF34\uFF45\uFF58\uFF54' }], 'Text').length, 1);
   // 不换行空格 / 连续空白折叠为单空格
-  assert.equal(api.searchPageText([{ str: 'a\u00A0\u00A0b' }], 'a b').length, 1);
-  assert.equal(api.searchPageText([{ str: 'a  b' }], 'a  b'.replace(/\s+/g, ' ')).length, 1);
+  assert.equal(searchItems(api, [{ str: 'a\u00A0\u00A0b' }], 'a b').length, 1);
+  assert.equal(searchItems(api, [{ str: 'a  b' }], 'a  b'.replace(/\s+/g, ' ')).length, 1);
   // 大小写
-  assert.equal(api.searchPageText([{ str: 'Snapshot' }], 'SNAPSHOT').length, 1);
+  assert.equal(searchItems(api, [{ str: 'Snapshot' }], 'SNAPSHOT').length, 1);
   // 空白 needle 不产生命中
-  assert.equal(JSON.stringify(api.searchPageText([{ str: 'text' }], '   ')), '[]');
+  assert.equal(JSON.stringify(searchItems(api, [{ str: 'text' }], '   ')), '[]');
 
   // CJK 行界不插空格，跨行仍可命中
   const cjkItems = [
     { str: '\u4E2D\u6587\u6587\u732E', hasEOL: true },
     { str: '\u68C0\u7D22\u51C6\u5EA6' }
   ];
-  assert.equal(api.searchPageText(cjkItems, '\u6587\u732E\u68C0\u7D22').length, 1);
+  assert.equal(searchItems(api, cjkItems, '\u6587\u732E\u68C0\u7D22').length, 1);
   // 拉丁行界折叠为单空格：跨行词组仍可命中
   const latin = [
     { str: 'target', hasEOL: true },
     { str: 'text' }
   ];
-  assert.equal(api.searchPageText(latin, 'target text').length, 1);
+  assert.equal(searchItems(api, latin, 'target text').length, 1);
 
   // 多个不重叠命中与命中文本上报
-  const multiMatches = api.searchPageText([{ str: 'the cat and the dog and the bird' }], 'the');
+  const multiMatches = searchItems(api, [{ str: 'the cat and the dog and the bird' }], 'the');
   assert.equal(multiMatches.length, 3);
   assert.equal(multiMatches[0].text, 'the');
   assert.equal(multiMatches[2].fragments[0].start, 24);
@@ -335,35 +356,35 @@ test('reader search match basics: folding (case, ligature, fullwidth, whitespace
 test('reader search options: caseSensitive and wholeWord keep folding and boundaries consistent', function () {
   const api = loadPdfModule();
   const items = [{ str: 'Snapshot snapshot SNAPSHOT' }];
-  assert.equal(api.searchPageText(items, 'snapshot').length, 3); // 默认忽略大小写
-  const cs = api.searchPageText(items, 'snapshot', { caseSensitive: true });
+  assert.equal(searchItems(api, items, 'snapshot').length, 3); // 默认忽略大小写
+  const cs = searchItems(api, items, 'snapshot', { caseSensitive: true });
   assert.equal(cs.length, 1);
   assert.equal(cs[0].fragments[0].start, 9);
-  assert.equal(api.searchPageText(items, 'Snapshot', { caseSensitive: true }).length, 1);
-  assert.equal(api.searchPageText(items, 'SNAPSHOT', { caseSensitive: true }).length, 1);
+  assert.equal(searchItems(api, items, 'Snapshot', { caseSensitive: true }).length, 1);
+  assert.equal(searchItems(api, items, 'SNAPSHOT', { caseSensitive: true }).length, 1);
   // 区分大小写与 NFKC 折叠共存：全角/连字照常折叠，只是不再小写化
-  assert.equal(api.searchPageText([{ str: '\uFF34\uFF45\uFF58\uFF54' }], 'Text', { caseSensitive: true }).length, 1);
-  assert.equal(api.searchPageText([{ str: '\uFF34\uFF45\uFF58\uFF54' }], 'text', { caseSensitive: true }).length, 0);
-  assert.equal(api.searchPageText([{ str: '\uFB01le' }], 'file', { caseSensitive: true }).length, 1);
-  assert.equal(api.searchPageText([{ str: '\uFB01le' }], 'File', { caseSensitive: true }).length, 0);
+  assert.equal(searchItems(api, [{ str: '\uFF34\uFF45\uFF58\uFF54' }], 'Text', { caseSensitive: true }).length, 1);
+  assert.equal(searchItems(api, [{ str: '\uFF34\uFF45\uFF58\uFF54' }], 'text', { caseSensitive: true }).length, 0);
+  assert.equal(searchItems(api, [{ str: '\uFB01le' }], 'file', { caseSensitive: true }).length, 1);
+  assert.equal(searchItems(api, [{ str: '\uFB01le' }], 'File', { caseSensitive: true }).length, 0);
 
   // 全字匹配：嵌入式命中被否决后逐位推进，跨 item 命中照常映射片段
   const wordItems = [{ str: 'the theory is thematic; the cat' }];
-  assert.equal(api.searchPageText(wordItems, 'the').length, 4); // the/theory/thematic/the
-  const whole = api.searchPageText(wordItems, 'the', { wholeWord: true });
+  assert.equal(searchItems(api, wordItems, 'the').length, 4); // the/theory/thematic/the
+  const whole = searchItems(api, wordItems, 'the', { wholeWord: true });
   assert.equal(whole.length, 2);
   assert.equal(whole[0].fragments[0].start, 0);
   assert.equal(whole[1].fragments[0].start, 24);
   // 被否决的命中之后逐位推进：有效命中可能与否决部分重叠
-  assert.equal(api.searchPageText([{ str: 'cat catcat cat' }], 'cat', { wholeWord: true }).length, 2);
+  assert.equal(searchItems(api, [{ str: 'cat catcat cat' }], 'cat', { wholeWord: true }).length, 2);
   // 跨 item 的全字命中照常映射片段
-  const split = api.searchPageText([{ str: 'a big ' }, { str: 'cat and cats' }], 'cat', { wholeWord: true });
+  const split = searchItems(api, [{ str: 'a big ' }, { str: 'cat and cats' }], 'cat', { wholeWord: true });
   assert.equal(split.length, 1);
   assert.deepEqual([split[0].fragments[0].itemIndex, split[0].fragments[0].end], [1, 3]);
   // CJK 不是词字符（与 JS \b 同语义）：邻接汉字视作边界
-  assert.equal(api.searchPageText([{ str: '\u7F51\u7EDC\u68C0\u7D22' }], '\u68C0\u7D22', { wholeWord: true }).length, 1);
+  assert.equal(searchItems(api, [{ str: '\u7F51\u7EDC\u68C0\u7D22' }], '\u68C0\u7D22', { wholeWord: true }).length, 1);
   // 与区分大小写叠加
-  assert.equal(api.searchPageText([{ str: 'The the' }], 'The', { caseSensitive: true, wholeWord: true }).length, 1);
+  assert.equal(searchItems(api, [{ str: 'The the' }], 'The', { caseSensitive: true, wholeWord: true }).length, 1);
 });
 
 test('reader search app wiring: options UI bound and all rendered pages repainted on query change', function () {
@@ -381,4 +402,109 @@ test('reader search app wiring: options UI bound and all rendered pages repainte
   // renderSearchLayer 对空结果也会先移除旧层，重画全部已渲染页即同时完成清理
   assert.match(appSource, /function repaintAllPdfSearchHighlights/);
   assert.match(appSource, /repaintAllPdfSearchHighlights\(\);\s*goToPdfSearchResult\(1\)/);
+});
+
+test('searchPageText 死代码已删除；搜索经 handle.search 的 worker 分块路径主链接线', function () {
+  const api = loadPdfModule();
+  const pdfSource = fs.readFileSync(path.join(root, 'js', 'pdfimport.js'), 'utf8');
+
+  assert.ok(!('searchPageText' in api), 'LitPdf 不再导出 searchPageText（产品搜索走 pdfsearch.js / handle.search，此包装器仅测试在用）');
+  assert.doesNotMatch(pdfSource, /function searchPageText/, '实现一并删除');
+  assert.match(pdfSource, /searchDocumentChunk/, 'handle.search 主路径走 worker 侧 searchDocument 分块');
+  assert.ok(typeof api.buildPageSearchIndex === 'function' && typeof api.runPageSearch === 'function',
+    '纯函数仍导出：handle.search 兼容回退与 worker 对拍都依赖它们');
+});
+
+// ---------- worker 侧搜索核心 与 渲染侧纯函数 对拍 ----------
+// worker 的 searchDocument 在 WASM 侧逐页折叠匹配（免逐页 RPC 与逐字 quad 负载），
+// 其命中片段必须与渲染层逐字对齐（itemIndex = textDivs 下标），因此两套实现
+// 用同一份 fixture 对拍：任一侧改折叠/行界/全字规则，本用例即红。
+test('worker 搜索核心与渲染侧纯函数逐位一致（同一 fixture 对拍）', function () {
+  const api = loadPdfModule();
+  const worker = loadWorkerSearchCore();
+  const fixtures = [
+    { str: 'shown in figure (a) and ' }, { str: '', hasEOL: true }, { str: 'snapshot' },
+    { str: ' whenever useful' }, { str: '', hasEOL: true }, { str: 'free of charge' }
+  ];
+  const split = [{ str: 'snaps' }, { str: 'hot' }, { str: ' of the' }];
+  const lines = [{ str: 'at the end of', hasEOL: true }, { str: 'line text' }];
+  const hyphenated = [{ str: 'a sig-', hasEOL: true }, { str: 'nificant result' }];
+  const cjk = [{ str: '\u4E2D\u6587\u6587\u732E', hasEOL: true }, { str: '\u68C0\u7D22\u51C6\u5EA6' }];
+  const latin = [{ str: 'target', hasEOL: true }, { str: 'text' }];
+  const folding = [{ str: '\uFB01le system \uFF34\uFF45\uFF58\uFF54 a\u00A0\u00A0b  the cat' }];
+  const word = [{ str: 'the theory is thematic; the cat catcat' }];
+  const cases = [
+    [fixtures, 'snapshot', null],
+    [split, 'snapshot', null],
+    [lines, 'end of line', null],
+    [hyphenated, 'significant', null],
+    [hyphenated, 'sig-', null],
+    [cjk, '\u6587\u732E\u68C0\u7D22', null],
+    [cjk, '\u68C0\u7D22', { wholeWord: true }],
+    [latin, 'target text', null],
+    [folding, 'file', null],
+    [folding, 'TEXT', null],
+    [folding, 'text', { caseSensitive: true }],
+    [folding, 'a b', null],
+    [folding, 'cat', null],
+    [folding, 'cat', { wholeWord: true }],
+    [word, 'the', null],
+    [word, 'the', { wholeWord: true }],
+    [word, 'The', { caseSensitive: true, wholeWord: true }],
+    [[{ str: 'text' }], '   ', null],
+    [[{ str: 'a big ' }, { str: 'cat and cats' }], 'cat', { wholeWord: true }]
+  ];
+  cases.forEach(function (item) {
+    const rendererSide = searchItems(api, item[0], item[1], item[2]);
+    const workerSide = worker.searchItems(item[0], item[1], item[2]);
+    assert.equal(JSON.stringify(workerSide), JSON.stringify(rendererSide),
+      'worker 与渲染侧结果不一致: ' + JSON.stringify(item[1]) + ' ' + JSON.stringify(item[2]));
+  });
+});
+
+// ---------- 位图 LRU（releasePage 不再立即销毁位图） ----------
+test('bitmap LRU：命中刷新热度、超限逐最旧淘汰（close 显式释放）、整体失效', function () {
+  const api = loadPdfModule();
+  const lru = api.createBitmapLru({ maxEntries: 3, maxBytes: 4096 });
+  const mkBitmap = function (w, h) {
+    return { width: w, height: h, bitmap: { closed: false, close: function () { this.closed = true; } } };
+  };
+  const byteOf = function (w, h) { return w * h * 4; };
+
+  assert.ok(lru.put('a', mkBitmap(8, 8)));
+  const bitmapB = mkBitmap(8, 8);
+  assert.ok(lru.put('b', bitmapB));
+  assert.ok(lru.put('c', mkBitmap(8, 8)));
+  assert.equal(lru.size(), 3);
+  assert.equal(lru.bytes(), byteOf(8, 8) * 3);
+
+  assert.ok(lru.use('a'), '命中 a 并刷新热度');
+  assert.ok(lru.put('d', mkBitmap(8, 8)), '入第 4 条触发淘汰');
+  assert.equal(lru.size(), 3);
+  assert.strictEqual(lru.use('b'), null, '最旧的 b 被淘汰');
+  assert.equal(bitmapB.bitmap.closed, true, '淘汰即显式 close');
+  assert.ok(lru.use('a') && lru.use('c') && lru.use('d'), '其余条目健在');
+
+  // 内存上限：条数未满但字节超限同样逐最旧淘汰
+  const tight = api.createBitmapLru({ maxEntries: 10, maxBytes: byteOf(8, 8) });
+  assert.ok(tight.put('x', mkBitmap(8, 8)));
+  assert.ok(tight.put('y', mkBitmap(8, 8)));
+  assert.equal(tight.size(), 1, '字节超限淘汰最旧');
+  assert.strictEqual(tight.use('x'), null);
+  assert.ok(tight.use('y'));
+
+  // 单条超内存上限（异常巨页）：拒绝入缓存，调用方自行释放
+  const tiny = api.createBitmapLru({ maxEntries: 4, maxBytes: 64 });
+  const huge = mkBitmap(64, 64);
+  assert.strictEqual(tiny.put('huge', huge), false);
+  assert.equal(tiny.size(), 0);
+
+  // clear：全部释放（bitmap close 可观察），缓存归零
+  const bitmapC = mkBitmap(8, 8);
+  lru.put('c2', bitmapC);
+  lru.clear();
+  assert.equal(lru.size(), 0);
+  assert.equal(lru.bytes(), 0);
+  assert.strictEqual(lru.use('c2'), null);
+  assert.equal(bitmapC.bitmap.closed, true, 'clear 释放全部位图');
 });

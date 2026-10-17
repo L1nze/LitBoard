@@ -332,11 +332,11 @@ test('A13: max_steps termination adds explainer error note; summarize_paper exte
   const last = run.core.messages[run.core.messages.length - 1];
   assert.equal(last.role, 'error');
   assert.ok(last.content.indexOf('最大步数') !== -1);
-  // summarize_paper 只为当前轮扩展步数预算
+  // summarize_paper 只为当前轮扩展步数预算（预算表经 createRunner 注入，编排层不点名工具）
   const script = Array.from({ length: 14 }, (_, i) => toolCall('review-' + i, 'summarize_paper', { paperId: 'p1', from: i * 8 + 1 }));
   script.push({ message: { content: '全文梳理完成' } });
   const { hooks: hooks2, calls: calls2 } = makeHooks(script);
-  const runner2 = Loop.createRunner(hooks2);
+  const runner2 = Loop.createRunner(Object.assign({}, hooks2, { toolStepBudgets: { summarize_paper: 48 } }));
   const run2 = makeRun();
   run2.core.maxSteps = 2;
   Core.appendUser(run2.core, '梳理整篇文献');

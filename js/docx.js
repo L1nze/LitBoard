@@ -367,16 +367,6 @@
     return { fields: out, report: report };
   }
 
-  /** 用转换后的 fields 重建 docx（新副本；原件不动） */
-  function buildDocxFromFields(fields, extraParagraphs) {
-    var paragraphs = [];
-    (fields || []).forEach(function (field) {
-      paragraphs.push({ runs: [{ citation: { payload: field.payload || field.instr, text: field.text } }] });
-    });
-    (extraParagraphs || []).forEach(function (p) { paragraphs.push(p); });
-    return buildDocx(paragraphs);
-  }
-
   /**
    * document.xml 级 Zotero 转换：把 ADDIN ZOTERO_ITEM 域的 instrText 原位替换为
    * LitBoard 指令（保留域结果文本、样式与其余全部内容；只生成新表示，调用方另存副本）。
@@ -460,7 +450,6 @@
     readDocxFields: readDocxFields,
     readDocxFieldsAll: readDocxFieldsAll,
     convertZoteroFields: convertZoteroFields,
-    convertZoteroDocxXml: convertZoteroDocxXml,
-    buildDocxFromFields: buildDocxFromFields
+    convertZoteroDocxXml: convertZoteroDocxXml
   };
 });

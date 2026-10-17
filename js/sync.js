@@ -1038,21 +1038,6 @@
       (version >= LEGACY_SYNC_VERSION && version <= SYNC_VERSION);
   }
 
-  function readSyncEnvelope(value) {
-    var input = value && typeof value === 'object' ? value : {};
-    var version = input.syncVersion === undefined || input.syncVersion === null || input.syncVersion === '' ?
-      LEGACY_SYNC_VERSION : Number(input.syncVersion);
-    if (!isSupportedSyncVersion(version)) throw new Error(T('不支持的 LitBoard 同步版本：') + input.syncVersion);
-    var workspace = workspaceParts(input);
-    return {
-      syncVersion: version,
-      legacy: version < SYNC_VERSION,
-      supported: true,
-      workspace: partsWorkspace(workspace),
-      envelope: cloneValue(input)
-    };
-  }
-
   function createSyncEnvelope(value, options) {
     var opts = options || {};
     return syncEnvelope(value, Object.assign({}, opts, { version: SYNC_VERSION }));
@@ -1067,7 +1052,6 @@
     syncEnvelope: syncEnvelope,
     createSyncEnvelope: createSyncEnvelope,
     isSupportedSyncVersion: isSupportedSyncVersion,
-    readSyncEnvelope: readSyncEnvelope,
     createSyncPlan: createSyncPlan,
     applySyncPlan: applySyncPlan,
     invertLocalChoices: invertLocalChoices,

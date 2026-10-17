@@ -844,87 +844,6 @@ function createResearchDb(options) {
     };
   }
 
-  /** harness（literature-mcp）本地库一次性导入：只读连接，映射进调研 schema，幂等可重跑 */
-  async function importFromHarness(harnessFile, onProgress) {
-    ensureOpen();
-    const file = String(harnessFile || '');
-    if (!file) throw new Error('missing harness db path');
-    let source = null;
-    try {
-      source = new DatabaseSync(file, { readOnly: true });
-    } catch (error) {
-      throw new Error('无法以只读方式打开调研缓存库：' + (error && error.message || error));
-    }
-    try {
-      const table = source.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='works'"
-      ).get();
-      if (!table) throw new Error('所选文件不是 literature-mcp 调研库（缺少 works 表）');
-      const total = Number(source.prepare('SELECT COUNT(*) AS n FROM works').get().n) || 0;
-      const stmt = source.prepare(`
-        SELECT id, doi, title, publication_year, publication_date, type, cited_by_count,
-          is_oa, language, abstract, authors_json, concepts_json, keywords_json,
-          referenced_works, source_id, source_name, oa_url
-        FROM works ORDER BY rowid LIMIT ? OFFSET ?
-      `);
-      const batch = 500;
-      let done = 0;
-      while (done < total) {
-        const rows = stmt.all(batch, done);
-        if (!rows.length) break;
-        upsertWorks(rows.map(harnessRowToWork));
-        done += rows.length;
-        if (typeof onProgress === 'function') onProgress({ done: done, total: total });
-      }
-      return { imported: done, total: total };
-    } finally {
-      try { source.close(); } catch (error) { /* 只读连接，关不掉也不影响 */ }
-    }
-  }
-
-  /** harness works 行 → 调研行（防御式解析：上游 JSON 列形态不保证） */
-  function harnessRowToWork(row) {
-    const asNames = function (value) {
-      return parseJsonArray(value).map(function (item) {
-        if (typeof item === 'string') return { name: item };
-        if (item && typeof item === 'object') {
-          const name = item.display_name || item.name || item.raw_author_name || '';
-          return name ? { name: String(name) } : null;
-        }
-        return null;
-      }).filter(Boolean);
-    };
-    const asStrings = function (value) {
-      return parseJsonArray(value).map(function (item) {
-        if (typeof item === 'string') return item;
-        if (item && typeof item === 'object') {
-          const s = item.display_name || item.keyword || item.name || '';
-          return s ? String(s) : null;
-        }
-        return null;
-      }).filter(Boolean);
-    };
-    return {
-      id: LitResearch.shortWorkId(row.id),
-      doi: LitResearch.normalizeDoi(row.doi),
-      title: String(row.title || ''),
-      year: Number(row.publication_year) || null,
-      pubdate: String(row.publication_date || '').slice(0, 10),
-      type: String(row.type || ''),
-      sourceId: LitResearch.shortWorkId(row.source_id),
-      sourceName: String(row.source_name || ''),
-      abstract: String(row.abstract || ''),
-      lang: String(row.language || ''),
-      citedBy: Number(row.cited_by_count) || 0,
-      isOa: row.is_oa === 1 || row.is_oa === true,
-      oaUrl: String(row.oa_url || ''),
-      authors: asNames(row.authors_json),
-      refs: asStrings(row.referenced_works),
-      concepts: asStrings(row.concepts_json),
-      keywords: asStrings(row.keywords_json)
-    };
-  }
-
   function close() {
     if (works) { try { works.close(); } catch (error) {} works = null; }
     if (vec) { try { vec.close(); } catch (error) {} vec = null; }
@@ -1186,46 +1105,6 @@ function createResearchDb(options) {
     };
   }
 
-  /** 恢复身份核：空库/新库导入；元数据（摘要等）留空，由后台批量重拉补齐 */
-  function importIdentityCore(data) {
-    ensureOpen();
-    const core = data && typeof data === 'object' ? data : {};
-    const workRows = (Array.isArray(core.works) ? core.works : []).filter(function (w) { return w && w.id; });
-    upsertWorks(workRows.map(function (w) {
-      return {
-        id: String(w.id), doi: String(w.doi || ''), title: String(w.title || ''),
-        year: Number(w.year) || null
-      };
-    }));
-    works.exec('BEGIN');
-    try {
-      const extStmt = works.prepare('INSERT OR IGNORE INTO ext_ids(work_id, kind, value) VALUES(?, ?, ?)');
-      (Array.isArray(core.extIds) ? core.extIds : []).forEach(function (row) {
-        if (row && row.work_id && row.kind && row.value) extStmt.run(String(row.work_id), String(row.kind), String(row.value));
-      });
-      const mergeStmt = works.prepare('INSERT OR IGNORE INTO merge_log(old_id, new_id, at) VALUES(?, ?, ?)');
-      (Array.isArray(core.mergeLog) ? core.mergeLog : []).forEach(function (row) {
-        if (row && row.old_id) mergeStmt.run(String(row.old_id), String(row.new_id || ''), Number(row.at) || 0);
-      });
-      const provStmt = works.prepare(`
-        INSERT INTO field_provenance(work_id, field, source, fetched_at) VALUES(?, ?, ?, ?)
-        ON CONFLICT(work_id, field) DO UPDATE SET source = excluded.source, fetched_at = excluded.fetched_at
-      `);
-      (Array.isArray(core.provenance) ? core.provenance : []).forEach(function (row) {
-        if (row && row.work_id && row.field) provStmt.run(String(row.work_id), String(row.field), String(row.source || ''), Number(row.fetched_at) || 0);
-      });
-      const searchStmt = works.prepare('INSERT INTO searches(q, filters_json, result_count, at) VALUES(?, ?, ?, ?)');
-      (Array.isArray(core.searches) ? core.searches : []).forEach(function (row) {
-        if (row) searchStmt.run(String(row.q || ''), String(row.filters_json || '{}'), Number(row.result_count) || 0, Number(row.at) || 0);
-      });
-      works.exec('COMMIT');
-    } catch (error) {
-      works.exec('ROLLBACK');
-      throw error;
-    }
-    return { works: workRows.length };
-  }
-
   return {
     open: open,
     close: close,
@@ -1241,7 +1120,6 @@ function createResearchDb(options) {
     recordSearch: recordSearch,
     updateWorkText: updateWorkText,
     stats: stats,
-    importFromHarness: importFromHarness,
     vecPut: vecPut,
     vecDelete: vecDelete,
     vecClear: vecClear,
@@ -1249,8 +1127,7 @@ function createResearchDb(options) {
     cosineSearch: cosineSearch,
     vecCoverage: vecCoverage,
     findWorksNeedingAbstract: findWorksNeedingAbstract,
-    exportIdentityCore: exportIdentityCore,
-    importIdentityCore: importIdentityCore
+    exportIdentityCore: exportIdentityCore
   };
 }
 

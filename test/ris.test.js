@@ -61,11 +61,11 @@ test('RIS parser handles missing ER terminator and empty input', function () {
 });
 
 test('RIS export preserves creator roles and date fields', function () {
-  const text = LitRis.paperToRis({
+  const text = LitRis.paperToRisReport({
     key: 'x1', entryType: 'article', title: 'X', date: '2024-02-29', accessDate: '2025-01-02',
     creators: [{ creatorType: 'author', family: 'Doe', given: 'Jane', name: '' },
       { creatorType: 'editor', family: 'Roe', given: 'John', name: '' }], venue: 'Journal'
-  });
+  }).text;
   assert.match(text, /DA {2}- 2024-02-29/);
   assert.match(text, /Y2 {2}- 2025-01-02/);
   assert.match(text, /AU {2}- Doe, Jane/);

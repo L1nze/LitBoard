@@ -168,57 +168,6 @@
         });
       },
 
-      /** 就地更新集群内容（定位符/前后缀/省略作者/条目集合） */
-      updateCitation: function (citationId, patch) {
-        var cluster = byId[citationId];
-        if (!cluster) return Promise.reject(new Error(T('引文不存在：') + citationId));
-        var next = patch && (patch.items || patch.paperIds) ? normalizeClusterInput(patch) : cluster.citationItems;
-        if (!next.length) return Promise.reject(new Error(T('引文集群为空')));
-        cluster.citationItems = next;
-        if (patch && patch.noteIndex != null) cluster.properties.noteIndex = Number(patch.noteIndex);
-        return loadCSL().then(function (CSL) {
-          rebuild(CSL);
-          return { citationId: citationId, text: texts[citationId] };
-        });
-      },
-
-      /** 删除集群；其余引文统一重算（数字制重编号） */
-      removeCitation: function (citationId) {
-        var index = citations.findIndex(function (c) { return c.citationID === citationId; });
-        if (index === -1) return Promise.resolve({ removed: false });
-        citations.splice(index, 1);
-        delete byId[citationId];
-        delete texts[citationId];
-        return loadCSL().then(function (CSL) {
-          rebuild(CSL);
-          return { removed: true, texts: clone(texts) };
-        });
-      },
-
-      /** 移动集群到文档顺序 toIndex（数字制重编号） */
-      moveCitation: function (citationId, toIndex) {
-        var from = citations.findIndex(function (c) { return c.citationID === citationId; });
-        if (from === -1) return Promise.reject(new Error(T('引文不存在：') + citationId));
-        var cluster = citations.splice(from, 1)[0];
-        var index = Math.max(0, Math.min(citations.length, Number(toIndex)));
-        citations.splice(index, 0, cluster);
-        return loadCSL().then(function (CSL) {
-          rebuild(CSL);
-          return { citationId: citationId, text: texts[citationId] };
-        });
-      },
-
-      /** 换样式：重建引擎并统一重算。options = { styleId, localeXml } */
-      setStyle: function (nextStyleXml, nextOptions) {
-        if (text(nextStyleXml)) styleXml = text(nextStyleXml);
-        if (nextOptions && text(nextOptions.localeXml)) localeXml = text(nextOptions.localeXml);
-        if (nextOptions && text(nextOptions.styleId)) styleId = text(nextOptions.styleId);
-        return loadCSL().then(function (CSL) {
-          rebuild(CSL);
-          return doc;
-        });
-      },
-
       getCitationText: function (citationId) { return applyEtAl(texts[citationId] || ''); },
 
       /** 参考文献表（HTML 条目数组） */

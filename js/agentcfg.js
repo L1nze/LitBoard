@@ -137,12 +137,6 @@
     };
   }
 
-  /** 界面选择：{providerId, model}（对话面板底部徽标与设置页选中行都由它驱动） */
-  function selectionOf(config) {
-    var provider = activeProvider(config);
-    return { providerId: provider.id, model: provider.activeModel };
-  }
-
   /** 切换当前服务商 / 模型（纯函数：返回新的 {providers, activeId}） */
   function selectModel(config, providerId, model) {
     var cfg = normalizeConfig(config);
@@ -254,7 +248,6 @@
     activeProvider: activeProvider,
     activeModel: activeModel,
     mirror: mirror,
-    selectionOf: selectionOf,
     selectModel: selectModel,
     upsertProvider: upsertProvider,
     removeProvider: removeProvider,

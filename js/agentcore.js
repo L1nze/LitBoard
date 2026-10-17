@@ -204,22 +204,10 @@
     return state;
   }
 
-  /** 最后一条 assistant 消息的待执行工具调用（无则空数组 = 本轮结束） */
-  function pendingToolCalls(state) {
-    var last = state.messages[state.messages.length - 1];
-    if (!last || last.role !== 'assistant' || !Array.isArray(last.tool_calls)) return [];
-    return last.tool_calls.map(function (call) {
-      return {
-        callId: call.id,
-        name: call.function.name,
-        args: parseToolArgs(call.function.arguments)
-      };
-    });
-  }
-
-  /** 同 pendingToolCalls，但参数解析失败不抛：坏参数调用归入 invalid，由调用方以
-   *  错误工具结果回喂模型重新发起（流式截断产出坏 JSON 时不能让整轮失败——
-   *  对照 pi 的 failToolCallsFromTruncatedMessage：不执行残缺参数，要求重发完整调用）。 */
+  /** 取最后一条 assistant 消息的待执行工具调用（无则空），但参数解析失败不抛：坏参数
+   *  调用归入 invalid，由调用方以错误工具结果回喂模型重新发起（流式截断产出坏 JSON 时
+   *  不能让整轮失败——对照 pi 的 failToolCallsFromTruncatedMessage：不执行残缺参数，
+   *  要求重发完整调用）。 */
   function safePendingToolCalls(state) {
     var last = state.messages[state.messages.length - 1];
     var out = { calls: [], invalid: [] };
@@ -255,8 +243,8 @@
   /**
    * 编排循环的续跑判定（A01 修正：按「最后一条消息的角色」区分阶段）：
    * - 刚落账完工具结果（last=tool）→ 必须回到模型消费结果，continue（受步数/卡死护栏约束）；
-   *   旧实现在这里用 pendingToolCalls 判定，工具落账后必然误判为 done，导致模型永远
-   *   没机会总结工具结果；
+   *   旧实现按「最后一条 assistant 消息的待执行调用」判定，工具落账后必然误判为 done，
+   *   导致模型永远没机会总结工具结果；
    * - 模型刚产出工具调用但结果未落账（last=assistant 带 tool_calls）→ pending_tools，
    *   编排层负责执行并落账，绝不能直接再请求模型；
    * - 模型给出最终回答（无调用）→ done；
@@ -299,7 +287,9 @@
    * - opts.replayReasoning：assistant 重放时带上 reasoning_content（DeepSeek 带 tools 的
    *   链式调用硬性要求；仅在该端点开启，不全局发送）；
    * - opts.sendImages：user 消息带 images 引用时以 content parts 形态发出（图像引用
-   *   原样传递，由主进程在出网前解析成 image_url；关闭时退回纯文本，不丢消息）。
+   *   原样传递，由主进程在出网前解析成 image_url；关闭时退回纯文本，不丢消息）；
+   * - opts.toolAliasMap(messages)：工具结果 [cN] 证据短别名表构造器，由调用方注入
+   *   （不传则工具结果原样发出，本模块零业务依赖）。
    * 预算（token 估算，设置 → AI 助手 可改；留空 = DEFAULTS）：
    * - opts.maxContextTokens：**整份请求**的上下文预算。系统提示与工具 schema 也占上下文，
    *   所以先扣掉它们再裁消息窗口——否则实发量会比设置值大一截（工具 schema 就有几千 token）；
@@ -355,11 +345,10 @@
     var callsById = collectCallIds(window_);
     // 证据短别名：请求里每条工具结果行首标注 [cN]，模型在 update_research_plan 的
     // evidenceCallIds 里引用 cN 即可，不必抄写长随机 call_… id——实践中模型会编造
-    // call_2 这类短 id 而被证据校验连续拒绝（编号规则与 js/agentplan.toolAliasMap 一致，
-    // 按存储顺序数 role:'tool' 消息；加载顺序无关，运行时查找）。
-    var Plan = (typeof module === 'object' && module.exports) ? require('./agentplan.js')
-      : (typeof window !== 'undefined' && window.LitAgentPlan ? window.LitAgentPlan : null);
-    var aliasById = Plan && Plan.toolAliasMap ? Plan.toolAliasMap(state.messages).byId : null;
+    // call_2 这类短 id 而被证据校验连续拒绝。别名表由调用方经 opts.toolAliasMap 注入
+    // （LitBoard 传 js/agentplan.toolAliasMap，按存储顺序数 role:'tool' 消息），本模块
+    // 不 require 任何业务模块——作为通用状态机被复用时可不传，工具结果原样发出。
+    var aliasById = typeof opts.toolAliasMap === 'function' ? opts.toolAliasMap(state.messages).byId : null;
     messages = messages.concat(window_.map(function (msg, index) {
       if (msg.role === 'tool') {
         var alias = aliasById ? aliasById[String(msg.tool_call_id)] : null;
@@ -542,7 +531,6 @@
     appendAssistant: appendAssistant,
     appendToolResults: appendToolResults,
     decorateToolCalls: decorateToolCalls,
-    pendingToolCalls: pendingToolCalls,
     safePendingToolCalls: safePendingToolCalls,
     shouldContinue: shouldContinue,
     isStuck: isStuck,

@@ -744,6 +744,9 @@
         seed: seedIds.indexOf(id) !== -1
       };
     });
+    // 节点字段已提取完毕：及早放掉整批库行（含各篇 refs 引用数组），
+    // 让后续重要性截取/社区检测/布局阶段的峰值内存不再叠加这份数据。
+    byId = null;
 
     // 可读性截取（超过上限时按重要性保留；对照 graph_visualize 的截断语义）
     var selection = selectImportantNodes(nodes, edges, maxNodes);
@@ -1198,8 +1201,10 @@
     'var index={};DATA.nodes.forEach(function(n){index[n.id]=n;});',
     'var selected=null;var syncing=false;var freezeTimer=null;var animStart=performance.now();',
     'function detail(node){document.getElementById("detailCard").innerHTML=DATA.detailHtml[node.id]||"";}',
-    'function list(){document.getElementById("paperList").innerHTML=DATA.paperListHtml[selected]||DATA.paperListHtml.__default;',
-    '  Array.prototype.forEach.call(document.getElementById("paperList").querySelectorAll(".paper-row"),function(row){',
+    'function list(){var html="";for(var i=0;i<DATA.sortedIds.length;i++)html+=DATA.paperRows[DATA.sortedIds[i]]||"";',
+    '  var el=document.getElementById("paperList");el.innerHTML=html;',
+    '  Array.prototype.forEach.call(el.querySelectorAll(".paper-row"),function(row){',
+    '    row.classList.toggle("active",row.getAttribute("data-id")===selected);',
     '    row.addEventListener("click",function(){select(row.getAttribute("data-id"),true);});});}',
     'function select(id,focus){var node=index[id];if(!node)return;',
     '  if(selected&&selected!==id){var prev=nodes.get(selected);if(prev&&!prev.pinnedLabel)nodes.update({id:prev.id,label:""});}',
@@ -1264,8 +1269,11 @@
     var title = String(opts.title || view.texts.title);
     var detailById = {};
     view.nodes.forEach(function (node) { detailById[node.id] = detailHtml(node, view.texts); });
-    var listBySelection = { __default: paperListHtml(view, null) };
-    view.nodes.forEach(function (node) { listBySelection[node.id] = paperListHtml(view, node.id); });
+    // 论文列表按行编码（O(n)）：不能按选中态预渲染 N 份完整列表——那是 O(n²) 的时间
+    // 与体积（500 节点 = 25 万行 HTML 塞进单个快照文件）。选中态由查看器脚本的
+    // list() 按 data-id toggle active 类补上，最终 DOM 与预渲染版逐字节等价。
+    var rowById = {};
+    view.nodes.forEach(function (node) { rowById[node.id] = paperRowHtml(node, view.texts, null); });
     var payload = escapeForInlineScript(JSON.stringify({
       nodes: view.nodes,
       edges: view.edges,
@@ -1274,7 +1282,8 @@
       shadowColor: 'rgba(194,120,3,0.30)',
       texts: view.texts,
       detailHtml: detailById,
-      paperListHtml: listBySelection,
+      paperRows: rowById,
+      sortedIds: view.sortedIds,
       defaultSelectedId: view.defaultSelectedId
     }));
     var summary = metaSummary(view.meta, view.texts);

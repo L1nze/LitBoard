@@ -23,7 +23,7 @@ function paper(id, title, family, year, extra) {
   }, extra || {});
 }
 
-test('vancouver numbering renumbers on insert, move and remove', async function () {
+test('vancouver numbering renumbers on insert', async function () {
   const doc = LitCslDoc.createDocument({ styleXml: STYLE.vancouver, localeXml: LOCALE_EN, styleId: 'vancouver' });
   await doc.updateLibrary([paper('p1', 'Alpha', 'Smith', 2020), paper('p2', 'Beta', 'Wang', 2021), paper('p3', 'Gamma', 'Li', 2022)]);
   const c1 = await doc.addCitation({ items: [{ paperId: 'p1' }] });
@@ -34,14 +34,6 @@ test('vancouver numbering renumbers on insert, move and remove', async function 
   const cm = await doc.addCitation({ items: [{ paperId: 'p3' }] }, 1);
   assert.equal(cm.text, '[2]');
   assert.equal(doc.getCitationText(c2.citationId), '[3]');
-  // 移动到最后到最前
-  await doc.moveCitation(c2.citationId, 0);
-  assert.equal(doc.getCitationText(c2.citationId), '[1]');
-  assert.equal(doc.getCitationText(c1.citationId), '[2]');
-  // 删除 → 重编号
-  await doc.removeCitation(cm.citationId);
-  assert.equal(doc.getCitationText(c2.citationId), '[1]');
-  assert.equal(doc.getCitationText(c1.citationId), '[2]');
 });
 
 test('apa same-year disambiguation and repeated citation', async function () {
@@ -77,18 +69,6 @@ test('multi-item cluster renders combined citation', async function () {
   const r = await doc.addCitation({ items: [{ paperId: 'p1' }, { paperId: 'p2', prefix: 'cf. ' }] });
   assert.match(r.text, /Smith/);
   assert.match(r.text, /Wang/);
-});
-
-test('switching style recomputes every citation and bibliography', async function () {
-  const doc = LitCslDoc.createDocument({ styleXml: STYLE.vancouver, localeXml: LOCALE_EN, styleId: 'vancouver' });
-  await doc.updateLibrary([paper('p1', 'Alpha', 'Smith', 2020), paper('p2', 'Beta', 'Wang', 2021)]);
-  const c1 = await doc.addCitation({ items: [{ paperId: 'p1' }] });
-  const c2 = await doc.addCitation({ items: [{ paperId: 'p2' }] });
-  assert.match(doc.getCitationText(c1.citationId), /^\[1\]$/);
-  await doc.setStyle(STYLE.apa, { styleId: 'apa' });
-  assert.match(doc.getCitationText(c1.citationId), /Smith/);
-  assert.match(doc.getCitationText(c2.citationId), /Wang/);
-  assert.match(doc.getBibliography().join(' '), /Smith/);
 });
 
 test('missing paper keeps rendering via embedded snapshot and relinks', async function () {

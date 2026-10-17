@@ -5,34 +5,45 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const Core = require('../js/agentcore.js');
+const Sessions = require('../js/agentsessions.js');
 const source = fs.readFileSync(path.join(__dirname, '../js/agentui.js'), 'utf8');
+const sendTextSlice = source.slice(source.indexOf('  function sendText('), source.indexOf('  /* ---------------- 快照推送'));
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-function harness() {
+/* 会话生命周期（open/new/LRU）已拆至 js/agentsessions.js：直接用真 store；
+ * sendText 仍在 agentui.js，继续切片注入。 */
+function makeStore(desk, runner) {
+  return Sessions.createSessionStore({
+    desk: desk, T: (s) => s, $: () => ({ appendChild() {}, classList: { toggle() {} } }), el: () => ({ appendChild() {} }), deps: {},
+    core: Core, runner: () => runner,
+    isUploadBusy: () => false, isCompactBusy: () => false,
+    setStatus() {}, renderAttachments() {}, renderChips() {}, renderMode() {}, bump() {},
+    toastText() {}, toastError(e) { throw e; }
+  });
+}
+
+function sendCtx(store, runner) {
   const ctx = {
-    desk: {}, runs: new Map(), current: null, openSeq: 0, pendingNewSession: null,
-    runner: { restoreInterrupted: () => false }, tools: { tools: [] },
-    window: { LitAgentCore: Core }, T: s => s, $: () => ({}),
-    touchRun() {}, evictIdleRuns() {}, renderMode() {}, renderAttachments() {}, renderChips() {},
-    bump() {}, renderHistory() {}, loadSessions() {}, toastText() {}, toastError(e) { throw e; },
-    uploadBusy: false, forkBusy: false, compactBusy: false, setStatus() {}, persistRun: async () => ({ ok: true }),
-    renderPendingReferences() {}, freezeContext: () => ({ model: 'test' })
+    S: store, runner: runner, desk: { sessionRename: () => Promise.resolve() },
+    tools: { tools: [] }, window: { LitAgentCore: Core, LitResearch: { sessionTitleFrom: (t) => t } },
+    T: (s) => s, $: () => ({}), uploadBusy: false, compactBusy: false,
+    freezeContext: () => ({ model: 'test' }), thinkingCapability: () => ({ vision: false }),
+    renderPendingReferences() {}, setStatus() {}, bump() {}, renderChips() {}, toastText() {}
   };
-  ctx.makeRun = (id, doc) => ({ id, doc, core: Core.deserialize(doc), streaming: false });
-  vm.runInNewContext(source.slice(source.indexOf('  function newSession('), source.indexOf('  /** 会话持久化')) +
-    source.slice(source.indexOf('  function sendText('), source.indexOf('  /* ---------------- core.messages')), ctx);
+  vm.runInNewContext(sendTextSlice, ctx);
   return ctx;
 }
 
 test('late sessionRead cannot roll back a completed reply or unsaved in-memory messages', async () => {
-  const ctx = harness();
+  const desk = {};
+  const store = makeStore(desk, { restoreInterrupted: () => false });
   const doc = { title: 'topic', messages: [{ role: 'user', content: 'question' }] };
-  const run = ctx.makeRun('s', structuredClone(doc));
-  ctx.runs.set('s', run);
+  const run = store.makeRun('s', structuredClone(doc));
+  store.runs.set('s', run);
   run.streaming = true;
   let release;
-  ctx.desk.sessionRead = () => new Promise(resolve => { release = () => resolve(structuredClone(doc)); });
-  ctx.openSession('s');
+  desk.sessionRead = () => new Promise(resolve => { release = () => resolve(structuredClone(doc)); });
+  store.openSession('s');
   run.core.messages.push({ role: 'assistant', content: 'completed while read was pending' });
   run.streaming = false;
   release();
@@ -42,14 +53,16 @@ test('late sessionRead cannot roll back a completed reply or unsaved in-memory m
 });
 
 test('send binds to the selected session before asynchronous work starts', async () => {
-  const ctx = harness();
-  const a = ctx.makeRun('a', { title: 'A' }), b = ctx.makeRun('b', { title: 'B' });
-  ctx.runs.set('a', a); ctx.runs.set('b', b); ctx.current = 'a';
+  const runner = { isStreaming: () => false, runTurn: (run) => { run.streaming = true; } };
+  const store = makeStore({}, runner);
   const started = [];
-  ctx.runner.isStreaming = () => false;
-  ctx.runner.runTurn = run => { run.streaming = true; started.push(run.id); };
+  runner.runTurn = (run) => { run.streaming = true; started.push(run.id); };
+  const a = store.makeRun('a', { title: 'A' }), b = store.makeRun('b', { title: 'B' });
+  store.runs.set('a', a); store.runs.set('b', b);
+  store.current = 'a';
+  const ctx = sendCtx(store, runner);
   ctx.sendText('belongs to A');
-  ctx.current = 'b';
+  ctx.S.current = 'b';
   await tick();
   assert.deepEqual(started, ['a']);
   assert.equal(a.core.messages[0].content, 'belongs to A');
@@ -57,13 +70,18 @@ test('send binds to the selected session before asynchronous work starts', async
 });
 
 test('rapid sends before session creation resolves share one session and one turn', async () => {
-  const ctx = harness();
   let release, creates = 0, starts = 0;
   const gate = new Promise(resolve => { release = resolve; });
-  ctx.desk.sessionCreate = async () => { creates++; await gate; return { id: 'new-' + creates, data: { title: 'topic' } }; };
-  ctx.desk.sessionRead = async () => ({ title: 'topic' });
-  ctx.runner.isStreaming = id => !!ctx.runs.get(id).streaming;
-  ctx.runner.runTurn = run => { run.streaming = true; starts++; };
+  const desk = {
+    sessionCreate: async () => { creates++; await gate; return { id: 'new-' + creates, data: { title: 'topic' } }; },
+    sessionRead: async () => ({ title: 'topic' })
+  };
+  const store = makeStore(desk, {});
+  const runner = {
+    isStreaming: (id) => !!(store.runs.get(id) && store.runs.get(id).streaming),
+    runTurn: (run) => { run.streaming = true; starts++; }
+  };
+  const ctx = sendCtx(store, runner);
   ctx.sendText('one'); ctx.sendText('two');
   release();
   await tick();
@@ -74,13 +92,15 @@ test('rapid sends before session creation resolves share one session and one tur
 test('cache eviction retains unsaved conversation history', () => {
   const failed = { id: 'failed', persistenceError: new Error('disk full') };
   const idle = { id: 'idle' };
-  const current = { id: 'current' };
+  const currentRun = { id: 'current' };
   const removed = [];
-  const ctx = { runs: new Map([[failed.id, failed], [idle.id, idle], [current.id, current]]),
-    current: current.id, RUNS_LIMIT: 2, persistWarned: {},
-    runner: { unregister: id => { removed.push(id); return true; } } };
-  vm.runInNewContext(source.slice(source.indexOf('  function touchRun('), source.indexOf('  function newSession(')), ctx);
-  ctx.evictIdleRuns();
-  assert.equal(ctx.runs.get(failed.id), failed);
+  const store = makeStore({}, { unregister: (id) => { removed.push(id); return true; } });
+  store.runs.set(failed.id, failed);
+  store.runs.set(idle.id, idle);
+  store.runs.set(currentRun.id, currentRun);
+  store.current = currentRun.id;
+  store.RUNS_LIMIT = 2;
+  store.evictIdleRuns();
+  assert.ok(store.runs.get(failed.id) === failed, '保存失败的内存历史不得被驱逐');
   assert.deepEqual(removed, [idle.id]);
 });

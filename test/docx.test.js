@@ -103,7 +103,7 @@ test('legacy fixtures: pre-JSZip bytes still parse (document fields + media, foo
   assert.deepEqual(storyFields.map(function (item) { return item.text; }), ['[1]', '[2]', '[3]']);
 });
 
-test('convertZoteroFields maps resolved keys and keeps unmatched embedded snapshots; buildDocxFromFields rebuilds a converted document', async function () {
+test('convertZoteroFields maps resolved keys and keeps unmatched embedded snapshots', async function () {
   const zoteroField = function (citationID, key, title, year) {
     return {
       instr: ' ADDIN ZOTERO_ITEM CSL_CITATION ' + JSON.stringify({
@@ -146,23 +146,6 @@ test('convertZoteroFields maps resolved keys and keeps unmatched embedded snapsh
   assert.equal(unmatched.payload.items[0].paperId, ''); // 保留嵌入快照，等待 UI 选择
   assert.equal(unmatched.payload.items[0].cslItem.title, 'Gone Paper');
   assert.match(result.fields[2].instr, /LitBoard\.Citation\.1/); // 已有 LitBoard 域原样保留
-
-  // 转换结果重建为新文档（new copy）
-  const zotero = {
-    instr: ' ADDIN ZOTERO_ITEM CSL_CITATION ' + JSON.stringify({
-      citationID: 'z1',
-      properties: {},
-      citationItems: [{ id: 1, uris: ['http://zotero.org/users/local/x/items/K1'], itemData: { title: 'T' } }]
-    }),
-    text: '(Anon)'
-  };
-  const rebuild = LitDocx.convertZoteroFields([zotero], { resolveKey: function () { return 'pK1'; } });
-  const rebuildBytes = await LitDocx.buildDocxFromFields(rebuild.fields, [{ text: '其余段落' }]);
-  const rebuildFields = await LitDocx.readDocxFields(rebuildBytes);
-  assert.equal(rebuildFields.length, 1);
-  assert.equal(rebuildFields[0].addin, 'LitBoard.Citation.1');
-  assert.equal(rebuildFields[0].payload.items[0].paperId, 'pK1');
-  assert.equal(rebuildFields[0].text, '(Anon)');
 });
 
 test('docx image runs embed media parts with rels', async function () {

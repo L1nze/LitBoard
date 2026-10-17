@@ -73,12 +73,12 @@ test('A01: full agentic loop keeps going after tool results until final answer; 
     }, { prompt_tokens: 10, completion_tokens: 5 });
     assert.equal(state.steps, 1);
     assert.equal(state.tokens.in, 10);
-    let pending = Core.pendingToolCalls(state);
-    assert.equal(pending.length, 1);
-    assert.equal(pending[0].name, 'search_openalex');
+    const pending = Core.safePendingToolCalls(state);
+    assert.equal(pending.calls.length, 1);
+    assert.equal(pending.calls[0].name, 'search_openalex');
 
-    // 工具结果落账后必须回到模型（A01：旧的 pendingToolCalls 判定在这里误返回 done）
-    Core.decorateToolCalls(state, [{ callId: 'c1', name: 'search_openalex', args: pending[0].args }]);
+    // 工具结果落账后必须回到模型（A01：旧的「按待执行调用判定」在这里误返回 done）
+    Core.decorateToolCalls(state, [{ callId: 'c1', name: 'search_openalex', args: pending.calls[0].args }]);
     Core.appendToolResults(state, [{ callId: 'c1', name: 'search_openalex', result: '{"works":[1]}' }]);
     let verdict = Core.shouldContinue(state);
     assert.deepEqual(verdict, { continue: true, reason: '' });
@@ -246,7 +246,7 @@ test('serialize/deserialize round-trips state；estimateTokens 对中文加权�
     assert.equal(restored.messages.length, 3);
     assert.equal(restored.steps, 1);
     assert.deepEqual(restored.tokens, { in: 0, out: 0 });
-    assert.equal(Core.pendingToolCalls(restored).length, 0);
+    assert.equal(Core.safePendingToolCalls(restored).calls.length, 0);
   }
   { // estimateTokens weights CJK heavier
     assert.ok(Core.estimateTokens('电池电池电池') > Core.estimateTokens('abcdefgh'));
@@ -406,4 +406,22 @@ test('current context uses request schemas, reasoning and images, not cumulative
     const state = Core.initState(); Core.recordInputUsage(state, { prompt_tokens: 9000, estimated: true }, { messages: [] });
     assert.equal(Core.currentInputTokens(state, { messages: [] }), 0);
   }
+});
+
+test('toolAliasMap 注入契约：传入则工具结果行首带 [cN] 短别名，不传则原样发出（core 零业务依赖）', () => {
+  const state = Core.initState();
+  Core.appendUser(state, 'q');
+  Core.appendAssistant(state, { tool_calls: [{ id: 'call_long_random_1', function: { name: 'search_research', arguments: '{}' } }] });
+  Core.appendToolResults(state, [{ callId: 'call_long_random_1', result: 'evidence text' }]);
+  const aliasMap = (messages) => {
+    const byId = {}; let n = 0;
+    messages.forEach((msg) => { if (msg.role === 'tool') byId[String(msg.tool_call_id)] = 'c' + (++n); });
+    return { byId };
+  };
+  const withAlias = Core.buildRequestBody(state, { toolAliasMap: aliasMap });
+  const toolMsg = withAlias.messages.find((m) => m.role === 'tool');
+  assert.equal(toolMsg.content, '[c1] evidence text');
+  assert.equal(toolMsg.tool_call_id, 'call_long_random_1');
+  const withoutAlias = Core.buildRequestBody(state, {});
+  assert.equal(withoutAlias.messages.find((m) => m.role === 'tool').content, 'evidence text');
 });

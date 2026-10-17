@@ -24,7 +24,7 @@ test('OpenAlex 归一化小函数：shortWorkId 剥 URL 形态、normalizeDoi �
   assert.equal(LitResearch.abstractFromInvertedIndex('not-an-object'), '');
 });
 
-test('normalizeOpenAlexWork 全量映射；extIdsForRow / mergeExtIdLists 按 kind+value 去重', function () {
+test('normalizeOpenAlexWork 全量映射；extIdsForRow 按 kind+value 生成外部标识', function () {
   const row = LitResearch.normalizeOpenAlexWork({
     id: 'https://openalex.org/W42',
     doi: 'https://doi.org/10.1000/XYZ',
@@ -55,10 +55,7 @@ test('normalizeOpenAlexWork 全量映射；extIdsForRow / mergeExtIdLists 按 ki
   assert.deepEqual(row.refs, ['W1', 'W2', 'garbage']);
   assert.equal(LitResearch.normalizeOpenAlexWork(null).id, '');
 
-  const a = LitResearch.extIdsForRow({ id: 'W1', doi: '10.1/a' });
-  const b = LitResearch.extIdsForRow({ id: 'W2', doi: '10.1/a' });
-  const merged = LitResearch.mergeExtIdLists(a, b);
-  assert.equal(merged.length, 3);
+  assert.equal(LitResearch.extIdsForRow({ id: 'W1', doi: '10.1/a' }).length, 2);
   const local = LitResearch.extIdsForRow({ id: 'local:x', doi: '' });
   assert.equal(local.length, 0);
 });

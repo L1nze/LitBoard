@@ -68,10 +68,37 @@ function isTrustedSender(event) {
   return true;
 }
 
+/* 慢 IPC 统一 watchdog：经 ctx.handle 注册的通道一律计时，超过 2s 记 startupLog
+ * （通道名 + 耗时）。此前只有 integrations:get-config 与 data-paths:get 两条手写计时
+ * （域文件各自保留，不重复改）；这里对全部通道兜底——主进程是窗口的消息泵，任何一条
+ * 慢通道都是「整窗无响应」的候选来源。同步返回与 Promise 两条路径都量到落定为止。 */
+const SLOW_IPC_MS = 2000;
+
 function handle(channel, fn) {
   ipcMain.handle(channel, function (event, ...args) {
     if (!isTrustedSender(event)) throw new Error(ctx.T('LitBoard: 非受信调用来源（') + channel + '）');
-    return fn(event, ...args);
+    const startedAt = Date.now();
+    const reportSlow = function () {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed > SLOW_IPC_MS) startupLog('slow ipc: ' + channel + ' ' + elapsed + 'ms');
+    };
+    try {
+      const result = fn(event, ...args);
+      if (result && typeof result.then === 'function') {
+        return result.then(function (value) {
+          reportSlow();
+          return value;
+        }, function (error) {
+          reportSlow();
+          throw error;
+        });
+      }
+      reportSlow();
+      return result;
+    } catch (error) {
+      reportSlow();
+      throw error;
+    }
   });
 }
 ctx.handle = handle;

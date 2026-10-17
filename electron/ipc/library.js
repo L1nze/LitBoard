@@ -14,12 +14,16 @@ function register() {
   ctx.handle('library:record-read', function (_event, value) {
     return ctx.libraryDb.recordReadAt(String(value && value.paperId || ''), Number(value && value.at) || Date.now());
   });
-  // 实体级保存协议：payload = { workspace, baseSignatures }；旧调用（直接传 workspace）自动兼容
+  // 实体级保存协议：payload = { workspace, baseSignatures, nextSignatures? }；旧调用（直接传 workspace）自动兼容。
+  // nextSignatures 是渲染层对同一 payload 算好的签名表（省主进程整库重签一遍）；
+  // preload 目前只透传 workspace/base 两个字段，渲染层把它捎带在 workspace.nextSignatures 上，
+  // 这里取出来提升为顶层字段——db.saveState 只认 value.nextSignatures，校验失败自动回退本地重算。
   ctx.handle('library:save', function (_event, value) {
     const payload = value && value.workspace && typeof value.workspace === 'object'
       ? value : { workspace: value || {} };
     const result = ctx.libraryDb.saveState(Object.assign({}, payload.workspace, {
-      baseSignatures: payload.baseSignatures || null
+      baseSignatures: payload.baseSignatures || null,
+      nextSignatures: payload.nextSignatures || payload.workspace.nextSignatures || null
     }));
     ctx.lastLibraryWriteAt = Date.now();
     return result;

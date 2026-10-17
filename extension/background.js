@@ -27,8 +27,38 @@ async function getFolders() {
   return response.json();
 }
 
+/** base64 → 原始字节（直传前解码；30MB 级别 atob + 填充约百毫秒量级） */
+function base64ToBytes(base64) {
+  const binary = atob(String(base64 || ''));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * 上传浏览器下载好的 PDF。优先原始字节直传（Content-Type: application/pdf，
+ * paperId/fileName 走查询参数）——省掉 base64 JSON 约 33% 的体积膨胀与服务端解码；
+ * 旧桌面端不认这个形态（JSON.parse 二进制失败回 400；415/404 一并视为不支持；
+ * 网络层被预检拒绝也回退），此时退回 base64 JSON 老路径，两个更新方向互不依赖。
+ */
 async function attachPdf(base64, paperId, fileName) {
   const { port, token } = await getConfig();
+  let bytes = null;
+  try { bytes = base64ToBytes(base64); } catch (e) { bytes = null; }
+  if (bytes) {
+    try {
+      const qs = 'paperId=' + encodeURIComponent(paperId) +
+        (fileName ? '&fileName=' + encodeURIComponent(fileName) : '');
+      const raw = await fetch(`http://127.0.0.1:${port}/attach-pdf?${qs}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/pdf', 'X-LitBoard-Token': token },
+        body: bytes
+      });
+      if (raw.status !== 400 && raw.status !== 404 && raw.status !== 415) {
+        return raw.json();
+      }
+    } catch (e) { /* 旧端点拒绝/连接被断 → 回退老路径重试 */ }
+  }
   const response = await fetch(`http://127.0.0.1:${port}/attach-pdf`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-LitBoard-Token': token },
@@ -45,7 +75,9 @@ async function extractFromTab(tabId) {
 }
 
 async function downloadPdfWithCookies(tabId, pdfUrl) {
-  // 页面上下文 fetch（携带知网登录 cookie）→ base64
+  // 页面上下文 fetch（携带知网登录 cookie）→ base64。
+  // base64 是必须的：chrome.scripting.executeScript 的返回值只走 JSON 序列化，
+  // ArrayBuffer/Blob 过不了消息边界；真正的省流量在 attachPdf 的原始字节直传。
   return chrome.scripting.executeScript({
     target: { tabId: tabId },
     func: async function (url) {

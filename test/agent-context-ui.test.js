@@ -11,7 +11,7 @@ test('context UI drops immediately after compaction while cumulative billing rem
   run.core.messages = [{ role: 'user', content: 'a'.repeat(30000) }, { role: 'assistant', content: 'b'.repeat(30000) }, { role: 'user', content: 'latest'.repeat(15000) }];
   run.core.tokens = { in: 700000, out: 14000 };
   const node = { innerHTML: '', title: '', textContent: '', classList: { toggle() {}, remove() {} } }, statuses = [];
-  const ctx = { autoCompactEnabled: true, current: 's', runs: new Map([['s', run]]), tools: { tools: [] }, shouldMaskToolResults: () => false, MASK_KEEP_LAST: 3, window: { LitAgentCore: Core, LitAgentContext: Context },
+  const ctx = { autoCompactEnabled: true, S: { current: 's', runs: new Map([['s', run]]), persistRun: async () => true }, tools: { tools: [] }, shouldMaskToolResults: () => false, MASK_KEEP_LAST: 3, window: { LitAgentCore: Core, LitAgentContext: Context },
     T: s => s, $: () => node, systemPrompt: () => 'system', agentLimits: () => ({ contextTokens: 100000, maxOutputTokens: 1000 }),
     estimateMessageTokens: Core.estimateMessageTokens, setStatus: s => statuses.push(s), persistRun: async () => true, bump() {},
     desk: { agentChat: async input => { assert.equal(input.body.model, 'frozen-model'); return { message: { content: 'concise summary' }, usage: { prompt_tokens: 100, completion_tokens: 20 } }; } } };
