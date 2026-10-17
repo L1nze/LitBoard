@@ -1080,6 +1080,12 @@ test('性能回归：pdfTextPut 分块提交让出事件循环，大书入库不
     if (now - last > maxGap) maxGap = now - last;
     last = now;
   }, 10);
+  // 机制断言（与机器快慢无关）：分块提交的让出走的是全局 setImmediate（db.js yieldTick），
+  // 计数 ≥6 只有真分块才可能达到（400 页 ÷32 页/块 ≈ 13 块；去分块回归 = 0 次）。
+  const realSetImmediate = global.setImmediate;
+  let yields = 0;
+  global.setImmediate = function (fn) { yields++; return realSetImmediate(fn); };
+  const t0 = Date.now();
   let result = null;
   try {
     result = await db.pdfTextPut({ paperId: 'book', attachmentId: 'main', fingerprint: 'fp', pages: pages });
@@ -1087,10 +1093,15 @@ test('性能回归：pdfTextPut 分块提交让出事件循环，大书入库不
     // 最后一个同步块的时长永远不会被观测到（去分块回归就会漏检）
     await new Promise(function (resolve) { setTimeout(resolve, 20); });
   } finally {
+    global.setImmediate = realSetImmediate;
     clearInterval(heartbeat);
   }
+  const wall = Date.now() - t0;
   assert.equal(result.pages, 400);
-  assert.ok(maxGap < 300, '最长同步块 ' + maxGap + 'ms（分块提交后应远小于整篇重建）');
+  assert.ok(yields >= 6, '分块让出次数 ' + yields + '（去分块回归为 0）');
+  // 相对阈值（免慢机误报）：CI 慢机上单块可到秒级，但只要还在分块，
+  // 单块必远小于整篇墙钟；去分块时 maxGap ≈ wall，比值逼近 1。
+  assert.ok(maxGap < wall * 0.5, '最长同步块 ' + maxGap + 'ms / 总 ' + wall + 'ms（分块提交后单块不得占过半墙钟）');
   // 写完真的可检索（跨块页都在）
   const hits = await db.pdfTextQuery('needlepage399');
   assert.equal(hits.length, 1);

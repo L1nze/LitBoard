@@ -296,7 +296,16 @@ test('超时兜底：无 signal 的请求统一挂 AbortSignal.timeout，超时�
       signal.addEventListener('abort', function () { reject(new Error('timeout-sim')); });
     });
   }, { sleep: async function () {}, timeoutMs: 5 });
-  await assert.rejects(function () { return q.requestJson('https://api.test/hang'); }, /网络请求失败/);
+  // AbortSignal.timeout 的计时器是 unref 的：假 fetch 不碰真 socket、注入的 sleep 又是空转，
+  // 事件循环里没有任何 ref 计时器时 Node 22 会先排空循环（node:test 报
+  // "Promise resolution is still pending"并连带判死同文件后续用例）。这里用一个 ref
+  // 心跳把循环撑到超时信号触发为止——真实主进程恒有窗口/巡检定时器，不存在此场景。
+  const keepAlive = setInterval(function () {}, 5);
+  try {
+    await assert.rejects(function () { return q.requestJson('https://api.test/hang'); }, /网络请求失败/);
+  } finally {
+    clearInterval(keepAlive);
+  }
   assert.equal(recorded.length, 3, '三次尝试各挂一份新的超时信号');
   recorded.forEach(function (signal) { assert.equal(typeof signal.aborted, 'boolean'); });
 
