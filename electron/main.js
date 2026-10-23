@@ -463,6 +463,7 @@ function createWindow() {
             agentFindLiteraturePresent: !!window.LitLitSearch &&
               !!window.litboardDesktop.researchFindLiterature &&
               !!window.litboardDesktop.researchSearchSemanticscholar &&
+              !!window.litboardDesktop.researchSearchCrossref &&
               window.LitAgent.createTools({ desktop: {} }).tools.some(function (t) {
                 return t.function.name === 'find_literature';
               }),
@@ -613,7 +614,7 @@ function createWindow() {
                     content: [
                       { type: 'reasoning', text: '先检索……' },
                       { type: 'text', text: '**结果**如下' },
-                      { type: 'tool-call', toolCallId: 'c1', toolName: 'search_openalex', args: { query: 'x' }, argsText: '{"query":"x"}', result: '{"works":[]}' }
+                      { type: 'tool-call', toolCallId: 'c1', toolName: 'search_papers', args: { query: 'x' }, argsText: '{"query":"x"}', result: '{"works":[]}' }
                     ],
                     metadata: { custom: { turnId: 't1', forkIndex: 2 } }
                   }

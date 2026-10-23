@@ -170,6 +170,97 @@
     };
   }
 
+  /* ---------------- Crossref 归一化（检索渠道：最新上线的文献） ---------------- */
+
+  /** HTML 实体解码（Crossref abstract 常含 &amp; 等；amp 放最后避免二次解码） */
+  function decodeEntities(s) {
+    return String(s || '')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+      .replace(/&#0?39;/g, "'").replace(/&amp;/g, '&');
+  }
+
+  /** Crossref message.abstract 多为 JATS 标签串 → 剥标签、解实体取纯文本 */
+  function crossrefAbstract(item) {
+    var raw = item && typeof item.abstract === 'string' ? item.abstract : '';
+    if (!raw) return '';
+    return decodeEntities(raw.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+  }
+
+  /** issued / published-online / published-print / created 的首个 date-parts → { year, pubdate }
+   *  （issued 对在线优先（ahead-of-print）通常是上线日期——对「找最新文献」恰恰是想要的） */
+  function crossrefDate(item) {
+    var keys = ['issued', 'published-online', 'published-print', 'created'];
+    for (var i = 0; i < keys.length; i++) {
+      var parts = item && item[keys[i]] && item[keys[i]]['date-parts'];
+      var first = parts && Array.isArray(parts[0]) ? parts[0] : null;
+      if (first && first[0]) {
+        var pubdate = String(first[0]) +
+          (first[1] != null ? '-' + String(first[1]).padStart(2, '0') : '') +
+          (first[2] != null ? '-' + String(first[2]).padStart(2, '0') : '');
+        return { year: Number(first[0]) || null, pubdate: pubdate };
+      }
+    }
+    return { year: null, pubdate: '' };
+  }
+
+  // Crossref type → 我们认识的少量类型（与 normalizeSemanticScholarPaper 的口径一致：认识不了不硬塞）
+  var CROSSREF_TYPES = {
+    'journal-article': 'article',
+    'book-chapter': 'book-chapter',
+    'book': 'book',
+    'monograph': 'book',
+    'edited-book': 'book',
+    'proceedings-article': 'proceedings-article',
+    'posted-content': 'preprint',
+    'report': 'report',
+    'dissertation': 'dissertation',
+    'dataset': 'dataset'
+  };
+
+  /**
+   * Crossref work（/works 的 message item）→ 调研行（字段语义比照 normalizeOpenAlexWork）。
+   * Crossref 是 DOI 注册库：出版商一登记就收录，最新上线的论文常比 OpenAlex / S2 更早出现。
+   * 注意事项：
+   * - 没有 OpenAlex 的 W-id：id 留空，身份由调用方按 DOI → 标题 → local: 顺序决定（ingestCandidates）；
+   * - 摘要只有部分出版商登记（带内联 JATS 标签），剥标签后入库；
+   * - Crossref 不提供 OA 判定（license 字段形态杂、直链罕见），PDF 定位交由补全链。
+   */
+  function normalizeCrossrefWork(item) {
+    var m = item && typeof item === 'object' ? item : {};
+    var date = crossrefDate(m);
+    var doi = normalizeDoi(m.DOI || '');
+    return {
+      id: '',
+      doi: doi,
+      title: String((Array.isArray(m.title) ? m.title : [])[0] || '').trim(),
+      year: date.year,
+      pubdate: date.pubdate,
+      type: CROSSREF_TYPES[String(m.type || '').toLowerCase()] || String(m.type || '').toLowerCase(),
+      sourceId: '',
+      sourceName: Array.isArray(m['container-title']) && m['container-title'][0] ? String(m['container-title'][0]) : '',
+      abstract: crossrefAbstract(m),
+      pageUrl: doi ? 'https://doi.org/' + doi : '',
+      lang: '',
+      citedBy: Number(m['is-referenced-by-count']) || 0,
+      isOa: false,
+      oaUrl: '',
+      authors: (Array.isArray(m.author) ? m.author : []).map(function (a) {
+        if (!a) return null;
+        var name = String(a.name || ((a.given || '') + ' ' + (a.family || '')).trim()).trim();
+        if (!name) return null;
+        var entry = { name: name };
+        if (a.ORCID) {
+          var orcid = String(a.ORCID).replace(/^https?:\/\/orcid\.org\//i, '');
+          if (orcid) entry.orcid = orcid;
+        }
+        return entry;
+      }).filter(Boolean).slice(0, 50),
+      refs: [],
+      concepts: [],
+      keywords: []
+    };
+  }
+
   /* ---------------- Windows 文件名 / 目录名消毒 ---------------- */
 
   var RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
@@ -394,6 +485,8 @@
     abstractFromInvertedIndex: abstractFromInvertedIndex,
     normalizeOpenAlexWork: normalizeOpenAlexWork,
     normalizeSemanticScholarPaper: normalizeSemanticScholarPaper,
+    normalizeCrossrefWork: normalizeCrossrefWork,
+    crossrefAbstract: crossrefAbstract,
     extIdsForRow: extIdsForRow,
     sanitizeFileStem: sanitizeFileStem,
     sessionDirName: sessionDirName,

@@ -66,7 +66,7 @@ test('tool schemas cover the base read-only tools with valid shape', function ()
   const t = LitAgent.createTools(makeDeps());
   assert.equal(t.tools.length, 20); // 计划读写与会话参考读取常驻
   const names = t.tools.map((x) => x.function.name);
-  ['search_library', 'search_research', 'search_openalex', 'get_research_work', 'get_paper', 'fulltext_search', 'read_pdf_pages', 'summarize_paper', 'list_pdf_annotations',
+  ['search_library', 'search_research', 'search_papers', 'get_research_work', 'get_paper', 'fulltext_search', 'read_pdf_pages', 'summarize_paper', 'list_pdf_annotations',
     'find_literature',
     // R18（对照 literature-mcp 补齐）：精确解析 / 实体联想 / 摘要回填 / 库内引文邻接
     'get_work', 'autocomplete_entity', 'backfill_abstracts', 'graph_neighbors']
@@ -520,7 +520,7 @@ test('R11+性能回归: render_pdf_pages 仅视觉能力下注册，渲染→存
   }
 });
 
-test('R16: search_openalex 透传 mode（keyword/semantic）并在 source 如实标明；search_semanticscholar 仅注入能力时注册并如实声明它不是向量语义检索', async function () {
+test('R16: search_papers 透传 mode（keyword/semantic）并在 source 如实标明；search_semanticscholar 仅注入能力时注册并如实声明它不是向量语义检索', async function () {
   {
     const deps = makeDeps();
     let seen = null;
@@ -529,10 +529,10 @@ test('R16: search_openalex 透传 mode（keyword/semantic）并在 source 如实
       return { count: 1, stored: 1, mode: input.mode, works: [{ id: 'W1', title: 't' }] };
     };
     const t = LitAgent.createTools(deps);
-    const sem = JSON.parse(await t.execute('search_openalex', { query: '一段话', mode: 'semantic' }, {}));
+    const sem = JSON.parse(await t.execute('search_papers', { query: '一段话', mode: 'semantic' }, {}));
     assert.equal(seen.mode, 'semantic');
     assert.ok(sem.source.indexOf('语义检索') !== -1);
-    const kw = JSON.parse(await t.execute('search_openalex', { query: 'x' }, {}));
+    const kw = JSON.parse(await t.execute('search_papers', { query: 'x' }, {}));
     assert.equal(seen.mode, 'keyword', '未指定时默认关键词');
     assert.ok(kw.source.indexOf('关键词检索') !== -1);
   }
@@ -559,6 +559,125 @@ test('R16: search_openalex 透传 mode（keyword/semantic）并在 source 如实
     assert.equal(out.works[0].alreadyInResearch, true);
     assert.ok(out.note.indexOf('没有文本→向量') !== -1 || out.note.indexOf('无文本→向量') !== -1,
       '必须如实说明 S2 没有向量语义检索端点');
+  }
+});
+
+test('双源纪律：search_papers 必须并行查 Crossref 并按 DOI 去重合并；任一路失败降级不拖垮另一路', async function () {
+  {
+    const deps = makeDeps();
+    let oaSeen = null, crSeen = null;
+    deps.desktop.researchSearchOpenalex = async (input) => {
+      oaSeen = input;
+      return {
+        count: 11, stored: 2, mode: input.mode,
+        works: [
+          { id: 'W1', doi: '10.1/shared', title: 'Shared Paper', year: 2024, sourceName: 'J', citedBy: 5, hasAbstract: false },
+          { id: 'W2', doi: '10.1/oa-only', title: 'OA Only', year: 2023 }
+        ]
+      };
+    };
+    deps.desktop.researchSearchCrossref = async (input) => {
+      crSeen = input;
+      return {
+        count: 22, stored: 1, hasMore: true,
+        works: [
+          { id: 'local:a', doi: '10.1/shared', title: 'Shared Paper (CR variant)', year: 2024, sourceName: 'J CR', citedBy: 9,
+            hasAbstract: true, existed: true, inLibrary: false },
+          { id: 'local:b', doi: '10.1/cr-only', title: 'Fresh CR Paper', year: 2026, sourceName: 'Nature', citedBy: 0,
+            hasAbstract: true, existed: false, inLibrary: true }
+        ]
+      };
+    };
+    const t = LitAgent.createTools(deps);
+    const out = JSON.parse(await t.execute('search_papers', { query: 'zinc' }, {}));
+    // 两路拿到同一查询与同一年份参数（mode 只属于 OpenAlex 路）
+    assert.equal(oaSeen.query, 'zinc');
+    assert.equal(crSeen.query, 'zinc');
+    assert.equal(crSeen.yearFrom, 2022, '不传 yearFrom 时 Crossref 路同样走联网默认下限');
+    assert.equal(crSeen.mode, undefined);
+    // 合并：DOI 去重（两源都有以 OpenAlex 元数据为准、Crossref 补摘要与收藏态），crossref-only 追加在后
+    assert.equal(out.works.length, 3);
+    assert.equal(out.works[0].foundIn, 'openalex+crossref');
+    assert.equal(out.works[0].workId, 'W1', '两源都有时身份用 OpenAlex 的 W-id');
+    assert.equal(out.works[0].hasAbstract, true, 'Crossref 的摘要状态补进合并项');
+    assert.equal(out.works[0].citedBy, 5, '两源都有时引用数以 OpenAlex 为准');
+    assert.equal(out.works[1].foundIn, 'openalex');
+    assert.equal(out.works[2].foundIn, 'crossref');
+    assert.equal(out.works[2].alreadyInLibrary, true);
+    assert.equal(out.crossrefOnly, 1);
+    assert.equal(out.openalexTotal, 11);
+    assert.equal(out.crossrefTotal, 22);
+    assert.ok(out.source.indexOf('Crossref 并行') !== -1);
+    assert.ok(out.note.indexOf('仅 Crossref 收录') !== -1, '要说明 crossref-only 通常是最新上线文献');
+  }
+  {
+    // Crossref 失败：OpenAlex 结果照常返回，note 如实说明
+    const deps = makeDeps();
+    deps.desktop.researchSearchOpenalex = async () => ({ count: 1, stored: 1, works: [{ id: 'W1', doi: '10.1/a', title: 'T' }] });
+    deps.desktop.researchSearchCrossref = async () => { throw new Error('HTTP 429'); };
+    const t = LitAgent.createTools(deps);
+    const out = JSON.parse(await t.execute('search_papers', { query: 'q' }, {}));
+    assert.equal(out.works.length, 1);
+    assert.equal(out.works[0].foundIn, 'openalex');
+    assert.ok(out.note.indexOf('Crossref 线路失败') !== -1);
+    assert.ok(out.note.indexOf('HTTP 429') !== -1);
+  }
+  {
+    // OpenAlex 失败：Crossref 结果照常返回，不整单报错
+    const deps = makeDeps();
+    deps.desktop.researchSearchOpenalex = async () => { throw new Error('HTTP 429'); };
+    deps.desktop.researchSearchCrossref = async () => ({ count: 1, stored: 1, works: [{ id: 'local:x', doi: '10.1/b', title: 'CR' }] });
+    const t = LitAgent.createTools(deps);
+    const out = JSON.parse(await t.execute('search_papers', { query: 'q' }, {}));
+    assert.equal(out.works.length, 1);
+    assert.equal(out.works[0].foundIn, 'crossref');
+    assert.ok(out.note.indexOf('OpenAlex 线路失败') !== -1);
+  }
+});
+
+test('search_crossref 仅 includeCrossref 时注册并映射字段；yearFrom 缺省走联网检索默认下限；inLibrary/existed 分开回报', async function () {
+  {
+    const deps = makeDeps();
+    deps.desktop.researchSearchCrossref = async () => ({ count: 1, stored: 1, works: [{ id: 'local:x', title: 't' }] });
+    assert.ok(!LitAgent.createTools(deps).tools.map((x) => x.function.name).includes('search_crossref'),
+      '未注入 includeCrossref 时不得注册');
+  }
+  {
+    let seen = null;
+    const deps = makeDeps({
+      includeCrossref: true,
+      desktop: {
+        researchSearchCrossref: async (input) => {
+          seen = input;
+          return {
+            count: 9, stored: 2, hasMore: true,
+            works: [
+              { id: 'local:a', title: 'Fresh Paper', year: 2026, doi: '10.1/new', sourceName: 'Nature', citedBy: 0,
+                hasAbstract: true, pageUrl: 'https://doi.org/10.1/new', existed: false, inLibrary: false },
+              { id: 'W7', title: 'Known', year: 2024, doi: '10.1/old', sourceName: 'J', citedBy: 3,
+                hasAbstract: false, pageUrl: '', existed: true, inLibrary: true }
+            ]
+          };
+        }
+      }
+    });
+    const t = LitAgent.createTools(deps);
+    assert.ok(t.tools.map((x) => x.function.name).includes('search_crossref'));
+    const out = JSON.parse(await t.execute('search_crossref', { query: 'newest battery' }, {}));
+    assert.equal(seen.query, 'newest battery');
+    assert.equal(seen.yearFrom, 2022, '不传 yearFrom 走联网检索默认下限（偏新文献）');
+    assert.equal(seen.limit, 20);
+    assert.equal(out.total, 9);
+    assert.equal(out.hasMore, true);
+    assert.ok(out.source.indexOf('Crossref') !== -1);
+    assert.equal(out.works[0].workId, 'local:a');
+    assert.equal(out.works[0].pageUrl, 'https://doi.org/10.1/new');
+    assert.equal(out.works[0].alreadyInResearch, false);
+    assert.equal(out.works[1].alreadyInLibrary, true, '正式库反查命中才是已收藏');
+    assert.equal(out.works[1].alreadyInResearch, true, '调研库已有独立于正式库收藏');
+    // 显式 yearFrom: 0 = 不限年份（netYearFrom 语义：0 归一为 null 下传）
+    await t.execute('search_crossref', { query: 'classic', yearFrom: 0 }, {});
+    assert.equal(seen.yearFrom, null);
   }
 });
 
@@ -624,14 +743,14 @@ test('联网检索默认偏新文献：不传 yearFrom 时补 2022，传 0 表�
   deps.desktop.researchSearchOpenalex = async (input) => { calls.push(input); return origOa(input); };
   deps.desktop.researchSearchSemanticscholar = async (input) => { calls.push(input); return origS2(input); };
 
-  const dflt = JSON.parse(await t.execute('search_openalex', { query: 'x' }, {}));
+  const dflt = JSON.parse(await t.execute('search_papers', { query: 'x' }, {}));
   assert.equal(calls[0].yearFrom, 2022, '默认只看 2022 年以后');
   assert.ok(dflt.note.indexOf('2022') !== -1, '默认生效时如实回报（免得模型说「没有早期文献」）');
   assert.equal(dflt.yearFrom, 2022);
 
-  await t.execute('search_openalex', { query: 'x', yearFrom: 0 }, {});
+  await t.execute('search_papers', { query: 'x', yearFrom: 0 }, {});
   assert.equal(calls[1].yearFrom, null, 'yearFrom: 0 = 不限年份');
-  await t.execute('search_openalex', { query: 'x', yearFrom: 1998 }, {});
+  await t.execute('search_papers', { query: 'x', yearFrom: 1998 }, {});
   assert.equal(calls[2].yearFrom, 1998, '显式年份照传');
 
   const s2 = JSON.parse(await t.execute('search_semanticscholar', { query: 'x' }, {}));
@@ -669,7 +788,7 @@ test('R18: get_work 精确解析并如实回报（未命中给替代建议）；
       desktop: {
         researchGetWork: async (input) => input.query.indexOf('10.') === 0
           ? { found: true, origin: 'local', work: { id: 'W9', doi: input.query, title: 'Resolved', year: 2025, sourceName: 'J', citedBy: 7, isOa: true, oaUrl: 'https://oa', hasAbstract: true, abstract: 'abs' } }
-          : { found: false, note: '本地与 OpenAlex 均未精确命中；模糊/主题检索请改用 search_openalex 或 search_research' }
+          : { found: false, note: '本地与 OpenAlex 均未精确命中；模糊/主题检索请改用 search_papers 或 search_research' }
       }
     }));
     const hit = JSON.parse(await t.execute('get_work', { query: '10.1038/abc' }));
@@ -678,7 +797,7 @@ test('R18: get_work 精确解析并如实回报（未命中给替代建议）；
     assert.equal(hit.note, '');
     const miss = JSON.parse(await t.execute('get_work', { query: '根本不存在的标题' }));
     assert.equal(miss.found, false);
-    assert.ok(miss.note.indexOf('search_openalex') !== -1);
+    assert.ok(miss.note.indexOf('search_papers') !== -1);
   }
   {
     const t = LitAgent.createTools(makeDeps({
@@ -975,5 +1094,5 @@ test('plan tool verifies actual successful execution and registered artifacts be
   assert.equal(saved.steps[0].id, 'find');
   await assert.rejects(tools.execute('update_research_plan', { goal: 'review', steps: [{ content: 'claim done', status: 'completed' }] }, { messages }), /需要成功工具证据/);
   await assert.rejects(tools.execute('update_research_plan', { goal: 'review', steps: [{ content: 'claim done', status: 'completed', artifacts: ['附件/missing.md'] }] }, { sessionId: 's', messages }), /尚未登记/);
-  assert.equal(LitAgent.isParallelTool('search_library'), true); assert.equal(LitAgent.isParallelTool('search_openalex'), false); assert.equal(LitAgent.isParallelTool('collect_papers'), false);
+  assert.equal(LitAgent.isParallelTool('search_library'), true); assert.equal(LitAgent.isParallelTool('search_papers'), false); assert.equal(LitAgent.isParallelTool('collect_papers'), false);
 });

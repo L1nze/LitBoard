@@ -166,3 +166,48 @@ test('A-followup #5: normalizeTitleKey 折叠大小写/标点/空白', function 
   assert.equal(LitResearch.normalizeTitleKey('  Zinc   Battery  '), 'zinc battery');
   assert.equal(LitResearch.normalizeTitleKey(null), '');
 });
+
+test('normalizeCrossrefWork 全量映射：JATS 摘要剥标签解实体、日期多级回退、作者 given+family/ORCID、类型映射、id 留空交由身份解析', function () {
+  const row = LitResearch.normalizeCrossrefWork({
+    DOI: '10.1016/j.t.2026.01.001',
+    title: ['Zinc battery health'],
+    'container-title': ['Journal of Power Sources'],
+    type: 'journal-article',
+    issued: { 'date-parts': [[2026, 3, 5]] },
+    abstract: '<jats:p>Background &amp; aims: <jats:italic>test</jats:italic> done</jats:p>',
+    'is-referenced-by-count': 7,
+    author: [
+      { given: 'Zhang', family: 'San', ORCID: 'https://orcid.org/0000-0002-1825-0097' },
+      { name: 'LitBoard Consortium' }
+    ]
+  });
+  assert.equal(row.id, '', 'Crossref 无 OpenAlex W-id，身份由调用方解析');
+  assert.equal(row.doi, '10.1016/j.t.2026.01.001');
+  assert.equal(row.title, 'Zinc battery health');
+  assert.equal(row.year, 2026);
+  assert.equal(row.pubdate, '2026-03-05');
+  assert.equal(row.type, 'article');
+  assert.equal(row.sourceName, 'Journal of Power Sources');
+  assert.equal(row.abstract, 'Background & aims: test done');
+  assert.equal(row.citedBy, 7);
+  assert.equal(row.isOa, false);
+  assert.equal(row.pageUrl, 'https://doi.org/10.1016/j.t.2026.01.001');
+  assert.deepEqual(row.authors, [
+    { name: 'Zhang San', orcid: '0000-0002-1825-0097' },
+    { name: 'LitBoard Consortium' }
+  ]);
+  // 在线优先：issued 缺失时回退 published-online；date-parts 只有年也只出年份
+  const onlineFirst = LitResearch.normalizeCrossrefWork({
+    DOI: '10.1/online-first', title: ['Ahead of print'], type: 'posted-content',
+    'published-online': { 'date-parts': [[2026]] }
+  });
+  assert.equal(onlineFirst.year, 2026);
+  assert.equal(onlineFirst.pubdate, '2026');
+  assert.equal(onlineFirst.type, 'preprint');
+  // 全空对象不炸：产出空行（title 空会被调用方过滤）
+  const empty = LitResearch.normalizeCrossrefWork({});
+  assert.equal(empty.title, '');
+  assert.equal(empty.doi, '');
+  assert.equal(empty.year, null);
+  assert.equal(LitResearch.normalizeCrossrefWork(null).title, '');
+});

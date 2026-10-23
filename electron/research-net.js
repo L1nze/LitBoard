@@ -85,10 +85,8 @@ function normalizeScopusHit(entry) {
 }
 
 function parseCrossrefAbstract(work) {
-  const raw = work && typeof work.abstract === 'string' ? work.abstract : '';
-  if (!raw) return '';
-  const text = decodeEntities(raw.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
-  return text;
+  // JATS 剥标签与实体解码的唯一实现在 js/research.js（与检索归一化共用），此处只做转发
+  return LitResearch.crossrefAbstract(work);
 }
 
 /** Elsevier abstracts-retrieval-response：abstracts[].abstract 形态多变，深度优先收文本 */
@@ -161,6 +159,20 @@ function createResearchNet(options) {
     return parseCrossrefAbstract(data && data.message);
   }
 
+  /** 单条 DOI 直查 Crossref → 归一化调研行（无标题的畸形记录返回 null）。
+   *  get_work 兜底用：刚登记、OpenAlex 尚未索引的最新文献常只有这里能解析到。 */
+  async function fetchCrossrefWork(doi) {
+    const params = new URLSearchParams();
+    const cfg = await getConfig();
+    if (cfg && cfg.openalexEmail) params.set('mailto', String(cfg.openalexEmail).slice(0, 200));
+    const url = 'https://api.crossref.org/works/' + encodeURIComponent(doi) +
+      (params.toString() ? '?' + params.toString() : '');
+    const data = await queue.requestJson(url, { headers: { Accept: 'application/json' } });
+    if (!data || !data.message) return null;
+    const row = LitResearch.normalizeCrossrefWork(data.message);
+    return row.title ? row : null;
+  }
+
   async function fetchElsevierAbstract(doi) {
     const cfg = await getConfig();
     if (!cfg || !cfg.elsevierApiKey) return '';
@@ -225,6 +237,21 @@ function createResearchNet(options) {
     return params;
   }
 
+  /** OpenAlex 429 → 带行动指引的错误：匿名配额按出口 IP 共享（代理/公司网下常被挤兑
+   *  耗尽），免费 API Key 走个人配额。这条话术会进检索工具的失败说明，用户照着做即可。 */
+  function openalexQuotaHint(error) {
+    if (error && error.status === 429) {
+      const hours = Math.max(1, Math.round((error.retryAfterSeconds || 0) / 3600));
+      const err = new Error('OpenAlex 免费额度已用尽（匿名额度按出口 IP 共享、每日重置，本次约 ' + hours +
+        ' 小时后恢复）；在「设置 → 检索与元数据服务」填入免费 API Key（openalex.org/settings/api，注册即得）' +
+        '可改用个人每日配额，不再与共享出口 IP 抢额度。检索可先用 Crossref 侧结果');
+      err.status = 429;
+      err.retryAfterSeconds = error.retryAfterSeconds || 0;
+      return err;
+    }
+    return error;
+  }
+
   function yearFilters(input) {
     const filters = [];
     const from = Number(input && input.yearFrom);
@@ -254,9 +281,12 @@ function createResearchNet(options) {
     if (filters.length) params.set('filter', filters.join(','));
     if (query && mode !== 'semantic') params.set('sort', 'relevance_score:desc');
     if (mode === 'semantic') await openalexSemanticGate();
-    const data = await queue.requestJson(OPENALEX_WORKS + '?' + params.toString(), {
-      headers: { Accept: 'application/json' }
-    });
+    let data;
+    try {
+      data = await queue.requestJson(OPENALEX_WORKS + '?' + params.toString(), {
+        headers: { Accept: 'application/json' }
+      });
+    } catch (error) { throw openalexQuotaHint(error); }
     const results = Array.isArray(data.results) ? data.results : [];
     return {
       mode: mode,
@@ -313,6 +343,55 @@ function createResearchNet(options) {
     };
   }
 
+  /**
+   * Crossref 检索（DOI 注册库，无需 Key；mailto 进 polite pool 与 OpenAlex 共用邮箱配置）。
+   * 出版商一登记就收录——最新上线的论文常先于 OpenAlex / S2 出现在这里。
+   * query.bibliographic 官方按相关度排序（sort 与 query 不兼容，故不传 sort）；
+   * 年份走 from-pub-date / until-pub-date 过滤（覆盖 print/online 发行日期）。
+   */
+  // 检索噪声类型：eLife 一类出版商把同行评审记录（Review for … / Decision letter …）
+  // 也注册成 DOI（type=peer-review），相关度排序里大量混入；component 是论文的图表部件
+  // 记录。两者都不属于「文献发现」，检索侧剔除——直查单条 DOI（fetchCrossrefWork）
+  // 不过滤：用户点名要的 DOI 照常解析。
+  const CROSSREF_SEARCH_NOISE_TYPES = new Set(['peer-review', 'component']);
+  async function searchCrossref(input) {
+    const req = input || {};
+    const query = String(req.query || '').trim().slice(0, 500);
+    if (!query) throw new Error('Crossref 检索词为空');
+    const params = new URLSearchParams();
+    params.set('query.bibliographic', query);
+    const limit = Math.max(1, Math.min(50, Number(req.limit) || 20));
+    params.set('rows', String(limit));
+    const offset = Math.max(0, Number(req.offset) || 0);
+    if (offset) params.set('offset', String(offset));
+    const cfg = await getConfig();
+    if (cfg && cfg.openalexEmail) params.set('mailto', String(cfg.openalexEmail).slice(0, 200));
+    const filters = [];
+    const from = Number(req.yearFrom);
+    const to = Number(req.yearTo);
+    if (isFinite(from) && from > 1000) filters.push('from-pub-date:' + Math.floor(from) + '-01-01');
+    if (isFinite(to) && to > 1000) filters.push('until-pub-date:' + Math.floor(to) + '-12-31');
+    if (filters.length) params.set('filter', filters.join(','));
+    const data = await queue.requestJson('https://api.crossref.org/works?' + params.toString(), {
+      headers: { Accept: 'application/json' }
+    });
+    const message = data && data.message ? data.message : {};
+    const items = Array.isArray(message.items) ? message.items : [];
+    const total = Number(message['total-results']) || items.length;
+    const results = items
+      .filter(function (item) {
+        return !CROSSREF_SEARCH_NOISE_TYPES.has(String(item && item.type || '').toLowerCase());
+      })
+      .map(LitResearch.normalizeCrossrefWork)
+      .filter(function (row) { return row.title; });
+    return {
+      count: total,
+      offset: offset,
+      hasMore: offset + items.length < total,
+      results: results
+    };
+  }
+
   /** 批量按 ID 拉取（扩邻居/补登记用）：filter=openalex_id:W1|W2…，100/批。
    *  分块并发发入队列（结果仍按分块序落位）：主机策略本就限 OpenAlex 并发 3 + 最小间隔，
    *  并发递交只会填满策略允许的槽位，不会越过限流。 */
@@ -327,9 +406,12 @@ function createResearchNet(options) {
         filter: 'openalex_id:' + chunk.join('|'),
         per_page: 100
       });
-      const data = await queue.requestJson(OPENALEX_WORKS + '?' + params.toString(), {
-        headers: { Accept: 'application/json' }
-      });
+      let data;
+      try {
+        data = await queue.requestJson(OPENALEX_WORKS + '?' + params.toString(), {
+          headers: { Accept: 'application/json' }
+        });
+      } catch (error) { throw openalexQuotaHint(error); }
       return (Array.isArray(data.results) ? data.results : []).map(LitResearch.normalizeOpenAlexWork)
         .filter(function (row) { return row.id; });
     }));
@@ -350,9 +432,12 @@ function createResearchNet(options) {
         filter: 'doi:' + chunk.join('|'),
         per_page: 25
       });
-      const data = await queue.requestJson(OPENALEX_WORKS + '?' + params.toString(), {
-        headers: { Accept: 'application/json' }
-      });
+      let data;
+      try {
+        data = await queue.requestJson(OPENALEX_WORKS + '?' + params.toString(), {
+          headers: { Accept: 'application/json' }
+        });
+      } catch (error) { throw openalexQuotaHint(error); }
       return (Array.isArray(data.results) ? data.results : []).map(LitResearch.normalizeOpenAlexWork)
         .filter(function (row) { return row.id; });
     }));
@@ -458,6 +543,8 @@ function createResearchNet(options) {
   return {
     searchOpenAlex: searchOpenAlex,
     searchSemanticScholar: searchSemanticScholar,
+    searchCrossref: searchCrossref,
+    fetchCrossrefWork: fetchCrossrefWork,
     fetchWorksByIds: fetchWorksByIds,
     fetchWorksByDois: fetchWorksByDois,
     searchScopus: searchScopus,

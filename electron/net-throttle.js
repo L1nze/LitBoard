@@ -12,6 +12,13 @@
 
 const DEFAULT_POLICY = { concurrency: 2, minIntervalMs: 400 };
 const MAX_ATTEMPTS = 3;
+/** 配额级 429 的判定线（秒）：Retry-After 超过它说明不是瞬时抖动，而是每日/长期配额
+ *  耗尽（OpenAlex 匿名池实测 Retry-After 7 万秒级）——重试毫无意义，立即失败并把
+ *  主机加入短期熔断。熔断上限 QUOTA_BLOCK_CAP_MS（30 分钟）远小于 Retry-After：
+ *  一是让「刚配好 API Key」的用户最多半小时自动恢复，不至于被冷却锁到次日；
+ *  二是冷却到期后的一次探针只花一个请求，代价可忽略。 */
+const QUOTA_RETRY_AFTER_LINE_S = 120;
+const QUOTA_BLOCK_CAP_MS = 30 * 60 * 1000;
 /** 单请求超时上限：JSON 检索请求一律 20s 封顶（与 agent-net 的空闲超时同一量级）。
  *  本库只有 JSON 请求——流式 SSE 在 agent-net，有自己的超时/中止体系，不受影响。
  *  没有这层兜底时，上游挂起会让 find_literature / 检索工具的调用无限等待。
@@ -33,11 +40,11 @@ function createThrottleQueue(doFetch, options) {
   const now = opts.now || function () { return Date.now(); };
   // 可注入（测试用假时钟加速）；缺省用生产 20s 兜底
   const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : REQUEST_TIMEOUT_MS;
-  const hosts = new Map(); // host → { running, lastDispatch, waiters, slot, pumping }
+  const hosts = new Map(); // host → { running, lastDispatch, waiters, slot, pumping, quotaBlockedUntil }
 
   function hostState(host) {
     if (!hosts.has(host)) {
-      hosts.set(host, { running: 0, lastDispatch: -Infinity, waiters: [], slot: makeDeferred(), pumping: false });
+      hosts.set(host, { running: 0, lastDispatch: -Infinity, waiters: [], slot: makeDeferred(), pumping: false, quotaBlockedUntil: 0 });
     }
     return hosts.get(host);
   }
@@ -111,35 +118,57 @@ function createThrottleQueue(doFetch, options) {
     return (1 << Math.min(attempt, 5)) * 500 + Math.floor(Math.random() * 250);
   }
 
+  /** 配额级 429 的统一错误（带重置时间；status/retryAfterSeconds 供调用方做指引与分类） */
+  function quotaError(host, retryAfterSeconds) {
+    const hours = Math.max(1, Math.round((retryAfterSeconds || 0) / 3600));
+    const err = new Error('上游限流（HTTP 429）：' + host + ' 免费配额已耗尽，约 ' + hours + ' 小时后重置');
+    err.status = 429;
+    err.retryAfterSeconds = retryAfterSeconds || 0;
+    return err;
+  }
+
   /** 带重试的 JSON GET/POST：仅 429/5xx/传输错误重试，其余状态码立即上抛 */
   async function requestJson(url, init) {
+    const host = new URL(url).host;
     let attempt = 0;
     while (true) {
       attempt++;
+      // 配额熔断期内快速失败：不排队、不发请求——同一配额再发只会再收 429，
+      // 白白让检索工具多等几轮重试（双源检索里另一源照常出结果）
+      const st = hostState(host);
+      if (now() < st.quotaBlockedUntil) throw quotaError(host, st.quotaRetryAfterSeconds);
       let response = null;
       try {
         response = await fetchThrottled(url, init || {});
       } catch (error) {
         if (attempt >= MAX_ATTEMPTS) {
-          throw new Error('网络请求失败（' + new URL(url).host + '）：' + String(error && error.message || error));
+          throw new Error('网络请求失败（' + host + '）：' + String(error && error.message || error));
         }
         await sleep(backoffMs(attempt));
         continue;
       }
       if (response.status === 429 || response.status >= 500) {
+        const retryAfter = Number(response.headers && response.headers.get && response.headers.get('retry-after'));
+        if (response.status === 429 && isFinite(retryAfter) && retryAfter > QUOTA_RETRY_AFTER_LINE_S) {
+          // 配额级限流（每日额度耗尽一类，OpenAlex 匿名池实测 Retry-After 7 万秒级）：
+          // 重试无意义，立即失败并熔断该主机一段时间（上限见 QUOTA_BLOCK_CAP_MS 注释）
+          st.quotaBlockedUntil = now() + Math.min(retryAfter * 1000, QUOTA_BLOCK_CAP_MS);
+          st.quotaRetryAfterSeconds = retryAfter;
+          throw quotaError(host, retryAfter);
+        }
         if (attempt >= MAX_ATTEMPTS) {
-          const err = new Error('上游限流或服务异常（HTTP ' + response.status + '）：' + new URL(url).host);
+          const err = new Error('上游限流或服务异常（HTTP ' + response.status + '）：' + host);
           err.status = response.status;
+          if (response.status === 429 && isFinite(retryAfter) && retryAfter > 0) err.retryAfterSeconds = retryAfter;
           throw err;
         }
-        const retryAfter = Number(response.headers && response.headers.get && response.headers.get('retry-after'));
-        await sleep(isFinite(retryAfter) && retryAfter > 0 && retryAfter <= 120
+        await sleep(isFinite(retryAfter) && retryAfter > 0 && retryAfter <= QUOTA_RETRY_AFTER_LINE_S
           ? retryAfter * 1000
           : backoffMs(attempt));
         continue;
       }
       if (!response.ok) {
-        const err = new Error('HTTP ' + response.status + '（' + new URL(url).host + '）');
+        const err = new Error('HTTP ' + response.status + '（' + host + '）');
         err.status = response.status;
         throw err;
       }

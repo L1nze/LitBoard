@@ -323,29 +323,112 @@
       }
     },
     {
-      name: 'search_openalex',
+      name: 'search_papers',
       def: function () {
-        return schema('search_openalex', '联网检索 OpenAlex 发现新文献，结果自动存入本地调研库。mode=keyword（默认，词匹配，适合明确的术语/作者/标题）与 mode=semantic（整段自然语言按含义检索，官方基于标题/摘要向量）各有所长：查术语用 keyword，找「和这段话同主题」的用 semantic。默认只检索 ' + DEFAULT_MIN_YEAR + ' 年以后的文献（偏新文献）；要找更早的经典文献传 yearFrom: 0。', {
+        return schema('search_papers', '联网检索发现文献，结果自动存入本地调研库。**OpenAlex 与 Crossref 两源并行、按 DOI/标题合并去重**（Crossref 收录出版商刚登记的最新文献，常比 OpenAlex 更早；OpenAlex 元数据更全）。mode=keyword（默认，词匹配，适合明确的术语/作者/标题）与 mode=semantic（整段自然语言按含义检索，作用于 OpenAlex；Crossref 侧始终按词面匹配）各有所长：查术语用 keyword，找「和这段话同主题」的用 semantic。默认只检索 ' + DEFAULT_MIN_YEAR + ' 年以后的文献（偏新文献）；要找更早的经典文献传 yearFrom: 0。', {
                 query: qProp, yearFrom: yearFromNetProp, yearTo: yearToProp, limit: limitProp,
-                mode: { type: 'string', description: '检索模式：keyword（默认）或 semantic（整段自然语言的语义检索）' }
+                mode: { type: 'string', description: '检索模式：keyword（默认）或 semantic（整段自然语言的语义检索，作用于 OpenAlex）' }
               }, ['query']);
       },
       run: async function (a, context, env, execute) {
         var desktop = env.desktop;
         var oaMode = a.mode === 'semantic' ? 'semantic' : 'keyword';
         var oaYearFrom = netYearFrom(a);
-        var r2 = await desktop.researchSearchOpenalex({
+        // 双源纪律：检索论文不得只查 OpenAlex——同一查询必须并行带上 Crossref
+        // （出版商一登记就收录，最新上线的文献常只有 Crossref 有），这是代码保证，
+        // 不依赖模型自己记得另调 search_crossref。任一源失败不拖垮另一源，失败如实写进 note。
+        var baseParams = {
           query: String(a.query || ''),
           yearFrom: oaYearFrom,
           yearTo: Number(a.yearTo) || null,
-          limit: clampLimit(a),
-          mode: oaMode
-        });
+          limit: clampLimit(a)
+        };
+        var legs = await Promise.allSettled([
+          desktop.researchSearchOpenalex(Object.assign({ mode: oaMode }, baseParams)),
+          desktop.researchSearchCrossref ? desktop.researchSearchCrossref(baseParams) : Promise.resolve(null)
+        ]);
+        var oa = legs[0].status === 'fulfilled' ? legs[0].value : null;
+        var cr = legs[1].status === 'fulfilled' ? legs[1].value : null;
+        if (!oa && !cr) throw (legs[0].reason || legs[1].reason);
+
+        function mergeKey(doi, title) {
+          if (doi) return 'doi:' + String(doi).toLowerCase()
+            .replace(/^https?:\/\/(dx\.)?doi\.org\//i, '').replace(/^doi:/i, '').trim();
+          return 't:' + String(title || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+        }
+
+        var byKey = {};
+        var merged = [];
+        function pushWork(w, provider) {
+          if (!w || (!w.id && !w.title)) return;
+          var hit = byKey[mergeKey(w.doi, w.title)];
+          if (hit) {
+            if (hit.sources.indexOf(provider) === -1) hit.sources.push(provider);
+            // Crossref 命中补足 OpenAlex 摘要里没有的信息（摘要有无 / 收藏状态 / 身份兜底）
+            if (provider === 'crossref') {
+              hit.hasAbstract = hit.hasAbstract || !!w.hasAbstract;
+              hit.alreadyInResearch = hit.alreadyInResearch || !!w.existed;
+              hit.alreadyInLibrary = hit.alreadyInLibrary || !!w.inLibrary;
+              if (!hit.workId && w.id) hit.workId = w.id;
+            }
+            return;
+          }
+          hit = {
+            workId: w.id || '',
+            title: String(w.title || '').slice(0, 300),
+            year: w.year || null,
+            doi: w.doi || '',
+            source: w.sourceName || '',
+            citedBy: w.citedBy || 0,
+            hasAbstract: !!w.hasAbstract,
+            alreadyInResearch: !!w.existed,
+            alreadyInLibrary: !!w.inLibrary,
+            sources: [provider]
+          };
+          byKey[mergeKey(w.doi, w.title)] = hit;
+          merged.push(hit);
+        }
+        // OpenAlex 结果在前（保持其相关度序），仅 Crossref 收录的最新文献追加在后
+        (oa && oa.works || []).forEach(function (w) { pushWork(w, 'openalex'); });
+        (cr && cr.works || []).forEach(function (w) { pushWork(w, 'crossref'); });
+        // 预算护栏：core 的工具结果上限 12000 字符，超长会在 JSON 中部被硬截断（不可解析）。
+        // 双源合并最多 2×limit 条，先砍 OpenAlex 块的尾部（相关度最低），仅 Crossref 的新文献尽量保全。
+        var trimmed = 0;
+        while (merged.length > 2 && JSON.stringify(merged).length > 9500) {
+          var cutAt = -1;
+          for (var i = merged.length - 1; i >= 0; i--) {
+            if (merged[i].sources[0] === 'openalex') { cutAt = i; break; }
+          }
+          if (cutAt === -1) cutAt = merged.length - 1;
+          merged.splice(cutAt, 1);
+          trimmed++;
+        }
+
+        var routeNotes = [];
+        if (oa) routeNotes.push('OpenAlex ' + ((oa.works || []).length) + ' 条');
+        else routeNotes.push('OpenAlex 线路失败（' + String(legs[0].reason && legs[0].reason.message || legs[0].reason) + '），本次结果不含 OpenAlex');
+        if (cr) routeNotes.push('Crossref ' + ((cr.works || []).length) + ' 条');
+        else if (desktop.researchSearchCrossref) {
+          routeNotes.push('Crossref 线路失败（' + String(legs[1].reason && legs[1].reason.message || legs[1].reason) + '），本次结果不含 Crossref');
+        }
+        var crossrefOnly = merged.filter(function (w) { return w.sources.length === 1 && w.sources[0] === 'crossref'; }).length;
+        merged.forEach(function (w) { w.foundIn = w.sources.join('+'); delete w.sources; });
+        if (trimmed > 0) {
+          routeNotes.push('超出单次返回预算，已省略 ' + trimmed + ' 条 OpenAlex 尾部结果（改用更小的 limit 或 search_crossref 可细分）');
+        }
+
         return JSON.stringify({
-          source: 'OpenAlex · ' + (oaMode === 'semantic' ? '语义检索' : '关键词检索') + '（已存入调研库）',
-          query: String(a.query || ''), mode: r2.mode || oaMode, total: r2.count, stored: r2.stored,
-          yearFrom: oaYearFrom, note: netYearNote(a, oaYearFrom),
-          works: (r2.works || []).slice(0, clampLimit(a)).map(workSummary)
+          source: 'OpenAlex · ' + (oaMode === 'semantic' ? '语义检索' : '关键词检索') + (cr ? ' + Crossref 并行' : '') + '（已存入调研库）',
+          query: String(a.query || ''), mode: (oa && oa.mode) || oaMode,
+          openalexTotal: oa ? oa.count : 0,
+          crossrefTotal: cr ? cr.count : 0,
+          stored: (oa && oa.stored || 0) + (cr && cr.stored || 0),
+          crossrefOnly: crossrefOnly,
+          yearFrom: oaYearFrom,
+          note: joinNotes([netYearNote(a, oaYearFrom),
+            '每源各取上限条数后按 DOI/标题合并去重；foundIn=crossref 的是仅 Crossref 收录的文献（通常为最新上线、OpenAlex 尚未索引），foundIn=openalex+crossref 两边都有。',
+            routeNotes.join('；') + '。']),
+          works: merged
         });
       }
     },
@@ -353,7 +436,7 @@
       name: 'get_research_work',
       parallel: true, // 可与其它本地只读工具并发执行
       def: function () {
-        return schema('get_research_work', '按 workId 取调研库中一篇文献的完整信息（含摘要全文）。workId 来自 search_research / search_openalex 的结果。', {
+        return schema('get_research_work', '按 workId 取调研库中一篇文献的完整信息（含摘要全文）。workId 来自 search_research / search_papers 的结果。', {
                 workId: { type: 'string', description: '调研库文献 ID（W 开头）' }
               }, ['workId']);
       },
@@ -374,7 +457,7 @@
     {
       name: 'get_work',
       def: function () {
-        return schema('get_work', '精确解析一篇文献：输入 DOI（含 doi.org 链接）、OpenAlex ID（W 开头）或**精确标题**，返回该文献的元数据并入本地调研库。本地已有所需身份时不联网。适合用户直接给出 DOI/链接时；不确定的模糊/主题检索请改用 search_openalex。', {
+        return schema('get_work', '精确解析一篇文献：输入 DOI（含 doi.org 链接）、OpenAlex ID（W 开头）或**精确标题**，返回该文献的元数据并入本地调研库。本地已有所需身份时不联网；DOI 在本地与 OpenAlex 都查不到时会再直查 Crossref 兜底（刚登记、OpenAlex 尚未索引的最新文献常能在这里解析到）。适合用户直接给出 DOI/链接时；不确定的模糊/主题检索请改用 search_papers。', {
                 query: { type: 'string', description: 'DOI / doi.org 或 openalex.org 链接 / W 开头的 OpenAlex ID / 精确标题' }
               }, ['query']);
       },
@@ -885,10 +968,44 @@
       }
     },
     {
+      name: 'search_crossref',
+      when: function (deps, desktop) { return !!(deps.includeCrossref && desktop.researchSearchCrossref); },
+      def: function () {
+        return schema('search_crossref', '单独检索 Crossref DOI 注册库（出版商一登记就收录，无需 Key；最新上线的论文常比 OpenAlex / Semantic Scholar 更早出现，也含在线优先与预印本记录）。search_papers 已默认并行包含 Crossref，本工具用于：只要 Crossref 一家的召回（如专门追最新上线）、用 offset 翻页、或交叉验证引用数。citedBy 为 Crossref 引用数。默认只检索 ' + DEFAULT_MIN_YEAR + ' 年以后的文献；要找更早的经典文献传 yearFrom: 0。', {
+                query: qProp, yearFrom: yearFromNetProp, yearTo: yearToProp, limit: limitProp
+              }, ['query']);
+      },
+      run: async function (a, context, env, execute) {
+        var desktop = env.desktop;
+        if (!desktop.researchSearchCrossref) return '当前环境不支持 Crossref 检索';
+        var crYearFrom = netYearFrom(a);
+        var cr = await desktop.researchSearchCrossref({
+          query: String(a.query || ''),
+          yearFrom: crYearFrom,
+          yearTo: Number(a.yearTo) || null,
+          limit: clampLimit(a)
+        });
+        return JSON.stringify({
+          source: 'Crossref（已存入调研库）', query: String(a.query || ''),
+          total: cr.count, stored: cr.stored, hasMore: !!cr.hasMore,
+          yearFrom: crYearFrom, note: netYearNote(a, crYearFrom),
+          works: (cr.works || []).slice(0, clampLimit(a)).map(function (w) {
+            return {
+              workId: w.id, title: w.title, year: w.year, doi: w.doi,
+              source: w.sourceName || '', citedBy: w.citedBy || 0,
+              hasAbstract: !!w.hasAbstract, pageUrl: w.pageUrl || '',
+              // A-followup #3：alreadyInLibrary 只认真式库反查结果；调研库命中的是 alreadyInResearch
+              alreadyInLibrary: !!w.inLibrary, alreadyInResearch: !!w.existed
+            };
+          })
+        });
+      }
+    },
+    {
       name: 'search_scopus',
       when: function (deps, desktop) { return !!(deps.includeScopus && desktop.researchSearchScopus); },
       def: function () {
-        return schema('search_scopus', '联网检索 Elsevier Scopus 索引（需已配置 Elsevier Key）。与 search_openalex 互补：Scopus 引用数更权威、召回略有差异；返回 Scopus 引用数但不含摘要。适合：需要权威引用数、OpenAlex 结果偏少想交叉验证、或用户明确提到 Scopus 时。默认只检索 ' + DEFAULT_MIN_YEAR + ' 年以后的文献；查早期文献（Scopus 引用数在此更有参考价值）时传 yearFrom: 0。', {
+        return schema('search_scopus', '联网检索 Elsevier Scopus 索引（需已配置 Elsevier Key）。与 search_papers 互补：Scopus 引用数更权威、召回略有差异；返回 Scopus 引用数但不含摘要。适合：需要权威引用数、OpenAlex 结果偏少想交叉验证、或用户明确提到 Scopus 时。默认只检索 ' + DEFAULT_MIN_YEAR + ' 年以后的文献；查早期文献（Scopus 引用数在此更有参考价值）时传 yearFrom: 0。', {
                 query: qProp, yearFrom: yearFromNetProp, yearTo: yearToProp, limit: limitProp
               }, ['query']);
       },
@@ -923,7 +1040,7 @@
       when: function (deps, desktop) { return !!deps.includeWrite; },
       def: function () {
         return schema('collect_papers', '把调研库中的文献收藏进用户的正式库（执行前会向用户确认；已存在的自动去重合并）。调研产生了值得保留的结果时使用。', {
-                workIds: { type: 'array', items: { type: 'string' }, description: '调研库文献 ID 列表（来自 search_research / search_openalex / semantic_search）' },
+                workIds: { type: 'array', items: { type: 'string' }, description: '调研库文献 ID 列表（来自 search_research / search_papers / semantic_search）' },
                 folderId: { type: 'string', description: '目标文件夹 ID（可选，缺省用当前文件夹）' }
               }, ['workIds']);
       },

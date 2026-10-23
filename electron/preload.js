@@ -176,6 +176,7 @@ contextBridge.exposeInMainWorld('litboardDesktop', {
   /* R16：段落找文献 · 多源召回 + 证据归因；Semantic Scholar 相关度检索 */
   researchFindLiterature: function (input) { return ipcRenderer.invoke('research:find-literature', input); },
   researchSearchSemanticscholar: function (input) { return ipcRenderer.invoke('research:search-semanticscholar', input); },
+  researchSearchCrossref: function (input) { return ipcRenderer.invoke('research:search-crossref', input); },
   ocrStatus: function () { return ipcRenderer.invoke('ocr:status'); },
   ocrEnsureData: function () { return ipcRenderer.invoke('ocr:ensure-data'); },
   // legacyFallback：只有「读该文献主 PDF 的旧版单 PDF 索引」这一种场景传 true；

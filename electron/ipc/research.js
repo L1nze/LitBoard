@@ -240,6 +240,14 @@ async function recallForClaim(claim, recallCtx) {
       }
     },
     {
+      // Crossref：出版商一登记就收录，最新上线（OpenAlex/S2 还没索引）的证据多从这里召回
+      id: 'crossref', enabled: recallCtx.providers.crossref,
+      run: async function (q) {
+        const r = await ctx.researchNet.searchCrossref({ query: q, limit: 15, yearFrom: yearFrom, yearTo: yearTo });
+        return { rows: r.results || [], total: r.count };
+      }
+    },
+    {
       id: 'web', enabled: recallCtx.providers.web,
       run: async function (q) {
         const r = await ctx.webFetchNet.webSearch({ query: q, mode: 'paper', limit: 10, yearFrom: yearFrom, yearTo: yearTo });
@@ -419,6 +427,34 @@ function register() {
     });
     ctx.researchDb.recordSearch({ q: req.query, filters: { source: 'semanticscholar' }, count: works.length });
     return { count: result.total, stored: works.length, hasMore: result.hasMore, works: works };
+  });
+  /* Crossref 检索（DOI 注册库，无需 Key 常开）：出版商一登记就收录，是 OpenAlex / S2
+   * 尚未索引的最新文献的主发现渠道。身份按 DOI → 规范化标题 → local: 归位（ingestCandidates，
+   * 新建 local: 不绑 DOI ext——等 upsertWorks 归属汇聚认领，纪律同 web-search）。 */
+  ctx.handle('research:search-crossref', async function (_event, input) {
+    if (!ctx.researchDb || !ctx.researchNet) throw new Error(ctx.T('调研库未就绪'));
+    const req = input || {};
+    const result = await ctx.researchNet.searchCrossref(req);
+    const before = ctx.researchDb.getWorks((result.results || []).map(function (row) {
+      return row.doi ? ctx.researchDb.findByExtId('doi', row.doi) : null;
+    }).filter(Boolean));
+    const existedIds = {};
+    before.forEach(function (row) { existedIds[row.id] = true; });
+    const candidates = ingestCandidates(result.results);
+    const works = candidates.filter(Boolean).map(function (c) {
+      return {
+        id: c.workId, doi: c.doi, title: c.title, year: c.year,
+        sourceName: c.sourceName, citedBy: c.citedBy, pageUrl: c.pageUrl,
+        hasAbstract: !!c.abstract, existed: !!existedIds[c.workId]
+      };
+    });
+    // A-followup #3 同纪律：「正式库已收藏」必须来自正式库反查，调研库已有只算 existed
+    const inLibrary = await inLibraryIndex();
+    works.forEach(function (w) {
+      w.inLibrary = inLibrary.has(w.id) || !!(w.doi && inLibrary.has('doi:' + LitResearch.normalizeDoi(w.doi)));
+    });
+    ctx.researchDb.recordSearch({ q: req.query, filters: { source: 'crossref', yearFrom: req.yearFrom, yearTo: req.yearTo }, count: result.count });
+    return { count: result.count, stored: works.length, hasMore: result.hasMore, works: works };
   });
   /* 语义检索（库内相似文献，R16 入口一）：向量可用则走向量，否则**降级为关键词**——
    * 用户没配 embedding 时这个按钮不该变成摆设，只是召回质量如实降级并说明。
@@ -866,12 +902,14 @@ function register() {
     // 预算：远端召回只覆盖前 N 条论点（OpenAlex 语义 1 req/s，条数一多会拖很久）
     const budget = Math.max(1, Math.min(FIND_MAX_CLAIMS, Number(req.remoteClaimBudget) || FIND_REMOTE_CLAIM_BUDGET));
     const webOk = await webSearchGateOk();
-    // 召回源：OpenAlex（关键词 + 语义）与 Semantic Scholar 常开——语义检索只作为 agent 工具
-    // 存在，没有用户侧供应商开关；学术网页仍受开关 + 出境告知双重门控
+    // 召回源：OpenAlex（关键词 + 语义）、Semantic Scholar 与 Crossref 常开（Crossref 收录
+    // 最新登记文献最及时；语义检索只作为 agent 工具存在，没有用户侧供应商开关）；
+    // 学术网页仍受开关 + 出境告知双重门控
     const providers = {
       openalexKeyword: true,
       openalexSemantic: true,
       semanticscholar: true,
+      crossref: true,
       web: webOk
     };
     const findEmbedTarget = await ctx.embedService.resolveTarget();
@@ -959,6 +997,7 @@ function register() {
         localVector: vectorReady,
         openalex: providers.openalexKeyword,
         semanticscholar: providers.semanticscholar,
+        crossref: providers.crossref,
         web: webOk
       },
       remoteClaimsCovered: Math.min(budget, claims.length),
@@ -1113,11 +1152,23 @@ function register() {
         origin = 'openalex';
       }
     }
+    if (!row && doi && ctx.researchNet && typeof ctx.researchNet.fetchCrossrefWork === 'function') {
+      // DOI 刚登记、OpenAlex 尚未索引：Crossref 直查兜底（与检索渠道同款双源纪律——
+      // 精确解析不得只依赖 OpenAlex）。失败不阻断，走未命中路径如实回报。
+      try {
+        const fromCrossref = await ctx.researchNet.fetchCrossrefWork(doi);
+        if (fromCrossref) {
+          const claimed = ingestCandidates([fromCrossref])[0];
+          if (claimed) row = ctx.researchDb.getWorks([claimed.workId])[0] || null;
+          if (row) origin = 'crossref';
+        }
+      } catch (error) { /* Crossref 不可达/查无：继续走标题与未命中路径 */ }
+    }
     if (!row) {
       const byTitle = ctx.researchDb.findIdByNormalizedTitle(raw);
       if (byTitle) row = ctx.researchDb.getWorks([byTitle])[0] || null;
     }
-    if (!row) return { found: false, note: '本地与 OpenAlex 均未精确命中；模糊/主题检索请改用 search_openalex 或 search_research' };
+    if (!row) return { found: false, note: '本地、OpenAlex 与 Crossref 均未精确命中；模糊/主题检索请改用 search_papers 或 search_research' };
     return {
       found: true,
       origin: origin,

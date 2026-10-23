@@ -92,6 +92,60 @@ test('throttle queue：并发上限、最小分发间隔、429 重试后成功�
   }
 });
 
+test('配额级 429（Retry-After > 120s，OpenAlex 匿名池每日额度耗尽实测 7 万秒级）：立即失败不重试、主机短期熔断快速失败、其他主机不受影响', async function () {
+  const clock = fakeClock();
+  let calls = 0;
+  const q = createThrottleQueue(async function (url) {
+    calls++;
+    if (url.indexOf('api.other.org') !== -1) return jsonResponse({ ok: true });
+    return {
+      ok: false, status: 429,
+      headers: { get: function (k) { return k === 'retry-after' ? '75538' : null; } },
+      json: async function () { return {}; }
+    };
+  }, { sleep: clock.sleep, now: clock.now });
+  // ① 首发即失败：配额耗尽重试无意义（不烧满 3 次尝试），错误带重置时间与 status
+  await assert.rejects(function () { return q.requestJson('https://api.openalex.org/works'); }, function (err) {
+    assert.equal(err.status, 429);
+    assert.equal(err.retryAfterSeconds, 75538);
+    assert.ok(err.message.indexOf('约 21 小时后重置') !== -1);
+    return true;
+  });
+  assert.equal(calls, 1, '配额级 429 只发一次请求');
+  // ② 熔断期内：同主机快速失败（不发请求），别的日子（30 分钟上限后）重新探针
+  await assert.rejects(function () { return q.requestJson('https://api.openalex.org/works?x=2'); }, /配额已耗尽/);
+  assert.equal(calls, 1, '熔断期内不得再发请求');
+  clock.advance(31 * 60 * 1000);
+  await assert.rejects(function () { return q.requestJson('https://api.openalex.org/works?x=3'); }, /配额已耗尽/);
+  assert.equal(calls, 2, '熔断到期后允许再探一次');
+  // ③ 其他主机不受熔断牵连
+  const other = await q.requestJson('https://api.other.org/works');
+  assert.deepEqual(other, { ok: true });
+});
+
+test('OpenAlex 配额 429 → 报错带行动指引（申请免费 Key），status 保留供连接测试分类', async function () {
+  const net = createResearchNet({
+    fetch: async function () {
+      return {
+        ok: false, status: 429,
+        headers: { get: function (k) { return k === 'retry-after' ? '75538' : null; } },
+        json: async function () { return {}; }
+      };
+    },
+    sleep: async function () {},
+    getConfig: async function () { return {}; }
+  });
+  await assert.rejects(function () { return net.searchOpenAlex({ query: 'q' }); }, function (err) {
+    assert.equal(err.status, 429, 'status 保留：classifyTestError 依赖它判 rate_limited');
+    assert.ok(err.message.indexOf('openalex.org/settings/api') !== -1, '要给出申请免费 Key 的入口');
+    assert.ok(err.message.indexOf('个人每日配额') !== -1, '要说明 Key 解决的是共享 IP 配额');
+    assert.ok(err.message.indexOf('21') !== -1, '要带重置时间');
+    return true;
+  });
+  // fetchWorksByDois（补登记/Scopus 归并链）同样走指引化报错
+  await assert.rejects(function () { return net.fetchWorksByDois(['10.1234/a']); }, /免费额度已用尽/);
+});
+
 test('OpenAlex 请求层：search 构造 polite-pool URL 并归一化结果；fetchWorksByIds 按 100 分批且去重', async function () {
   {
     let seenUrl = '';
@@ -420,6 +474,91 @@ test('R16: Semantic Scholar 检索带 fields/x-api-key、解析 total/next 并�
   const unknown = LitResearch.normalizeSemanticScholarPaper({ paperId: 'p2', title: 'X', publicationTypes: ['SomethingNew'] });
   assert.equal(unknown.type, '', '认识不了的类型留空而非硬塞 article');
   assert.equal(LitResearch.normalizeSemanticScholarPaper(null).title, '');
+});
+
+test('searchCrossref：query.bibliographic + rows/offset + mailto 礼貌池 + from/until-pub-date 年份过滤，envelope 归一化（无标题条目过滤、hasMore 按 total 判定）', async function () {
+  const seen = [];
+  const net = createResearchNet({
+    fetch: async function (url) {
+      seen.push(url);
+      return jsonResponse({
+        status: 'ok',
+        'message-type': 'work-list',
+        message: {
+          'total-results': 57,
+          'items-per-page': 15,
+          items: [
+            {
+              DOI: '10.1038/s41586-026-9999-x',
+              title: ['Newest finding'],
+              'container-title': ['Nature'],
+              type: 'journal-article',
+              issued: { 'date-parts': [[2026, 10, 1]] },
+              abstract: '<jats:p>Hot off the press</jats:p>',
+              'is-referenced-by-count': 0,
+              author: [{ given: 'A', family: 'B' }]
+            },
+            { DOI: '10.1/x' }, // 无标题：过滤掉，不进结果
+            { title: '' },
+            // 同行评审记录（eLife 型噪声）：检索侧剔除
+            { DOI: '10.7554/rev.1', title: ['Review for "Some paper"'], type: 'peer-review' },
+            { DOI: '10.7554/comp.1', title: ['Figure S1'], type: 'component' }
+          ]
+        }
+      });
+    },
+    sleep: async function () {},
+    getConfig: async function () { return { openalexEmail: 'a@b.c' }; }
+  });
+  const r = await net.searchCrossref({ query: 'zinc battery', limit: 15, offset: 15, yearFrom: 2024, yearTo: 2026 });
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0].indexOf('query.bibliographic=zinc+battery') !== -1, 'query.bibliographic 传检索词');
+  assert.ok(seen[0].indexOf('rows=15') !== -1);
+  assert.ok(seen[0].indexOf('offset=15') !== -1);
+  assert.ok(seen[0].indexOf('mailto=a%40b.c') !== -1, '邮箱共用 openalexEmail 配置进 polite pool');
+  assert.ok(seen[0].indexOf('filter=from-pub-date%3A2024-01-01%2Cuntil-pub-date%3A2026-12-31') !== -1,
+    '年份过滤走 from-pub-date / until-pub-date');
+  assert.ok(!/sort=/.test(seen[0]), 'sort 与 query 不兼容，不得携带');
+  assert.equal(r.count, 57);
+  assert.equal(r.hasMore, true, '15 + 2 < 57');
+  assert.equal(r.results.length, 1, '无标题条目与 peer-review/component 噪声均被过滤');
+  assert.ok(!r.results.some(function (w) { return w.title.indexOf('Review for') !== -1; }));
+  assert.equal(r.results[0].doi, '10.1038/s41586-026-9999-x');
+  assert.equal(r.results[0].title, 'Newest finding');
+  assert.equal(r.results[0].sourceName, 'Nature');
+  assert.equal(r.results[0].abstract, 'Hot off the press');
+  assert.equal(r.results[0].authors[0].name, 'A B');
+  // 首页不带 offset；空检索词直接报错不发请求
+  const seen0 = seen.length;
+  await net.searchCrossref({ query: 'again' });
+  assert.ok(seen[1].indexOf('offset=') === -1, '首页不传 offset');
+  await assert.rejects(function () { return net.searchCrossref({ query: '  ' }); }, /检索词为空/);
+  assert.equal(seen.length, seen0 + 1, '空检索词不得发请求');
+});
+
+test('fetchCrossrefWork：DOI 直查归一化（mailto 礼貌池；无标题的畸形记录返回 null）', async function () {
+  const seen = [];
+  const net = createResearchNet({
+    fetch: async function (url) {
+      seen.push(url);
+      return jsonResponse({ message: { DOI: '10.1/x', title: ['Direct Hit'], issued: { 'date-parts': [[2026]] }, type: 'journal-article' } });
+    },
+    sleep: async function () {},
+    getConfig: async function () { return { openalexEmail: 'a@b.c' }; }
+  });
+  const row = await net.fetchCrossrefWork('10.1/x');
+  assert.equal(row.title, 'Direct Hit');
+  assert.equal(row.type, 'article');
+  assert.equal(row.year, 2026);
+  assert.ok(seen[0].indexOf('api.crossref.org/works/10.1%2Fx') !== -1);
+  assert.ok(seen[0].indexOf('mailto=a%40b.c') !== -1);
+  // 无标题：null（畸形记录不进库）
+  const net2 = createResearchNet({
+    fetch: async function () { return jsonResponse({ message: { DOI: '10.1/y' } }); },
+    sleep: async function () {},
+    getConfig: async function () { return {}; }
+  });
+  assert.equal(await net2.fetchCrossrefWork('10.1/y'), null);
 });
 
 /* ---------------- 连接测试探针（设置页「测试全部服务」） ----------------
