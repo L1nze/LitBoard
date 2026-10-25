@@ -962,7 +962,7 @@
     "取消上传": "Cancel upload",
     " · 附件登记 ": " · registered attachments ",
     " / 云端实有 ": " / objects on cloud ",
-    " 个附件云端缺失（需在有原文件的设备上点「立即同步」补传）": " attachments are missing on the cloud (run “Sync now” on a device that has the original files)",
+    " 个附件云端缺失（需在有原文件的设备上用「以本机为准整理云端」补传）": " attachments are missing on the cloud (use “Reconcile cloud from this device” on a device that has the original files)",
     " 个云端对象未被词条引用": " cloud objects are not referenced by any entry",
     "已取消首次上传：云端未做任何修改": "First upload cancelled; the cloud was not modified",
     "同步已因限流暂停": "Sync paused due to rate limiting",

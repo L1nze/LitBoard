@@ -15,7 +15,7 @@ const LitEmbedCfg = require('../js/embedcfg.js');
 const LitAgentCfg = require('../js/agentcfg.js');
 const { itemAttachmentDir } = require('./item-storage.js');
 const { availablePdfPath } = require('./pdfdownload.js');
-const { createRequestPacer, loadPacingValue } = require('./webdav-pacer.js');
+const { createRequestPacer, loadPacingValue, PACING_PROFILES } = require('./webdav-pacer.js');
 
 /** 快照入口解析：目录 → 内部 index.html / 首个 .html；文件 → 原样返回（Zotero 快照是目录型附件，F12） */
 async function resolveSnapshotEntry(filePath) {
@@ -221,8 +221,11 @@ function createIntegrations(options) {
   const configuredTimeout = Number(options.requestTimeoutMs);
   const REQUEST_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 30000;
   // 同步会话期间非空的节流器：所有 WebDAV 请求经它排队（坚果云 30 分钟窗口预算），
-  // 并在响应 429 时记下暂停时刻。仅在 runSyncTask 串行保护的同步会话内赋值。
+  // 并在响应 429/503（限流形态）时记下暂停时刻。仅在 runSyncTask 串行保护的同步会话内赋值。
   let activePacer = null;
+  // 只读路径（查看云端/对比，不经节流器）撞限流后的进程内记忆：恢复时刻前的
+  // 后续只读调用在入口直接拒绝，不再拿注定 503 的请求去撞共享额度。
+  let readerRateLimitedUntil = 0;
   const dispatchRequest = async function (url, init) {
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
     const sync = syncContext.getStore();
@@ -284,17 +287,80 @@ function createIntegrations(options) {
     }
     return response;
   };
+  /* 限流响应统一在 request 层定性（所有 WebDAV 请求的必经点）：
+   *  - 429 恒为限流；
+   *  - 503 需读正文确认——坚果云限流正文含「Too Many Requests」(BlockedTemporarily)，
+   *    维护期的 503 不是限流。响应体只能读一次，读出后把 text 重绑到缓存值，
+   *    不破坏调用方后续读取。 */
+  async function rateLimitResponseInfo(response) {
+    if (!response || (response.status !== 429 && response.status !== 503)) return null;
+    if (response.status === 503) {
+      let body = '';
+      try { body = await response.text(); } catch (error) {}
+      if (body) { try { response.text = function () { return Promise.resolve(body); }; } catch (error) {} }
+      if (!NUTSTORE_RATE_LIMIT_BODY.test(body)) return null;
+    }
+    const retryAfter = response.headers && response.headers.get
+      ? String(response.headers.get('retry-after') || '').trim() : '';
+    const hintMs = Math.max(0, Number(retryAfter) || 0) * 1000;
+    return {
+      status: response.status,
+      retryAfter: retryAfter,
+      // 无 Retry-After 时按 30 分钟窗口估恢复时刻（宁等勿撞：撞墙会延长封禁）
+      resumeAt: Date.now() + (hintMs > 0 ? hintMs + 2000 : 30 * 60 * 1000),
+      error: new WebDavRateLimitError(response, response.status)
+    };
+  }
+
   const request = async function (url, init) {
     if (activePacer) await activePacer.acquire();
     const response = await dispatchRequest(url, init);
-    if (activePacer && response && response.status === 429) {
-      // 交由节流器记账（消费 Retry-After、持久化恢复时刻）并转为暂停；
-      // 未启用节流的调用方仍由各请求点的 throwIfWebDavRateLimited 兜底。
-      const retryAfter = response.headers && response.headers.get ? String(response.headers.get('retry-after') || '').trim() : '';
-      throw activePacer.noteRateLimited(retryAfter);
+    const limited = await rateLimitResponseInfo(response);
+    if (!limited) return response;
+    if (activePacer) {
+      // 会话内交由节流器记账（消费 Retry-After、持久化恢复时刻）并转为软暂停。
+      throw activePacer.noteRateLimited(limited.retryAfter, '服务端 ' + limited.status);
     }
-    return response;
+    // 未启用节流的只读路径（查看云端/对比）：记住恢复时刻（后续调用入口快速
+    // 失败）并直接抛——调用方原有的 WEBDAV_RATE_LIMITED 重抛链路全部兼容。
+    readerRateLimitedUntil = Math.max(readerRateLimitedUntil, limited.resumeAt);
+    throw limited.error;
   };
+
+  /** 只读路径（inspectNutstoreRemote / createNutstoreSyncPlan）入口守卫：本进程
+   *  或台账（节流器持久化）记录的限流恢复时刻未到时直接拒绝——坚果云窗口额度
+   *  是全账号共享的，恢复前发请求只会再吃 503 并可能延长封禁。 */
+  async function assertReaderNotRateLimited(remoteOptions) {
+    let resumeAt = readerRateLimitedUntil;
+    try {
+      const ledger = await loadAssetLedger(remoteOptions);
+      const saved = Number(ledger && ledger.pacing && ledger.pacing.resumeAt) || 0;
+      if (saved > resumeAt) resumeAt = saved;
+    } catch (error) {}
+    if (!(resumeAt > Date.now())) return;
+    const error = new Error('坚果云 WebDAV 已触发访问频率限制（503 Too Many Requests）：' +
+      new Date(resumeAt).toLocaleTimeString() + ' 前的云端读取会被坚果云拒绝（30 分钟窗口限流，多设备共享额度），请稍后再试');
+    error.name = 'WebDavRateLimitError';
+    error.code = 'WEBDAV_RATE_LIMITED';
+    error.resumeAt = resumeAt;
+    throw error;
+  }
+
+  /* 无节流器的只读列举（查看云端对账扫描）防连发：坚果云对密集 PROPFIND 的突发
+   *  保护会直接 503 封禁。间隔取档位间隔与 1.1s 的较小者——对账扫描不该分钟级
+   *  膨胀，窗口级额度由 503 识别 + 入口快速失败兜底。测试可注入更小间隔。 */
+  const READER_LISTING_MAX_INTERVAL_MS = 1100;
+  let readerListingLastAt = 0;
+  const injectedListingIntervalMs = Number(options.readerListingIntervalMs);
+  async function spaceReaderListing(remoteOptions) {
+    const interval = Number.isFinite(injectedListingIntervalMs) && injectedListingIntervalMs >= 0
+      ? injectedListingIntervalMs
+      : Math.min(PACING_PROFILES[remoteOptions && remoteOptions.pacing === 'pro' ? 'pro' : 'free'].minIntervalMs,
+          READER_LISTING_MAX_INTERVAL_MS);
+    const waitMs = readerListingLastAt + interval - Date.now();
+    if (waitMs > 0) await new Promise(function (resolve) { setTimeout(resolve, waitMs); });
+    readerListingLastAt = Date.now();
+  }
   const safeStorage = options.safeStorage;
   // AI 助手接口协议（与 js/agentproto.js 的 DIALECTS 对应；空串 = 自动判定）
   const AGENT_DIALECTS = ['chat', 'responses', 'messages'];
@@ -867,20 +933,28 @@ function createIntegrations(options) {
     }
   }
 
+  /* 坚果云限流的真实形态：HTTP 503 + 正文「Too Many Requests」(BlockedTemporarily)，
+   * 官方从不用 429 表达 30 分钟窗口限流（免费版 600 次、专业版 1500 次）。
+   * 只认 429 会把限流误报成「坚果云读取失败（503）」这类无法行动的死错。 */
+  const NUTSTORE_RATE_LIMIT_BODY = /too\s*many\s*requests|blocked\s*temporarily/i;
+
   class WebDavRateLimitError extends Error {
-    constructor(response) {
+    constructor(response, statusHint) {
       const retryAfter = response && response.headers && response.headers.get
         ? String(response.headers.get('retry-after') || '').trim() : '';
-      super('坚果云 WebDAV 已触发访问频率限制，请暂停同步并在 30 分钟额度窗口恢复后重试' +
-        (retryAfter ? '（服务器建议等待 ' + retryAfter + ' 秒）' : ''));
+      const status = Number(statusHint) || (response && response.status) || 503;
+      super('坚果云 WebDAV 已触发访问频率限制（HTTP ' + status + ' Too Many Requests）：' +
+        '坚果云按 30 分钟窗口限流（免费版 600 次、专业版 1500 次，多设备/多应用共享额度），' +
+        '请等待窗口恢复后重试' + (retryAfter ? '（服务器建议等待 ' + retryAfter + ' 秒）' : '（约 30 分钟）'));
       this.name = 'WebDavRateLimitError';
       this.code = 'WEBDAV_RATE_LIMITED';
+      this.status = status;
       this.retryAfter = retryAfter;
     }
   }
 
   function throwIfWebDavRateLimited(response) {
-    if (response && response.status === 429) throw new WebDavRateLimitError(response);
+    if (response && response.status === 429) throw new WebDavRateLimitError(response, 429);
   }
 
   async function conditionalPut(url, body, headers, etag, options) {
@@ -929,7 +1003,11 @@ function createIntegrations(options) {
       result.pathConflict = true;
       return result;
     }
-    if (!response.ok) throw new Error('坚果云配置读取失败（' + response.status + '）');
+    if (!response.ok) {
+      throw new Error(response.status === 503
+        ? '坚果云配置读取失败（503）：服务暂时不可用（维护或访问受限），请稍后重试'
+        : '坚果云配置读取失败（' + response.status + '）');
+    }
     result.exists = true;
     const text = await response.text();
     if (!password) {
@@ -1419,6 +1497,80 @@ function createIntegrations(options) {
     return names;
   }
 
+  function comparableAssets(entity, collection) {
+    if (!entity) return null;
+    if (collection === 'papers') return {
+      attachments: Array.isArray(entity.attachments) ? entity.attachments : [],
+      snapshots: (Array.isArray(entity.pdfAnnotations) ? entity.pdfAnnotations : []).filter(function (item) {
+        return item && item.type === 'snapshot';
+      })
+    };
+    if (collection === 'notes') return Array.isArray(entity.assets) ? entity.assets : [];
+    return null;
+  }
+
+  function sameAssetMetadata(left, right) {
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  function scopedAssetWorkspace(workspace, scope) {
+    if (!scope) return workspace;
+    return {
+      papers: (workspace && workspace.papers || []).filter(function (paper) {
+        return paper && scope.has('papers:' + paper.id);
+      }),
+      notes: (workspace && workspace.notes || []).filter(function (note) {
+        return note && scope.has('notes:' + note.id);
+      })
+    };
+  }
+
+  async function hasLocalAssetDrift(paper) {
+    for (const asset of Array.isArray(paper.attachments) ? paper.attachments : []) {
+      if (!asset) continue;
+      if (asset.kind === 'snapshot') return true;
+      const localPath = String(asset.path || '');
+      if (!localPath) continue;
+      try {
+        const stat = await fs.stat(localPath);
+        if (!stat.isFile() || !assetSignatureUnchanged(asset,
+          assetLocalSignature(stat, asset.cloudHash), safeCloudName(asset.cloudName), null, stat.size)) return true;
+      } catch (error) { return true; }
+    }
+    for (const asset of Array.isArray(paper.pdfAnnotations) ? paper.pdfAnnotations : []) {
+      if (!asset || asset.type !== 'snapshot' || !asset.imagePath) continue;
+      try {
+        const stat = await fs.stat(asset.imagePath);
+        if (!stat.isFile() || !assetSignatureUnchanged(asset,
+          assetLocalSignature(stat, asset.cloudHash), safeCloudName(asset.cloudName), null, stat.size)) return true;
+      } catch (error) { return true; }
+    }
+    return false;
+  }
+
+  async function buildAssetSyncScope(corePlan, workspace) {
+    if (!corePlan || !corePlan.baseProvided || corePlan.mode === 'restore') return null;
+    const scope = new Set();
+    for (const entry of corePlan.entities || []) {
+      const collection = entry && entry.collection;
+      if (collection !== 'papers' && collection !== 'notes') continue;
+      const list = Array.isArray(workspace && workspace[collection]) ? workspace[collection] : [];
+      const entity = list.find(function (item) { return item && String(item.id) === String(entry.id); });
+      if (!entity || entity.deletedAt) continue;
+      const assets = comparableAssets(entity, collection);
+      const hasAssets = collection === 'papers'
+        ? assets.attachments.length + assets.snapshots.length > 0
+        : assets.length > 0;
+      if (!hasAssets) continue;
+      const key = collection + ':' + entry.id;
+      const localAssets = comparableAssets(entry.cloudLocal, collection);
+      const remoteAssets = comparableAssets(entry.cloudRemote, collection);
+      if (!sameAssetMetadata(localAssets, remoteAssets) ||
+          collection === 'notes' || await hasLocalAssetDrift(entity)) scope.add(key);
+    }
+    return scope;
+  }
+
   function xmlText(value) {
     return String(value || '')
       .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
@@ -1487,6 +1639,9 @@ function createIntegrations(options) {
     const folders = new Set();
     for (let page = 0; page < 40; page++) {
       const start = page * PROPFIND_PAGE_SIZE;
+      // 只读列举无节流器时防连发（坚果云突发保护会 503 封禁密集 PROPFIND）；
+      // 同步会话内由节流器统一排队，不重复间隔。
+      if (!activePacer) await spaceReaderListing(remoteOptions);
       const response = await request(folderUrl, {
         method: 'PROPFIND',
         headers: Object.assign({
@@ -1499,7 +1654,11 @@ function createIntegrations(options) {
       if (response.status === 404 || response.status === 409) return verifyListing && page > 0 ? null : { files: files, folders: folders };
       // 部分 WebDAV 服务不支持 PROPFIND；此时回退到库 JSON 登记名（见调用方）。
       if (response.status === 403 || response.status === 405 || response.status === 501) return null;
-      if (!response.ok) throw new Error('坚果云附件清单读取失败（' + response.status + '）');
+      if (!response.ok) {
+        throw new Error(response.status === 503
+          ? '坚果云附件清单读取失败（503）：服务暂时不可用（维护或访问受限），请稍后重试'
+          : '坚果云附件清单读取失败（' + response.status + '）');
+      }
       const pageBody = await response.text();
       const parsed = parsePropfindEntries(pageBody, remoteOptions.attachmentsUrl, verifyListing);
       if (parsed === null) return null;
@@ -1561,21 +1720,31 @@ function createIntegrations(options) {
     return walkRemoteAssets(remoteOptions, verifyListing, onProgress);
   }
 
+  async function probeRemoteAssetNames(names, remoteOptions, onProgress) {
+    const existing = new Set();
+    let checked = 0;
+    for (const name of Array.from(names).sort()) {
+      const response = await request(joinUrl(remoteOptions.attachmentsUrl, name), {
+        method: 'HEAD', headers: remoteOptions.headers
+      });
+      throwIfWebDavRateLimited(response);
+      if (response.status === 403 || response.status === 405 || response.status === 501) return null;
+      if (response.status === 200) existing.add(name);
+      else if (response.status !== 404) throw new Error('坚果云附件核验失败（' + response.status + '）');
+      checked++;
+      if (onProgress) onProgress({ folders: 0, files: checked });
+    }
+    return existing;
+  }
+
   /** 本会话的云端对象存在性证据。库 JSON 里的 cloudName 登记绝不能当存在性
-   *  证明使用（正是「假元数据自证已上传、永不重传」事故的根源）：只要两侧
-   *  出现任何登记名就做一次真实 PROPFIND。服务器不支持清单时退回登记名集合
-   *  （此时不做写前净化，见 sanitizeCloudAssets）。
-   *  onScan 在列举开始前回调一次；onProgress 每列完一个目录回调
-   *  （{ folders, files } 计数）——免费档限流 3.1s/请求，逐目录列举是分钟级
-   *  过程，静态文案期间 UI 与卡死无异。 */
-  async function resolveRemoteAssetNames(remoteWorkspace, localWorkspace, remoteOptions, onScan, onProgress) {
+   *  证明使用（正是「假元数据自证已上传、永不重传」事故的根源）：调用方按
+   *  差异范围传入工作区，范围内出现登记名才做真实 HEAD / PROPFIND。服务器
+   *  不支持清单时退回登记名集合（此时不做写前净化，见 sanitizeCloudAssets）。 */
+  async function resolveRemoteAssetNames(remoteWorkspace, localWorkspace, remoteOptions, onScan, onProgress, deltaScope) {
     const names = remoteAssetNames(remoteWorkspace);
     const localNames = remoteAssetNames(localWorkspace);
     if (!names.size && !localNames.size) return new Set();
-    if (onScan) onScan();
-    // 选择性下钻：同步只判定「登记名是否在云端」（去重上传 + 悬空登记剥离），
-    // 登记指向的目录（含多级前缀，如 snapshots/<id>/）全列，其余目录不列——
-    // 无登记对象的上传凭据由台账（assetLedgerProof）担保，重传同内容是幂等 PUT。
     const wantedFolders = new Set();
     const addFolderPrefixes = function (name) {
       const parts = String(name || '').split('/');
@@ -1583,7 +1752,24 @@ function createIntegrations(options) {
     };
     names.forEach(addFolderPrefixes);
     localNames.forEach(addFolderPrefixes);
-    const listed = await listRemoteAssetNames(remoteOptions, false, onProgress, wantedFolders.size ? wantedFolders : null);
+    let scanStarted = false;
+    const startScan = function () {
+      if (!scanStarted && onScan) onScan();
+      scanStarted = true;
+    };
+    if (deltaScope) {
+      const candidates = new Set(Array.from(names).concat(Array.from(localNames)));
+      if (candidates.size <= wantedFolders.size + 1) {
+        startScan();
+        const probed = await probeRemoteAssetNames(candidates, remoteOptions, onProgress);
+        if (probed !== null) return probed;
+      }
+    }
+    startScan();
+    // 完整核对不限制目录；差异核对只下钻登记指向的目录，根目录对象场景
+    // 传空集合也只列根目录，不把无关子树重新卷进来。
+    const folderFilter = deltaScope || wantedFolders.size ? wantedFolders : null;
+    const listed = await listRemoteAssetNames(remoteOptions, false, onProgress, folderFilter);
     return listed === null ? names : listed;
   }
 
@@ -1630,7 +1816,11 @@ function createIntegrations(options) {
       if (response.status === 409) result.pathConflict = true;
       return result;
     }
-    if (!response.ok) throw new Error('坚果云读取失败（' + response.status + '）');
+    if (!response.ok) {
+      throw new Error(response.status === 503
+        ? '坚果云读取失败（503）：服务暂时不可用（维护或访问受限），请稍后重试'
+        : '坚果云读取失败（' + response.status + '）');
+    }
     const remoteText = await response.text();
     let remote;
     try { remote = JSON.parse(remoteText); } catch (error) { throw new Error('坚果云同步文件不是有效 JSON'); }
@@ -2320,7 +2510,11 @@ function createIntegrations(options) {
     const papersList = Array.isArray(workspace && workspace.papers) ? workspace.papers : [];
     const notesList = Array.isArray(workspace && workspace.notes) ? workspace.notes : [];
     const skip = config.skip instanceof Set ? config.skip : null;
-    const skipped = function (kind, id) { return !!skip && skip.has(kind + ':' + id); };
+    const scope = config.scope instanceof Set ? config.scope : null;
+    const skipped = function (kind, id) {
+      const key = kind + ':' + id;
+      return !!skip && skip.has(key) || !!scope && !scope.has(key);
+    };
     // 进度：先数一遍待处理资产，再逐个上报 done/total
     let assetTotal = 0;
     const countPaper = function (paper) {
@@ -2402,40 +2596,41 @@ function createIntegrations(options) {
   }
 
   /** 云端写入前的附件元数据净化（对象先行不变式的写侧执行）：
-   *  verifiedNames（本会话上传/核实成功）∪ 真实远端清单之外的 cloudName 一律
-   *  剥离，云端库 JSON 不留下「词条声称有附件但对象不存在」的悬空登记。
+   *  本次 scope 内，verifiedNames（本会话上传/核实成功）∪ 真实远端清单之外的
+   *  cloudName 一律剥离；scope 外未核对登记原样保留，不把未扫描误判为不存在。
    *  绝不原地改动入参：先对原对象只读扫描判定剥离点，确有剥离才深拷贝后在
    *  拷贝上执行（同一判定、同一遍历序，剥离结果与拷贝后判定逐位一致）；
    *  零剥离的常见路径（健康同步的 finalLocal / 无悬空登记的 firstPass）直接
    *  返回原对象引用，省一次全库深克隆。knownRemoteAssets 为 null（服务器
    *  不支持清单）时不净化，维持旧语义。 */
-  function sanitizeCloudAssets(workspace, verifiedNames, knownRemoteAssets) {
+  function sanitizeCloudAssets(workspace, verifiedNames, knownRemoteAssets, scope) {
     if (!knownRemoteAssets) return { workspace: workspace, stripped: 0 };
     const verified = verifiedNames instanceof Set ? verifiedNames : new Set();
     const doomed = [];
-    const collect = function (asset) {
-      if (!asset) return;
+    const collect = function (asset, key) {
+      if (!asset || scope instanceof Set && !scope.has(key)) return;
       const name = safeCloudName(asset.cloudName);
       if (name && !cloudNameInSet(verified, name) && !cloudNameInSet(knownRemoteAssets, name)) doomed.push(asset);
     };
     const walk = function (value, visit) {
       (Array.isArray(value && value.papers) ? value.papers : []).forEach(function (paper) {
         if (!paper) return;
-        (Array.isArray(paper.attachments) ? paper.attachments : []).forEach(visit);
+        const key = 'papers:' + paper.id;
+        (Array.isArray(paper.attachments) ? paper.attachments : []).forEach(function (asset) { visit(asset, key); });
         (Array.isArray(paper.pdfAnnotations) ? paper.pdfAnnotations : []).forEach(function (annotation) {
-          if (annotation && annotation.type === 'snapshot') visit(annotation);
+          if (annotation && annotation.type === 'snapshot') visit(annotation, key);
         });
       });
       (Array.isArray(value && value.notes) ? value.notes : []).forEach(function (note) {
-        if (note) (Array.isArray(note.assets) ? note.assets : []).forEach(visit);
+        if (note) (Array.isArray(note.assets) ? note.assets : []).forEach(function (asset) { visit(asset, 'notes:' + note.id); });
       });
     };
     walk(workspace, collect);
     if (!doomed.length) return { workspace: workspace, stripped: 0 };
     const out = cloneJson(workspace);
     let stripped = 0;
-    walk(out, function (asset) {
-      if (!asset) return;
+    walk(out, function (asset, key) {
+      if (!asset || scope instanceof Set && !scope.has(key)) return;
       const name = safeCloudName(asset.cloudName);
       if (name && !cloudNameInSet(verified, name) && !cloudNameInSet(knownRemoteAssets, name)) {
         delete asset.cloudName;
@@ -2510,6 +2705,7 @@ function createIntegrations(options) {
 
   async function inspectNutstoreRemote(input) {
     const remoteOptions = await resolveNutstoreOptions(input);
+    await assertReaderNotRateLimited(remoteOptions);
     if (input && input.verifyAssets) remoteOptions.headers['Cache-Control'] = 'no-cache';
     const library = input && input._library ? input._library : await readRemoteLibrary(remoteOptions);
     const configPassword = remoteOptions.configPassword;
@@ -2547,7 +2743,15 @@ function createIntegrations(options) {
     if (!input || !input._skipAudit) {
       const claimed = new Set(assets.map(function (item) { return item.cloudName; }));
       let actual = null;
-      try { actual = await listRemoteAssetNames(remoteOptions, !!(input && input.verifyAssets)); } catch (error) {}
+      try {
+        actual = await listRemoteAssetNames(remoteOptions, !!(input && input.verifyAssets), function (scan) {
+          // 防连发间隔下大库对账是分钟级过程：进度必须透出，静态「正在只读检查云端…」与卡死无异
+          emitSyncProgress({ scope: 'inspect', message: '正在读取云端附件清单（已列 ' + scan.folders + ' 个目录 · ' + scan.files + ' 个文件）…' });
+        });
+      } catch (error) {
+        // 限流必须如实上抛：吞掉会让对账静默退化为「服务器不支持清单」，掩盖真问题
+        if (error && error.code === 'WEBDAV_RATE_LIMITED') throw error;
+      }
       if (actual) {
         assetCheck.existing = Array.from(names).filter(function (name) { return actual.has(name); }).length;
         assetCheck.missing = names.size - assetCheck.existing;
@@ -2606,6 +2810,7 @@ function createIntegrations(options) {
     const value = input && typeof input === 'object' ? input : {};
     if (value.mode === 'mirror') return runSyncTask(function () { return cloudMirror.create(value); });
     const remoteOptions = await resolveNutstoreOptions(value);
+    await assertReaderNotRateLimited(remoteOptions);
     // 计划流程随后会自行做真实 PROPFIND（resolveRemoteAssetNames），这里跳过
     // inspect 的对账扫描，避免一次会话列两遍附件清单。
     const inspected = await inspectNutstoreRemote(Object.assign({}, value, { _skipAudit: true }));
@@ -3019,13 +3224,15 @@ function createIntegrations(options) {
           throw new Error('坚果云路径冲突：请确认“' + plan._options.folderName + '”是文件夹而非普通文件');
         }
       }
-      const knownRemoteAssets = await resolveRemoteAssetNames(current.remote, workspace, plan._options, function () {
-        reportProgress('scan-assets', { message: '正在读取云端附件清单，避免重复上传…' });
-      }, function (scan) {
-        // 逐目录计数上报：分钟级列举期间界面必须看得见在动（2026-10 卡死投诉）
-        reportProgress('scan-assets', { message: '正在读取云端附件清单（已列 ' + scan.folders + ' 个目录 · ' + scan.files + ' 个文件）…' });
-      });
-      const firstPass = sanitizeCloudAssets(cloudWorkspace, null, knownRemoteAssets);
+      const assetScope = await buildAssetSyncScope(plan.corePlan, workspace);
+      const knownRemoteAssets = await resolveRemoteAssetNames(
+        scopedAssetWorkspace(current.remote, assetScope), scopedAssetWorkspace(workspace, assetScope), plan._options, function () {
+          reportProgress('scan-assets', { message: '正在读取云端附件清单，避免重复上传…' });
+        }, function (scan) {
+          // 逐目录计数上报：分钟级列举期间界面必须看得见在动（2026-10 卡死投诉）
+          reportProgress('scan-assets', { message: '正在读取云端附件清单（已列 ' + scan.folders + ' 个目录 · ' + scan.files + ' 个文件）…' });
+        }, assetScope instanceof Set);
+      const firstPass = sanitizeCloudAssets(cloudWorkspace, null, knownRemoteAssets, assetScope);
       const firstWrite = await writeCloudLibrary(plan._options, firstPass.workspace, current, function (phase, message) {
         reportProgress(phase, { message: message });
       }, session);
@@ -3034,6 +3241,7 @@ function createIntegrations(options) {
         // 附件失败不阻断文献库 JSON 写入：附件靠台账续传，先把文献元数据救回来
         strict: false,
         skip: pinSkipSet(pins),
+        scope: assetScope,
         remoteAssets: knownRemoteAssets,
         ledger: session.ledger,
         verifiedNames: session.verifiedNames,
@@ -3048,9 +3256,9 @@ function createIntegrations(options) {
       // firstPass 逐位相同，直接复用同一结果对象（省一次全库深克隆与整库重哈希）；
       // 有新上传/新核实的名字才重建。
       const finalPass = hasUnlistedVerifiedNames(session.verifiedNames, knownRemoteAssets)
-        ? sanitizeCloudAssets(cloudWorkspace, session.verifiedNames, knownRemoteAssets)
+        ? sanitizeCloudAssets(cloudWorkspace, session.verifiedNames, knownRemoteAssets, assetScope)
         : firstPass;
-      const finalLocal = sanitizeCloudAssets(workspace, session.verifiedNames, knownRemoteAssets);
+      const finalLocal = sanitizeCloudAssets(workspace, session.verifiedNames, knownRemoteAssets, assetScope);
       const finalWrite = await writeCloudLibrary(plan._options, finalPass.workspace, firstWrite.current, function (phase, message) {
         reportProgress(phase, { message: message });
       }, session);
@@ -3111,6 +3319,8 @@ function createIntegrations(options) {
           plan.massDropSuspected || plan.firstUploadSuspected || plan.collectionResetSuspected) {
         return { pendingPlan: plan, workspace: plan.workspace, conflicts: plan.conflicts, uploaded: false };
       }
+      const internalPlan = pendingSyncPlans.get(plan.planId);
+      const corePlan = internalPlan && internalPlan.corePlan;
       pendingSyncPlans.delete(plan.planId);
       if (!library.exists) {
         const folderStatus = await ensureWebDavFolder(remoteOptions.url, remoteOptions.folderName, remoteOptions.headers);
@@ -3128,13 +3338,15 @@ function createIntegrations(options) {
       pinsForPause = pins;
       const cloudWorkspace = LitSync.applyPinsToWorkspace(merged, pins);
       // 真实清单先行：firstWrite 之前就知道哪些登记是悬空的，写入云端的词条
-      // 从第一笔起就不带假元数据。
-      const knownRemoteAssets = await resolveRemoteAssetNames(remote, merged, remoteOptions, function () {
-        emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取云端附件清单，避免重复上传…' });
-      }, function (scan) {
-        emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取云端附件清单（已列 ' + scan.folders + ' 个目录 · ' + scan.files + ' 个文件）…' });
-      });
-      const firstPass = sanitizeCloudAssets(cloudWorkspace, null, knownRemoteAssets);
+      // 从第一笔起就不带假元数据；无附件差异时不列举。
+      const assetScope = await buildAssetSyncScope(corePlan, merged);
+      const knownRemoteAssets = await resolveRemoteAssetNames(
+        scopedAssetWorkspace(remote, assetScope), scopedAssetWorkspace(merged, assetScope), remoteOptions, function () {
+          emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取云端附件清单，避免重复上传…' });
+        }, function (scan) {
+          emitSyncProgress({ scope: 'sync', phase: 'scan-assets', message: '正在读取云端附件清单（已列 ' + scan.folders + ' 个目录 · ' + scan.files + ' 个文件）…' });
+        }, assetScope instanceof Set);
+      const firstPass = sanitizeCloudAssets(cloudWorkspace, null, knownRemoteAssets, assetScope);
       const firstWrite = await writeCloudLibrary(remoteOptions, firstPass.workspace, library, function (phase, message) {
         emitSyncProgress({ scope: 'sync', phase: phase, message: message });
       }, session);
@@ -3143,6 +3355,7 @@ function createIntegrations(options) {
         // 附件失败不阻断文献库 JSON 写入：附件靠台账续传，先把文献元数据救回来
         strict: false,
         skip: pinSkipSet(pins),
+        scope: assetScope,
         remoteAssets: knownRemoteAssets,
         ledger: session.ledger,
         verifiedNames: session.verifiedNames,
@@ -3162,9 +3375,9 @@ function createIntegrations(options) {
       // 本地应用用净化后的合并结果（保持 pins 的两侧分叉语义）。附件核对未引入
       // 清单外新核实的 cloudName 时复用 firstPass 的结果对象，免第二次全库深克隆。
       const finalPass = hasUnlistedVerifiedNames(session.verifiedNames, knownRemoteAssets)
-        ? sanitizeCloudAssets(cloudWorkspace, session.verifiedNames, knownRemoteAssets)
+        ? sanitizeCloudAssets(cloudWorkspace, session.verifiedNames, knownRemoteAssets, assetScope)
         : firstPass;
-      const finalLocal = sanitizeCloudAssets(merged, session.verifiedNames, knownRemoteAssets);
+      const finalLocal = sanitizeCloudAssets(merged, session.verifiedNames, knownRemoteAssets, assetScope);
       const finalWrite = await writeCloudLibrary(remoteOptions, finalPass.workspace, firstWrite.current, function (phase, message) {
         emitSyncProgress({ scope: 'sync', phase: phase, message: message });
       }, session);

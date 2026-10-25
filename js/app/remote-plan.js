@@ -761,6 +761,12 @@
         }
         return;
       }
+      // 「查看云端」对账扫描同样受防连发间隔约束（大库分钟级）：进度落到状态行，
+      // 静态「正在只读检查云端…」与卡死无异
+      if (payload.scope === 'inspect' && payload.message) {
+        setSyncInlineStatus('sync-remote-status', payload.message, 'pending');
+        return;
+      }
       // 后台自动同步：设置弹窗开着时把阶段信息透出到状态行；无论开不开都更新同步图标提示，
       // 用户关掉设置后靠顶栏图标确认「还在跑、跑到哪一步」
       if (payload.message && isSyncBusy()) {

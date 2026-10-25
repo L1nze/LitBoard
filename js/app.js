@@ -9915,7 +9915,7 @@
           // 待上传（本机有文件，限流窗口自动续传）/ 云端缺失（需在有原文件的设备上补传）/ 其他暂时失败
           var afParts = [];
           if (pendingUpload) afParts.push(pendingUpload + T(' 个附件待上传（限流窗口自动续传）'));
-          if (missingOnCloud) afParts.push(missingOnCloud + T(' 个附件云端缺失（需在有原文件的设备上点「立即同步」补传）'));
+          if (missingOnCloud) afParts.push(missingOnCloud + T(' 个附件云端缺失（需在有原文件的设备上用「以本机为准整理云端」补传）'));
           var otherFailures = assetFailures.length - pendingUpload - missingOnCloud;
           if (otherFailures > 0) afParts.push(otherFailures + T(' 个附件暂时失败（下次同步自动重试）'));
           var afMsg = T('文献库已同步；') + afParts.join(T('，'));

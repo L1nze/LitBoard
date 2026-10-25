@@ -112,10 +112,11 @@ function createRequestPacer(pacerOptions) {
     return result;
   }
 
-  /** 服务端 429：尊重 Retry-After；缺省按滚动窗口恢复时刻估算（宁等勿撞）。
-   *  正常路径下 429 响应来自一次已 acquire 的请求（state 必已就绪）；直接
-   *  调用时也保证 state 存在，暂停时刻不丢。 */
-  function noteRateLimited(retryAfterSeconds) {
+  /** 服务端限流响应（429，或坚果云实际形态 503 Too Many Requests）：尊重
+   *  Retry-After；缺省按滚动窗口恢复时刻估算（宁等勿撞）。
+   *  正常路径下限流响应来自一次已 acquire 的请求（state 必已就绪）；直接
+   *  调用时也保证 state 存在，暂停时刻不丢。reason 区分 429/503 便于文案定性。 */
+  function noteRateLimited(retryAfterSeconds, reason) {
     if (!state) state = loadPacingValue(null);
     const hintMs = Math.max(0, Number(retryAfterSeconds) || 0) * 1000;
     const fallback = state.requests.length
@@ -124,7 +125,7 @@ function createRequestPacer(pacerOptions) {
     state.resumeAt = Math.max(state.resumeAt || 0, resumeAt);
     if (state.resumeAt > now() + WINDOW_MS) state.requests = [];
     lastPersist = persist();
-    return pauseError('服务端 429', resumeAt);
+    return pauseError(reason || '服务端 429', resumeAt);
   }
 
   return {
@@ -141,4 +142,4 @@ function createRequestPacer(pacerOptions) {
   };
 }
 
-module.exports = { createRequestPacer, loadPacingValue, WINDOW_MS, TAIL_RESERVE };
+module.exports = { createRequestPacer, loadPacingValue, WINDOW_MS, TAIL_RESERVE, PACING_PROFILES };

@@ -34,6 +34,7 @@ function makeDavServer() {
     libraryPuts: 0,
     propfinds: 0,
     propfindPages: 0,
+    heads: [],
     failAttachmentPuts: 0,     // 前 N 次附件 PUT 返回 500
     rateLimitAttachmentPuts: 0, // 前 N 次附件 PUT 返回 429
     paged: true,               // PROPFIND 是否模拟坚果云 750/页
@@ -60,6 +61,10 @@ function makeDavServer() {
       return body !== undefined
         ? new Response(body, { status: 200, headers: { ETag: state.etags.get(url) || '"e1"' } })
         : new Response('', { status: 404 });
+    }
+    if (method === 'HEAD') {
+      state.heads.push(url.startsWith(attachmentsUrl + '/') ? url.slice(attachmentsUrl.length + 1) : url);
+      return new Response(null, { status: state.files.has(url) ? 200 : 404 });
     }
     if (method === 'PUT') {
       if (url === libraryUrl) { state.libraryPuts++; }
@@ -188,7 +193,7 @@ test('对象先行（既有悬空登记）：清单缺对象且重传失败时�
   assert.ok(!cloudAsset.cloudName, '真实清单缺对象 + 重传失败：悬空登记被剥离');
 });
 
-test('真实对账（A2 回归）：云端对象被外部删除后，下一轮同步重传', async function (t) {
+test('真实对账（A2 回归）：完整对账发现外部删除，本地差异同步负责重传', async function (t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-reupload-deleted-'));
   t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
   const dav = makeDavServer();
@@ -202,13 +207,14 @@ test('真实对账（A2 回归）：云端对象被外部删除后，下一轮�
   });
   assert.equal(first.assets.uploaded, 1);
   assert.equal(dav.state.attachmentPuts.length, 1);
-  // 稳态：再同步一次，不重传（清单里有）
   await integrations.nutstoreSync({ papers: first.workspace.papers, folders: [] });
   assert.equal(dav.state.attachmentPuts.length, 1, '对象在云端：不重复上传');
-  // 用户在云端直接删掉对象：下轮必须发现并重传（旧实现拿库 JSON 自证，永不重传）
   dav.state.deleteObject('p1.pdf');
-  const third = await integrations.nutstoreSync({ papers: first.workspace.papers, folders: [] });
-  assert.equal(third.assets.uploaded, 1, '对象被删：重新上传');
+  const inspected = await integrations.inspectNutstoreRemote({});
+  assert.deepEqual(inspected.audit.missing, ['p1.pdf'], '完整对账必须发现云端对象被外部删除');
+  await fs.writeFile(pdfPath, '%PDF-reupload-changed');
+  const repaired = await integrations.nutstoreSync({ papers: first.workspace.papers, folders: [] });
+  assert.equal(repaired.assets.uploaded, 1, '本地内容变化进入差异范围后重新上传');
   assert.equal(dav.state.attachmentPuts.length, 2);
 });
 
@@ -471,16 +477,22 @@ test('云端 JSON 自证捷径已废除：登记名不再跳过真实 PROPFIND',
  * mock 按 Depth:1 真实语义只返回一层子项（objects: [相对路径, 内容字节]）。 */
 
 function makeDepthOneDav(objects, libraryText) {
-  const state = { propfinds: [], progress: [] };
+  const state = { propfinds: [], heads: [], progress: [] };
   const rootUrl = 'https://dav.jianguoyun.com/dav/LitBoard/attachments';
   const libraryUrl = 'https://dav.jianguoyun.com/dav/LitBoard/litboard-library.json';
   const files = new Map();
+  state.files = files;
   objects.forEach(function (pair) { files.set(rootUrl + '/' + pair[0], pair[1]); });
   if (libraryText != null) files.set(libraryUrl, libraryText);
   const fetch = async function (url, init) {
     if (init.method === 'GET') {
       const body = files.get(url);
       return body !== undefined ? new Response(body, { status: 200, headers: { ETag: '"e1"' } }) : new Response('', { status: 404 });
+    }
+    if (init.method === 'HEAD') {
+      const name = url.startsWith(rootUrl + '/') ? url.slice(rootUrl.length + 1) : '';
+      state.heads.push(name);
+      return new Response(null, { status: files.has(url) ? 200 : 404 });
     }
     if (init.method === 'PUT') { files.set(url, init.body); return new Response('', { status: 201 }); }
     if (init.method === 'MKCOL') return new Response('', { status: 201 });
@@ -554,6 +566,94 @@ test('scan-assets 逐目录上报进度，且只下钻登记指向的目录（�
   assert.ok(scanEvents.some(function (p) { return /目录/.test(p.message || ''); }), '进度文案应带已列目录/文件计数');
   // 反馈环断言 2：只有登记指向的目录才下钻（root + p2 + snapshots + snapshots/p1）
   assert.deepEqual(dav.state.propfinds.sort(), ['', 'p2', 'snapshots', 'snapshots/p1']);
+});
+
+test('普通字段有差异时不重扫附件清单', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-metadata-only-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const pdf = Buffer.from('%PDF-metadata-only');
+  const pdfPath = path.join(dir, 'paper.pdf');
+  await fs.writeFile(pdfPath, pdf);
+  const dav = makeDepthOneDav([], null);
+  const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: dav.fetch });
+  await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
+  const first = await syncWithFirstUpload(integrations, {
+    papers: [{ id: 'p1', title: '旧标题', updatedAt: 1000, attachments: [{ id: 'a1', addedAt: 1000, kind: 'pdf', fileName: 'paper.pdf', path: pdfPath }] }],
+    folders: []
+  });
+  dav.state.propfinds.length = 0;
+  const local = JSON.parse(JSON.stringify(first.workspace));
+  local.papers[0].title = '新标题';
+  local.papers[0].updatedAt = 2000;
+  const plan = await integrations.createNutstoreSyncPlan({ workspace: local, mode: 'merge' });
+  const result = await integrations.applyNutstoreSyncPlan({ planId: plan.planId, resolutions: {} });
+  assert.deepEqual(dav.state.propfinds, [], '应用纯元数据对照时不应发附件 PROPFIND');
+  assert.equal(result.assets.uploaded, 0);
+  assert.equal(result.assets.downloaded, 0);
+});
+
+test('单个附件变化只 HEAD 目标对象，范围外登记不剥离', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-asset-delta-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const one = path.join(dir, 'one.pdf'), two = path.join(dir, 'two.pdf');
+  await fs.writeFile(one, '%PDF-one');
+  await fs.writeFile(two, '%PDF-two');
+  const dav = makeDepthOneDav([], null);
+  let headUnsupported = false;
+  const routedFetch = async function (url, init) {
+    if (headUnsupported && init.method === 'HEAD') return new Response(null, { status: 405 });
+    return dav.fetch(url, init);
+  };
+  const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: routedFetch });
+  await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
+  const first = await syncWithFirstUpload(integrations, { papers: [
+    { id: 'p1', title: 'T1', updatedAt: 1000, attachments: [{ id: 'a1', addedAt: 1000, kind: 'supp', fileName: 'one.pdf', path: one }] },
+    { id: 'p2', title: 'T2', updatedAt: 1000, attachments: [{ id: 'a2', addedAt: 1000, kind: 'supp', fileName: 'two.pdf', path: two }] }
+  ], folders: [] });
+  dav.state.propfinds.length = 0;
+  dav.state.heads.length = 0;
+  const local = JSON.parse(JSON.stringify(first.workspace));
+  local.papers[0].attachments[0].path = one;
+  local.papers[1].attachments[0].path = two;
+  await fs.writeFile(one, '%PDF-one-changed');
+  const result = await integrations.nutstoreSync(local);
+  assert.equal(result.assets.uploaded, 1, '只上传变化的附件');
+  assert.deepEqual(dav.state.heads, ['p1/a1.pdf'], '只核验变化对象，不查询范围外附件');
+  assert.deepEqual(dav.state.propfinds, [], '单个深层对象不应再逐级列目录');
+  const cloud = JSON.parse(dav.state.files.get('https://dav.jianguoyun.com/dav/LitBoard/litboard-library.json'));
+  assert.equal(cloud.papers.find(function (p) { return p.id === 'p2'; }).attachments[0].cloudName, 'p2/a2.pdf', '未扫描的 p2 登记必须保留');
+  if (result.syncToken) await integrations.confirmSyncApplied(result.syncToken);
+  headUnsupported = true;
+  await fs.writeFile(one, '%PDF-one-changed-again');
+  const fallback = await integrations.nutstoreSync(result.workspace);
+  assert.equal(fallback.assets.uploaded, 1);
+  assert.deepEqual(dav.state.propfinds, ['', 'p1'], 'HEAD 不受支持时回退选择性目录清单');
+});
+
+test('同批根目录附件变化按请求数选择一次目录清单', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-asset-batch-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const one = path.join(dir, 'one.pdf'), two = path.join(dir, 'two.pdf');
+  await fs.writeFile(one, '%PDF-one');
+  await fs.writeFile(two, '%PDF-two');
+  const dav = makeDepthOneDav([], null);
+  const integrations = createIntegrations({ baseDir: dir, homeDir: dir, safeStorage: makeSafeStorage(), fetch: dav.fetch });
+  await integrations.saveConfig({ nutstoreUser: 'u', nutstorePassword: 'p' });
+  const first = await syncWithFirstUpload(integrations, { papers: [
+    { id: 'p1', title: 'T1', updatedAt: 1000, attachments: [{ id: 'a1', addedAt: 1000, kind: 'pdf', fileName: 'one.pdf', path: one }] },
+    { id: 'p2', title: 'T2', updatedAt: 1000, attachments: [{ id: 'a2', addedAt: 1000, kind: 'pdf', fileName: 'two.pdf', path: two }] }
+  ], folders: [] });
+  dav.state.propfinds.length = 0;
+  dav.state.heads.length = 0;
+  const local = JSON.parse(JSON.stringify(first.workspace));
+  local.papers[0].attachments[0].path = one;
+  local.papers[1].attachments[0].path = two;
+  await fs.writeFile(one, '%PDF-one-changed');
+  await fs.writeFile(two, '%PDF-two-changed');
+  const result = await integrations.nutstoreSync(local);
+  assert.equal(result.assets.uploaded, 2);
+  assert.deepEqual(dav.state.heads, [], '两个 HEAD 比一次根目录清单更贵时不逐对象核验');
+  assert.deepEqual(dav.state.propfinds, ['']);
 });
 
 test('待确认同步计划上限：超额 FIFO 淘汰最旧，最新计划仍可正常应用', async function (t) {
