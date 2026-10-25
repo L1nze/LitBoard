@@ -27,14 +27,14 @@
     "release-checksums": "node scripts/release-checksums.js"
   },
   "devDependencies": {
-    "electron": "44.4.3",
+    "electron": "44.9.3",
     "electron-builder": "26.15.3",
     "eslint": "^10.10.0"
   },
   "build": {
     "appId": "com.litboard.desktop",
     "productName": "LitBoard",
-    "electronVersion": "44.4.3",
+    "electronVersion": "44.9.3",
     "asar": true,
     "npmRebuild": false,
     "directories": {
