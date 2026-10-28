@@ -468,6 +468,61 @@ test('nutstore sync skips the upload when the merged content is identical to rem
   assert.equal(putCount, 1);
 });
 
+/* 同一会话「首写 → 附件核对 → 终写」会产生两次库 PUT：终写覆盖的是本会话自己
+ * 刚写入（并核读）的内容，不该再往云端备份链 COPY 一份中间态——真正要保的
+ * 「覆盖前既有云端内容」首写时已经备份，本地 sync-history 每次读取也都有留档。
+ * 回归点：终写前的 backupCloudLibrary 必须被 session.backupsDone 挡下。 */
+test('one sync backs up the pre-existing cloud library once, not our own intermediate write', async function (t) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-sync-backup-'));
+  t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });
+  const localPdf = path.join(dir, 'local.pdf');
+  await fs.writeFile(localPdf, '%PDF-test-bytes');
+  // ETag 跟内容走：只有 PUT 之后才变（计划应用前会复核 etag，GET 不许改值）
+  let etag = '"v1"';
+  let remoteBody = JSON.stringify({ syncVersion: 4, papers: [{ id: 'p1', title: 'Same', updatedAt: 10 }], folders: [] });
+  const copyRequests = [];
+  const libraryPuts = [];
+  const integrations = createIntegrations({
+    baseDir: dir, homeDir: dir,
+    safeStorage: {
+      isEncryptionAvailable: function () { return true; },
+      encryptString: function (value) { return Buffer.from(value, 'utf8'); },
+      decryptString: function (value) { return value.toString('utf8'); }
+    },
+    fetch: async function (url, init) {
+      if (init.method === 'GET' && url.endsWith('litboard-library.json')) {
+        return new Response(remoteBody, { status: 200, headers: { ETag: etag } });
+      }
+      if (init.method === 'GET' && url.endsWith('litboard-config.enc')) return new Response('', { status: 404 });
+      if (init.method === 'PUT' && url.endsWith('litboard-config.enc')) return new Response('', { status: 201 });
+      if (init.method === 'PUT' && url.endsWith('litboard-library.json')) {
+        libraryPuts.push(init.body); remoteBody = init.body;
+        etag = '"v' + (libraryPuts.length + 1) + '"';
+        return new Response('', { status: 201, headers: { ETag: etag } });
+      }
+      if (init.method === 'COPY') { copyRequests.push(url); return new Response('', { status: 201 }); }
+      if (init.method === 'MKCOL') return new Response('', { status: 201 });
+      if (init.method === 'PROPFIND') return new Response('', { status: 404 }); // 备份清理看不见清单就不删
+      if (init.method === 'PUT' && url.includes('/attachments/')) return new Response('', { status: 201 });
+      throw new Error('Unexpected request ' + init.method + ' ' + url);
+    }
+  });
+  await integrations.saveConfig({ nutstoreUser: 'u@example.com', nutstorePassword: 'p', nutstoreFolder: 'LitBoard' });
+  // 标题两侧一致、本地仅多出附件且 updatedAt 较新：无字段冲突，直接进入写入流程
+  const workspace = {
+    papers: [{ id: 'p1', title: 'Same', updatedAt: 20,
+      attachments: [{ id: 'a1', kind: 'pdf', fileName: 'paper.pdf', path: localPdf }] }],
+    folders: []
+  };
+  const plan = await integrations.createNutstoreSyncPlan({ mode: 'merge', workspace: workspace });
+  assert.equal(plan.conflicts.length, 0);
+  const result = await integrations.applyNutstoreSyncPlan({ planId: plan.planId, resolutions: {}, workspace: workspace });
+  assert.equal(result.uploaded, true);
+  assert.equal(result.assets.uploaded, 1, '附件 a1 首传');
+  assert.equal(libraryPuts.length, 2, '首写 + 终写（附件核对为 a1 补上 cloudName）');
+  assert.equal(copyRequests.length, 1, '只备份覆盖前的既有云端内容一次；终写不再 COPY 自己的中间态');
+});
+
 test('sync rejects a successful PUT when the remote library did not persist the payload', async function (t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'litboard-sync-write-verify-'));
   t.after(function () { return fs.rm(dir, { recursive: true, force: true }); });

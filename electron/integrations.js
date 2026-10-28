@@ -1987,6 +1987,14 @@ function createIntegrations(options) {
         conditional: baseline.exists, createOnly: !baseline.exists });
     reportProgress('verify-write', '正在确认云端写入结果…');
     const verified = await verifyRemoteLibraryWrite(remoteOptions, workspace);
+    if (session) {
+      // 本次会话自己刚写入（并已核读）的内容登记为「已备份」：同一会话的终写
+      // （首写→附件核对→终写是既有顺序）再覆盖它时，不必再 COPY 一份进云端
+      // 备份链——真正要保的「覆盖前既有云端内容」首写时已经备份，中间态内容
+      // 本地 sync-history 每次读取也都有留档。省一次 MKCOL+COPY（免费档 2 个
+      // 请求额度 + 数秒间隔等待）。
+      session.backupsDone.add(hashWorkspace(workspace));
+    }
     return { current: verified, uploaded: true };
   }
 

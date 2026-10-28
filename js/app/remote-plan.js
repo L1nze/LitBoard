@@ -173,6 +173,9 @@
           remotePlanModel.resolvedKeys.delete(key);
         }
         updateRemotePlanApplyButton();
+        // 摘要里的「已选 n/m」必须随单项选择实时变：不刷新的话行内 ✓ 已亮、
+        // 摘要还停在「已选 0/1」，用户无法确认自己的选择已登记（2026-10 截图反馈）
+        updateRemotePlanSummary();
       }
       var row = remotePlanModel.rowMap.get(key) || (typeof window !== 'undefined' && window.CSS && window.CSS.escape ? document.querySelector('[data-remote-conflict-key="' + window.CSS.escape(key) + '"]') : null);
       if (row) {
@@ -355,6 +358,14 @@
     }
 
     function renderRemotePlan(plan) {
+      // 后台同步在对照弹窗开着时带回新计划会整窗重渲：同键的既有决议必须沿用，
+      // 否则用户正在做的选择被悄悄清零（表现为「已选 0/1」、应用钮失效）。
+      // 安全断路器键（plan:*/mirror:*）不沿用——新计划的事实（数量/触发原因）
+      // 可能已变，必须对着新计划重新显式确认。
+      var SKIP_CARRY_KEYS = new Set([LOCAL_EMPTY_RESET_KEY, COLLECTION_RESET_KEY, MASS_DROP_RESET_KEY,
+        FIRST_UPLOAD_KEY, 'mirror:confirm', 'mirror:cleanup']);
+      var priorResolutions = pendingRemotePlan ? pendingRemoteResolutions : {};
+      var refreshingOpenPlan = !!(pendingRemotePlan && !$('#sync-remote-plan-mask').hidden);
       pendingRemotePlan = plan;
       pendingRemoteResolutions = {};
       remotePlanModel.items = [];
@@ -523,6 +534,16 @@
           remoteText: entity.title || entity.name || marker.id });
       });
 
+      var carriedChoices = 0;
+      remotePlanModel.items.forEach(function (item) {
+        if (SKIP_CARRY_KEYS.has(item.key)) return;
+        var prior = priorResolutions[item.key];
+        if (prior !== 'local' && prior !== 'remote') return;
+        pendingRemoteResolutions[item.key] = prior;
+        if (item.isRequired) remotePlanModel.resolvedKeys.add(item.key);
+        carriedChoices++;
+      });
+
       remotePlanModel.filteredItems = remotePlanModel.items;
 
       var filterInput = $('#sync-remote-plan-filter');
@@ -536,6 +557,9 @@
       updateRemotePlanSummary();
       updateRemotePlanApplyButton();
       updateRemotePlanBulkButtons();
+      if (refreshingOpenPlan && carriedChoices) {
+        toast(T('云端对照已刷新，已沿用此前的选择（') + carriedChoices + T(' 项）'));
+      }
       $('#sync-remote-plan-mask').hidden = false;
     }
 
@@ -777,6 +801,17 @@
       }
     }
 
+    /* 应用被前置守卫拦下时，原因必须留在对照弹窗里（进度区 + toast）：只写设置页
+     * 状态行等于把提示藏在遮罩下面，用户看到的就是「点了应用没反应」。
+     * 与镜像失败的处理同款（见对应测试：整理失败原因留在当前弹窗内，不藏在遮罩下）。 */
+    function rejectRemotePlanApply(message) {
+      setSyncInlineStatus('sync-remote-status', message, 'warning');
+      setRemotePlanProgress({ phase: 'error', message: message });
+      var progress = $('#sync-remote-plan-progress');
+      if (progress) progress.hidden = false;
+      toast('⚠ ' + message);
+    }
+
     function applyRemotePlan() {
       inspectionRevision++;
       if (!pendingRemotePlan || !desktop || !desktop.applyNutstoreSyncPlan) return;
@@ -792,11 +827,11 @@
       // 应用前快照守卫（全模式）：对照弹窗期间（生成→应用窗口）本地有过修改就阻断，
       // 必须重开对照——旧实现只护 mirror，merge/restore 会用旧快照覆盖同步期间的新修改
       if (planLocalSnapshot !== JSON.stringify(workspacePayload())) {
-        setSyncInlineStatus('sync-remote-status', T('本机文献库已变化，请重新预览整理计划'), 'warning');
+        rejectRemotePlanApply(T('本机文献库已变化，请重新预览整理计划'));
         return;
       }
       if (planMode === 'mirror' && pendingRemoteResolutions['mirror:confirm'] !== 'local') {
-        setSyncInlineStatus('sync-remote-status', T('请核对确认；本机内容变化后需重新预览整理计划'), 'warning');
+        rejectRemotePlanApply(T('请核对确认；本机内容变化后需重新预览整理计划'));
         return;
       }
       var button = $('#sync-remote-plan-apply'); button.disabled = true;

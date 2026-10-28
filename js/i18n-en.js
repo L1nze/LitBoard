@@ -1010,6 +1010,8 @@
     "正在校验云端版本…": "Verifying the cloud version…",
     "正在校验云端版本并应用…": "Verifying the cloud version and applying…",
     "同步对照已应用": "Sync comparison applied",
+    "云端对照已刷新，已沿用此前的选择（": "Cloud comparison refreshed; your earlier choices were kept (",
+    " 项）": " item(s))",
     "云端恢复完成": "Cloud restore finished",
     " 个附件失败，下次同步自动续传）": " attachment(s) failed; auto-resume next sync)",
     "本地数据库未加载成功，已阻止同步：请重启应用或检查数据目录，避免把空库传到云端": "The local database did not load; sync blocked. Restart the app or check the data directory to avoid uploading an empty library to the cloud",

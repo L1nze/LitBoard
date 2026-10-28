@@ -453,3 +453,83 @@ test('应用守卫：对照弹窗期间本机有新修改，merge 模式也必�
   });
   assert.ok(blocked, '状态行明确要求重开对照');
 });
+
+/* ---------- 拦截原因必须留在弹窗里（2026-10「点了应用没反应」反馈） ---------- */
+
+test('应用守卫：拦截原因进弹窗进度区 + toast，不藏在遮罩下的设置页状态行', async () => {
+  let payload = { papers: [{ id: 'p1', title: '计划时刻' }] };
+  const h = makeHarness(null, null, { workspacePayload: function () { return payload; } });
+  h.els['#sync-remote-merge'].click();
+  await flush();
+  payload = { papers: [{ id: 'p1', title: '用户刚改的' }] };
+  h.els['#sync-remote-choose-local'].click();
+  h.els['#sync-remote-plan-apply'].click();
+  await flush();
+  assert.strictEqual(h.calls.applied, null);
+  assert.strictEqual(h.els['#sync-remote-plan-mask'].hidden, false, '弹窗保持打开');
+  assert.strictEqual(h.els['#sync-remote-plan-progress'].hidden, false, '拦截原因显示在弹窗进度区');
+  assert.match(h.els['#sync-remote-plan-progress-text'].textContent, /本机文献库已变化/);
+  assert.strictEqual(h.els['#sync-remote-plan-progress-bar'].hidden, true, '被拦下不是进行中的进度条');
+  assert.ok(h.calls.toasts.some(function (s) { return s.indexOf('本机文献库已变化') !== -1; }), '同时给 toast');
+  assert.strictEqual(h.els['#sync-remote-plan-apply'].disabled, false, '应用钮未被误锁，重开对照后可再点');
+});
+
+/* ---------- 单项选择的摘要实时刷新（截图反馈：行内 ✓ 已亮、摘要仍停在已选 0/1） ---------- */
+
+function clickRowChoice(h, key, choice) {
+  const row = { dataset: { remoteConflictKey: key } };
+  const btn = {
+    dataset: { remoteChoice: choice },
+    closest: function (selector) { return selector === '[data-remote-conflict-key]' ? row : this; }
+  };
+  h.els['#sync-remote-plan-list'].handlers.click[0].call(
+    h.els['#sync-remote-plan-list'], { target: btn });
+}
+
+test('对照：单项选择实时刷新摘要计数，决议齐后应用钮才亮', async () => {
+  const h = makeHarness();
+  h.els['#sync-remote-merge'].click();
+  await flush();
+  const keys = h.api.stateForTest().model.items.map(function (item) { return item.key; });
+  clickRowChoice(h, keys[0], 'local');
+  assert.match(h.els['#sync-remote-plan-summary'].textContent, /已选 1\/2/, '单项选择后摘要立即更新');
+  assert.strictEqual(h.els['#sync-remote-plan-apply'].disabled, true, '还差一项，应用仍禁用');
+  clickRowChoice(h, keys[1], 'remote');
+  assert.match(h.els['#sync-remote-plan-summary'].textContent, /已选 2\/2/);
+  assert.strictEqual(h.els['#sync-remote-plan-apply'].disabled, false, '决议齐后应用可用');
+});
+
+/* ---------- 后台同步带回新计划：整窗重渲不吞掉用户已做的选择 ---------- */
+
+test('对照刷新：同键决议沿用并提示；安全断路器键必须对着新计划重新确认', async () => {
+  const h = makeHarness();
+  h.els['#sync-remote-merge'].click();
+  await flush();
+  const oldKeys = h.api.stateForTest().model.items.map(function (item) { return item.key; });
+  clickRowChoice(h, oldKeys[0], 'local');
+  clickRowChoice(h, oldKeys[1], 'remote');
+
+  // 后台同步在弹窗开着时带回新计划（同样的两条冲突 + 一个首传断路器）
+  h.api.show({
+    mode: 'merge', remoteCount: 5, remoteExists: false, firstUploadSuspected: true, localPaperCount: 4,
+    conflicts: [
+      { collection: 'papers', entityId: 'p1', field: 'title', title: '论文 A', local: '旧题', remote: '新题' },
+      { collection: 'notes', entityId: 'n1', field: 'content', title: '笔记 B', local: { title: '本地笔记' }, remote: { title: '云端笔记' } }
+    ],
+    localOnly: []
+  });
+  const st = h.api.stateForTest();
+  assert.strictEqual(st.resolutions[oldKeys[0]], 'local', '同键决议沿用');
+  assert.strictEqual(st.resolutions[oldKeys[1]], 'remote', '同键决议沿用');
+  assert.ok(!st.resolutions['plan:first-upload'], '断路器键不沿用，须重新确认');
+  assert.strictEqual(h.els['#sync-remote-plan-apply'].disabled, true, '断路器未决则不得应用');
+  assert.match(h.els['#sync-remote-plan-summary'].textContent, /已选 2\/3/, '计数含沿用的决议');
+  assert.ok(h.calls.toasts.some(function (s) { return s.indexOf('已沿用此前的选择') !== -1; }), '刷新有提示');
+
+  // 弹窗未开时的渲染（首次生成）不提示、也不该有可沿用的旧决议
+  h.api.close();
+  const fresh = makeHarness();
+  fresh.els['#sync-remote-merge'].click();
+  await flush();
+  assert.ok(!fresh.calls.toasts.some(function (s) { return s.indexOf('已沿用') !== -1; }), '首次生成无沿用提示');
+});

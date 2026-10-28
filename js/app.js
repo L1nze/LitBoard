@@ -7664,6 +7664,15 @@
     deepseek: 'DeepSeek'
   };
 
+  /* 云端对照弹窗开着（有待决议计划）期间，自动同步不得插队：后台同步一旦落库，
+   * 应用前快照守卫必拦（用户看到「点了应用没反应」，原因还藏在遮罩下的状态行里）；
+   * 若同步自己撞出冲突，带回的新计划会把整窗重渲、清掉用户正在做的选择。
+   * 手动「立即同步」是显式意图，不走此闸。 */
+  function remotePlanDialogOpen() {
+    var mask = $('#sync-remote-plan-mask');
+    return !!mask && !mask.hidden;
+  }
+
   function scheduleNutstoreSync(force) {
     if (!desktop || !desktop.getIntegrationConfig) return;
     // 库未加载成功（含启动读取失败）：不排队联网同步，空工作区上传会清空云端
@@ -7674,6 +7683,11 @@
     nutstoreSyncTimer = setTimeout(function () {
       nutstoreSyncTimer = null;
       if (syncBusy) { scheduleNutstoreSync(force); return; }
+      if (remotePlanDialogOpen()) {
+        // 对照弹窗开着：推迟重试（30s），编辑触发的同步意图不丢，弹窗关后自然续跑
+        nutstoreSyncTimer = setTimeout(function () { nutstoreSyncTimer = null; scheduleNutstoreSync(force); }, 30000);
+        return;
+      }
       desktop.getIntegrationConfig().then(function (config) {
         integrationConfig = config;
         return performSync(config, true);
@@ -7690,7 +7704,7 @@
     var delay = Math.max(5000, Math.min(Number(resumeAt) - Date.now() + 5000, 35 * 60 * 1000));
     syncResumeTimer = setTimeout(function () {
       syncResumeTimer = null;
-      if (syncBusy) { scheduleSyncResume(resumeAt + 60000); return; }
+      if (syncBusy || remotePlanDialogOpen()) { scheduleSyncResume(resumeAt + 60000); return; }
       desktop.getIntegrationConfig().then(function (config) {
         integrationConfig = config;
         return performSync(config, true);
@@ -12571,7 +12585,7 @@
       // 定时自动同步（15 分钟；编辑后另有 1.2s 防抖同步）。两者都受
       // 「内容变化时自动同步」开关控制，关闭后仅手动「立即同步」联网。
       setInterval(function () {
-        if (autoSyncEnabled && !syncBusy && integrationConfig && integrationConfig.nutstoreUser && integrationConfig.hasNutstorePassword) {
+        if (autoSyncEnabled && !syncBusy && !remotePlanDialogOpen() && integrationConfig && integrationConfig.nutstoreUser && integrationConfig.hasNutstorePassword) {
           performSync(integrationConfig, true);
         }
       }, 15 * 60 * 1000);
