@@ -13,13 +13,13 @@
   var engineLangDir = '';
   var cancelled = false;
   var idleTimer = 0;        // 用后空闲回收：OCR worker（wasm 运行时）不永久常驻
-  var IDLE_TERMINATE_MS = 5 * 60 * 1000;
+  var IDLE_TERMINATE_MS = 2 * 60 * 1000;
 
   function clearIdleTerminate() {
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = 0; }
   }
 
-  /** 识别结束后计时：5 分钟无新请求即 dispose worker（下次 ensureEngine 自愈重建） */
+  /** 识别结束后计时：2 分钟无新请求即 dispose worker（下次 ensureEngine 自愈重建） */
   function scheduleIdleTerminate() {
     clearIdleTerminate();
     idleTimer = setTimeout(function () {

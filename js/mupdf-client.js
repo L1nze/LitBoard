@@ -9,12 +9,14 @@
  * 低优先级（OCR 大位图、缩略图、批注全档扫描分块）单飞且让路——任一高优先级
  * 请求在途时低优先级在客户端排队，worker 队列里阅读器渲染永不排在 OCR 后面。
  *
- * 空闲回收：所有文档关闭且无在途/排队请求持续 idleTimeoutMs（默认 5 分钟）即
- * terminate worker；下次调用自动重建（startup-error/crash 兜底路径复用）。 */
+ * 空闲回收：所有文档关闭且无在途/排队请求持续 idleTimeoutMs（默认 2 分钟）即
+ * terminate worker；下次调用自动重建（startup-error/crash 兜底路径复用）。
+ * 回收窗口实测取舍：WASM 线性内存只涨不缩，关文档后 worker 按峰值常驻（~50MB），
+ * 5 分钟窗口把这段残留拖得太长；2 分钟内重开仍命中热 worker。 */
 (function () {
   'use strict';
 
-  var DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+  var DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
 
   function createClient(options) {
     options = options || {};

@@ -1808,8 +1808,9 @@
     // pendingRefresh：渲染途中被标记过期（stale/false）时，完成后自动补一轮重绘
     var renderingPages = {}, pendingRefresh = {};
     // bitmapCache：releasePage 后按 (页码|位图边长|旋转) 保留位图，回滚免重光栅；
-    // 缩放/旋转/dpr 变化整体失效（见 clear 调用点）
-    var bitmapCache = createBitmapLru({ maxEntries: 10, maxBytes: 120 * 1024 * 1024 });
+    // 上限 8 页 / 64MB——HiDPI 下单页位图可达 14MB，旧上限（10 页 / 120MB）最坏
+    // 常驻翻倍；8 页回翻覆盖仍充足，超限逐最旧淘汰
+    var bitmapCache = createBitmapLru({ maxEntries: 8, maxBytes: 64 * 1024 * 1024 });
     // searchGeneration：handle.search 的代际 token——换查询后旧代际的未完成结果
     // （worker 回包/高亮落地）一律丢弃，晚到的部分结果不得覆盖新查询
     var searchGeneration = 0;
