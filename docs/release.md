@@ -1,34 +1,23 @@
 # 下载 LitBoard
 
-LitBoard 提供 Windows x64 安装版和便携版，可从[正式发布页](https://github.com/L1nze/LitBoard/releases)和下方的直接下载链接获取。
+从 [GitHub Releases](https://github.com/L1nze/LitBoard/releases) 选择正式版本，下载同一 Release 的程序与 `SHA256SUMS.txt`。
 
-## 直接下载
+| 文件 | 用途 |
+|---|---|
+| `LitBoard-Setup-<版本>-x64.exe` | Windows x64 安装版 |
+| `LitBoard-Portable-<版本>-x64.exe` | Windows x64 免安装版 |
+| `LitBoard-Extension-<版本>.zip`（如提供） | Chrome / Edge 扩展，需连接桌面应用 |
 
-以下直接下载 1.0.3 正式版的发布附件。
-
-| 版本 | 直接下载 | 适合 |
-| --- | --- | --- |
-| Windows 安装版 | [下载 LitBoard-Setup-1.0.3-x64.exe](https://github.com/L1nze/LitBoard/releases/download/v1.0.3/LitBoard-Setup-1.0.3-x64.exe) | 常规安装，可选择安装目录 |
-| Windows 便携版 | [下载 LitBoard-Portable-1.0.3-x64.exe](https://github.com/L1nze/LitBoard/releases/download/v1.0.3/LitBoard-Portable-1.0.3-x64.exe) | 免安装运行，适合放在自选位置 |
-
-[查看 1.0.3 发布说明](https://github.com/L1nze/LitBoard/releases/tag/v1.0.3) · [下载 SHA256SUMS.txt](https://github.com/L1nze/LitBoard/releases/download/v1.0.3/SHA256SUMS.txt)
-
-浏览器扩展可[下载 LitBoard-Extension-1.0.3.zip](https://github.com/L1nze/LitBoard/releases/download/v1.0.3/LitBoard-Extension-1.0.3.zip)。它需要连接正在运行的 LitBoard 桌面应用。
-
-## 校验下载文件
-
-从同一次 Release 下载 exe 与 `SHA256SUMS.txt`。在 PowerShell 中计算文件哈希：
+PowerShell 校验（替换为实际文件名）：
 
 ```powershell
-Get-FileHash -LiteralPath '.\LitBoard-Setup-1.0.3-x64.exe' -Algorithm SHA256
+Get-FileHash -LiteralPath '.\LitBoard-Setup-<版本>-x64.exe' -Algorithm SHA256
 ```
 
-便携版将命令中的文件名换为 `LitBoard-Portable-1.0.3-x64.exe`。把输出的 `Hash` 与校验文件中相应文件的 SHA-256 值逐字比较。
+将 Hash 与同版本校验文件对应项比较。当前构建未签名，Windows 可能提示未知发布者。
 
-## 安装与数据
+两种版本都无需另装 Node.js。数据默认在 `%APPDATA%\LitBoard`，可另选目录；Portable 不自动把数据放到 exe 旁。
 
-运行安装包即可安装；便携版可放在自选位置直接启动。两种版本都不需要另行安装 Node.js。主文献库、笔记和受管附件默认保存在 `%APPDATA%\LitBoard`，也可选择其他数据目录；便携版不会自动把数据保存在 exe 所在目录。
+应用支持检查正式版本、后台下载和校验；安装版点击「立即更新」启动安装，便携版定位下载文件供替换。升级前可在「数据与备份」创建快照。
 
-应用会检查 GitHub Releases 是否有更高版本的正式发布包，并提示下载；也可在设置中手动检查。下载后仍需自行完成升级。升级前建议在「设置 → 数据与备份」创建快照。当前构建未进行代码签名，Windows SmartScreen 可能显示未知发布者提示；运行前请核对下载文件的 SHA-256。
-
-功能演示见[功能导览](feature-tour.md)。
+操作示例见[功能导览](feature-tour.md)，源码构建见[发布流程](releasing.md)。

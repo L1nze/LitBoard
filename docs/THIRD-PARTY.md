@@ -1,10 +1,6 @@
 # 第三方组件（THIRD-PARTY）
 
-> 开源分发义务的核对表：列明随应用分发的第三方组件的**版本、来源、哈希、许可证、NOTICE 义务**；未随包分发的设计来源另列说明。
-> 哈希为 SHA-256（完整值见 `vendor/SHA256SUMS`，由 `scripts/vendor-hashes.js` 生成）。
-> 新增 vendor 文件时：登记本表，并把哈希加进 `SHA256SUMS`。
-> README 的许可章节分别为中文 `README.zh-CN.md`「许可证与第三方组件」和英文 `README.md`「License and third-party components」。
-> 仓库根目录的 `LICENSE` 当前为 MIT，适用于 LitBoard 自有代码；随包第三方组件保留各自的许可证。
+记录随包组件的版本、来源、许可与声明；哈希见 `vendor/SHA256SUMS`。新增或升级组件同步更新本表与哈希。根目录 MIT 仅适用于自有代码。
 
 ## 运行时随应用分发的组件
 
@@ -15,7 +11,7 @@
 | onnxruntime-web（OCR 推理 wasm） | 1.24.3 | https://github.com/microsoft/onnxruntime | MIT（指津见 `vendor/paddleocr/LICENSE.onnxruntime-web.txt`） | `ort/ort-wasm-simd-threaded{,.jsep}.{mjs,wasm}`（完整值见 SHA256SUMS） |
 | PP-OCRv5 mobile 模型（det/rec，运行时下载） | paddle3.0.0 官方导出 | https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/ | Apache-2.0（tar 内 README 声明） | 不随安装包分发；运行时下载到用户配置目录 `ocr/paddle/` |
 | foliate-js（EPUB 内核；esbuild 0.25.12 构建，内含上游 vendor 的 zip.js 与 fflate） | 钉 commit 78914aef4466eb960965702401634c2cb348e9b1（2026-05-01） | 源码 scripts/foliate-bundle/（复现构建见其 build.js）；上游 https://github.com/johnfactotum/foliate-js | MIT（© John Factotum，完整文本见 `vendor/foliate/LICENSE.foliate-js`）；vendored deps：@zip.js/zip.js BSD-3、fflate MIT（随 bundle 内联，版本见 scripts/foliate-bundle/package.json） | `foliate.min.js`（完整值见 SHA256SUMS） |
-| JSZip | 3.10.1 | https://github.com/Stuk/jszip | MIT 或 GPLv3（本项目以 MIT 使用） | `vendor/jszip/jszip.min.js` 8d2c73c115c5b5c8（EPUB 解包 + docx ZIP 容器 + 网页快照 stored-ZIP 共用） |
+| JSZip | 3.10.1 | https://github.com/Stuk/jszip | MIT 或 GPLv3（本项目以 MIT 使用） | `vendor/jszip/jszip.min.js` 8d2c73c115c5b5c8（docx 与网页快照 ZIP） |
 | citeproc-js | 1.4.61 | https://github.com/Juris-M/citeproc-js | CPAL-1.0 / AGPL-3.0 双许可（本项目以 CPAL 使用，完整文本见 `vendor/citeproc/LICENSE.CPAL`，署名 © Frank Bennett） | `citeproc.js` 55abba1a8b8b48c1 |
 | CSL 样式 / 语言环境 | 随仓库快照 | https://github.com/citation-style-language/styles 、 /locales | CC BY-SA 3.0（完整文本见 `vendor/citeproc/LICENSE.CC-BY-SA-3.0`） | `vendor/citeproc/styles/*.csl`、`locales/*.xml` |
 | bibtex-parse | 上游版（未在文件头标注） | https://github.com/noahfalk/ （PEG.js 生成解析器，MIT） | MIT | `bibtex-parse.js` 041dc7977d34e890 |
@@ -35,15 +31,15 @@
 
 LitBoard 文献Agent调研模块的核心工作流以 [PAPER-SQL](https://github.com/galois-yan/PAPER-SQL) 为设计基础，包括检索结果写入本地调研库、缺失摘要回填、语义检索和引文关系分析。感谢该项目作者，我的导师严寅中老师（Yinzhong Yan，西北工业大学）。PAPER-SQL 的[许可证为 MIT](https://github.com/galois-yan/PAPER-SQL/blob/master/LICENSE)，版权声明为 © 2026 严寅中。
 
-这里登记的是方法与设计来源；LitBoard 的对应功能由本项目的 JavaScript / Electron 模块实现，PAPER-SQL 的 Python 包不作为运行时组件随应用分发，因此不列入上表的随包文件哈希。若后续直接引入其源代码，应按 MIT 许可证保留版权和许可声明，并在本台账登记具体文件。
+此处仅登记设计来源，Python 包不随应用分发；若引入源代码，保留其版权与许可并登记文件。
 
 ## 构建工具（不随应用分发，装在 %LOCALAPPDATA%\LitBoardBuildTools）
 
 | 组件 | 版本（唯一真源：package.json devDependencies） | 来源 | 许可证 |
 |---|---|---|---|
-| Electron | 44.4.3 | https://www.electronjs.org/ | MIT |
-| electron-builder | 26.15.3 | https://www.electron.build/ | MIT |
-| ESLint | ^10.10.0 | https://eslint.org/ | MIT |
+| Electron | 见 package.json | https://www.electronjs.org/ | MIT |
+| electron-builder | 见 package.json | https://www.electron.build/ | MIT |
+| ESLint | 见 package.json | https://eslint.org/ | MIT |
 
 ## NOTICE 汇总
 
