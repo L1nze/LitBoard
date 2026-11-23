@@ -477,8 +477,11 @@ function createWindow() {
             // buildRequestBody 真的跳过已压缩消息，新工具（get_work 等）已注册
             agentExecutablePlanPresent: !!window.LitAgentPlan && !!window.LitAgentDispatch &&
               window.LitAgentPlan.validateProposal({ goal: 'x', steps: [{ content: 'read', status: 'completed' }] }, {}).ok === false,
+            // 注意此处不查 .aui-composer-wrap：本对象字面量在服务商配置前求值，真实
+            // 聊天组件此时尚未挂载（该 DOM 检查恒假）；composer 渲染端到端由下方
+            // agentChatRendered（探针挂载 + 几何断言，已入通过判定）覆盖
             agentSteeringPresent: typeof window.LitAgentLoop.createRunner({ core: window.LitAgentCore }).enqueue === 'function' &&
-              !!window.LitAgentChat && !!document.querySelector('.aui-composer-wrap'),
+              !!window.LitAgentChat && typeof window.LitAgentChat.mount === 'function',
             agentReferenceSearchPresent: !!window.LitAgentFileContext &&
               !!window.litboardDesktop.sessionListReferences && !!window.litboardDesktop.sessionSearchReference &&
               window.LitAgent.createTools({ desktop: {} }).tools.some(function (t) { return t.function.name === 'search_session_file'; }),
